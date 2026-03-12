@@ -37,7 +37,7 @@ except ImportError:
     ChatbotMessage = None  # type: ignore[assignment,misc]
 
 
-class NanobotDingTalkHandler(CallbackHandler):
+class MarkBotDingTalkHandler(CallbackHandler):
     """
     Standard DingTalk Stream SDK Callback Handler.
     Parses incoming messages and forwards them to the markbot channel.
@@ -153,7 +153,7 @@ class DingTalkChannel(BaseChannel):
             self._client = DingTalkStreamClient(credential)
 
             # Register standard handler
-            handler = NanobotDingTalkHandler(self)
+            handler = MarkBotDingTalkHandler(self)
             self._client.register_callback_handler(ChatbotMessage.TOPIC, handler)
 
             logger.info("DingTalk bot started with Stream Mode")
@@ -448,7 +448,7 @@ class DingTalkChannel(BaseChannel):
         conversation_type: str | None = None,
         conversation_id: str | None = None,
     ) -> None:
-        """Handle incoming message (called by NanobotDingTalkHandler).
+        """Handle incoming message (called by MarkBotDingTalkHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
         permission checks before publishing to the bus.

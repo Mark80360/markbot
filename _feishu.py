@@ -11,11 +11,11 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.bus.events import OutboundMessage
-from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
-from markbot.config.paths import get_media_dir
-from markbot.config.schema import FeishuConfig
+from nanobot.bus.events import OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
+from nanobot.config.schema import FeishuConfig
 
 import importlib.util
 
@@ -244,11 +244,11 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    display_name = "Feishu"
 
-    def __init__(self, config: FeishuConfig, bus: MessageBus, groq_api_key: str = ""):
+    def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
-        self.groq_api_key = groq_api_key
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
@@ -352,8 +352,29 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
-        """Sync helper for adding reaction (runs in thread pool). Returns reaction_id."""
+    def _is_bot_mentioned(self, message: Any) -> bool:
+        """Check if the bot is @mentioned in the message."""
+        raw_content = message.content or ""
+        if "@_all" in raw_content:
+            return True
+
+        for mention in getattr(message, "mentions", None) or []:
+            mid = getattr(mention, "id", None)
+            if not mid:
+                continue
+            # Bot mentions have no user_id (None or "") but a valid open_id
+            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+                return True
+        return False
+
+    def _is_group_message_for_bot(self, message: Any) -> bool:
+        """Allow group messages when policy is open or bot is @mentioned."""
+        if self.config.group_policy == "open":
+            return True
+        return self._is_bot_mentioned(message)
+
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
+        """Sync helper for adding reaction (runs in thread pool)."""
         from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
         try:
             request = CreateMessageReactionRequest.builder() \
@@ -368,53 +389,22 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
-                return None
             else:
-                reaction_id = response.data.reaction_id
-                logger.debug("Added {} reaction to message {}: {}", emoji_type, message_id, reaction_id)
-                return reaction_id
+                logger.debug("Added {} reaction to message {}", emoji_type, message_id)
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
-            return None
 
-    def _delete_reaction_sync(self, message_id: str, reaction_id: str) -> None:
-        """Sync helper for deleting reaction (runs in thread pool)."""
-        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
-        try:
-            request = DeleteMessageReactionRequest.builder() \
-                .message_id(message_id) \
-                .reaction_id(reaction_id) \
-                .build()
-
-            response = self._client.im.v1.message_reaction.delete(request)
-
-            if not response.success():
-                logger.warning("Failed to delete reaction: code={}, msg={}", response.code, response.msg)
-            else:
-                logger.debug("Deleted reaction {} from message {}", reaction_id, message_id)
-        except Exception as e:
-            logger.warning("Error deleting reaction: {}", e)
-
-    async def _add_reaction(self, message_id: str, emoji_type: str = "SMILE") -> str | None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
         """
         Add a reaction emoji to a message (non-blocking).
 
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
-        Returns reaction_id for later deletion.
         """
-        if not self._client:
-            return None
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
-
-    async def _delete_reaction(self, message_id: str, reaction_id: str) -> None:
-        """Delete a reaction emoji from a message (non-blocking)."""
         if not self._client:
             return
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._delete_reaction_sync, message_id, reaction_id)
+        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -887,10 +877,6 @@ class FeishuChannel(BaseChannel):
                             receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
                         )
 
-            # Delete reaction after sending reply
-            if msg.metadata and msg.metadata.get("reaction_id") and msg.metadata.get("message_id"):
-                await self._delete_reaction(msg.metadata["message_id"], msg.metadata["reaction_id"])
-
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
 
@@ -928,8 +914,12 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # Add reaction and store reaction_id for later deletion
-            reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
+            if chat_type == "group" and not self._is_group_message_for_bot(message):
+                logger.debug("Feishu: skipping group message (not mentioned)")
+                return
+
+            # Add reaction
+            await self._add_reaction(message_id, self.config.react_emoji)
 
             # Parse content
             content_parts = []
@@ -963,16 +953,10 @@ class FeishuChannel(BaseChannel):
                 if file_path:
                     media_paths.append(file_path)
 
-                # Transcribe audio using Groq Whisper
-                if msg_type == "audio" and file_path and self.groq_api_key:
-                    try:
-                        from markbot.providers.transcription import GroqTranscriptionProvider
-                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                        transcription = await transcriber.transcribe(file_path)
-                        if transcription:
-                            content_text = f"[transcription: {transcription}]"
-                    except Exception as e:
-                        logger.warning("Failed to transcribe audio: {}", e)
+                if msg_type == "audio" and file_path:
+                    transcription = await self.transcribe_audio(file_path)
+                    if transcription:
+                        content_text = f"[transcription: {transcription}]"
 
                 content_parts.append(content_text)
 
@@ -1001,7 +985,6 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
-                    "reaction_id": reaction_id,
                 }
             )
 
