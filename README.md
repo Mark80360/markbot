@@ -1,19 +1,27 @@
 # MarkBot 🦞
 
-A lightweight personal AI assistant framework that helps you automate tasks, manage information, and interact with various services through natural language.
+An advanced AI-powered automation and development assistant designed for developers and power users. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
+
+## Core Strengths
+
+- **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
+- **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
+- **Multi-Modal Integration**: Seamlessly interact with various platforms and services through a unified interface
+- **Extensible Architecture**: Customize and extend capabilities through a powerful skills system
 
 ## Features
 
-- **Multiple LLM Providers**: OpenAI, Azure OpenAI, LiteLLM, Anthropic, Ollama, and more
+- **Multiple LLM Providers**: OpenAI, Azure OpenAI, Anthropic, DeepSeek, Groq, and 15+ providers
 - **Multi-channel Support**: Discord, DingTalk, Feishu, Email, and more
-- **Agent Framework**: Built-in agent loop with tools, memory, and sub-agents
-- **Skills System**: Extensible skill framework for adding capabilities
-- **Cron Jobs**: Schedule and run recurring tasks
-- **Heartbeat Service**: Monitor and maintain persistent connections
-- **MCP Support**: Model Context Protocol integration
-- **Memory System**: Two-layer memory with long-term storage and searchable history
-- **Sub-agent Support**: Delegate tasks to specialized sub-agents
-- **Web Integration**: Built-in web browsing and content extraction tools
+- **Advanced Agent Framework**: Sophisticated agent loop with tools, memory, and sub-agent delegation
+- **Skills System**: Modular skill framework for adding specialized capabilities
+- **Cron Jobs**: Schedule and automate recurring tasks with precision
+- **Heartbeat Service**: Maintain persistent connections and real-time monitoring
+- **MCP Support**: Model Context Protocol for seamless tool integration
+- **Two-Layer Memory System**: Long-term knowledge storage with searchable event history
+- **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents
+- **Web Integration**: Built-in web browsing, content extraction, and API interaction
+- **Code Analysis**: Deep codebase understanding and intelligent code navigation
 
 ## Installation
 
