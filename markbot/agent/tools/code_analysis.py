@@ -11,8 +11,9 @@ from markbot.agent.tools.base import Tool
 class CodeAnalysisTool(Tool):
     """Analyze code structure, dependencies, and complexity."""
 
-    def __init__(self, workspace: Path | None = None):
+    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
+        self._allowed_dir = allowed_dir
 
     @property
     def name(self) -> str:
@@ -41,6 +42,13 @@ class CodeAnalysisTool(Tool):
         p = Path(path)
         if self._workspace and not p.is_absolute():
             p = self._workspace / p
+
+        p = p.resolve()
+        if self._allowed_dir:
+            try:
+                p.relative_to(self._allowed_dir.resolve())
+            except ValueError:
+                return f"Error: Path {path} is outside allowed directory {self._allowed_dir}"
 
         if not p.exists():
             return f"Error: Path {path} does not exist"
