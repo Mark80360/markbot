@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import mimetypes
 import platform
 import time
@@ -8,9 +9,58 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from markbot.agent.memory import MemoryStore
 from markbot.agent.skills import SkillsLoader
 from markbot.utils.helpers import detect_image_mime
+
+
+def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sanitize tool_calls to ensure arguments are valid JSON objects."""
+    sanitized = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function", {})
+        if not func:
+            continue
+        args = func.get("arguments")
+        if args is None:
+            continue
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                if isinstance(parsed, dict):
+                    func["arguments"] = parsed
+                else:
+                    logger.warning(
+                        "Tool call '{}' has non-object arguments (type: {}), skipping",
+                        func.get("name"),
+                        type(parsed).__name__,
+                    )
+                    continue
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Tool call '{}' has invalid JSON arguments: {}, skipping",
+                    func.get("name"),
+                    args[:100],
+                )
+                continue
+        elif isinstance(args, list):
+            logger.warning(
+                "Tool call '{}' has array arguments (should be object), skipping", func.get("name")
+            )
+            continue
+        elif not isinstance(args, dict):
+            logger.warning(
+                "Tool call '{}' has invalid arguments type: {}, skipping",
+                func.get("name"),
+                type(args).__name__,
+            )
+            continue
+        sanitized.append(tc)
+    return sanitized
 
 
 class ContextBuilder:
@@ -248,15 +298,21 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: str,
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: str,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        )
         return messages
 
     def add_assistant_message(
-        self, messages: list[dict[str, Any]],
+        self,
+        messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
@@ -265,7 +321,12 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """Add an assistant message to the message list."""
         msg: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
-            msg["tool_calls"] = tool_calls
+            sanitized = _sanitize_tool_calls(tool_calls)
+            if sanitized:
+                msg["tool_calls"] = sanitized
+            elif not content:
+                content = "[Invalid tool calls omitted]"
+                msg["content"] = content
         if reasoning_content is not None:
             msg["reasoning_content"] = reasoning_content
         if thinking_blocks:

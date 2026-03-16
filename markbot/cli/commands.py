@@ -670,7 +670,7 @@ def channels_status():
 
     config = load_config()
 
-    table = Table(title="Channel Status", title_justify="left")
+    table = Table(title="\nChannel Status", title_justify="left")
     table.add_column("Channel", style="cyan")
     table.add_column("Enabled", style="green")
     table.add_column("Configuration", style="yellow")
@@ -1170,7 +1170,7 @@ def gateway_status():
     import json
     from datetime import datetime
 
-    table = Table(title=f"{__logo__} MarkBot Gateway Status", title_justify="left")
+    table = Table(title=f"\n{__logo__} MarkBot Gateway Status", title_justify="left")
     table.add_column("Component", style="cyan", width=20)
     table.add_column("Status", style="green", width=20)
     table.add_column("Details", width=50)
@@ -1405,7 +1405,7 @@ def config_list(
         console.print(f"[yellow]No keys found with prefix '{prefix}'[/yellow]")
         return
 
-    table = Table(title=f"{__logo__} MarkBot Configuration", title_justify="left")
+    table = Table(title=f"\n{__logo__} MarkBot Configuration", title_justify="left")
     table.add_column("Key", style="cyan")
     table.add_column("Value", style="green")
 
@@ -1448,7 +1448,7 @@ def pairing_list(
         console.print("[yellow]No pending pairing requests[/yellow]")
         raise typer.Exit(0)
 
-    table = Table(title=f"{__logo__} Pending Pairing Requests", title_justify="left")
+    table = Table(title=f"\n{__logo__} Pending Pairing Requests", title_justify="left")
     table.add_column("Code", style="cyan")
     table.add_column("Channel", style="green")
     table.add_column("Sender ID", style="yellow")

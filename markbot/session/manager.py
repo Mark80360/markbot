@@ -34,18 +34,13 @@ class Session:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            **kwargs
-        }
+        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a user turn."""
-        unconsolidated = self.messages[self.last_consolidated:]
+        unconsolidated = self.messages[self.last_consolidated :]
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
@@ -60,8 +55,62 @@ class Session:
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
+
+            # Validate and sanitize tool_calls
+            if "tool_calls" in entry:
+                entry["tool_calls"] = self._sanitize_tool_calls(entry["tool_calls"])
+
             out.append(entry)
         return out
+
+    def _sanitize_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:
+        """Sanitize tool_calls to ensure arguments are valid JSON objects."""
+        if not isinstance(tool_calls, list):
+            return []
+
+        sanitized = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function", {})
+            if not func:
+                continue
+            args = func.get("arguments")
+            if args is None:
+                continue
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    if isinstance(parsed, dict):
+                        func["arguments"] = parsed
+                    else:
+                        logger.warning(
+                            "History contains tool call '{}' with non-object arguments (type: {}), skipping",
+                            func.get("name"),
+                            type(parsed).__name__,
+                        )
+                        continue
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "History contains tool call '{}' with invalid JSON arguments, skipping",
+                        func.get("name"),
+                    )
+                    continue
+            elif isinstance(args, list):
+                logger.warning(
+                    "History contains tool call '{}' with array arguments (should be object), skipping",
+                    func.get("name"),
+                )
+                continue
+            elif not isinstance(args, dict):
+                logger.warning(
+                    "History contains tool call '{}' with invalid arguments type: {}, skipping",
+                    func.get("name"),
+                    type(args).__name__,
+                )
+                continue
+            sanitized.append(tc)
+        return sanitized
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
@@ -144,7 +193,11 @@ class SessionManager:
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
+                        created_at = (
+                            datetime.fromisoformat(data["created_at"])
+                            if data.get("created_at")
+                            else None
+                        )
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -154,7 +207,7 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -171,7 +224,7 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
+                "last_consolidated": session.last_consolidated,
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
@@ -201,12 +254,14 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                            sessions.append(
+                                {
+                                    "key": key,
+                                    "created_at": data.get("created_at"),
+                                    "updated_at": data.get("updated_at"),
+                                    "path": str(path),
+                                }
+                            )
             except Exception:
                 continue
 

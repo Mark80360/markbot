@@ -245,7 +245,7 @@ class AgentLoop:
             # except Exception as e:
             #     logger.warning(f"Failed to log response: {e}")
 
-            if response.has_tool_calls:
+            if response.has_tool_calls and response.tool_calls:
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
@@ -279,17 +279,15 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
+                    messages, clean or "", reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
-                final_content = clean
+                final_content = clean or "Sorry, I couldn't process that request."
                 break
 
         if final_content is None and iteration >= self.max_iterations:
