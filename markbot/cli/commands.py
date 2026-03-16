@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+from rich import box
 
 from markbot import __logo__, __version__
 from markbot.config.paths import get_workspace_path
@@ -1192,27 +1193,41 @@ def gateway_status():
                 minutes, _ = divmod(remainder, 60)
                 uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
                 mem_mb = proc.memory_info().rss / 1024 / 1024
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}, Uptime: {uptime_str}, Memory: {mem_mb:.1f}MB")
+                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}, Uptime: {uptime_str}, Memory: {mem_mb:.1f}MB", end_section=True)
             except:
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}")
+                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
         else:
-            table.add_row("Process", "[red]● Stopped[/red]", "Stale PID file")
+            table.add_row("Process", "[red]● Stopped[/red]", "Stale PID file", end_section=True)
             _remove_pid()
     else:
-        table.add_row("Process", "[red]● Stopped[/red]", "No PID file")
+        table.add_row("Process", "[red]● Stopped[/red]", "No PID file", end_section=True)
 
     if GATEWAY_LOG_FILE.exists():
         log_size = GATEWAY_LOG_FILE.stat().st_size / 1024
         log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        table.add_row("Log File", f"{log_size:.1f}KB", f"{GATEWAY_LOG_FILE}\nLast modified: {log_mtime}")
+        table.add_row("Log File", f"{log_size:.1f}KB", f"Last modified: {log_mtime}")
     else:
-        table.add_row("Log File", "[yellow]Not found[/yellow]", str(GATEWAY_LOG_FILE))
+        table.add_row("Log File", "[yellow]○ Not found[/yellow]", str(GATEWAY_LOG_FILE))
 
     config = load_config()
     workspace = config.workspace_path
-    table.add_row("Workspace", str(workspace.exists()), str(workspace))
+    table.add_row("Workspace", "[green]✓[/green]" if workspace.exists() else "[red]✗[/red]", str(workspace), end_section=True)
 
     table.add_row("Model", config.agents.defaults.model, f"Temp: {config.agents.defaults.temperature}, Max tokens: {config.agents.defaults.max_tokens}")
+
+    hb_cfg = config.gateway.heartbeat
+    hb_status = "[green]● Enabled[/green]" if hb_cfg.enabled else "[yellow]○ Disabled[/yellow]"
+    table.add_row("Heartbeat", hb_status, f"Interval: {hb_cfg.interval_s}s")
+
+    channels_config = config.channels
+    enabled_channels = []
+    if channels_config:
+        if channels_config.feishu and channels_config.feishu.enabled:
+            enabled_channels.append("feishu")
+        if channels_config.email and channels_config.email.enabled:
+            enabled_channels.append("email")
+    channels_str = ", ".join(enabled_channels) if enabled_channels else "None"
+    table.add_row("Channels", str(len(enabled_channels)), channels_str, end_section=True)
 
     cron_store_path = workspace / "cron" / "jobs.json"
     cron_jobs = 0
@@ -1227,26 +1242,21 @@ def gateway_status():
             pass
     table.add_row("Cron Jobs", f"{active_jobs}/{cron_jobs} active", str(cron_store_path))
 
-    hb_cfg = config.gateway.heartbeat
-    hb_status = "[green]● Enabled[/green]" if hb_cfg.enabled else "[yellow]○ Disabled[/yellow]"
-    table.add_row("Heartbeat", hb_status, f"Interval: {hb_cfg.interval_s}s")
-
-    channels_config = config.channels
-    enabled_channels = []
-    if channels_config:
-        if channels_config.feishu and channels_config.feishu.enabled:
-            enabled_channels.append("feishu")
-        if channels_config.email and channels_config.email.enabled:
-            enabled_channels.append("email")
-    channels_str = ", ".join(enabled_channels) if enabled_channels else "None"
-    table.add_row("Channels", channels_str or "None", f"{len(enabled_channels)} enabled")
-
     sessions_dir = workspace / "sessions"
     session_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
     table.add_row("Sessions", str(session_count), str(sessions_dir))
 
     mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
-    table.add_row("MCP Servers", str(mcp_count), ", ".join(config.tools.mcp_servers.keys()) if mcp_count else "None")
+    mcp_names = ", ".join(config.tools.mcp_servers.keys()) if mcp_count else "None"
+    table.add_row("MCP Servers", str(mcp_count), mcp_names)
+
+    from markbot.agent.skills import SkillsLoader
+    skills_loader = SkillsLoader(workspace)
+    all_skills = skills_loader.list_skills(filter_unavailable=False)
+    builtin_skills = [s for s in all_skills if s["source"] == "builtin"]
+    workspace_skills = [s for s in all_skills if s["source"] == "workspace"]
+    skills_detail = f"builtin: {len(builtin_skills)}, workspace: {len(workspace_skills)}"
+    table.add_row("Skills", str(len(all_skills)), skills_detail, end_section=True)
 
     console.print(table)
 

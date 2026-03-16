@@ -9,7 +9,10 @@ from markbot.agent.tools.base import Tool
 
 
 def _resolve_path(
-    path: str, workspace: Path | None = None, allowed_dir: Path | None = None
+    path: str,
+    workspace: Path | None = None,
+    allowed_dir: Path | None = None,
+    extra_allowed_dirs: list[Path] | None = None,
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
     p = Path(path).expanduser()
@@ -17,21 +20,42 @@ def _resolve_path(
         p = workspace / p
     resolved = p.resolve()
     if allowed_dir:
-        try:
-            resolved.relative_to(allowed_dir.resolve())
-        except ValueError:
+        all_dirs = [allowed_dir] + (extra_allowed_dirs or [])
+        if not any(_is_under(resolved, d) for d in all_dirs):
             raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
     return resolved
 
 
-class ReadFileTool(Tool):
-    """Tool to read file contents."""
+def _is_under(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
 
-    _MAX_CHARS = 128_000  # ~128 KB — prevents OOM from reading huge files into LLM context
 
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+class _FsTool(Tool):
+    """Shared base for filesystem tools — common init and path resolution."""
+
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+        extra_allowed_dirs: list[Path] | None = None,
+    ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._extra_allowed_dirs = extra_allowed_dirs
+
+    def _resolve(self, path: str) -> Path:
+        return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
+
+
+class ReadFileTool(_FsTool):
+    """Read file contents with optional line-based pagination."""
+
+    _MAX_CHARS = 128_000
+    _DEFAULT_LIMIT = 2000
 
     @property
     def name(self) -> str:
@@ -39,47 +63,68 @@ class ReadFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file at the given path."
+        return (
+            "Read the contents of a file. Returns numbered lines. "
+            "Use offset and limit to paginate through large files."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "The file path to read"}},
+            "properties": {
+                "path": {"type": "string", "description": "The file path to read"},
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed, default 1)",
+                    "minimum": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read (default 2000)",
+                    "minimum": 1,
+                },
+            },
             "required": ["path"],
         }
 
-    async def execute(self, path: str, **kwargs: Any) -> str:
+    async def execute(self, path: str, offset: int = 1, limit: int | None = None, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
-            if not file_path.exists():
+            fp = self._resolve(path)
+            if not fp.exists():
                 return f"Error: File not found: {path}"
-            if not file_path.is_file():
+            if not fp.is_file():
                 return f"Error: Not a file: {path}"
 
-            size = file_path.stat().st_size
-            if size > self._MAX_CHARS * 4:  # rough upper bound (UTF-8 chars ≤ 4 bytes)
-                return (
-                    f"Error: File too large ({size:,} bytes). "
-                    f"Use exec tool with head/tail/grep to read portions."
-                )
-
-            content = file_path.read_text(encoding="utf-8")
-            if len(content) > self._MAX_CHARS:
-                return content[: self._MAX_CHARS] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._MAX_CHARS:,})"
-            return content
+            limit = limit or self._DEFAULT_LIMIT
+            lines = fp.read_text(encoding="utf-8").splitlines()
+            
+            if offset > len(lines):
+                return f"Error: Offset {offset} is beyond file length ({len(lines)} lines)"
+            
+            selected = lines[offset - 1 : offset - 1 + limit]
+            has_more = offset + limit <= len(lines)
+            
+            result_lines = [f"{i + offset:6d} | {line}" for i, line in enumerate(selected)]
+            result = "\n".join(result_lines)
+            
+            info = []
+            if offset > 1:
+                info.append(f"offset: {offset}")
+            if has_more:
+                info.append(f"remaining: {len(lines) - offset - limit + 1}")
+            info.append(f"total: {len(lines)} lines")
+            
+            suffix = f"\n\n... ({', '.join(info)})" if info else ""
+            return result + suffix
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error reading file: {str(e)}"
 
 
-class WriteFileTool(Tool):
+class WriteFileTool(_FsTool):
     """Tool to write content to a file."""
-
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
-        self._workspace = workspace
-        self._allowed_dir = allowed_dir
 
     @property
     def name(self) -> str:
@@ -102,7 +147,7 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = self._resolve(path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
@@ -112,12 +157,8 @@ class WriteFileTool(Tool):
             return f"Error writing file: {str(e)}"
 
 
-class EditFileTool(Tool):
+class EditFileTool(_FsTool):
     """Tool to edit a file by replacing text."""
-
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
-        self._workspace = workspace
-        self._allowed_dir = allowed_dir
 
     @property
     def name(self) -> str:
@@ -141,7 +182,7 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = self._resolve(path)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
 
@@ -193,12 +234,8 @@ class EditFileTool(Tool):
         )
 
 
-class ListDirTool(Tool):
+class ListDirTool(_FsTool):
     """Tool to list directory contents."""
-
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
-        self._workspace = workspace
-        self._allowed_dir = allowed_dir
 
     @property
     def name(self) -> str:
@@ -218,7 +255,7 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            dir_path = self._resolve(path)
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():
