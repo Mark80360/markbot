@@ -12,7 +12,7 @@ An advanced AI-powered automation and development assistant designed for develop
 ## Features
 
 - **Multiple LLM Providers**: OpenAI, Azure OpenAI, Anthropic, DeepSeek, Groq, and 15+ providers
-- **Multi-channel Support**: Discord, DingTalk, Feishu, Email, and more
+- **Multi-channel Support**: DingTalk, Feishu, Email, and more
 - **Advanced Agent Framework**: Sophisticated agent loop with tools, memory, and sub-agent delegation
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision

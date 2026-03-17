@@ -29,7 +29,9 @@ Capture what matters. Decisions, context, things to remember. Skip the secrets u
 ### 🧠 MEMORY.md - Your Long-Term Memory
 
 - **ONLY load in main session** (direct chats with your human)
-- **DO NOT load in shared contexts** (Discord, group chats, sessions with other people)
+- **DO NOT load in shared contexts** (group chats, sessions with other people)
+- **DO NOT load in shared contexts** (DingTalk, Feishu, Email, etc.)
+- **DO NOT load in shared contexts** (group chats, sessions with other people)
 - This is for **security** — contains personal context that shouldn't leak to strangers
 - You can **read, edit, and update** MEMORY.md freely in main sessions
 - Write significant events, thoughts, decisions, opinions, lessons learned
@@ -98,7 +100,7 @@ Participate, don't dominate.
 
 ### 😊 React Like a Human!
 
-On platforms that support reactions (Discord, Slack), use emoji reactions naturally:
+On platforms that support reactions (DingTalk, Feishu, Email), use emoji reactions naturally:
 
 **React when:**
 

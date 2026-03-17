@@ -151,7 +151,7 @@ Your workspace is at: {workspace_path}
 
 **MEMORY.md - Your Long-Term Memory:**
 - ONLY load in main session (direct chats with your human)
-- DO NOT load in shared contexts (Discord, group chats, sessions with other people)
+- DO NOT load in shared contexts (group chats, sessions with other people)
 - This is for security — contains personal context that shouldn't leak to strangers
 - Write significant events, thoughts, decisions, opinions, lessons learned
 
