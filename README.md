@@ -18,7 +18,7 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
 - **Heartbeat Service**: Maintain persistent connections and real-time monitoring
 - **MCP Support**: Model Context Protocol for seamless tool integration
-- **Two-Layer Memory System**: Long-term knowledge storage with searchable event history
+- **Three-Layer Memory System**: Core, working, and episodic memory with time-based decay
 - **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents
 - **Web Integration**: Built-in web browsing, content extraction, and API interaction
 - **Code Analysis**: Deep codebase understanding and intelligent code navigation
@@ -244,7 +244,9 @@ MarkBot uses a workspace directory to store your data and customizations. Defaul
 ├── HEARTBEAT.md       # Heartbeat system prompt (customizable)
 ├── TOOLS.md           # Tool descriptions (customizable)
 ├── memory/
-│   ├── MEMORY.md      # Long-term memory facts
+│   ├── ENTRIES.json   # Structured memory entries
+│   ├── ENTITIES.json  # Tracked entities (people, projects)
+│   ├── MEMORY.md      # Human-readable memory (auto-generated)
 │   └── HISTORY.md     # Append-only event log
 └── skills/            # Custom skills directory
 ```
@@ -259,17 +261,50 @@ Edit the template files in your workspace to customize agent behavior:
 
 ### Memory System
 
-MarkBot uses a two-layer memory system:
+MarkBot uses a three-layer memory system with intelligent selective loading:
 
-1. **MEMORY.md**: Long-term facts that are always loaded into context
-   - Preferences, project context, relationships
-   - Important facts that should be remembered
-   - Updated using `edit_file` or `write_file`
+**Memory Layers:**
 
-2. **HISTORY.md**: Append-only event log
-   - Not loaded into context by default
-   - Searchable using grep-style tools
-   - Each entry starts with `[YYYY-MM-DD HH:MM]`
+1. **Core Layer** (~500 tokens): Always loaded
+   - User identity, core preferences
+   - Highest importance memories
+
+2. **Working Layer** (~1500 tokens): Loaded by relevance
+   - Recent projects, tasks, facts
+   - Boosted when matching current context
+
+3. **Episodic Layer**: Search-only
+   - Historical events, lessons learned
+   - Accessed via search, not auto-loaded
+
+**Memory Categories:**
+
+| Category | Default Layer | Decay Rate |
+|----------|---------------|------------|
+| Identity | Core | Very slow |
+| Preference | Core | Slow |
+| Fact | Working | Moderate |
+| Project | Working | Moderate |
+| Task | Working | Fast |
+| Event | Episodic | Moderate |
+| Lesson | Episodic | Slow |
+| Contact | Working | Moderate |
+
+**Features:**
+
+- **Time-based Decay**: Memories fade over time based on category
+- **Access Tracking**: Frequently accessed memories stay relevant longer
+- **Entity Tracking**: People, projects, and topics are automatically tracked
+- **AI-powered Extraction**: Entities extracted during memory consolidation (no regex patterns)
+- **Automatic Cleanup**: Low-relevance memories pruned after 500 entries
+- **Dual Storage**: `ENTRIES.json` (structured) + `MEMORY.md` (human-readable)
+
+**Storage Files:**
+
+- `ENTRIES.json`: Structured memory entries with metadata
+- `ENTITIES.json`: Tracked entities with mention counts
+- `MEMORY.md`: Auto-generated human-readable view
+- `HISTORY.md`: Append-only event log (rotates at 10MB)
 
 ## Skills
 
@@ -283,7 +318,7 @@ MarkBot includes a variety of built-in skills that extend its capabilities. Skil
 | `summarize` | Summarize URLs, files, and YouTube videos | "Summarize this URL: https://example.com" |
 | `cron` | Schedule reminders and recurring tasks | "Remind me to take a break every 2 hours" |
 | `github` | Interact with GitHub using the `gh` CLI | "Check the status of my pull requests" |
-| `memory` | Two-layer memory system with grep-based recall | "Remember that I prefer Python for data analysis" |
+| `memory` | Three-layer memory with categories, decay, and entity tracking | "Remember that I prefer Python for data analysis" |
 | `tmux` | Remote-control tmux sessions | "List all tmux sessions" |
 | `weather` | Get weather info using wttr.in and Open-Meteo | "What's the weather in Tokyo?" |
 | `clawhub` | Search and install skills from ClawHub registry | "Search for a skill for task management" |
@@ -403,7 +438,7 @@ MarkBot is built with a modular architecture:
 - **Provider Layer**: Abstraction for different LLM providers
 - **Channel Layer**: Integration with various messaging platforms
 - **Skill System**: Modular capabilities that can be loaded/unloaded
-- **Memory System**: Two-layer memory for long-term and short-term storage
+- **Memory System**: Three-layer memory with categories, decay, and entity tracking
 - **Cron Service**: Scheduled task execution
 - **Heartbeat Service**: Maintains persistent connections
 

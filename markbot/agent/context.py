@@ -75,16 +75,15 @@ class ContextBuilder:
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, and skills (memory loaded separately)."""
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        # Memory context is now built in build_messages with current message context
+        # for relevance-based selective loading
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -257,6 +256,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        memory_max_tokens: int = 2000,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -269,11 +269,54 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        # Build system prompt with memory context based on current message relevance
+        system_prompt = self._build_system_prompt_with_memory(
+            current_message, skill_names, memory_max_tokens
+        )
+
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": system_prompt},
             *history,
             {"role": "user", "content": merged},
         ]
+
+    def _build_system_prompt_with_memory(
+        self,
+        current_message: str,
+        skill_names: list[str] | None = None,
+        memory_max_tokens: int = 2000,
+    ) -> str:
+        """Build system prompt with relevance-based memory loading."""
+        parts = [self._get_identity()]
+
+        bootstrap = self._load_bootstrap_files()
+        if bootstrap:
+            parts.append(bootstrap)
+
+        # Load memory context with relevance to current message
+        memory = self.memory.get_memory_context(
+            current_message=current_message,
+            max_tokens=memory_max_tokens,
+        )
+        if memory:
+            parts.append(f"# Memory\n\n{memory}")
+
+        always_skills = self.skills.get_always_skills()
+        if always_skills:
+            always_content = self.skills.load_skills_for_context(always_skills)
+            if always_content:
+                parts.append(f"# Active Skills\n\n{always_content}")
+
+        skills_summary = self.skills.build_skills_summary()
+        if skills_summary:
+            parts.append(f"""# Skills
+
+The following skills extend your capabilities. Use the use_skill tool to load a skill's instructions.
+Skills with available="false" need dependencies installed first.
+
+{skills_summary}""")
+
+        return "\n\n---\n\n".join(parts)
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

@@ -1,6 +1,6 @@
 [project]
 name = "markbot-ai"
-version = "1.8.8"
+version = "1.8.9"
 description = "A lightweight personal AI assistant framework"
 requires-python = ">=3.11"
 license = {text = "MIT"}
