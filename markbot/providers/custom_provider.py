@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -54,16 +55,24 @@ class CustomProvider(LLMProvider):
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]
         msg = choice.message
-        tool_calls = [
-            ToolCallRequest(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=json_repair.loads(tc.function.arguments)
-                if isinstance(tc.function.arguments, str)
-                else tc.function.arguments,
+        tool_calls = []
+        for tc in (msg.tool_calls or []):
+            args = json_repair.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+            # Validate that args is a dict (tool arguments must be an object)
+            if not isinstance(args, dict):
+                logger.warning(
+                    "Tool call '{}' has non-object arguments (type: {}), skipping",
+                    tc.function.name,
+                    type(args).__name__,
+                )
+                continue
+            tool_calls.append(
+                ToolCallRequest(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=args,
+                )
             )
-            for tc in (msg.tool_calls or [])
-        ]
         u = response.usage
         return LLMResponse(
             content=msg.content,

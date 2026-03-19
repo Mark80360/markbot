@@ -287,6 +287,14 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                     args = json.loads(args_raw)
                 except Exception:
                     args = {"raw": args_raw}
+                # Validate that args is a dict (tool arguments must be an object)
+                if not isinstance(args, dict):
+                    logger.warning(
+                        "Tool call '{}' has non-object arguments (type: {}), skipping",
+                        buf.get("name") or item.get("name"),
+                        type(args).__name__,
+                    )
+                    continue
                 tool_calls.append(
                     ToolCallRequest(
                         id=f"{call_id}|{buf.get('id') or item.get('id') or 'fc_0'}",

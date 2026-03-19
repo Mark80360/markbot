@@ -926,6 +926,7 @@ def _start_daemon(port: int, workspace: str | None, config: str | None, verbose:
 
 
 def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
+    from loguru import logger
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
@@ -935,9 +936,83 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     from markbot.heartbeat.service import HeartbeatService
     from markbot.session.manager import SessionManager
 
-    if verbose:
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
+    # Configure loguru for detailed logging
+    import logging
+    logging.basicConfig(level=logging.WARNING)  # Reduce standard library logging noise
+
+    # Remove default handler and add custom ones with full exception tracing
+    logger.remove()
+    log_level = "DEBUG" if verbose else "INFO"
+
+    # Filter function to exclude noisy logs
+    def log_filter(record):
+        # Filter out websockets ping/pong noise
+        msg = record["message"]
+        if "PING" in msg or "PONG" in msg:
+            if "keepalive" in msg.lower() or "websockets" in record["name"]:
+                return False
+        # Filter out websockets binary/frame noise
+        if record["name"].startswith("websockets"):
+            return False
+        # Filter out urllib3 connection pool noise (keep errors)
+        if record["name"].startswith("urllib3") and record["level"].name == "DEBUG":
+            return False
+        # Filter out httpcore noise (keep errors)
+        if record["name"].startswith("httpcore") and record["level"].name == "DEBUG":
+            return False
+        # Filter out asyncio selector noise
+        if record["name"] == "asyncio" and "selector" in msg.lower():
+            return False
+        return True
+
+    # Console handler - show filtered logs
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        colorize=True,
+        backtrace=True,
+        diagnose=True,
+        catch=True,
+        filter=log_filter,
+    )
+
+    # File handler - log INFO and above (filter noise but keep errors for debugging)
+    logger.add(
+        GATEWAY_LOG_FILE,
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        rotation="10 MB",
+        retention="7 days",
+        backtrace=True,
+        diagnose=True,
+        catch=True,
+        encoding="utf-8",
+        filter=log_filter,
+    )
+
+    logger.info("Logging configured: level={}, backtrace=True, diagnose=True", log_level)
+
+    # Add global exception hook to catch all unhandled exceptions (including in SDK threads)
+    import traceback
+    import threading
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        """Global exception handler for unhandled exceptions."""
+        logger.exception("Unhandled exception: {}:{}",
+                        exc_type.__name__, exc_value,
+                        exc_info=(exc_type, exc_value, exc_traceback))
+
+    def thread_exception_hook(args):
+        """Exception handler for threads."""
+        logger.exception("Unhandled exception in thread {}: {}:{}",
+                        args.thread.name if args.thread else "unknown",
+                        args.exc_type.__name__, args.exc_value,
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = handle_exception
+    threading.excepthook = thread_exception_hook
+    logger.info("Global exception hooks installed")
 
     config_path = Path(config) if config else None
     config = load_config(config_path)

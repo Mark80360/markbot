@@ -49,7 +49,10 @@ class Session:
                 sliced = sliced[i:]
                 break
 
-        out: list[dict[str, Any]] = []
+        # First pass: sanitize tool_calls and collect valid tool_call_ids
+        valid_tool_call_ids: set[str] = set()
+        sanitized_entries: list[dict[str, Any]] = []
+
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
             for k in ("tool_calls", "tool_call_id", "name"):
@@ -58,9 +61,42 @@ class Session:
 
             # Validate and sanitize tool_calls
             if "tool_calls" in entry:
-                entry["tool_calls"] = self._sanitize_tool_calls(entry["tool_calls"])
+                sanitized_tc = self._sanitize_tool_calls(entry["tool_calls"])
+                if sanitized_tc:
+                    entry["tool_calls"] = sanitized_tc
+                    # Collect valid tool_call_ids from this assistant message
+                    for tc in sanitized_tc:
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            valid_tool_call_ids.add(tc_id)
+                else:
+                    # All tool_calls were invalid, remove the field entirely
+                    entry.pop("tool_calls", None)
 
-            out.append(entry)
+            sanitized_entries.append(entry)
+
+        # Second pass: remove orphaned tool messages without valid tool_call_ids
+        out: list[dict[str, Any]] = []
+        for entry in sanitized_entries:
+            if entry.get("role") == "tool":
+                tc_id = entry.get("tool_call_id")
+                if tc_id and tc_id in valid_tool_call_ids:
+                    out.append(entry)
+                else:
+                    logger.warning(
+                        "Dropping orphaned tool message with tool_call_id '{}'",
+                        tc_id,
+                    )
+            else:
+                # For assistant messages, update valid_tool_call_ids
+                if entry.get("role") == "assistant" and entry.get("tool_calls"):
+                    valid_tool_call_ids = set()
+                    for tc in entry["tool_calls"]:
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            valid_tool_call_ids.add(tc_id)
+                out.append(entry)
+
         return out
 
     def _sanitize_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:

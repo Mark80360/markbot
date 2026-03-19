@@ -263,13 +263,17 @@ class AgentLoop:
                     }
                     for tc in response.tool_calls
                 ]
-                messages = self.context.add_assistant_message(
+                messages, valid_tool_call_ids = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                # Only execute tool calls that have valid IDs (not sanitized away)
                 for tool_call in response.tool_calls:
+                    if tool_call.id not in valid_tool_call_ids:
+                        logger.warning("Skipping tool call '{}' with invalid format", tool_call.name)
+                        continue
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
@@ -283,7 +287,7 @@ class AgentLoop:
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
-                messages = self.context.add_assistant_message(
+                messages, _ = self.context.add_assistant_message(
                     messages, clean or "", reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -425,7 +429,7 @@ class AgentLoop:
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+                                  content="✨ New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 markbot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")

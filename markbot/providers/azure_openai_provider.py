@@ -8,6 +8,7 @@ from urllib.parse import urljoin
 
 import httpx
 import json_repair
+from loguru import logger
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -171,6 +172,15 @@ class AzureOpenAIProvider(LLMProvider):
                     args = tc["function"]["arguments"]
                     if isinstance(args, str):
                         args = json_repair.loads(args)
+
+                    # Validate that args is a dict (tool arguments must be an object)
+                    if not isinstance(args, dict):
+                        logger.warning(
+                            "Tool call '{}' has non-object arguments (type: {}), skipping",
+                            tc["function"]["name"],
+                            type(args).__name__,
+                        )
+                        continue
 
                     tool_calls.append(
                         ToolCallRequest(

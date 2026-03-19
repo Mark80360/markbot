@@ -342,6 +342,15 @@ class LiteLLMProvider(LLMProvider):
             if isinstance(args, str):
                 args = json_repair.loads(args)
 
+            # Validate that args is a dict (tool arguments must be an object)
+            if not isinstance(args, dict):
+                logger.warning(
+                    "Tool call '{}' has non-object arguments (type: {}), skipping",
+                    tc.function.name,
+                    type(args).__name__,
+                )
+                continue
+
             tool_calls.append(
                 ToolCallRequest(
                     id=_short_tool_id(),

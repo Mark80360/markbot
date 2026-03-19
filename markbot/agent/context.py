@@ -360,13 +360,22 @@ Skills with available="false" need dependencies installed first.
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Add an assistant message to the message list."""
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Add an assistant message to the message list.
+        
+        Returns:
+            Tuple of (updated messages list, valid tool_call_ids).
+            Only tool results with matching IDs should be added after this call.
+        """
         msg: dict[str, Any] = {"role": "assistant", "content": content}
+        valid_tool_call_ids: list[str] = []
+        
         if tool_calls:
             sanitized = _sanitize_tool_calls(tool_calls)
             if sanitized:
                 msg["tool_calls"] = sanitized
+                # Collect valid tool_call_ids for caller to use
+                valid_tool_call_ids = [tc.get("id") for tc in sanitized if tc.get("id")]
             elif not content:
                 content = "[Invalid tool calls omitted]"
                 msg["content"] = content
@@ -375,4 +384,4 @@ Skills with available="false" need dependencies installed first.
         if thinking_blocks:
             msg["thinking_blocks"] = thinking_blocks
         messages.append(msg)
-        return messages
+        return messages, valid_tool_call_ids

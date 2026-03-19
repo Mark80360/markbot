@@ -30,6 +30,19 @@ MSG_TYPE_MAP = {
 }
 
 
+def _truncate_safe(s: str | None, max_len: int = 16, suffix: str = "...") -> str:
+    """Safely truncate a string, handling None values.
+
+    Returns a truncated string with suffix if longer than max_len,
+    or the original string if shorter, or 'None' if s is None.
+    """
+    if s is None:
+        return "None"
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + suffix
+
+
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
     """Extract text representation from share cards and interactive messages."""
     parts = []
@@ -279,7 +292,7 @@ class FeishuChannel(BaseChannel):
         self._client = lark.Client.builder() \
             .app_id(self.config.app_id) \
             .app_secret(self.config.app_secret) \
-            .log_level(lark.LogLevel.INFO) \
+            .log_level(lark.LogLevel.DEBUG) \
             .build()
         builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
@@ -308,7 +321,7 @@ class FeishuChannel(BaseChannel):
             self.config.app_id,
             self.config.app_secret,
             event_handler=event_handler,
-            log_level=lark.LogLevel.INFO
+            log_level=lark.LogLevel.DEBUG
         )
 
         # Start WebSocket client in a separate thread with reconnect loop.
@@ -357,15 +370,26 @@ class FeishuChannel(BaseChannel):
 
     def _is_bot_mentioned(self, message: Any) -> bool:
         """Check if the bot is @mentioned in the message."""
-        raw_content = message.content or ""
+        if not message:
+            return False
+
+        raw_content = getattr(message, "content", None) or ""
         if "@_all" in raw_content:
             return True
 
-        for mention in getattr(message, "mentions", None) or []:
+        mentions = getattr(message, "mentions", None)
+        if not mentions:
+            return False
+
+        for mention in mentions if isinstance(mentions, (list, tuple)) else []:
+            if not mention:
+                continue
             mid = getattr(mention, "id", None)
             if not mid:
                 continue
-            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+            user_id = getattr(mid, "user_id", None)
+            open_id = getattr(mid, "open_id", None)
+            if not user_id and (open_id or "").startswith("ou_"):
                 return True
         return False
 
@@ -393,8 +417,11 @@ class FeishuChannel(BaseChannel):
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
                 return None
             else:
-                reaction_id = response.data.reaction_id
-                logger.debug("Added {} reaction to message {}: {}", emoji_type, message_id, reaction_id)
+                # Safely access response.data
+                data = getattr(response, "data", None)
+                reaction_id = getattr(data, "reaction_id", None) if data else None
+                if reaction_id:
+                    logger.debug("Added {} reaction to message {}: {}", emoji_type, message_id, reaction_id)
                 return reaction_id
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
@@ -670,7 +697,10 @@ class FeishuChannel(BaseChannel):
     def _upload_image_sync(self, file_path: str) -> str | None:
         """Upload an image to Feishu and return the image_key."""
         from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
+        logger.debug("Feishu: uploading image {}", os.path.basename(file_path))
         try:
+            file_size = os.path.getsize(file_path)
+            logger.debug("Feishu: image size = {} bytes", file_size)
             with open(file_path, "rb") as f:
                 request = CreateImageRequest.builder() \
                     .request_body(
@@ -681,14 +711,17 @@ class FeishuChannel(BaseChannel):
                     ).build()
                 response = self._client.im.v1.image.create(request)
                 if response.success():
-                    image_key = response.data.image_key
-                    logger.debug("Uploaded image {}: {}", os.path.basename(file_path), image_key)
+                    data = getattr(response, "data", None)
+                    image_key = getattr(data, "image_key", None) if data else None
+                    if image_key:
+                        logger.info("Feishu: uploaded image {} -> key={}", os.path.basename(file_path), image_key)
                     return image_key
                 else:
-                    logger.error("Failed to upload image: code={}, msg={}", response.code, response.msg)
+                    logger.error("Feishu: failed to upload image {}: code={}, msg={}",
+                               os.path.basename(file_path), response.code, response.msg)
                     return None
         except Exception as e:
-            logger.error("Error uploading image {}: {}", file_path, e)
+            logger.exception("Feishu: error uploading image {}: {}", file_path, e)
             return None
 
     def _upload_file_sync(self, file_path: str) -> str | None:
@@ -697,7 +730,10 @@ class FeishuChannel(BaseChannel):
         ext = os.path.splitext(file_path)[1].lower()
         file_type = self._FILE_TYPE_MAP.get(ext, "stream")
         file_name = os.path.basename(file_path)
+        logger.debug("Feishu: uploading file {} (type={})", file_name, file_type)
         try:
+            file_size = os.path.getsize(file_path)
+            logger.debug("Feishu: file size = {} bytes", file_size)
             with open(file_path, "rb") as f:
                 request = CreateFileRequest.builder() \
                     .request_body(
@@ -709,19 +745,24 @@ class FeishuChannel(BaseChannel):
                     ).build()
                 response = self._client.im.v1.file.create(request)
                 if response.success():
-                    file_key = response.data.file_key
-                    logger.debug("Uploaded file {}: {}", file_name, file_key)
+                    data = getattr(response, "data", None)
+                    file_key = getattr(data, "file_key", None) if data else None
+                    if file_key:
+                        logger.info("Feishu: uploaded file {} -> key={}", file_name, file_key)
                     return file_key
                 else:
-                    logger.error("Failed to upload file: code={}, msg={}", response.code, response.msg)
+                    logger.error("Feishu: failed to upload file {}: code={}, msg={}",
+                               file_name, response.code, response.msg)
                     return None
         except Exception as e:
-            logger.error("Error uploading file {}: {}", file_path, e)
+            logger.exception("Feishu: error uploading file {}: {}", file_path, e)
             return None
 
     def _download_image_sync(self, message_id: str, image_key: str) -> tuple[bytes | None, str | None]:
         """Download an image from Feishu message by message_id and image_key."""
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        logger.debug("Feishu: downloading image key={} from msg={}",
+                    _truncate_safe(image_key), _truncate_safe(message_id))
         try:
             request = GetMessageResourceRequest.builder() \
                 .message_id(message_id) \
@@ -734,12 +775,15 @@ class FeishuChannel(BaseChannel):
                 # GetMessageResourceRequest returns BytesIO, need to read bytes
                 if hasattr(file_data, 'read'):
                     file_data = file_data.read()
+                file_size = len(file_data) if file_data else 0
+                logger.info("Feishu: downloaded image {} ({} bytes, name={})",
+                           _truncate_safe(image_key), file_size, response.file_name)
                 return file_data, response.file_name
             else:
-                logger.error("Failed to download image: code={}, msg={}", response.code, response.msg)
+                logger.error("Feishu: failed to download image {}: code={}, msg={}", image_key, response.code, response.msg)
                 return None, None
         except Exception as e:
-            logger.error("Error downloading image {}: {}", image_key, e)
+            logger.exception("Feishu: error downloading image {}: {}", image_key, e)
             return None, None
 
     def _download_file_sync(
@@ -753,6 +797,8 @@ class FeishuChannel(BaseChannel):
         if resource_type == "audio":
             resource_type = "file"
 
+        logger.debug("Feishu: downloading {} key={} from msg={}",
+                    resource_type, _truncate_safe(file_key), _truncate_safe(message_id))
         try:
             request = (
                 GetMessageResourceRequest.builder()
@@ -766,12 +812,15 @@ class FeishuChannel(BaseChannel):
                 file_data = response.file
                 if hasattr(file_data, "read"):
                     file_data = file_data.read()
+                file_size = len(file_data) if file_data else 0
+                logger.info("Feishu: downloaded {} {} ({} bytes, name={})",
+                           resource_type, _truncate_safe(file_key), file_size, response.file_name)
                 return file_data, response.file_name
             else:
-                logger.error("Failed to download {}: code={}, msg={}", resource_type, response.code, response.msg)
+                logger.error("Feishu: failed to download {}: code={}, msg={}", resource_type, response.code, response.msg)
                 return None, None
-        except Exception:
-            logger.exception("Error downloading {} {}", resource_type, file_key)
+        except Exception as e:
+            logger.exception("Feishu: error downloading {} {}: {}", resource_type, file_key, e)
             return None, None
 
     async def _download_and_save_media(
@@ -791,18 +840,24 @@ class FeishuChannel(BaseChannel):
 
         data, filename = None, None
 
+        logger.debug("Feishu: downloading {} media, msg_id={}", msg_type, _truncate_safe(message_id))
+
         if msg_type == "image":
             image_key = content_json.get("image_key")
             if image_key and message_id:
+                logger.debug("Feishu: image_key={}", _truncate_safe(image_key))
                 data, filename = await loop.run_in_executor(
                     None, self._download_image_sync, message_id, image_key
                 )
                 if not filename:
                     filename = f"{image_key[:16]}.jpg"
+            else:
+                logger.warning("Feishu: missing image_key or message_id for image download")
 
         elif msg_type in ("audio", "file", "media"):
             file_key = content_json.get("file_key")
             if file_key and message_id:
+                logger.debug("Feishu: file_key={}", _truncate_safe(file_key))
                 data, filename = await loop.run_in_executor(
                     None, self._download_file_sync, message_id, file_key, msg_type
                 )
@@ -810,18 +865,23 @@ class FeishuChannel(BaseChannel):
                     filename = file_key[:16]
                 if msg_type == "audio" and not filename.endswith(".opus"):
                     filename = f"{filename}.opus"
+            else:
+                logger.warning("Feishu: missing file_key or message_id for {} download", msg_type)
 
         if data and filename:
             file_path = media_dir / filename
             file_path.write_bytes(data)
-            logger.debug("Downloaded {} to {}", msg_type, file_path)
+            logger.info("Feishu: saved {} to {} ({} bytes)", msg_type, file_path, len(data))
             return str(file_path), f"[{msg_type}: {filename}]"
 
+        logger.warning("Feishu: failed to download {} media", msg_type)
         return None, f"[{msg_type}: download failed]"
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
         """Send a single message (text/image/file/interactive) synchronously."""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        logger.debug("Feishu: sending {} message to {} (type={})",
+                    msg_type, _truncate_safe(receive_id), receive_id_type)
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
@@ -835,14 +895,15 @@ class FeishuChannel(BaseChannel):
             response = self._client.im.v1.message.create(request)
             if not response.success():
                 logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
+                    "Feishu: failed to send {} message: code={}, msg={}, log_id={}, receive_id={}",
+                    msg_type, response.code, response.msg, response.get_log_id(),
+                    _truncate_safe(receive_id)
                 )
                 return False
-            logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
+            logger.info("Feishu: sent {} message to {}", msg_type, _truncate_safe(receive_id))
             return True
         except Exception as e:
-            logger.error("Error sending Feishu {} message: {}", msg_type, e)
+            logger.exception("Feishu: error sending {} message to {}: {}", msg_type, receive_id, e)
             return False
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -850,6 +911,17 @@ class FeishuChannel(BaseChannel):
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
+
+        if not msg.chat_id:
+            logger.warning("Feishu: chat_id is None, cannot send message")
+            return
+
+        # Log send request details
+        content_preview = (msg.content[:100] + "...") if msg.content and len(msg.content) > 100 else (msg.content or "")
+        logger.info("Feishu sending: chat={}, media_count={}, content_len={}, preview={}",
+                   _truncate_safe(msg.chat_id),
+                   len(msg.media), len(msg.content) if msg.content else 0,
+                   content_preview.replace("\n", "\\n"))
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
@@ -860,13 +932,17 @@ class FeishuChannel(BaseChannel):
                     logger.warning("Media file not found: {}", file_path)
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
+                logger.debug("Feishu: uploading media file {}", os.path.basename(file_path))
                 if ext in self._IMAGE_EXTS:
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
                     if key:
+                        logger.info("Feishu: sent image {} to {}", os.path.basename(file_path), _truncate_safe(msg.chat_id))
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
+                    else:
+                        logger.warning("Feishu: failed to upload image {}", os.path.basename(file_path))
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
@@ -876,17 +952,22 @@ class FeishuChannel(BaseChannel):
                             media_type = "media"
                         else:
                             media_type = "file"
+                        logger.info("Feishu: sent {} {} to {}", media_type, os.path.basename(file_path), _truncate_safe(msg.chat_id))
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
+                    else:
+                        logger.warning("Feishu: failed to upload file {}", os.path.basename(file_path))
 
             if msg.content and msg.content.strip():
                 fmt = self._detect_msg_format(msg.content)
+                logger.debug("Feishu: detected format '{}' for content length {}", fmt, len(msg.content))
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
                     text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    logger.info("Feishu: sent text message to {}", _truncate_safe(msg.chat_id))
                     await loop.run_in_executor(
                         None, self._send_message_sync,
                         receive_id_type, msg.chat_id, "text", text_body,
@@ -895,6 +976,7 @@ class FeishuChannel(BaseChannel):
                 elif fmt == "post":
                     # Medium content with links – send as rich-text post
                     post_body = self._markdown_to_post(msg.content)
+                    logger.info("Feishu: sent post message to {}", _truncate_safe(msg.chat_id))
                     await loop.run_in_executor(
                         None, self._send_message_sync,
                         receive_id_type, msg.chat_id, "post", post_body,
@@ -903,8 +985,11 @@ class FeishuChannel(BaseChannel):
                 else:
                     # Complex / long content – send as interactive card
                     elements = self._build_card_elements(msg.content)
-                    for chunk in self._split_elements_by_table_limit(elements):
+                    chunks = self._split_elements_by_table_limit(elements)
+                    logger.info("Feishu: sending {} card(s) to {}", len(chunks), _truncate_safe(msg.chat_id))
+                    for i, chunk in enumerate(chunks):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                        logger.debug("Feishu: sending card {} of {}", i + 1, len(chunks))
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
@@ -912,29 +997,54 @@ class FeishuChannel(BaseChannel):
 
             # Delete reaction after sending reply
             if msg.metadata and msg.metadata.get("reaction_id") and msg.metadata.get("message_id"):
+                logger.debug("Feishu: deleting reaction {} from msg {}",
+                           msg.metadata.get("reaction_id"), msg.metadata.get("message_id"))
                 await self._delete_reaction(msg.metadata["message_id"], msg.metadata["reaction_id"])
 
         except Exception as e:
-            logger.error("Error sending Feishu message: {}", e)
+            logger.exception("Error sending Feishu message: {}", e)
 
     def _on_message_sync(self, data: Any) -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
         Schedules async handling in the main event loop.
         """
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        # Log at the very beginning to confirm SDK called this handler
+        logger.info("Feishu: _on_message_sync called, data type={}", type(data).__name__ if data else "None")
+        try:
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        except Exception as e:
+            logger.exception("Feishu: error in _on_message_sync: {}", e)
 
     async def _on_message(self, data: Any) -> None:
         """Handle incoming message from Feishu."""
         try:
-            event = data.event
-            message = event.message
-            sender = event.sender
+            # Safely extract event, message, and sender with null checks
+            if not data:
+                logger.warning("Feishu: received empty data")
+                return
+
+            event = getattr(data, "event", None)
+            if not event:
+                logger.warning("Feishu: event is None")
+                return
+
+            message = getattr(event, "message", None)
+            sender = getattr(event, "sender", None)
+
+            if not message:
+                logger.warning("Feishu: message is None")
+                return
 
             # Deduplication check
-            message_id = message.message_id
+            message_id = getattr(message, "message_id", None)
+            if not message_id:
+                logger.warning("Feishu: message_id is None")
+                return
+
             if message_id in self._processed_message_ids:
+                logger.debug("Feishu: duplicate message {} skipped", message_id)
                 return
             self._processed_message_ids[message_id] = None
 
@@ -943,13 +1053,28 @@ class FeishuChannel(BaseChannel):
                 self._processed_message_ids.popitem(last=False)
 
             # Skip bot messages
-            if sender.sender_type == "bot":
+            sender_type = getattr(sender, "sender_type", None) if sender else None
+            if sender_type == "bot":
+                logger.debug("Feishu: skipping bot message {}", message_id)
                 return
 
-            sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
-            chat_id = message.chat_id
-            chat_type = message.chat_type
-            msg_type = message.message_type
+            # Safely extract sender_id
+            sender_id_obj = getattr(sender, "sender_id", None) if sender else None
+            sender_id = getattr(sender_id_obj, "open_id", "unknown") if sender_id_obj else "unknown"
+
+            chat_id = getattr(message, "chat_id", None)
+            chat_type = getattr(message, "chat_type", None)
+            msg_type = getattr(message, "message_type", None)
+
+            if not chat_id or not chat_type or not msg_type:
+                logger.warning("Feishu: missing required message fields (chat_id={}, chat_type={}, msg_type={})",
+                              chat_id, chat_type, msg_type)
+                return
+
+            # Log incoming message details
+            logger.info("Feishu received: msg_id={}, type={}, chat_type={}, sender={}, chat={}",
+                       message_id, msg_type, chat_type, _truncate_safe(sender_id),
+                       _truncate_safe(chat_id))
 
             if chat_type == "group" and not self._is_group_message_for_bot(message):
                 logger.debug("Feishu: skipping group message (not mentioned)")
@@ -957,14 +1082,18 @@ class FeishuChannel(BaseChannel):
 
             # Add reaction and store reaction_id for later deletion
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
+            logger.debug("Feishu: added reaction {} to msg {}", reaction_id or "failed", message_id)
 
             # Parse content
             content_parts = []
             media_paths = []
 
+            raw_content = getattr(message, "content", None)
+            logger.debug("Feishu: raw content length={}", len(raw_content) if raw_content else 0)
             try:
-                content_json = json.loads(message.content) if message.content else {}
-            except json.JSONDecodeError:
+                content_json = json.loads(raw_content) if raw_content else {}
+            except json.JSONDecodeError as e:
+                logger.warning("Feishu: JSON parse error for msg {}: {}", message_id, e)
                 content_json = {}
 
             if msg_type == "text":
@@ -1015,10 +1144,17 @@ class FeishuChannel(BaseChannel):
             content = "\n".join(content_parts) if content_parts else ""
 
             if not content and not media_paths:
+                logger.debug("Feishu: msg {} has no content or media, skipping", message_id)
                 return
+
+            # Log parsed content summary
+            content_preview = content[:100] + "..." if len(content) > 100 else content
+            logger.info("Feishu parsed: msg_id={}, content_len={}, media_count={}, preview={}",
+                       message_id, len(content), len(media_paths), content_preview.replace("\n", "\\n"))
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            logger.debug("Feishu: forwarding to bus, reply_to={}", _truncate_safe(reply_to))
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -1033,7 +1169,7 @@ class FeishuChannel(BaseChannel):
             )
 
         except Exception as e:
-            logger.error("Error processing Feishu message: {}", e)
+            logger.exception("Error processing Feishu message: {}", e)
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""
