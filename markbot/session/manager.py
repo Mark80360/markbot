@@ -11,6 +11,7 @@ from loguru import logger
 
 from markbot.config.paths import get_legacy_sessions_dir
 from markbot.utils.helpers import ensure_dir, safe_filename
+from markbot.utils.sanitize import _sanitize_tool_calls
 
 
 @dataclass
@@ -61,7 +62,7 @@ class Session:
 
             # Validate and sanitize tool_calls
             if "tool_calls" in entry:
-                sanitized_tc = self._sanitize_tool_calls(entry["tool_calls"])
+                sanitized_tc = _sanitize_tool_calls(entry["tool_calls"])
                 if sanitized_tc:
                     entry["tool_calls"] = sanitized_tc
                     # Collect valid tool_call_ids from this assistant message
@@ -98,55 +99,6 @@ class Session:
                 out.append(entry)
 
         return out
-
-    def _sanitize_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:
-        """Sanitize tool_calls to ensure arguments are valid JSON objects."""
-        if not isinstance(tool_calls, list):
-            return []
-
-        sanitized = []
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                continue
-            func = tc.get("function", {})
-            if not func:
-                continue
-            args = func.get("arguments")
-            if args is None:
-                continue
-            if isinstance(args, str):
-                try:
-                    parsed = json.loads(args)
-                    if isinstance(parsed, dict):
-                        func["arguments"] = parsed
-                    else:
-                        logger.warning(
-                            "History contains tool call '{}' with non-object arguments (type: {}), skipping",
-                            func.get("name"),
-                            type(parsed).__name__,
-                        )
-                        continue
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "History contains tool call '{}' with invalid JSON arguments, skipping",
-                        func.get("name"),
-                    )
-                    continue
-            elif isinstance(args, list):
-                logger.warning(
-                    "History contains tool call '{}' with array arguments (should be object), skipping",
-                    func.get("name"),
-                )
-                continue
-            elif not isinstance(args, dict):
-                logger.warning(
-                    "History contains tool call '{}' with invalid arguments type: {}, skipping",
-                    func.get("name"),
-                    type(args).__name__,
-                )
-                continue
-            sanitized.append(tc)
-        return sanitized
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

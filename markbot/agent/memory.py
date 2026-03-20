@@ -1,4 +1,5 @@
-"""Enhanced memory system with categories, decay, layers, and entity tracking.
+"""
+Enhanced memory system with categories, decay, layers, and entity tracking.
 
 Architecture:
 - Singleton pattern for thread-safe access
@@ -6,6 +7,7 @@ Architecture:
 - Atomic file writes
 - Entity referential integrity
 - Automatic history rotation
+- Async-safe operations with asyncio.Lock
 """
 
 from __future__ import annotations
@@ -331,9 +333,9 @@ class MemoryStore:
     - Entity referential integrity
     - Automatic history rotation
     - Auto-save on garbage collection
+    - Async-safe operations with asyncio.Lock
     """
 
-    # Singleton instances per workspace
     _instances: ClassVar[dict[str, MemoryStore]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
@@ -348,7 +350,6 @@ class MemoryStore:
             return cls._instances[key]
 
     def __init__(self, workspace: Path):
-        # Skip if already initialized (singleton)
         if getattr(self, '_initialized', False):
             return
 
@@ -363,6 +364,7 @@ class MemoryStore:
         self._next_id = 1
         self._dirty = False
         self._save_task: asyncio.Task | None = None
+        self._async_lock = asyncio.Lock()
 
         self._load()
         self._initialized = True
@@ -436,57 +438,71 @@ class MemoryStore:
             logger.warning("Failed to migrate from MEMORY.md: {}", e)
 
     def _atomic_write(self, file_path: Path, content: str) -> None:
-        """Write to file atomically using temp file."""
+        """Write to file atomically using temp file (sync version)."""
         temp_path = file_path.with_suffix('.tmp')
         try:
             temp_path.write_text(content, encoding="utf-8")
             temp_path.replace(file_path)
         except Exception as e:
-            # Clean up temp file on failure
             if temp_path.exists():
                 temp_path.unlink()
             raise e
 
+    async def _async_atomic_write(self, file_path: Path, content: str) -> None:
+        """Write to file atomically using temp file (async version)."""
+        await asyncio.to_thread(self._atomic_write, file_path, content)
+
     def _save_now(self) -> None:
-        """Save immediately (blocking)."""
-        # Save entries
+        """Save immediately (blocking, for sync contexts like __del__)."""
         data = {
             "entries": [e.to_dict() for e in self.entries],
             "next_id": self._next_id,
         }
         self._atomic_write(self.entries_file, json.dumps(data, ensure_ascii=False, indent=2))
-
-        # Save entities
         self._atomic_write(self.entities_file, json.dumps(self.entity_tracker.to_dict(), ensure_ascii=False, indent=2))
-
-        # Sync MEMORY.md
         self._sync_to_memory_md()
-
         self._dirty = False
 
+    async def _async_save(self) -> None:
+        """Save asynchronously with lock protection."""
+        async with self._async_lock:
+            data = {
+                "entries": [e.to_dict() for e in self.entries],
+                "next_id": self._next_id,
+            }
+            await self._async_atomic_write(self.entries_file, json.dumps(data, ensure_ascii=False, indent=2))
+            await self._async_atomic_write(self.entities_file, json.dumps(self.entity_tracker.to_dict(), ensure_ascii=False, indent=2))
+            await asyncio.to_thread(self._sync_to_memory_md)
+            self._dirty = False
+
     def mark_dirty(self) -> None:
-        """Mark memory as needing save. Triggers debounced save."""
+        """Mark memory as needing save. Triggers debounced async save."""
         self._dirty = True
-
-        # Cancel existing save task
-        if self._save_task and not self._save_task.done():
-            self._save_task.cancel()
-
-        # Schedule new save
-        async def _delayed_save():
-            try:
-                await asyncio.sleep(MEMORY_CONFIG["save_debounce_seconds"])
-                if self._dirty:
-                    self._save_now()
-            except asyncio.CancelledError:
-                pass
 
         try:
             loop = asyncio.get_running_loop()
-            self._save_task = loop.create_task(_delayed_save())
         except RuntimeError:
-            # No event loop, save immediately
             self._save_now()
+            return
+
+        async def _schedule_save():
+            async with self._async_lock:
+                if not self._dirty:
+                    return
+                if self._save_task and not self._save_task.done():
+                    self._save_task.cancel()
+                    try:
+                        await self._save_task
+                    except asyncio.CancelledError:
+                        pass
+
+            await asyncio.sleep(MEMORY_CONFIG["save_debounce_seconds"])
+
+            async with self._async_lock:
+                if self._dirty:
+                    await self._async_save()
+
+        self._save_task = loop.create_task(_schedule_save())
 
     def _sync_to_memory_md(self) -> None:
         """Sync entries to MEMORY.md for human readability."""
@@ -915,57 +931,52 @@ Extract memories and call save_memory tool. Each entry should be concise (1-3 se
             # Process entries
             entries_data = args.get("entries", [])
             if isinstance(entries_data, list):
-                for entry_data in entries_data:
-                    if not isinstance(entry_data, dict):
-                        continue
-                    content = entry_data.get("content", "")
-                    if not content or not content.strip():
-                        continue
+                async with self._async_lock:
+                    for entry_data in entries_data:
+                        if not isinstance(entry_data, dict):
+                            continue
+                        content = entry_data.get("content", "")
+                        if not content or not content.strip():
+                            continue
 
-                    category_str = entry_data.get("category", "fact")
-                    try:
-                        category = MemoryCategory(category_str)
-                    except ValueError:
-                        category = MemoryCategory.FACT
+                        category_str = entry_data.get("category", "fact")
+                        try:
+                            category = MemoryCategory(category_str)
+                        except ValueError:
+                            category = MemoryCategory.FACT
 
-                    # Check duplicates
-                    content_lower = content.lower()
-                    is_duplicate = any(
-                        content_lower in existing.content.lower() or
-                        existing.content.lower() in content_lower
-                        for existing in self.entries
-                    )
-
-                    if not is_duplicate:
-                        entry = self._create_entry(
-                            content=content.strip(),
-                            category=category,
-                            importance=entry_data.get("importance"),
-                            tags=entry_data.get("tags", []),
-                            entities=entry_data.get("entities", []),
+                        content_lower = content.lower()
+                        is_duplicate = any(
+                            content_lower in existing.content.lower() or
+                            existing.content.lower() in content_lower
+                            for existing in self.entries
                         )
-                        self.entries.append(entry)
 
-                        # Update entity tracker (entities extracted by AI)
-                        for entity_name in entry.entities:
-                            self.entity_tracker.add_or_update(entity_name, entity_type="topic", context=content[:100])
+                        if not is_duplicate:
+                            entry = self._create_entry(
+                                content=content.strip(),
+                                category=category,
+                                importance=entry_data.get("importance"),
+                                tags=entry_data.get("tags", []),
+                                entities=entry_data.get("entities", []),
+                            )
+                            self.entries.append(entry)
 
-            # Save history entry
+                            for entity_name in entry.entities:
+                                self.entity_tracker.add_or_update(entity_name, entity_type="topic", context=content[:100])
+
             if history_entry := args.get("history_entry"):
                 if not isinstance(history_entry, str):
                     history_entry = json.dumps(history_entry, ensure_ascii=False)
                 self.append_history(history_entry)
 
-            # Update session
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
 
-            # Auto cleanup
             cleanup_results = self.auto_cleanup()
             if cleanup_results:
                 logger.info("Memory cleanup: {}", cleanup_results)
 
-            # Save now (don't wait for debounce)
-            self._save_now()
+            await self._async_save()
 
             logger.info("Memory consolidation done: {} entries, last_consolidated={}", len(self.entries), session.last_consolidated)
             return True
@@ -1002,6 +1013,12 @@ Extract memories and call save_memory tool. Each entry should be concise (1-3 se
                     self.add_entry(item, MemoryCategory.FACT)
 
     def flush(self) -> None:
-        """Force immediate save (call before shutdown)."""
+        """Force immediate save (call before shutdown, sync version)."""
         if self._dirty:
             self._save_now()
+
+    async def async_flush(self) -> None:
+        """Force immediate save (async version)."""
+        async with self._async_lock:
+            if self._dirty:
+                await self._async_save()
