@@ -79,6 +79,7 @@ class LLMProvider(ABC):
     """
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
+    _CHAT_TIMEOUT = 120.0  # seconds
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -253,20 +254,35 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        timeout: float | None = None,
     ) -> LLMResponse:
-        """Call chat() with retry on transient provider failures."""
+        """Call chat() with retry on transient provider failures.
+
+        Args:
+            timeout: Optional timeout in seconds. Defaults to _CHAT_TIMEOUT (120s).
+        """
+        effective_timeout = timeout if timeout is not None else self._CHAT_TIMEOUT
+
+        async def _call_chat() -> LLMResponse:
+            return await self.chat(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+            )
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             try:
-                response = await self.chat(
-                    messages=messages,
-                    tools=tools,
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    reasoning_effort=reasoning_effort,
-                )
+                response = await asyncio.wait_for(_call_chat(), timeout=effective_timeout)
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                response = LLMResponse(
+                    content=f"LLM request timed out after {effective_timeout}s",
+                    finish_reason="error",
+                )
             except Exception as exc:
                 response = LLMResponse(
                     content=f"Error calling LLM: {exc}",
@@ -289,16 +305,14 @@ class LLMProvider(ABC):
             await asyncio.sleep(delay)
 
         try:
-            return await self.chat(
-                messages=messages,
-                tools=tools,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-            )
+            return await asyncio.wait_for(_call_chat(), timeout=effective_timeout)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=f"LLM request timed out after {effective_timeout}s",
+                finish_reason="error",
+            )
         except Exception as exc:
             return LLMResponse(
                 content=f"Error calling LLM: {exc}",

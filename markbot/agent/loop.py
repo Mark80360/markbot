@@ -7,6 +7,7 @@ import json
 import re
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -19,6 +20,7 @@ from markbot.agent.tools.cron import CronTool
 from markbot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from markbot.agent.tools.search import GlobTool, GrepTool
 from markbot.agent.tools.code_analysis import CodeAnalysisTool
+from markbot.agent.tools.memory_tool import MemoryTool
 from markbot.agent.tools.message import MessageTool
 from markbot.agent.tools.question import AskUserQuestionTool
 from markbot.agent.tools.registry import ToolRegistry
@@ -28,11 +30,15 @@ from markbot.agent.tools.spawn import SpawnTool
 from markbot.agent.tools.web import WebFetchTool, HttpRequestTool
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
+from markbot.memory.compressor import SessionCompressor
+from markbot.memory.deduplicator import MemoryDeduplicator
+from markbot.memory.extractor import MemoryExtractor
+from markbot.memory.models import CompressionResult
 from markbot.providers.base import LLMProvider
 from markbot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from markbot.config.schema import ChannelsConfig, ExecToolConfig
+    from markbot.config.schema import ChannelsConfig, ExecToolConfig, MemoryConfig, SearchConfig
     from markbot.cron.service import CronService
 
 
@@ -68,8 +74,10 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        memory_config: MemoryConfig | None = None,
+        search_config: SearchConfig | None = None,
     ):
-        from markbot.config.schema import ExecToolConfig
+        from markbot.config.schema import ExecToolConfig, MemoryConfig, SearchConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -84,9 +92,12 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.memory_config = memory_config or MemoryConfig()
+        self.search_config = search_config
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
+        self.memory = MemoryStore(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -106,12 +117,42 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
-        self._consolidating: set[str] = set()  # Session keys with consolidation in progress
-        self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
+        self._consolidating: set[str] = set()
+        self._consolidation_tasks: set[asyncio.Task] = set()
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-        self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._processing_lock = asyncio.Lock()
+        
+        self._init_search_and_memory()
         self._register_default_tools()
+
+    def _init_search_and_memory(self) -> None:
+        """Initialize search and memory components."""
+        self.search_store = None
+        self.search_indexer = None
+        self.search_embedder = None
+        
+        if self.search_config and self.search_config.enabled:
+            from markbot.search.indexer import Indexer
+            from markbot.search.store import SearchStore
+            
+            db_path = (
+                Path(self.search_config.db_path).expanduser()
+                if self.search_config.db_path
+                else self.workspace / "search" / "index.sqlite"
+            )
+            self.search_store = SearchStore(db_path)
+            self.search_indexer = Indexer(self.search_store, self.workspace)
+            if self.search_config.auto_index:
+                self.search_indexer.auto_index_on_startup(self.search_config.index_dirs)
+            if self.search_config.vector_enabled:
+                try:
+                    from markbot.search.embedder import SentenceTransformerEmbedder
+                    self.search_embedder = SentenceTransformerEmbedder(
+                        self.search_config.embedding_model
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize embedder: {e}")
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -136,6 +177,11 @@ class AgentLoop:
         self.tools.register(AskUserQuestionTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(SkillTool(skills_loader=self.context.skills))
+        self.tools.register(MemoryTool(
+            memory_store=self.memory,
+            workspace=self.workspace,
+            indexer=self.search_indexer,
+        ))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -529,11 +575,50 @@ class AgentLoop:
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
-        )
+        """Compress session into structured memories using SessionCompressor."""
+        if not self.memory_config.enabled or not self.memory_config.auto_compress:
+            return True
+
+        snapshot = session.messages[session.last_consolidated:]
+        if not snapshot:
+            return True
+
+        try:
+            extractor = MemoryExtractor(
+                provider=self.provider,
+                workspace=self.workspace,
+                model=self.model,
+                output_language=self.memory_config.output_language,
+            )
+            deduplicator = MemoryDeduplicator(
+                store=self.search_store,
+                provider=self.provider,
+                model=self.model,
+                search_config=self.search_config,
+                embedder=self.search_embedder,
+                min_score=self.memory_config.dedup_min_score,
+                output_language=self.memory_config.output_language,
+            )
+            compressor = SessionCompressor(
+                extractor=extractor,
+                deduplicator=deduplicator,
+                memory_store=self.memory,
+                provider=self.provider,
+                model=self.model,
+                indexer=self.search_indexer,
+                max_memories_per_category=self.memory_config.max_memories_per_category,
+                output_language=self.memory_config.output_language,
+            )
+            result: CompressionResult = await compressor.compress(snapshot, session.key)
+            session.last_consolidated = len(session.messages)
+            logger.info(
+                f"Memory compression complete for {session.key}: "
+                f"{result.created} created, {result.merged} merged, {result.skipped} skipped"
+            )
+            return True
+        except Exception:
+            logger.exception(f"Memory compression failed for {session.key}")
+            return False
 
     async def process_direct(
         self,

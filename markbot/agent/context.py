@@ -239,18 +239,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         skill_names: list[str] | None = None,
         memory_max_tokens: int = 2000,
     ) -> str:
-        """Build system prompt with relevance-based memory loading."""
+        """Build system prompt with layered memory context."""
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        # Load memory context with relevance to current message
-        memory = self.memory.get_memory_context(
-            current_message=current_message,
-            max_tokens=memory_max_tokens,
-        )
+        memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 

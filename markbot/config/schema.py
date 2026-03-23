@@ -185,6 +185,28 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class MemoryConfig(Base):
+    """Structured memory extraction/compression configuration."""
+
+    enabled: bool = True
+    auto_compress: bool = True
+    compress_threshold: int = Field(default=10, ge=1, le=500)
+    max_memories_per_category: int = Field(default=50, ge=1, le=5000)
+    output_language: str = "zh-CN"
+    dedup_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
+
+
+class SearchConfig(Base):
+    """Search/index configuration for memory and knowledge retrieval."""
+
+    enabled: bool = False
+    db_path: str = ""
+    auto_index: bool = True
+    index_dirs: list[str] = Field(default_factory=lambda: ["memory"])
+    vector_enabled: bool = False
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+
+
 class Config(BaseSettings):
     """Root configuration for markbot."""
 
@@ -193,6 +215,8 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
 
     @property
     def workspace_path(self) -> Path:

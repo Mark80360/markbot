@@ -5,6 +5,7 @@
 dist/
 build/
 docs/
+temp/
 *.egg-info/
 *.egg
 *.pyc
@@ -19,5 +20,6 @@ venv/
 __pycache__/
 poetry.lock
 .pytest_cache/
+.spec-workflow/
 botpy.log
 
