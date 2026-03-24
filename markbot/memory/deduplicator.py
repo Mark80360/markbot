@@ -43,7 +43,9 @@ class MemoryDeduplicator:
     async def deduplicate(self, candidate: CandidateMemory) -> DedupResult:
         """Return create/merge/skip decision for a memory candidate."""
         similar = self._find_similar_memories(candidate)
+        logger.info(f"MemoryDeduplicator: candidate='{candidate.abstract[:50]}...', similar count={len(similar)}")
         if not similar:
+            logger.info("MemoryDeduplicator: no similar memories, decision=CREATE")
             return DedupResult(
                 decision=DedupDecision.CREATE,
                 candidate=candidate,
@@ -52,6 +54,7 @@ class MemoryDeduplicator:
             )
 
         decision, reason = await self._llm_decision(candidate, similar)
+        logger.info(f"MemoryDeduplicator: LLM decision={decision}, reason={reason}")
         return DedupResult(
             decision=decision,
             candidate=candidate,
@@ -82,7 +85,7 @@ class MemoryDeduplicator:
                     collection="memory",
                 )
                 results = self._merge_results(results, vector_results, limit=8)
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - optional runtime fallback
                 logger.warning(f"Vector dedup pre-filter failed: {e}")
 
         category_fragment = f"/memories/{candidate.category.value}/"

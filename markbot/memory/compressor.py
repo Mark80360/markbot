@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from loguru import logger
 
+from markbot.agent.memory import MemoryStore
 from markbot.memory.deduplicator import MemoryDeduplicator
 from markbot.memory.extractor import MemoryExtractor
 from markbot.memory.models import CATEGORY_DIRS, CompressionResult, DedupDecision, MemoryCategory
 from markbot.prompts import render_prompt
 from markbot.providers.base import LLMProvider
 from markbot.search.indexer import Indexer
-
-if TYPE_CHECKING:
-    from markbot.agent.memory import MemoryStore
 
 
 class SessionCompressor:
@@ -46,9 +44,12 @@ class SessionCompressor:
         """Compress a session into structured memories."""
         result = CompressionResult()
         if not messages:
+            logger.info("SessionCompressor.compress: no messages to compress")
             return result
 
+        logger.info(f"SessionCompressor.compress: starting with {len(messages)} messages")
         candidates = await self._extractor.extract(messages, session_key)
+        logger.info(f"SessionCompressor.compress: extracted {len(candidates)} candidates")
         for candidate in candidates:
             if candidate.category == MemoryCategory.PROFILE:
                 existed = (self._memory.memory_dir / CATEGORY_DIRS[MemoryCategory.PROFILE]).exists()
@@ -94,16 +95,52 @@ class SessionCompressor:
             return
         try:
             self._indexer.index_single(path, collection="memory")
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - non-critical index failure
             logger.warning(f"Memory indexing failed for {path}: {e}")
 
     async def _build_structured_summary(self, messages: list[dict[str, Any]], session_key: str) -> str:
+        """Build a structured summary, chunking messages if necessary."""
+        if not messages:
+            return ""
+
+        # For very long sessions, summarize in chunks first then consolidate
+        chunk_size = 80
+        if len(messages) <= chunk_size:
+            return await self._summarize_chunk(messages, session_key)
+
+        chunks = [messages[i:i + chunk_size] for i in range(0, len(messages), chunk_size)]
+        chunk_summaries = []
+        for i, chunk in enumerate(chunks):
+            summary = await self._summarize_chunk(chunk, f"{session_key} (part {i+1})")
+            if summary:
+                chunk_summaries.append(summary)
+
+        if not chunk_summaries:
+            return ""
+
+        # Final consolidation of chunk summaries
+        prompt = f"请将以下分段摘要合并为一个连贯的会话总摘要，聚焦关键决策和后续事项。\n\n会话标识: {session_key}\n\n分段摘要:\n" + "\n---\n".join(chunk_summaries)
+        try:
+            response = await self._provider.chat(
+                messages=[
+                    {"role": "system", "content": "你是高级摘要整合专家。输出纯文本。"},
+                    {"role": "user", "content": prompt},
+                ],
+                model=self._model,
+            )
+            return (response.content or "").strip()
+        except Exception as e:
+            logger.warning(f"Final summary consolidation failed: {e}")
+            return "\n\n".join(chunk_summaries)
+
+    async def _summarize_chunk(self, messages: list[dict[str, Any]], session_key: str) -> str:
         lines = []
         for msg in messages:
             role = str(msg.get("role", "unknown")).upper()
             content = str(msg.get("content", "")).strip()
             if content:
                 lines.append(f"[{role}] {content}")
+        
         prompt = render_prompt(
             "structured_summary",
             {
@@ -120,10 +157,9 @@ class SessionCompressor:
                 ],
                 model=self._model,
             )
-            summary = (response.content or "").strip()
-            return summary
+            return (response.content or "").strip()
         except Exception as e:
-            logger.warning(f"Structured summary generation failed: {e}")
+            logger.warning(f"Chunk summary generation failed: {e}")
             return ""
 
     def _enforce_limits(self) -> None:

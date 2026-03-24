@@ -22,4 +22,5 @@ poetry.lock
 .pytest_cache/
 .spec-workflow/
 botpy.log
-
+*.bak
+*.log

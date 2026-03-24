@@ -339,6 +339,8 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        memory_config=config.memory,
+        search_config=config.search,
     )
 
     # Set cron callback (needs agent)
@@ -522,6 +524,8 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        memory_config=config.memory,
+        search_config=config.search,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -546,6 +550,7 @@ def agent(
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             _print_agent_response(response, render_markdown=markdown)
+            await agent_loop.wait_for_compression()
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -650,6 +655,7 @@ def agent(
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
+                await agent_loop.wait_for_compression()
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
@@ -1045,6 +1051,8 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        memory_config=config.memory,
+        search_config=config.search,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:

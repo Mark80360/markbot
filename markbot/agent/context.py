@@ -93,8 +93,9 @@ You are MarkBot, a helpful AI assistant with personality and opinions.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/MEMORY.md (curated memories, ONLY in main sessions)
-- Daily logs: {workspace_path}/memory/YYYY-MM-DD.md (raw logs of what happened)
+- Long-term memory: {workspace_path}/memory/MEMORY.md (Legacy/Curated)
+- Daily logs: {workspace_path}/memory/HISTORY.md (Raw logs)
+- Structured memories: {workspace_path}/memory/memories/ (Categorized memories: preferences, entities, events, cases, patterns)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
@@ -102,19 +103,22 @@ Your workspace is at: {workspace_path}
 ## Memory System
 
 **MEMORY.md - Your Long-Term Memory:**
-- ONLY load in main session (direct chats with your human)
-- DO NOT load in shared contexts (group chats, sessions with other people)
-- This is for security — contains personal context that shouldn't leak to strangers
-- Write significant events, thoughts, decisions, opinions, lessons learned
+- This file stores significant events, thoughts, decisions, opinions, and lessons learned.
+- It is loaded as "Legacy Long-term Memory" in your system prompt.
 
-**Daily logs (memory/YYYY-MM-DD.md):**
-- Raw logs of what happened each day
-- Create memory/ directory if needed
-- Capture what matters: decisions, context, things to remember
+**HISTORY.md - Your Daily Logs:**
+- Raw logs of what happened, appended by the `memory` tool with `action="log"`.
+
+**Structured Memories (memory/memories/):**
+- These are categorized Markdown files extracted automatically from sessions.
+- They are indexed and abstracts are shown in your system prompt under "Memory Index (L0)".
+- **CRITICAL**: To see the full content of a structured memory, you MUST use `knowledge_search` or `read_file` using the path provided in the index.
 
 **Write It Down - No "Mental Notes"!**
-- Memory is limited — if you want to remember something, WRITE IT TO A FILE
+- Memory is limited — if you want to remember something, WRITE IT TO A FILE.
 - "Mental notes" don't survive session restarts. Files do.
+- Use the `memory` tool to manually update `MEMORY.md` or log to `HISTORY.md`.
+- Significant information will also be automatically extracted into structured memories.
 
 ## Behavior Guidelines
 
@@ -248,7 +252,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         memory = self.memory.get_memory_context()
         if memory:
-            parts.append(f"# Memory\n\n{memory}")
+            parts.append(f"# Memory\n\n{memory}\n\n当需要某条记忆的完整细节时，优先使用 `knowledge_search` 或 `read_file` 读取具体路径。")
+
+        parts.append(
+            "# Built-in Knowledge Search\n\n"
+            "- `knowledge_search`: BM25 keyword search over indexed workspace knowledge.\n"
+            "- Use it first when asked about historical details or prior documents.\n"
+            "- If the user asks what was discussed before, call `knowledge_search` before answering."
+        )
 
         always_skills = self.skills.get_always_skills()
         if always_skills:

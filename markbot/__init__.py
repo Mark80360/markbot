@@ -10,5 +10,5 @@ import os
 #logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 #logging.getLogger("litellm").setLevel(logging.ERROR)
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 __logo__ = "🦞"

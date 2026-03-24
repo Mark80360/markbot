@@ -97,7 +97,6 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
-        self.memory = MemoryStore(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -117,11 +116,12 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
-        self._consolidating: set[str] = set()
-        self._consolidation_tasks: set[asyncio.Task] = set()
-        self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._processing_lock = asyncio.Lock()
+        self._sessions_compressing: set[str] = set()
+        self._compression_tasks: set[asyncio.Task] = set()
+        self._session_compression_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self.memory_compressor: SessionCompressor | None = None
         
         self._init_search_and_memory()
         self._register_default_tools()
@@ -153,6 +153,8 @@ class AgentLoop:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to initialize embedder: {e}")
+        
+        self._setup_memory_compressor()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -178,12 +180,141 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(SkillTool(skills_loader=self.context.skills))
         self.tools.register(MemoryTool(
-            memory_store=self.memory,
+            memory_store=self.context.memory,
             workspace=self.workspace,
             indexer=self.search_indexer,
         ))
+        if self.search_config and self.search_config.enabled:
+            from markbot.agent.tools.knowledge_search import KnowledgeSearchTool
+            self.tools.register(
+                KnowledgeSearchTool(
+                    store=self.search_store,
+                    config=self.search_config,
+                    embedder=self.search_embedder,
+                    workspace=self.workspace,
+                    allowed_dir=allowed_dir,
+                )
+            )
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def _setup_memory_compressor(self) -> None:
+        """Initialize structured session compressor based on memory settings."""
+        if not self.memory_config.enabled:
+            self.memory_compressor = None
+            return
+        dedup = MemoryDeduplicator(
+            store=self.search_store,
+            provider=self.provider,
+            model=self.model,
+            search_config=self.search_config,
+            embedder=self.search_embedder,
+            min_score=self.memory_config.dedup_min_score,
+            output_language=self.memory_config.output_language,
+        )
+        extractor = MemoryExtractor(
+            provider=self.provider,
+            workspace=self.workspace,
+            model=self.model,
+            output_language=self.memory_config.output_language,
+        )
+        self.memory_compressor = SessionCompressor(
+            extractor=extractor,
+            deduplicator=dedup,
+            memory_store=self.context.memory,
+            provider=self.provider,
+            model=self.model,
+            indexer=self.search_indexer,
+            max_memories_per_category=self.memory_config.max_memories_per_category,
+            output_language=self.memory_config.output_language,
+        )
+
+    def _get_session_compression_lock(self, session_key: str) -> asyncio.Lock:
+        """Get or create a lock for session compression."""
+        lock = self._session_compression_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_compression_locks[session_key] = lock
+        return lock
+
+    def _maybe_schedule_session_compression(self, session) -> None:
+        """Schedule background compression when threshold is reached."""
+        if self.memory_compressor is None:
+            logger.debug("Memory compression skipped: compressor not initialized (enabled=False?)")
+            return
+        if not self.memory_config.auto_compress:
+            logger.debug("Memory compression skipped: auto_compress=False")
+            return
+        if self.memory_config.compress_threshold <= 0:
+            logger.debug("Memory compression skipped: compress_threshold=0")
+            return
+        if session.key in self._sessions_compressing:
+            logger.debug(f"Memory compression skipped for {session.key}: session already compressing")
+            return
+
+        current_count = len(session.messages)
+        last_count = int(session.metadata.get("last_compressed_count", 0))
+        diff = current_count - last_count
+        
+        logger.info(
+            f"Memory compression check ({session.key}): current={current_count}, last_compressed={last_count}, diff={diff}, threshold={self.memory_config.compress_threshold}"
+        )
+        
+        if current_count < self.memory_config.compress_threshold:
+            return
+        if diff < self.memory_config.compress_threshold:
+            return
+
+        logger.info(f"Scheduling background memory compression for {session.key} (diff={diff})")
+        task = asyncio.create_task(self._compress_session_background(session.key, current_count))
+        self._compression_tasks.add(task)
+        task.add_done_callback(self._compression_tasks.discard)
+
+    async def wait_for_compression(self, timeout: float = 30.0) -> None:
+        """Wait for all pending compression tasks to finish."""
+        if not self._compression_tasks:
+            return
+        
+        logger.info(f"Waiting for {len(self._compression_tasks)} memory compression tasks to finish...")
+        try:
+            await asyncio.wait_for(asyncio.gather(*self._compression_tasks, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for memory compression tasks")
+        except Exception as e:
+            logger.error(f"Error waiting for compression tasks: {e}")
+
+    async def _compress_session_background(self, session_key: str, message_count: int) -> None:
+        """Background task for session compression."""
+        lock = self._get_session_compression_lock(session_key)
+        async with lock:
+            if session_key in self._sessions_compressing:
+                return
+            self._sessions_compressing.add(session_key)
+            try:
+                session = self.sessions.get_or_create(session_key)
+                result = await self._compress_session_for_new(session)
+            finally:
+                self._sessions_compressing.discard(session_key)
+        if result is None:
+            return
+        session.metadata["last_compressed_count"] = message_count
+        self.sessions.save(session)
+        logger.info(
+            f"记忆压缩完成: "
+            f"session={session_key}, created={result.created}, merged={result.merged}, skipped={result.skipped}"
+        )
+
+    async def _compress_session_for_new(self, session):
+        """Handle session compression for /new command."""
+        if not session.messages:
+            return None
+        if self.memory_compressor is None:
+            return None
+        try:
+            return await self.memory_compressor.compress(session.messages, session.key)
+        except Exception as e:
+            logger.error(f"记忆压缩失败: {e}")
+            return None
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -455,48 +586,50 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        success = await self._consolidate_memory(temp, archive_all=True)
-                        if not success:
-                            logger.warning("Memory archival failed for {}, clearing session anyway", session.key)
-            except Exception:
-                logger.exception("/new archival failed for {}, clearing session anyway", session.key)
-            finally:
-                self._consolidating.discard(session.key)
+            msg_count = len(session.messages)
+            lock = self._get_session_compression_lock(session.key)
+            async with lock:
+                if session.key in self._sessions_compressing:
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="Memory consolidation in progress, please retry /new later.",
+                    )
+                self._sessions_compressing.add(session.key)
+                try:
+                    result = await self._compress_session_for_new(session)
+                finally:
+                    self._sessions_compressing.discard(session.key)
+
+            if result is None and msg_count > 0:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Memory consolidation failed, current session preserved. Please retry /new later.",
+                )
 
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="✨ New session started.")
+            if result is not None:
+                parts = ["✨ New session started."]
+                parts.append(f"- Archived messages: {msg_count}")
+                parts.append(
+                    f"- Memory consolidation result: Created {result.created}, Merged {result.merged}, Skipped {result.skipped}"
+                )
+                if result.summary:
+                    parts.append("- Session summary: Written to HISTORY.md")
+                else:
+                    parts.append("- Session summary: Not generated")
+                feedback = "\n".join(parts)
+            elif msg_count == 0:
+                feedback = "✨ New session started (previous session was empty)."
+            else:
+                feedback = "✨ New session started (memory consolidation failed, session preserved)."
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=feedback)
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 markbot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
-
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
+                                  content="MarkBot commands:\n\n/new - Start new session with memory consolidation\n/stop - Stop current request\n/help - Show this help")
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -528,6 +661,7 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+        self._maybe_schedule_session_compression(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -574,51 +708,7 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Compress session into structured memories using SessionCompressor."""
-        if not self.memory_config.enabled or not self.memory_config.auto_compress:
-            return True
 
-        snapshot = session.messages[session.last_consolidated:]
-        if not snapshot:
-            return True
-
-        try:
-            extractor = MemoryExtractor(
-                provider=self.provider,
-                workspace=self.workspace,
-                model=self.model,
-                output_language=self.memory_config.output_language,
-            )
-            deduplicator = MemoryDeduplicator(
-                store=self.search_store,
-                provider=self.provider,
-                model=self.model,
-                search_config=self.search_config,
-                embedder=self.search_embedder,
-                min_score=self.memory_config.dedup_min_score,
-                output_language=self.memory_config.output_language,
-            )
-            compressor = SessionCompressor(
-                extractor=extractor,
-                deduplicator=deduplicator,
-                memory_store=self.memory,
-                provider=self.provider,
-                model=self.model,
-                indexer=self.search_indexer,
-                max_memories_per_category=self.memory_config.max_memories_per_category,
-                output_language=self.memory_config.output_language,
-            )
-            result: CompressionResult = await compressor.compress(snapshot, session.key)
-            session.last_consolidated = len(session.messages)
-            logger.info(
-                f"Memory compression complete for {session.key}: "
-                f"{result.created} created, {result.merged} merged, {result.skipped} skipped"
-            )
-            return True
-        except Exception:
-            logger.exception(f"Memory compression failed for {session.key}")
-            return False
 
     async def process_direct(
         self,

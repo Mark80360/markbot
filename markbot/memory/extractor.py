@@ -34,48 +34,68 @@ class MemoryExtractor:
         self._memory_root = ensure_dir(self._workspace / "memory")
 
     async def extract(self, messages: list[dict[str, Any]], session_key: str) -> list[CandidateMemory]:
-        """Extract candidate memories from conversation messages."""
-        formatted = self._format_messages(messages)
-        if not formatted.strip():
+        """Extract candidate memories from conversation messages in chunks."""
+        if not messages:
             return []
 
-        prompt = render_prompt(
-            "memory_extraction",
-            {
-                "messages": formatted,
-                "session_key": session_key,
-                "output_language": self._output_language,
-            },
-        )
-        response = await self._provider.chat_with_retry(
-            messages=[
-                {"role": "system", "content": "你是严格的 JSON 提取器。只输出 JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            model=self._model,
-        )
-        payload = self._parse_json_payload(response.content or "")
-        raw_memories = payload.get("memories")
-        if not isinstance(raw_memories, list):
-            logger.warning("Memory extraction rejected: memories payload is not a list")
-            return []
-        candidates: list[CandidateMemory] = []
-        for item in raw_memories:
-            normalized = self._validate_memory_item(item)
-            if normalized is None:
-                logger.warning("Memory extraction rejected: invalid or incomplete memory payload item")
+        # Split messages into chunks of 50 to avoid prompt size or output token limits.
+        chunk_size = 50
+        chunks = [messages[i:i + chunk_size] for i in range(0, len(messages), chunk_size)]
+        
+        all_candidates: list[CandidateMemory] = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Memory extraction chunk {i+1}/{len(chunks)}: {len(chunk)} messages")
+            formatted = self._format_messages(chunk)
+            if not formatted.strip():
                 continue
-            candidates.append(
-                CandidateMemory(
-                    category=normalized["category"],
-                    abstract=normalized["abstract"],
-                    overview=normalized["overview"],
-                    content=normalized["content"],
-                    source_session=session_key,
-                    language=self._output_language,
-                )
+
+            prompt = render_prompt(
+                "memory_extraction",
+                {
+                    "messages": formatted,
+                    "session_key": session_key,
+                    "output_language": self._output_language,
+                },
             )
-        return candidates
+            try:
+                response = await self._provider.chat_with_retry(
+                    messages=[
+                        {"role": "system", "content": "你是严格的 JSON 提取器。请根据给出的会话内容，提取长期有价值的记忆。只输出 JSON，严禁输出任何 Markdown 代码块标签或其他解释性文字。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    model=self._model,
+                )
+                
+                content = (response.content or "").strip()
+                if not content:
+                    continue
+                
+                payload = self._parse_json_payload(content)
+                raw_memories = payload.get("memories")
+                if not isinstance(raw_memories, list):
+                    logger.warning(f"Memory extraction chunk {i+1} rejected: memories payload is not a list")
+                    continue
+
+                for item in raw_memories:
+                    normalized = self._validate_memory_item(item)
+                    if normalized is None:
+                        continue
+                    all_candidates.append(
+                        CandidateMemory(
+                            category=normalized["category"],
+                            abstract=normalized["abstract"],
+                            overview=normalized["overview"],
+                            content=normalized["content"],
+                            source_session=session_key,
+                            language=self._output_language,
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Memory extraction chunk {i+1} failed: {e}")
+                continue
+
+        logger.info(f"Memory extraction complete: {len(all_candidates)} candidates total from {len(chunks)} chunks")
+        return all_candidates
 
     async def create_memory(self, candidate: CandidateMemory, session_key: str) -> Path | None:
         """Persist a candidate memory into structured memory files."""
@@ -126,7 +146,7 @@ class MemoryExtractor:
             )
             merged = (response.content or "").strip()
             return merged or None
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - provider/runtime defensive path
             logger.warning(f"Memory merge failed: {e}")
             return None
 
@@ -189,12 +209,15 @@ class MemoryExtractor:
 
     def _parse_json_payload(self, text: str) -> dict[str, Any]:
         json_text = self._extract_json_text(text)
+        logger.info(f"Memory extraction: parsing JSON from {len(json_text)} chars")
         try:
             parsed = json.loads(json_text)
             if isinstance(parsed, dict):
+                memories = parsed.get("memories", [])
+                logger.info(f"Memory extraction: found {len(memories) if isinstance(memories, list) else 'N/A'} memories in JSON")
                 return parsed
-        except json.JSONDecodeError:
-            logger.warning("Memory extraction JSON parse failed; falling back to empty result")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Memory extraction JSON parse failed: {e}, raw text: {json_text[:200]}")
         return {"memories": []}
 
     @staticmethod

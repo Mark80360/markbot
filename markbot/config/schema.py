@@ -4,29 +4,42 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
 
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class FeishuGroupConfig(Base):
+    """Per-group configuration for Feishu channel."""
+
+    enabled: bool = True
+    allow_from: list[str] = Field(default_factory=list)
+    group_policy: Literal["open", "allowlist", "disabled"] | None = None
+    system_prompt: str | None = None
 
 
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
     enabled: bool = False
-    app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-    react_emoji: str = (
-        "SMILE"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
-    )
-    group_policy: Literal["open", "mention"] = "mention"  # "mention" responds when @mentioned, "open" responds to all
+    app_id: str = ""
+    app_secret: str = ""
+    encrypt_key: str = ""
+    verification_token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    group_allow_from: list[str] = Field(default_factory=list)
+    react_emoji: str = "Typing"
+    group_policy: Literal["open", "allowlist", "disabled"] = "open"
+    dm_policy: Literal["open", "pairing"] = "pairing"
+    require_mention: bool = True
+    streaming: bool = False
+    reply_mode: Literal["auto", "static", "streaming"] = "auto"
+    groups: dict[str, FeishuGroupConfig] = Field(default_factory=dict)
+    history_limit: int = 20
 
 
 class DingTalkConfig(Base):
@@ -199,12 +212,14 @@ class MemoryConfig(Base):
 class SearchConfig(Base):
     """Search/index configuration for memory and knowledge retrieval."""
 
-    enabled: bool = False
+    enabled: bool = True
     db_path: str = ""
     auto_index: bool = True
     index_dirs: list[str] = Field(default_factory=lambda: ["memory"])
     vector_enabled: bool = False
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    default_limit: int = 10
+    min_score: float = 0.15
 
 
 class Config(BaseSettings):
