@@ -25,3 +25,5 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `skill-creator` | Create new skills |
 | `cron` | Schedule reminders and recurring tasks |
 | `memory` | Two-layer memory system with grep-based recall |
+| `data-analysis` | Analyze Excel/CSV files using DuckDB |
+| `surprise-me` | Create a delightful, unexpected creative showcase |

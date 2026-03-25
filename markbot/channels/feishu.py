@@ -1,4 +1,11 @@
-"""Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
+"""Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection.
+
+Enhanced with features from openclaw-lark-main:
+- Markdown style optimization (heading downgrade, table spacing, list normalization)
+- Reply mode detection (auto/static/streaming)
+- Reasoning text extraction and separation
+- Improved group policy and allowlist handling
+"""
 
 import asyncio
 import json
@@ -7,7 +14,7 @@ import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -21,13 +28,217 @@ import importlib.util
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
-# Message type display mapping
 MSG_TYPE_MAP = {
     "image": "[image]",
     "audio": "[audio]",
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+ReplyMode = Literal["auto", "static", "streaming"]
+
+
+def optimize_markdown_style(text: str, card_version: int = 2) -> str:
+    """Optimize Markdown style for Feishu cards.
+
+    - Heading downgrade: H1 → H4, H2~H6 → H5
+    - Add paragraph spacing around tables
+    - Normalize ordered/unordered lists
+    - Protect code blocks from modification
+    """
+    try:
+        r = _optimize_markdown_style(text, card_version)
+        r = _strip_invalid_image_keys(r)
+        return r
+    except Exception:
+        return text
+
+
+def _optimize_markdown_style(text: str, card_version: int = 2) -> str:
+    MARK = "___CB_"
+    code_blocks: list[str] = []
+    code_block_re = re.compile(r"```[\s\S]*?```")
+
+    def save_code_block(m: re.Match) -> str:
+        code_blocks.append(m.group(0))
+        return f"{MARK}{len(code_blocks) - 1}___"
+
+    r = code_block_re.sub(save_code_block, text)
+
+    has_h1_to_h3 = bool(re.search(r"^#{1,3} ", text, re.MULTILINE))
+    if has_h1_to_h3:
+        r = re.sub(r"^#{2,6} (.+)$", r"##### \1", r, flags=re.MULTILINE)
+        r = re.sub(r"^# (.+)$", r"#### \1", r, flags=re.MULTILINE)
+
+    if card_version >= 2:
+        r = re.sub(r"^(#{4,5} .+)\n{1,2}(#{4,5} )", r"\1\n<br>\n\2", r, flags=re.MULTILINE)
+
+        for i, block in enumerate(code_blocks):
+            r = r.replace(f"{MARK}{i}___", f"\n{block}\n")
+    else:
+        for i, block in enumerate(code_blocks):
+            r = r.replace(f"{MARK}{i}___", block)
+
+    # 表格前后处理：<br> 本身就是换行，不要额外加 \n
+    # 表格前：段落紧接表格的情况，在表格前加 <br>
+    r = re.sub(r"([^\n|])\n(\|.+\|)", r"\1<br>\n\2", r)
+    # 表格后：表格紧接段落的情况，在表格后加 <br>
+    r = re.sub(r"(\|[^\n]*\|)\n([^|\n])", r"\1<br>\n\2", r)
+
+    # 清理多余换行
+    r = re.sub(r"\n{3,}", "\n\n", r)
+    r = re.sub(r"(<br>)\n\n+", r"\1\n", r)
+    r = re.sub(r"\n\n+(<br>)", r"\n\1", r)
+    return r
+
+
+def _strip_invalid_image_keys(text: str) -> str:
+    """Strip ![alt](value) where value is not a valid Feishu image key."""
+    if "![" not in text:
+        return text
+
+    def replace_image(m: re.Match) -> str:
+        value = m.group(2)
+        if value.startswith("img_"):
+            return m.group(0)
+        return ""
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", replace_image, text)
+
+
+def resolve_reply_mode(
+    feishu_cfg: FeishuConfig, chat_type: str | None = None
+) -> Literal["static", "streaming"]:
+    """Resolve the effective reply mode based on configuration and chat type.
+
+    Priority: replyMode.{scene} > replyMode.default > replyMode (string) > "auto"
+    """
+    if not feishu_cfg.streaming:
+        return "static"
+
+    mode = feishu_cfg.reply_mode or "auto"
+    if mode != "auto":
+        return mode if mode != "streaming" else "streaming"
+
+    if feishu_cfg.streaming:
+        return "streaming" if chat_type == "p2p" else "static"
+    return "static"
+
+
+def split_reasoning_text(text: str | None) -> dict[str, str | None]:
+    """Split payload text into optional reasoningText and answerText.
+
+    Handles two formats:
+    1. "Reasoning:\\n_italic line_\\n…" prefix
+    2. `ahreing…hra` / `<thinking>…</thinking>` XML tags
+    """
+    if not text or not text.strip():
+        return {}
+
+    trimmed = text.strip()
+    REASONING_PREFIX = "Reasoning:\n"
+
+    if trimmed.startswith(REASONING_PREFIX) and len(trimmed) > len(REASONING_PREFIX):
+        return {"reasoning_text": _clean_reasoning_prefix(trimmed)}
+
+    tagged_reasoning = _extract_thinking_content(text)
+    stripped_answer = _strip_reasoning_tags(text)
+
+    if not tagged_reasoning and stripped_answer == text:
+        return {"answer_text": text}
+
+    return {
+        "reasoning_text": tagged_reasoning or None,
+        "answer_text": stripped_answer or None,
+    }
+
+
+def _extract_thinking_content(text: str) -> str:
+    """Extract content from `ahreing`, `<thinking>`, `<thought>` blocks."""
+    if not text:
+        return ""
+
+    scan_re = re.compile(r"<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>", re.IGNORECASE)
+    result_parts: list[str] = []
+    last_idx = 0
+    in_thinking = False
+
+    for m in scan_re.finditer(text):
+        is_closing = m.group(1) == "/"
+        if in_thinking and is_closing:
+            result_parts.append(text[last_idx:m.start()])
+        in_thinking = not is_closing
+        last_idx = m.end()
+
+    if in_thinking:
+        result_parts.append(text[last_idx:])
+
+    return "".join(result_parts).strip()
+
+
+def _strip_reasoning_tags(text: str) -> str:
+    """Strip reasoning blocks - both XML tags with their content."""
+    result = re.sub(
+        r"<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*?<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(r"<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*$", "", result, flags=re.IGNORECASE)
+    result = re.sub(r"<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>", "", result, flags=re.IGNORECASE)
+    return result.strip()
+
+
+def _clean_reasoning_prefix(text: str) -> str:
+    """Clean a 'Reasoning:\\n_italic_' formatted message back to plain text."""
+    cleaned = re.sub(r"^Reasoning:\s*", "", text, flags=re.IGNORECASE)
+    cleaned = "\n".join(re.sub(r"^_(.+)_$", r"\1", line) for line in cleaned.split("\n"))
+    return cleaned.strip()
+
+
+def resolve_feishu_allowlist_match(
+    allow_from: list[str | int], sender_id: str, sender_name: str | None = None
+) -> dict[str, Any]:
+    """Check whether a sender is permitted by a given allowlist."""
+    normalized = [str(e).strip().lower() for e in allow_from if str(e).strip()]
+
+    if not normalized:
+        return {"allowed": False}
+
+    if "*" in normalized:
+        return {"allowed": True, "match_key": "*", "match_source": "wildcard"}
+
+    sender_lower = sender_id.lower()
+    if sender_lower in normalized:
+        return {"allowed": True, "match_key": sender_lower, "match_source": "id"}
+
+    return {"allowed": False}
+
+
+def is_feishu_group_allowed(
+    group_policy: str, allow_from: list[str | int], sender_id: str, sender_name: str | None = None
+) -> bool:
+    """Determine whether an inbound group message should be processed."""
+    if group_policy == "disabled":
+        return False
+    if group_policy == "open":
+        return True
+    return resolve_feishu_allowlist_match(allow_from, sender_id, sender_name)["allowed"]
+
+
+def split_legacy_group_allow_from(raw: list[str | int]) -> dict[str, list[str]]:
+    """Split raw groupAllowFrom into legacy chat-ID entries and sender entries."""
+    legacy_chat_ids: list[str] = []
+    sender_allow_from: list[str] = []
+
+    for entry in raw:
+        s = str(entry)
+        if s.startswith("oc_"):
+            legacy_chat_ids.append(s)
+        else:
+            sender_allow_from.append(s)
+
+    return {"legacy_chat_ids": legacy_chat_ids, "sender_allow_from": sender_allow_from}
 
 
 def _truncate_safe(s: str | None, max_len: int = 16, suffix: str = "...") -> str:
@@ -393,11 +604,53 @@ class FeishuChannel(BaseChannel):
                 return True
         return False
 
-    def _is_group_message_for_bot(self, message: Any) -> bool:
-        """Allow group messages when policy is open or bot is @mentioned."""
-        if self.config.group_policy == "open":
+    def _is_group_message_for_bot(self, message: Any, chat_id: str, sender_id: str) -> bool:
+        """Check if a group message should be processed.
+
+        Uses two-layer access control:
+        1. Group-level: Check if the group is in the allowlist
+        2. Sender-level: Check if the sender is allowed within the group
+        """
+        group_policy = self.config.group_policy
+        if group_policy == "disabled":
+            return False
+
+        if group_policy == "open":
+            if self.config.require_mention:
+                return self._is_bot_mentioned(message)
             return True
-        return self._is_bot_mentioned(message)
+
+        legacy = split_legacy_group_allow_from(self.config.group_allow_from)
+        legacy_chat_ids = legacy["legacy_chat_ids"]
+        sender_allow_from = legacy["sender_allow_from"]
+
+        chat_id_lower = chat_id.lower()
+        if any(cid.lower() == chat_id_lower for cid in legacy_chat_ids):
+            return True
+
+        group_config = self.config.groups.get(chat_id) or self.config.groups.get("*")
+        if group_config:
+            if group_config.enabled is False:
+                return False
+
+            per_group_policy = group_config.group_policy
+            if per_group_policy == "disabled":
+                return False
+            if per_group_policy == "open":
+                if self.config.require_mention:
+                    return self._is_bot_mentioned(message)
+                return True
+
+            merged_allow = list(set(sender_allow_from + (group_config.allow_from or [])))
+            if merged_allow:
+                return is_feishu_group_allowed("allowlist", merged_allow, sender_id)
+
+        if sender_allow_from:
+            return is_feishu_group_allowed("allowlist", sender_allow_from, sender_id)
+
+        if self.config.require_mention:
+            return self._is_bot_mentioned(message)
+        return True
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
         """Sync helper for adding reaction (runs in thread pool). Returns reaction_id."""
@@ -445,11 +698,11 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.warning("Error deleting reaction: {}", e)
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "SMILE") -> str | None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str | None:
         """
         Add a reaction emoji to a message (non-blocking).
 
-        Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
+        Common emoji types: THUMBSUP,THUMBSDOWN,HEART,SMILE,JOYFUL,FROWN,BLUSH,OK,CLAP,FIREWORKS,PARTY,MUSCLE,FIRE,EYES,THINKING,PRAISE,PRAY,ROCKET,DONE,SKULL,HUNDREDPOINTS,FACEPALM,CHECK,CrossMark,COOL,Typing,SPEECHLESS
         Returns reaction_id for later deletion.
         """
         if not self._client:
@@ -495,19 +748,84 @@ class FeishuChannel(BaseChannel):
             "rows": [{f"c{i}": r[i] if i < len(r) else "" for i in range(len(headers))} for r in rows],
         }
 
-    def _build_card_elements(self, content: str) -> list[dict]:
-        """Split content into div/markdown + table elements for Feishu card."""
+    def _build_card_elements(self, content: str, state: str = "complete") -> list[dict]:
+        """Split content into div/markdown + table elements for Feishu card.
+
+        States:
+        - "thinking": Show loading indicator
+        - "streaming": Show content being streamed
+        - "complete": Show final content
+        """
+        optimized = optimize_markdown_style(content)
         elements, last_end = [], 0
-        for m in self._TABLE_RE.finditer(content):
-            before = content[last_end:m.start()]
+        for m in self._TABLE_RE.finditer(optimized):
+            before = optimized[last_end:m.start()]
             if before.strip():
                 elements.extend(self._split_headings(before))
             elements.append(self._parse_md_table(m.group(1)) or {"tag": "markdown", "content": m.group(1)})
             last_end = m.end()
-        remaining = content[last_end:]
+        remaining = optimized[last_end:]
         if remaining.strip():
             elements.extend(self._split_headings(remaining))
-        return elements or [{"tag": "markdown", "content": content}]
+
+        if not elements:
+            elements = [{"tag": "markdown", "content": optimized}]
+
+        if state == "streaming":
+            elements.append({
+                "tag": "markdown",
+                "content": " ",
+                "icon": {
+                    "tag": "custom_icon",
+                    "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
+                    "size": "16px 16px",
+                },
+                "element_id": "loading_icon",
+            })
+
+        return elements
+
+    def _build_thinking_card(self) -> dict:
+        """Build a thinking/loading card for streaming mode."""
+        return {
+            "config": {
+                "wide_screen_mode": True,
+                "streaming_mode": True,
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "Thinking...",
+                    "i18n_content": {"zh_cn": "思考中...", "en_us": "Thinking..."},
+                }
+            ],
+        }
+
+    def _build_reasoning_card(self, reasoning_text: str, elapsed_ms: int | None = None) -> dict:
+        """Build a card showing reasoning/thinking content."""
+        elapsed_str = ""
+        if elapsed_ms:
+            seconds = elapsed_ms / 1000
+            elapsed_str = f" ({seconds:.1f}s)" if seconds < 60 else f" ({int(seconds // 60)}m {int(seconds % 60)}s)"
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"Reasoning{elapsed_str}",
+                    "i18n_content": {"zh_cn": f"思考过程{elapsed_str}", "en_us": f"Reasoning{elapsed_str}"},
+                },
+                "template": "turquoise",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": reasoning_text,
+                    "text_size": "notation",
+                }
+            ],
+        }
 
     @staticmethod
     def _split_elements_by_table_limit(elements: list[dict], max_tables: int = 1) -> list[list[dict]]:
@@ -907,7 +1225,13 @@ class FeishuChannel(BaseChannel):
             return False
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu, including media (images/files) if present."""
+        """Send a message through Feishu, including media (images/files) if present.
+
+        Enhanced features:
+        - Reasoning text separation for thinking models
+        - Markdown style optimization for Feishu cards
+        - Reply mode support (static/streaming)
+        """
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
@@ -916,12 +1240,14 @@ class FeishuChannel(BaseChannel):
             logger.warning("Feishu: chat_id is None, cannot send message")
             return
 
-        # Log send request details
         content_preview = (msg.content[:100] + "...") if msg.content and len(msg.content) > 100 else (msg.content or "")
-        logger.info("Feishu sending: chat={}, media_count={}, content_len={}, preview={}",
-                   _truncate_safe(msg.chat_id),
-                   len(msg.media), len(msg.content) if msg.content else 0,
-                   content_preview.replace("\n", "\\n"))
+        logger.info(
+            "Feishu sending: chat={}, media_count={}, content_len={}, preview={}",
+            _truncate_safe(msg.chat_id),
+            len(msg.media),
+            len(msg.content) if msg.content else 0,
+            content_preview.replace("\n", "\\n"),
+        )
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
@@ -936,69 +1262,116 @@ class FeishuChannel(BaseChannel):
                 if ext in self._IMAGE_EXTS:
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
                     if key:
-                        logger.info("Feishu: sent image {} to {}", os.path.basename(file_path), _truncate_safe(msg.chat_id))
+                        logger.info(
+                            "Feishu: sent image {} to {}",
+                            os.path.basename(file_path),
+                            _truncate_safe(msg.chat_id),
+                        )
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
+                            None,
+                            self._send_message_sync,
+                            receive_id_type,
+                            msg.chat_id,
+                            "image",
+                            json.dumps({"image_key": key}, ensure_ascii=False),
                         )
                     else:
                         logger.warning("Feishu: failed to upload image {}", os.path.basename(file_path))
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
-                        # Use msg_type "media" for audio/video so users can play inline;
-                        # "file" for everything else (documents, archives, etc.)
                         if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
                             media_type = "media"
                         else:
                             media_type = "file"
-                        logger.info("Feishu: sent {} {} to {}", media_type, os.path.basename(file_path), _truncate_safe(msg.chat_id))
+                        logger.info(
+                            "Feishu: sent {} {} to {}",
+                            media_type,
+                            os.path.basename(file_path),
+                            _truncate_safe(msg.chat_id),
+                        )
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                            None,
+                            self._send_message_sync,
+                            receive_id_type,
+                            msg.chat_id,
+                            media_type,
+                            json.dumps({"file_key": key}, ensure_ascii=False),
                         )
                     else:
                         logger.warning("Feishu: failed to upload file {}", os.path.basename(file_path))
 
             if msg.content and msg.content.strip():
-                fmt = self._detect_msg_format(msg.content)
-                logger.debug("Feishu: detected format '{}' for content length {}", fmt, len(msg.content))
+                split_result = split_reasoning_text(msg.content)
+                reasoning_text = split_result.get("reasoning_text")
+                answer_text = split_result.get("answer_text") or msg.content
+
+                if reasoning_text:
+                    reasoning_card = self._build_reasoning_card(reasoning_text)
+                    logger.debug("Feishu: sending reasoning card")
+                    await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "interactive",
+                        json.dumps(reasoning_card, ensure_ascii=False),
+                    )
+
+                content_to_send = answer_text
+                fmt = self._detect_msg_format(content_to_send)
+                logger.debug("Feishu: detected format '{}' for content length {}", fmt, len(content_to_send))
 
                 if fmt == "text":
-                    # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    text_body = json.dumps({"text": content_to_send.strip()}, ensure_ascii=False)
                     logger.info("Feishu: sent text message to {}", _truncate_safe(msg.chat_id))
                     await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "text", text_body,
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "text",
+                        text_body,
                     )
 
                 elif fmt == "post":
-                    # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
+                    post_body = self._markdown_to_post(content_to_send)
                     logger.info("Feishu: sent post message to {}", _truncate_safe(msg.chat_id))
                     await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "post", post_body,
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "post",
+                        post_body,
                     )
 
                 else:
-                    # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
+                    elements = self._build_card_elements(content_to_send)
                     chunks = self._split_elements_by_table_limit(elements)
-                    logger.info("Feishu: sending {} card(s) to {}", len(chunks), _truncate_safe(msg.chat_id))
+                    logger.info(
+                        "Feishu: sending {} card(s) to {}",
+                        len(chunks),
+                        _truncate_safe(msg.chat_id),
+                    )
                     for i, chunk in enumerate(chunks):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
                         logger.debug("Feishu: sending card {} of {}", i + 1, len(chunks))
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                            None,
+                            self._send_message_sync,
+                            receive_id_type,
+                            msg.chat_id,
+                            "interactive",
+                            json.dumps(card, ensure_ascii=False),
                         )
 
-            # Delete reaction after sending reply
             if msg.metadata and msg.metadata.get("reaction_id") and msg.metadata.get("message_id"):
-                logger.debug("Feishu: deleting reaction {} from msg {}",
-                           msg.metadata.get("reaction_id"), msg.metadata.get("message_id"))
+                logger.debug(
+                    "Feishu: deleting reaction {} from msg {}",
+                    msg.metadata.get("reaction_id"),
+                    msg.metadata.get("message_id"),
+                )
                 await self._delete_reaction(msg.metadata["message_id"], msg.metadata["reaction_id"])
 
         except Exception as e:
@@ -1076,8 +1449,8 @@ class FeishuChannel(BaseChannel):
                        message_id, msg_type, chat_type, _truncate_safe(sender_id),
                        _truncate_safe(chat_id))
 
-            if chat_type == "group" and not self._is_group_message_for_bot(message):
-                logger.debug("Feishu: skipping group message (not mentioned)")
+            if chat_type == "group" and not self._is_group_message_for_bot(message, chat_id, sender_id):
+                logger.debug("Feishu: skipping group message (policy check failed)")
                 return
 
             # Add reaction and store reaction_id for later deletion
