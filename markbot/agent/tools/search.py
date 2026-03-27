@@ -8,10 +8,32 @@ from typing import Any
 from markbot.agent.tools.base import Tool
 
 
+def _resolve_path(
+    path: str,
+    workspace: Path | None = None,
+    allowed_dir: Path | None = None,
+) -> Path:
+    """Resolve path against workspace (if relative) and enforce directory restriction."""
+    p = Path(path).expanduser()
+    if not p.is_absolute() and workspace:
+        p = workspace / p
+    resolved = p.resolve()
+    if allowed_dir:
+        try:
+            resolved.relative_to(allowed_dir.resolve())
+        except ValueError:
+            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+    return resolved
+
+
 class GlobTool(Tool):
     """Tool to search for files using glob patterns."""
 
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+    ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
 
@@ -21,7 +43,7 @@ class GlobTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Search for files matching a glob pattern (e.g., '**/*.py', 'src/**/*.ts'). Returns file paths."
+        return "Search for files matching a glob pattern (e.g., '**/*.py', 'src/**/*.ts'). Returns file paths sorted by modification time (most recent first)."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -40,9 +62,12 @@ class GlobTool(Tool):
             "required": ["pattern"]
         }
 
-    async def execute(self, pattern: str, path: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        pattern = kwargs.get("pattern", "")
+        path = kwargs.get("path")
+        
         try:
-            search_dir = self._resolve_path(path or ".")
+            search_dir = _resolve_path(path or ".", self._workspace, self._allowed_dir)
             if not search_dir.exists():
                 return f"Error: Directory not found: {path or '.'}"
             if not search_dir.is_dir():
@@ -52,6 +77,7 @@ class GlobTool(Tool):
             for file_path in search_dir.rglob("*"):
                 if file_path.is_file():
                     rel_path = file_path.relative_to(search_dir)
+                    # Try both native path and forward-slash variant
                     if fnmatch.fnmatch(str(rel_path), pattern) or fnmatch.fnmatch(str(rel_path).replace("\\", "/"), pattern):
                         matches.append(str(file_path))
 
@@ -73,24 +99,15 @@ class GlobTool(Tool):
         except Exception as e:
             return f"Error searching files: {str(e)}"
 
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve path against workspace."""
-        p = Path(path).expanduser()
-        if not p.is_absolute() and self._workspace:
-            p = self._workspace / p
-        resolved = p.resolve()
-        if self._allowed_dir:
-            try:
-                resolved.relative_to(self._allowed_dir.resolve())
-            except ValueError:
-                raise PermissionError(f"Path {path} is outside allowed directory {self._allowed_dir}")
-        return resolved
-
 
 class GrepTool(Tool):
     """Tool to search file contents using regex patterns."""
 
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+    ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
 
@@ -100,7 +117,7 @@ class GrepTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Search file contents for a pattern. Returns matching lines with file paths and line numbers."
+        return "Search file contents for a pattern using regex. Returns matching lines with file paths and line numbers."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -115,7 +132,7 @@ class GrepTool(Tool):
                     "type": "string",
                     "description": "Directory or file to search in (default: workspace root)"
                 },
-                "file_pattern": {
+                "include": {
                     "type": "string",
                     "description": "Optional glob pattern to filter files (e.g., '*.py')"
                 },
@@ -125,31 +142,35 @@ class GrepTool(Tool):
                 },
                 "context_lines": {
                     "type": "integer",
-                    "description": "Number of context lines to show (default: 0)"
+                    "description": "Number of context lines to show around matches (default: 0)",
+                    "minimum": 0,
+                    "maximum": 5
                 }
             },
             "required": ["pattern"]
         }
 
-    async def execute(
-        self,
-        pattern: str,
-        path: str | None = None,
-        file_pattern: str | None = None,
-        case_insensitive: bool = False,
-        context_lines: int = 0,
-        **kwargs: Any
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        pattern = kwargs.get("pattern", "")
+        path = kwargs.get("path")
+        include = kwargs.get("include")
+        case_insensitive = kwargs.get("case_insensitive", False)
+        context_lines = kwargs.get("context_lines", 0)
+        
         try:
-            search_path = self._resolve_path(path or ".")
+            search_path = _resolve_path(path or ".", self._workspace, self._allowed_dir)
             if not search_path.exists():
                 return f"Error: Path not found: {path or '.'}"
 
             flags = re.IGNORECASE if case_insensitive else 0
-            regex = re.compile(pattern, flags)
+            try:
+                regex = re.compile(pattern, flags)
+            except re.error as e:
+                return f"Error: Invalid regex pattern: {e}"
 
             matches = []
             files_searched = 0
+            max_matches = 100
 
             # Determine files to search
             if search_path.is_file():
@@ -158,10 +179,10 @@ class GrepTool(Tool):
                 files = []
                 for file_path in search_path.rglob("*"):
                     if file_path.is_file():
-                        if file_pattern:
+                        if include:
                             rel_path = file_path.relative_to(search_path)
-                            if not (fnmatch.fnmatch(str(rel_path), file_pattern) or
-                                   fnmatch.fnmatch(str(rel_path).replace("\\", "/"), file_pattern)):
+                            if not (fnmatch.fnmatch(str(rel_path), include) or
+                                   fnmatch.fnmatch(str(rel_path).replace("\\", "/"), include)):
                                 continue
                         files.append(file_path)
 
@@ -174,10 +195,10 @@ class GrepTool(Tool):
 
                     for i, line in enumerate(lines, 1):
                         if regex.search(line):
-                            context = []
                             if context_lines > 0:
                                 start = max(0, i - context_lines - 1)
                                 end = min(len(lines), i + context_lines)
+                                context = []
                                 for j in range(start, end):
                                     prefix = ">" if j == i - 1 else " "
                                     context.append(f"{prefix} {j + 1}: {lines[j]}")
@@ -185,10 +206,10 @@ class GrepTool(Tool):
                             else:
                                 matches.append(f"{file_path}:{i}: {line}")
 
-                            if len(matches) >= 100:
+                            if len(matches) >= max_matches:
                                 break
 
-                    if len(matches) >= 100:
+                    if len(matches) >= max_matches:
                         break
 
                 except (UnicodeDecodeError, PermissionError):
@@ -198,27 +219,12 @@ class GrepTool(Tool):
                 return f"No matches found for pattern: {pattern} (searched {files_searched} files)"
 
             result = "\n".join(matches)
-            if len(matches) >= 100:
+            if len(matches) >= max_matches:
                 result += f"\n\n... (limit reached, {files_searched} files searched)"
 
             return result
 
         except PermissionError as e:
             return f"Error: {e}"
-        except re.error as e:
-            return f"Error: Invalid regex pattern: {e}"
         except Exception as e:
             return f"Error searching content: {str(e)}"
-
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve path against workspace."""
-        p = Path(path).expanduser()
-        if not p.is_absolute() and self._workspace:
-            p = self._workspace / p
-        resolved = p.resolve()
-        if self._allowed_dir:
-            try:
-                resolved.relative_to(self._allowed_dir.resolve())
-            except ValueError:
-                raise PermissionError(f"Path {path} is outside allowed directory {self._allowed_dir}")
-        return resolved

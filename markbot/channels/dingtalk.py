@@ -41,7 +41,7 @@ except ImportError:
 class MarkbotDingTalkHandler(CallbackHandler):
     """
     Standard DingTalk Stream SDK Callback Handler.
-    Parses incoming messages and forwards them to the Markbot channel.
+    Parses incoming messages and forwards them to the MarkBot channel.
     """
 
     def __init__(self, channel: "DingTalkChannel"):
@@ -124,7 +124,7 @@ class MarkbotDingTalkHandler(CallbackHandler):
 
             logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
 
-            # Forward to Markbot via _on_message (non-blocking).
+            # Forward to MarkBot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
                 self.channel._on_message(
@@ -418,7 +418,7 @@ class DingTalkChannel(BaseChannel):
             token,
             chat_id,
             "sampleMarkdown",
-            {"text": content, "title": "Markbot Reply"},
+            {"text": content, "title": "I'am Reply"},
         )
 
     async def _send_media_ref(self, token: str, chat_id: str, media_ref: str) -> bool:

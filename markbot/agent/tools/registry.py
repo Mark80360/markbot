@@ -1,8 +1,14 @@
 """Tool registry for dynamic tool management."""
 
+import os
 from typing import Any
 
 from markbot.agent.tools.base import Tool
+
+
+def _is_production() -> bool:
+    """Check if running in production mode (hide detailed errors)."""
+    return os.environ.get("MARKBOT_PRODUCTION", "").lower() in ("1", "true", "yes")
 
 
 class ToolRegistry:
@@ -25,19 +31,22 @@ class ToolRegistry:
 
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
-        return self._tools.get(name)
+        return self._tools.get(name.strip() if name else name)
 
     def has(self, name: str) -> bool:
         """Check if a tool is registered."""
-        return name in self._tools
+        return name.strip() in self._tools if name else False
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
         return [tool.to_schema() for tool in self._tools.values()]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
+    async def execute(self, name: str, params: dict[str, Any]) -> Any:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+        
+        # Strip whitespace from tool name to handle LLM output with extra spaces
+        name = name.strip() if name else name
 
         tool = self._tools.get(name)
         if not tool:
@@ -56,6 +65,11 @@ class ToolRegistry:
                 return result + _HINT
             return result
         except Exception as e:
+            # Log full error details but only return generic message in production
+            from loguru import logger
+            logger.error("Tool execution failed for '{}': {}", name, str(e))
+            if _is_production():
+                return f"Error: Tool '{name}' failed to execute. Please try again." + _HINT
             return f"Error executing {name}: {str(e)}" + _HINT
 
     @property

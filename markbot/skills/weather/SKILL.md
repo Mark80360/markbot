@@ -37,13 +37,46 @@ Tips:
 - Today only: `?1` · Current only: `?0`
 - PNG: `curl -s "wttr.in/Berlin.png" -o /tmp/weather.png`
 
-## Open-Meteo (fallback, JSON)
+## Open-Meteo (fallback, JSON) ⭐ 推荐
 
 Free, no key, good for programmatic use:
 ```bash
-curl -s "https://api.open-meteo.com/v1/forecast?latitude=51.5&longitude=-0.12&current_weather=true"
+# 当前天气
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=31.23&longitude=121.47&current_weather=true"
+
+# 未来天气预报
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=31.23&longitude=121.47&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max&timezone=Asia/Shanghai&forecast_days=5"
 ```
 
-Find coordinates for a city, then query. Returns JSON with temp, windspeed, weathercode.
+### 常用城市坐标
+| 城市 | latitude | longitude |
+|------|----------|-----------|
+| 上海 | 31.23 | 121.47 |
+| 北京 | 39.91 | 116.39 |
+| 广州 | 23.13 | 113.26 |
+| 深圳 | 22.54 | 114.06 |
+| 成都 | 30.67 | 104.07 |
+| 杭州 | 30.27 | 120.15 |
+
+### 常用参数
+| 参数 | 说明 |
+|------|------|
+| `daily=weathercode` | 天气代码 |
+| `daily=temperature_2m_max/min` | 最高/最低温度 |
+| `daily=precipitation_sum` | 降水量 |
+| `daily=windspeed_10m_max` | 最大风速 |
+| `timezone=Asia/Shanghai` | 时区 |
+| `forecast_days=5` | 预报天数 (1-16) |
+
+### 天气代码对照
+| 代码 | 含义 |
+|------|------|
+| 0 | 晴天 ☀️ |
+| 1-3 | 多云 ⛅ |
+| 45-48 | 雾 🌫️ |
+| 51-67 | 雨 🌧️ |
+| 71-77 | 雪 ❄️ |
+| 80-82 | 阵雨 🌦️ |
+| 95-99 | 雷暴 ⛈️ |
 
 Docs: https://open-meteo.com/en/docs

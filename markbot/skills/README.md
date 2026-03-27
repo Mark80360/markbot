@@ -17,13 +17,12 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 
 | Skill | Description |
 |-------|-------------|
-| `github` | Interact with GitHub using the `gh` CLI |
-| `weather` | Get weather info using wttr.in and Open-Meteo |
-| `summarize` | Summarize URLs, files, and YouTube videos |
-| `tmux` | Remote-control tmux sessions |
 | `clawhub` | Search and install skills from ClawHub registry |
-| `skill-creator` | Create new skills |
 | `cron` | Schedule reminders and recurring tasks |
-| `memory` | Two-layer memory system with grep-based recall |
-| `data-analysis` | Analyze Excel/CSV files using DuckDB |
-| `surprise-me` | Create a delightful, unexpected creative showcase |
+| `github` | Interact with GitHub using the `gh` CLI |
+| `memory` | L1-L4 tiered memory system inspired by Swarmbot architecture |
+| `skill-creator` | Create new skills |
+| `summarize` | Summarize URLs, files, and YouTube videos |
+| `surprise-me` | Create delightful unexpected experiences by combining skills dynamically |
+| `tmux` | Remote-control tmux sessions |
+| `weather` | Get weather info using wttr.in and Open-Meteo |

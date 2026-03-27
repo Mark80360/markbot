@@ -1,37 +1,78 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: L1-L4 tiered memory system inspired by Swarmbot architecture.
 always: true
 ---
 
 # Memory
 
-## Structure
+Tiered memory system with 4 layers (L1-L4) for efficient context management.
 
-- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep-style tools or in-memory filters. Each entry starts with [YYYY-MM-DD HH:MM].
+## Architecture
 
-## Search Past Events
+### L1 Whiteboard - Loop-Level Temporary
+- **Purpose**: Temporary workspace for single conversation turn
+- **Lifetime**: Cleared after each assistant response
+- **Storage**: `memory/whiteboard/{chat_id}.json`
+- **Use for**: Drafting responses, calculations, temporary notes
 
-Choose the search method based on file size:
+### L1.5 Session - Chat-Level Sliding Window
+- **Purpose**: Recent conversation history
+- **Lifetime**: Last 8 turns (configurable)
+- **Storage**: In-memory, saved to session
+- **Use for**: Maintaining short-term conversation context
 
-- Small `memory/HISTORY.md`: use `read_file`, then search in-memory
-- Large or long-lived `memory/HISTORY.md`: use the `exec` tool for targeted search
+### L2 Hot - Global Important Facts
+- **Purpose**: Critical user preferences and project facts
+- **Lifetime**: Permanent, max 20 items (configurable)
+- **Storage**: `memory/hot.json`
+- **Use for**: User preferences, key relationships, project context
+- **Auto-loaded**: ✅ Always included in LLM context
 
-Examples:
+**When to update:**
+- User preferences ("I prefer dark mode", "My name is Mark")
+- Project facts ("API uses OAuth2", "Database is PostgreSQL")
+- Important relationships ("Alice is the tech lead")
+
+### L3 Warm - Daily Activity Log
+- **Purpose**: Append-only chronological activity log
+- **Lifetime**: 30 days retention (configurable)
+- **Storage**: `memory/HISTORY.md`
+- **Use for**: Event tracking, activity history, audit trail
+- **Auto-loaded**: ❌ Search on demand
+
+**Search methods:**
+
+For small HISTORY.md: Use `read_file` + in-memory search
+
+For large files: Use targeted search:
 - **Linux/macOS:** `grep -i "keyword" memory/HISTORY.md`
 - **Windows:** `findstr /i "keyword" memory\HISTORY.md`
-- **Cross-platform Python:** `python -c "from pathlib import Path; text = Path('memory/HISTORY.md').read_text(encoding='utf-8'); print('\n'.join([l for l in text.splitlines() if 'keyword' in l.lower()][-20:]))"`
+- **Python:** `python -c "from pathlib import Path; text = Path('memory/HISTORY.md').read_text(); print('\n'.join([l for l in text.splitlines() if 'keyword' in l.lower()][-20:]))"`
 
-Prefer targeted command-line search for large history files.
+### L4 Cold - Semantic Long-term Storage
+- **Purpose**: Vector-based semantic search for large history
+- **Lifetime**: Permanent (until manually deleted)
+- **Storage**: ChromaDB vector database (`memory/chroma/`)
+- **Use for**: Finding semantically similar past interactions
+- **Requirement**: Optional - requires `chromadb` dependency
 
-## When to Update MEMORY.md
+## Memory Consolidation
 
-Write important facts immediately using `edit_file` or `write_file`:
-- User preferences ("I prefer dark mode")
-- Project context ("The API uses OAuth2")
-- Relationships ("Alice is the project lead")
+When conversations grow large, the system automatically:
+1. Summarizes old session turns
+2. Appends to L3 Warm (HISTORY.md)
+3. Extracts long-term facts → L2 Hot
+4. Clears L1 Whiteboard
 
-## Auto-consolidation
+This happens transparently every 8 turns (configurable).
 
-Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.
+## Quick Reference
+
+| Layer | Type | Persistence | Search | Auto-Context |
+|-------|------|-------------|---------|--------------|
+| L1 Whiteboard | Temporary | Single turn | - | Yes |
+| L1.5 Session | History | 8 turns | - | Yes |
+| L2 Hot | Facts | Permanent | Key-based | ✅ Always |
+| L3 Warm | Events | 30 days | Grep/text | On demand |
+| L4 Cold | Semantic | Permanent | Vector similarity | On demand |

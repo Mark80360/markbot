@@ -1,6 +1,9 @@
 """Base channel interface for chat platforms."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -13,11 +16,12 @@ class BaseChannel(ABC):
     """
     Abstract base class for chat channel implementations.
 
-    Each channel (DingTalk, Feishu, etc.) should implement this interface
     to integrate with the markbot message bus.
     """
 
     name: str = "base"
+    display_name: str = "Base"
+    transcription_api_key: str = ""
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -30,8 +34,31 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
-        self._allow_cache = None
-        self._allow_cache_time = 0
+
+    async def transcribe_audio(self, file_path: str | Path) -> str:
+        """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
+        if not self.transcription_api_key:
+            return ""
+        try:
+            from markbot.providers.transcription import GroqTranscriptionProvider
+
+            provider = GroqTranscriptionProvider(api_key=self.transcription_api_key)
+            return await provider.transcribe(file_path)
+        except Exception as e:
+            logger.warning("{}: audio transcription failed: {}", self.name, e)
+            return ""
+
+    async def login(self, force: bool = False) -> bool:
+        """
+        Perform channel-specific interactive login (e.g. QR code scan).
+
+        Args:
+            force: If True, ignore existing credentials and force re-authentication.
+
+        Returns True if already authenticated or login succeeds.
+        Override in subclasses that support interactive login.
+        """
+        return True
 
     @abstractmethod
     async def start(self) -> None:
@@ -57,30 +84,51 @@ class BaseChannel(ABC):
 
         Args:
             msg: The message to send.
+
+        Implementations should raise on delivery failure so the channel manager
+        can apply any retry policy in one place.
         """
         pass
 
-    def reload_allow_list(self) -> None:
-        """Reload allow list from config file."""
-        import time
-        from markbot.config.loader import load_config
-        config = load_config()
-        channel_config = getattr(config.channels, self.name, None)
-        if channel_config:
-            self.config = channel_config
-            self._allow_cache = None
-            self._allow_cache_time = time.time()
-            logger.info("{}: Reloaded allow list", self.name)
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        """Deliver a streaming text chunk.
+
+        Override in subclasses to enable streaming. Implementations should
+        raise on delivery failure so the channel manager can retry.
+        """
+        pass
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        Perform a health check on this channel.
+
+        Returns:
+            A dict with keys:
+            - healthy (bool): True if channel is healthy
+            - latency_ms (int | None): Response latency in milliseconds if applicable
+            - error (str | None): Error message if not healthy
+            - details (dict): Channel-specific health details
+
+        Override in subclasses to implement actual health checks. The default
+        implementation checks if the channel is running.
+        """
+        return {
+            "healthy": self._running,
+            "latency_ms": None,
+            "error": None if self._running else "Channel not running",
+            "details": {"running": self._running}
+        }
+
+    @property
+    def supports_streaming(self) -> bool:
+        """True when config enables streaming AND this subclass implements send_delta."""
+        cfg = self.config
+        streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
+        return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
-        import time
-        # Reload cache every 5 seconds
-        if self._allow_cache is None or time.time() - self._allow_cache_time > 5:
-            self._allow_cache = getattr(self.config, "allow_from", [])
-            self._allow_cache_time = time.time()
-
-        allow_list = self._allow_cache
+        allow_list = getattr(self.config, "allow_from", [])
         if not allow_list:
             logger.warning("{}: allow_from is empty — all access denied", self.name)
             return False
@@ -116,8 +164,11 @@ class BaseChannel(ABC):
                 "Add them to allowFrom list in config to grant access.",
                 sender_id, self.name,
             )
-            await self._send_access_denied_message(sender_id, chat_id)
             return
+
+        meta = metadata or {}
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
 
         msg = InboundMessage(
             channel=self.name,
@@ -125,68 +176,16 @@ class BaseChannel(ABC):
             chat_id=str(chat_id),
             content=content,
             media=media or [],
-            metadata=metadata or {},
+            metadata=meta,
             session_key_override=session_key,
         )
 
         await self.bus.publish_inbound(msg)
 
-    async def _send_access_denied_message(self, sender_id: str, chat_id: str) -> None:
-        """Send access denied message to user."""
-        import secrets
-        import json
-        import os
-        from pathlib import Path
-        from datetime import datetime
-
-        # Store pairing request
-        pairing_file = Path.home() / ".markbot" / "gateway" / "pairings.json"
-        pairing_file.parent.mkdir(parents=True, exist_ok=True)
-
-        pairings = {}
-        if pairing_file.exists():
-            with open(pairing_file) as f:
-                pairings = json.load(f)
-
-        # Check if user already has a pending pairing request
-        pairing_code = None
-        for code, info in pairings.items():
-            if info.get("channel") == self.name and info.get("sender_id") == sender_id:
-                pairing_code = code
-                break
-
-        # Create new pairing code if none exists
-        if not pairing_code:
-            pairing_code = ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8))
-            pairings[pairing_code] = {
-                "channel": self.name,
-                "sender_id": sender_id,
-                "chat_id": chat_id,
-                "created_at": datetime.now().isoformat()
-            }
-
-            with open(pairing_file, "w") as f:
-                json.dump(pairings, f, indent=2)
-
-        message = (
-            f"MarkBot: access not configured.\n"
-            f"{sender_id}\n"
-            f"Pairing code: {pairing_code}\n\n"
-            f"Ask the bot owner to approve with:\n"
-            f"markbot pairing approve {self.name} {pairing_code}"
-        )
-
-        outbound = OutboundMessage(
-            channel=self.name,
-            chat_id=chat_id,
-            content=message,
-            metadata={}
-        )
-
-        try:
-            await self.send(outbound)
-        except Exception as e:
-            logger.error("Failed to send access denied message: {}", e)
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        """Return default config for onboard. Override in plugins to auto-populate config.json."""
+        return {"enabled": False}
 
     @property
     def is_running(self) -> bool:

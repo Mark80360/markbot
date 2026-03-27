@@ -3,8 +3,11 @@
 import asyncio
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+from loguru import logger
 
 from markbot.agent.tools.base import Tool
 
@@ -42,6 +45,9 @@ class ExecTool(Tool):
     def name(self) -> str:
         return "exec"
 
+    _MAX_TIMEOUT = 600
+    _MAX_OUTPUT = 10_000
+
     @property
     def description(self) -> str:
         return "Execute a shell command and return its output. Use with caution."
@@ -53,28 +59,35 @@ class ExecTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute",
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for the command"
+                    "description": "Optional working directory for the command",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Optional timeout in seconds (default: 60, max: 300)",
+                    "description": (
+                        "Timeout in seconds. Increase for long-running commands "
+                        "like compilation or installation (default 60, max 600)."
+                    ),
                     "minimum": 1,
-                    "maximum": 300
-                }
+                    "maximum": 600,
+                },
             },
-            "required": ["command"]
+            "required": ["command"],
         }
-    
-    async def execute(self, command: str, working_dir: str | None = None, timeout: int | None = None, **kwargs: Any) -> str:
+
+    async def execute(
+        self, command: str, working_dir: str | None = None,
+        timeout: int | None = None, **kwargs: Any,
+    ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
-        cmd_timeout = min(timeout or self.timeout, 300)  # Cap at 5 minutes
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+
+        effective_timeout = min(timeout or self.timeout, self._MAX_TIMEOUT)
 
         env = os.environ.copy()
         if self.path_append:
@@ -92,17 +105,21 @@ class ExecTool(Tool):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=cmd_timeout
+                    timeout=effective_timeout,
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
                 try:
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-                return f"Error: Command timed out after {cmd_timeout} seconds"
+                finally:
+                    if sys.platform != "win32":
+                        try:
+                            os.waitpid(process.pid, os.WNOHANG)
+                        except (ProcessLookupError, ChildProcessError) as e:
+                            logger.debug("Process already reaped or not found: {}", e)
+                return f"Error: Command timed out after {effective_timeout} seconds"
 
             output_parts = []
 
@@ -114,20 +131,29 @@ class ExecTool(Tool):
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
 
-            if process.returncode != 0:
-                output_parts.append(f"\nExit code: {process.returncode}")
+            output_parts.append(f"\nExit code: {process.returncode}")
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
 
-            # Truncate very long output
-            max_len = 20000  # Increased from 10000
+            # Head + tail truncation to preserve both start and end of output
+            max_len = self._MAX_OUTPUT
             if len(result) > max_len:
-                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
+                half = max_len // 2
+                result = (
+                    result[:half]
+                    + f"\n\n... ({len(result) - max_len:,} chars truncated) ...\n\n"
+                    + result[-half:]
+                )
 
             return result
 
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            # Log full error details but only return generic message in production
+            logger.error("Shell command execution failed: {}", str(e))
+            error_msg = str(e)
+            if os.environ.get("MARKBOT_PRODUCTION", "").lower() in ("1", "true", "yes"):
+                return "Error: Command execution failed. Please check the command and try again."
+            return f"Error executing command: {error_msg}"
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
@@ -142,6 +168,10 @@ class ExecTool(Tool):
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
+        from markbot.security.network import contains_internal_url
+        if contains_internal_url(cmd):
+            return "Error: Command blocked by safety guard (internal/private URL detected)"
+
         if self.restrict_to_workspace:
             if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
@@ -150,7 +180,8 @@ class ExecTool(Tool):
 
             for raw in self._extract_absolute_paths(cmd):
                 try:
-                    p = Path(raw.strip()).resolve()
+                    expanded = os.path.expandvars(raw.strip())
+                    p = Path(expanded).expanduser().resolve()
                 except Exception:
                     continue
                 if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
@@ -161,5 +192,6 @@ class ExecTool(Tool):
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
         win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]+", command)   # Windows: C:\...
-        posix_paths = re.findall(r"(?:^|[\s|>])(/[^\s\"'>]+)", command) # POSIX: /absolute only
-        return win_paths + posix_paths
+        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
+        home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
+        return win_paths + posix_paths + home_paths

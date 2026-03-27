@@ -1,12 +1,14 @@
 """Configuration loading utilities."""
 
 import json
-import re
 from pathlib import Path
+
+import pydantic
+from loguru import logger
 
 from markbot.config.schema import Config
 
-
+# Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
 
 
@@ -40,11 +42,10 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data = _migrate_config(data)
-            data = convert_keys(data)
             return Config.model_validate(data)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Warning: Failed to load config from {path}: {e}")
-            print("Using default configuration.")
+        except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
+            logger.warning(f"Failed to load config from {path}: {e}")
+            logger.warning("Using default configuration.")
 
     return Config()
 
@@ -60,8 +61,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = config.model_dump()
-    data = convert_to_snake_case(data)
+    data = config.model_dump(mode="json", by_alias=True)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -69,39 +69,9 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
+    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
     return data
-
-
-def convert_keys(data: dict) -> dict:
-    """Convert camelCase keys to snake_case."""
-    if not isinstance(data, dict):
-        return data
-
-    result = {}
-    for key, value in data.items():
-        snake_key = _camel_to_snake(key)
-        if isinstance(value, dict):
-            result[snake_key] = convert_keys(value)
-        elif isinstance(value, list):
-            result[snake_key] = [
-                convert_keys(item) if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
-            result[snake_key] = value
-    return result
-
-
-def convert_to_snake_case(data: dict) -> dict:
-    """Convert camelCase keys to snake_case (alias for convert_keys)."""
-    return convert_keys(data)
-
-
-def _camel_to_snake(name: str) -> str:
-    """Convert camelCase string to snake_case."""
-    s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
-    return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()

@@ -9,7 +9,7 @@ from typing import Any
 class InboundMessage:
     """Message received from a chat channel."""
 
-    channel: str  # dingtalk, feishu, email, etc.
+    channel: str  # discord, dingtalk, etc.
     sender_id: str  # User identifier
     chat_id: str  # Chat/channel identifier
     content: str  # Message text

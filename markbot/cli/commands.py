@@ -1,11 +1,14 @@
 """CLI commands for markbot."""
 
 import asyncio
+from contextlib import contextmanager, nullcontext
+
 import os
 import select
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -19,26 +22,32 @@ if sys.platform == "win32":
             pass
 
 import typer
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 from markbot import __logo__, __version__
-from markbot.config.paths import get_workspace_path
+from markbot.cli.stream import StreamRenderer, ThinkingSpinner
+from markbot.cli.skills import app as skills_app
+from markbot.config.paths import get_cron_dir, get_workspace_path, is_default_workspace
 from markbot.config.schema import Config
 from markbot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
     name="markbot",
-    help=f"{__logo__} MarkBot - Personal AI Assistant",
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=f"{__logo__} NarkBot - Personal AI Assistant",
     no_args_is_help=True,
 )
+
+# Add skill management subcommands
+app.add_typer(skills_app, name="skills")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -112,14 +121,88 @@ def _init_prompt_session() -> None:
     )
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
+def _make_console() -> Console:
+    return Console(file=sys.stdout)
+
+
+def _render_interactive_ansi(render_fn) -> str:
+    """Render Rich output to ANSI so prompt_toolkit can print it safely."""
+    ansi_console = Console(
+        force_terminal=True,
+        color_system=console.color_system or "standard",
+        width=console.width,
+    )
+    with ansi_console.capture() as capture:
+        render_fn(ansi_console)
+    return capture.get()
+
+
+def _print_agent_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict | None = None,
+) -> None:
     """Render assistant response with consistent terminal styling."""
+    console = _make_console()
     content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
+    body = _response_renderable(content, render_markdown, metadata)
     console.print()
-    console.print(f"[cyan]{__logo__} MarkBot[/cyan]")
+    console.print(f"[cyan]{__logo__} NarkBot[/cyan]")
     console.print(body)
     console.print()
+
+
+def _response_renderable(content: str, render_markdown: bool, metadata: dict | None = None):
+    """Render plain-text command output without markdown collapsing newlines."""
+    if not render_markdown:
+        return Text(content)
+    if (metadata or {}).get("render_as") == "text":
+        return Text(content)
+    return Markdown(content)
+
+
+async def _print_interactive_line(text: str) -> None:
+    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        ansi = _render_interactive_ansi(
+            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
+
+
+async def _print_interactive_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict | None = None,
+) -> None:
+    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        content = response or ""
+        ansi = _render_interactive_ansi(
+            lambda c: (
+                c.print(),
+                c.print(f"[cyan]{__logo__} NarkBot[/cyan]"),
+                c.print(_response_renderable(content, render_markdown, metadata)),
+                c.print(),
+            )
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
+
+
+def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
+    """Print a CLI progress line, pausing the spinner if needed."""
+    with thinking.pause() if thinking else nullcontext():
+        console.print(f"  [dim]↳ {text}[/dim]")
+
+
+async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
+    """Print an interactive progress line, pausing the spinner if needed."""
+    with thinking.pause() if thinking else nullcontext():
+        await _print_interactive_line(text)
 
 
 def _is_exit_command(command: str) -> bool:
@@ -149,7 +232,7 @@ async def _read_interactive_input_async() -> str:
 
 def version_callback(value: bool):
     if value:
-        console.print(f"{__logo__} MarkBot v{__version__}")
+        console.print(f"{__logo__} NarkBot v{__version__}")
         raise typer.Exit()
 
 
@@ -159,7 +242,7 @@ def main(
         None, "--version", "-v", callback=version_callback, is_eager=True
     ),
 ):
-    """MarkBot - Personal AI Assistant."""
+    """NarkBot - Personal AI Assistant."""
     pass
 
 
@@ -169,98 +252,196 @@ def main(
 
 
 @app.command()
-def onboard():
-    """Initialize MarkBot configuration and workspace."""
-    from markbot.config.loader import get_config_path, load_config, save_config
+def onboard(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    wizard: bool = typer.Option(False, "--wizard", help="Use interactive wizard"),
+):
+    """Initialize NarkBot configuration and workspace."""
+    from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
     from markbot.config.schema import Config
 
-    config_path = get_config_path()
-
-    if config_path.exists():
-        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-        console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-        console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
-        if typer.confirm("Overwrite?"):
-            config = Config()
-            save_config(config)
-            console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
-        else:
-            config = load_config()
-            save_config(config)
-            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+    if config:
+        config_path = Path(config).expanduser().resolve()
+        set_config_path(config_path)
+        console.print(f"[dim]Using config: {config_path}[/dim]")
     else:
-        save_config(Config())
-        console.print(f"[green]✓[/green] Created config at {config_path}")
+        config_path = get_config_path()
 
-    # Create workspace
-    workspace = get_workspace_path()
+    def _apply_workspace_override(loaded: Config) -> Config:
+        if workspace:
+            loaded.agents.defaults.workspace = workspace
+        return loaded
 
-    if not workspace.exists():
-        workspace.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace}")
+    # Create or update config
+    if config_path.exists():
+        if wizard:
+            config = _apply_workspace_override(load_config(config_path))
+        else:
+            console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
+            console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
+            console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+            if typer.confirm("Overwrite?"):
+                config = _apply_workspace_override(Config())
+                save_config(config, config_path)
+                console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+            else:
+                config = _apply_workspace_override(load_config(config_path))
+                save_config(config, config_path)
+                console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+    else:
+        config = _apply_workspace_override(Config())
+        # In wizard mode, don't save yet - the wizard will handle saving if should_save=True
+        if not wizard:
+            save_config(config, config_path)
+            console.print(f"[green]✓[/green] Created config at {config_path}")
 
-    sync_workspace_templates(workspace)
+    # Run interactive wizard if enabled
+    if wizard:
+        from markbot.cli.onboard import run_onboard
 
-    console.print(f"\n{__logo__} MarkBot is ready!")
+        try:
+            result = run_onboard(initial_config=config)
+            if not result.should_save:
+                console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
+                return
+
+            config = result.config
+            save_config(config, config_path)
+            console.print(f"[green]✓[/green] Config saved at {config_path}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Error during configuration: {e}")
+            console.print("[yellow]Please run 'markbot onboard' again to complete setup.[/yellow]")
+            raise typer.Exit(1)
+    _onboard_plugins(config_path)
+
+    # Create workspace, preferring the configured workspace path.
+    workspace_path = get_workspace_path(config.workspace_path)
+    if not workspace_path.exists():
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
+
+    sync_workspace_templates(workspace_path)
+
+    agent_cmd = 'markbot agent -m "Hello!"'
+    gateway_cmd = "markbot gateway"
+    if config:
+        agent_cmd += f" --config {config_path}"
+        gateway_cmd += f" --config {config_path}"
+
+    console.print(f"\n{__logo__} I'm ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.markbot/config.json[/cyan]")
-    console.print("  2. Chat: [cyan]markbot agent -m \"Hello!\"[/cyan]")
+    if wizard:
+        console.print(f"  1. Chat: [cyan]{agent_cmd}[/cyan]")
+        console.print(f"  2. Start gateway: [cyan]{gateway_cmd}[/cyan]")
+    else:
+        console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
+        console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
 
 
+def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
+    """Recursively fill in missing values from defaults without overwriting user config."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return existing
 
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = _merge_missing_defaults(merged[key], value)
+    return merged
+
+
+def _onboard_plugins(config_path: Path) -> None:
+    """Inject default config for all discovered channels (built-in + plugins)."""
+    import json
+
+    from markbot.channels.registry import discover_all
+
+    all_channels = discover_all()
+    if not all_channels:
+        return
+
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    channels = data.setdefault("channels", {})
+    for name, cls in all_channels.items():
+        if name not in channels:
+            channels[name] = cls.default_config()
+        else:
+            channels[name] = _merge_missing_defaults(channels[name], cls.default_config())
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
-    from markbot.providers.openai_codex_provider import OpenAICodexProvider
-    from markbot.providers.azure_openai_provider import AzureOpenAIProvider
+    """Create the appropriate LLM provider from config.
+
+    Routing is driven by ``ProviderSpec.backend`` in the registry.
+    """
+    from markbot.providers.base import GenerationSettings
+    from markbot.providers.registry import find_by_name
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
+    spec = find_by_name(provider_name) if provider_name else None
+    backend = spec.backend if spec else "openai_compat"
 
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    from markbot.providers.custom_provider import CustomProvider
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
-    if provider_name == "azure_openai":
+    # --- validation ---
+    if backend == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
             console.print("Set them in ~/.markbot/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        
-        return AzureOpenAIProvider(
+    elif backend == "openai_compat" and not model.startswith("bedrock/"):
+        needs_key = not (p and p.api_key)
+        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
+        if needs_key and not exempt:
+            console.print("[red]Error: No API key configured.[/red]")
+            console.print("Set one in ~/.markbot/config.json under providers section")
+            raise typer.Exit(1)
+
+    # --- instantiation by backend ---
+    if backend == "openai_codex":
+        from markbot.providers.openai_codex_provider import OpenAICodexProvider
+        provider = OpenAICodexProvider(default_model=model)
+    elif backend == "azure_openai":
+        from markbot.providers.azure_openai_provider import AzureOpenAIProvider
+        provider = AzureOpenAIProvider(
             api_key=p.api_key,
             api_base=p.api_base,
             default_model=model,
         )
+    elif backend == "anthropic":
+        from markbot.providers.anthropic_provider import AnthropicProvider
+        provider = AnthropicProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model),
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
+    else:
+        from markbot.providers.openai_compat_provider import OpenAICompatProvider
+        provider = OpenAICompatProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model),
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+            spec=spec,
+        )
 
-    from markbot.providers.litellm_provider import LiteLLMProvider
-    from markbot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.markbot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
+    defaults = config.agents.defaults
+    provider.generation = GenerationSettings(
+        temperature=defaults.temperature,
+        max_tokens=defaults.max_tokens,
+        reasoning_effort=defaults.reasoning_effort,
     )
+    return provider
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -277,61 +458,293 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
         console.print(f"[dim]Using config: {config_path}[/dim]")
 
     loaded = load_config(config_path)
+    _warn_deprecated_config_keys(config_path)
     if workspace:
         loaded.agents.defaults.workspace = workspace
     return loaded
+
+
+def _warn_deprecated_config_keys(config_path: Path | None) -> None:
+    """Hint users to remove obsolete keys from their config file."""
+    import json
+    from markbot.config.loader import get_config_path
+
+    path = config_path or get_config_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if "memoryWindow" in raw.get("agents", {}).get("defaults", {}):
+        console.print(
+            "[dim]Hint: `memoryWindow` in your config is no longer used "
+            "and can be safely removed.[/dim]"
+        )
 
 
 # ============================================================================
 # Gateway / Server
 # ============================================================================
 
+# Gateway subcommand app
+gateway_app = typer.Typer(
+    name="gateway",
+    help="Manage the markbot gateway service (start/stop/restart/status).",
+)
+app.add_typer(gateway_app, name="gateway")
 
-@app.command()
-def gateway(
-    port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
+# Gateway PID file management
+GATEWAY_PID_DIR = Path.home() / ".markbot" / "gateway"
+GATEWAY_PID_FILE = GATEWAY_PID_DIR / "gateway.pid"
+GATEWAY_LOG_FILE = GATEWAY_PID_DIR / "gateway.log"
+
+
+def _ensure_pid_dir() -> None:
+    GATEWAY_PID_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_pid() -> int | None:
+    if not GATEWAY_PID_FILE.exists():
+        return None
+    try:
+        return int(GATEWAY_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _write_pid(pid: int) -> None:
+    _ensure_pid_dir()
+    GATEWAY_PID_FILE.write_text(str(pid))
+
+
+def _remove_pid() -> None:
+    if GATEWAY_PID_FILE.exists():
+        GATEWAY_PID_FILE.unlink()
+
+
+def _is_process_running(pid: int) -> bool:
+    """Check if a process is running (cross-platform)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle == 0:
+                return False
+                
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                kernel32.CloseHandle(handle)
+                return exit_code.value == 259  # STILL_ACTIVE
+            
+            kernel32.CloseHandle(handle)
+            return True
+        else:
+            # Unix/Linux: send signal 0 to check if process exists
+            import os
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError):
+        return False
+    except Exception:
+        return False
+
+
+@gateway_app.command("start")
+def gateway_start(
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    daemon: bool = typer.Option(True, "--daemon/--foreground", "-d", help="Run as daemon (background)"),
 ):
-    """Start the markbot gateway."""
+    """Start the markbot gateway service."""
+    existing_pid = _read_pid()
+    if existing_pid and _is_process_running(existing_pid):
+        console.print(f"[yellow]Gateway is already running (PID: {existing_pid})[/yellow]")
+        console.print("Use [cyan]markbot gateway stop[/cyan] to stop it first.")
+        raise typer.Exit(1)
+
+    if daemon:
+        _start_daemon(port, workspace, config, verbose)
+    else:
+        _run_gateway_foreground(port, workspace, config, verbose)
+
+
+def _start_daemon(port: int, workspace: str | None, config_path: str | None, verbose: bool) -> None:
+    """Start the gateway as a daemon process (cross-platform)."""
+    _ensure_pid_dir()
+    
+    if sys.platform == "win32":
+        # Windows: use subprocess
+        import subprocess
+        
+        cmd = [
+            sys.executable, "-m", "markbot",
+            "gateway", "start",
+            "--port", str(port),
+            "--foreground",
+        ]
+        
+        if workspace:
+            cmd.extend(["--workspace", workspace])
+        if config_path:
+            cmd.extend(["--config", config_path])
+        if verbose:
+            cmd.append("--verbose")
+        
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP |
+            subprocess.CREATE_NO_WINDOW
+        )
+        
+        with open(GATEWAY_LOG_FILE, "w") as log_file:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                cwd=str(Path.cwd()),
+            )
+        
+        import time
+        time.sleep(0.5)
+        
+        if process.poll() is not None:
+            console.print("[red]Failed to start gateway daemon.[/red]")
+            raise typer.Exit(1)
+        
+        _write_pid(process.pid)
+        console.print(f"[green]✓[/green] Gateway started in background (PID: {process.pid})")
+        
+    else:
+        # Linux/Unix: use os.fork()
+        pid = os.fork()
+        if pid > 0:
+            _write_pid(pid)
+            console.print(f"[green]✓[/green] Gateway started in background (PID: {pid})")
+            console.print(f"  Log file: {GATEWAY_LOG_FILE}")
+            console.print(f"  Use [cyan]markbot gateway status[/cyan] to check status.")
+            return
+
+        os.setsid()
+        sys.stdin.close()
+        _ensure_pid_dir()
+        with open(GATEWAY_LOG_FILE, "w") as log_file:
+            os.dup2(log_file.fileno(), sys.stdout.fileno())
+            os.dup2(log_file.fileno(), sys.stderr.fileno())
+        try:
+            _run_gateway_foreground(port, workspace, config_path, verbose)
+        except Exception as e:
+            print(f"Gateway failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
+def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
+    """Run the gateway in foreground mode."""
+    from loguru import logger
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
-    from markbot.config.paths import get_cron_dir
+    from markbot.config.loader import load_config
     from markbot.cron.service import CronService
     from markbot.cron.types import CronJob
     from markbot.heartbeat.service import HeartbeatService
     from markbot.session.manager import SessionManager
 
-    if verbose:
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
-
-    config = _load_runtime_config(config, workspace)
-    port = port if port is not None else config.gateway.port
-
-    console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
+    # Configure logging
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    
+    logger.remove()
+    log_level = "DEBUG" if verbose else "INFO"
+    
+    def log_filter(record):
+        msg = record["message"]
+        if "PING" in msg or "PONG" in msg:
+            if "keepalive" in msg.lower() or "websockets" in record["name"]:
+                return False
+        if record["name"].startswith("websockets"):
+            return False
+        if record["name"].startswith("urllib3") and record["level"].name == "DEBUG":
+            return False
+        if record["name"].startswith("httpcore") and record["level"].name == "DEBUG":
+            return False
+        if record["name"] == "asyncio" and "selector" in msg.lower():
+            return False
+        return True
+    
+    logger.add(
+        sys.stderr,
+        level=log_level,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        colorize=True,
+        backtrace=True,
+        diagnose=True,
+        catch=True,
+        filter=log_filter,
+    )
+    
+    logger.add(
+        GATEWAY_LOG_FILE,
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        rotation="10 MB",
+        retention="7 days",
+        backtrace=True,
+        diagnose=True,
+        catch=True,
+        encoding="utf-8",
+        filter=log_filter,
+    )
+    
+    logger.info("Logging configured: level={}, backtrace=True, diagnose=True", log_level)
+    
+    # Global exception hooks
+    import traceback
+    import threading
+    
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        logger.exception("Unhandled exception: {}:{}",
+                        exc_type.__name__, exc_value,
+                        exc_info=(exc_type, exc_value, exc_traceback))
+    
+    def thread_exception_hook(args):
+        logger.exception("Unhandled exception in thread {}: {}:{}",
+                        args.thread.name if args.thread else "unknown",
+                        args.exc_type.__name__, args.exc_value,
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    
+    sys.excepthook = handle_exception
+    threading.excepthook = thread_exception_hook
+    logger.info("Global exception hooks installed")
+    
+    config_path = Path(config) if config else None
+    config = load_config(config_path)
+    if workspace:
+        config.agents.defaults.workspace = workspace
+    
+    console.print(f"{__logo__} Starting NarkBot gateway on port {port}...")
+    
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
-
-    # Create cron service first (callback set after agent creation)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    
+    cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
     cron = CronService(cron_store_path)
-
-    # Create agent with cron service
+    
     agent = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+        web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -339,28 +752,26 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        memory_config=config.memory,
-        search_config=config.search,
+        timezone=config.agents.defaults.timezone,
     )
-
-    # Set cron callback (needs agent)
+    
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
         from markbot.agent.tools.cron import CronTool
         from markbot.agent.tools.message import MessageTool
+        from markbot.utils.evaluator import evaluate_response
+        
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
-
-        # Prevent the agent from scheduling new cron jobs during execution
+        
         cron_tool = agent.tools.get("cron")
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
-            response = await agent.process_direct(
+            resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
@@ -369,28 +780,31 @@ def gateway(
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
-
+        
+        response = resp.content if resp else ""
+        
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
-
+        
         if job.payload.deliver and job.payload.to and response:
-            from markbot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
+            should_notify = await evaluate_response(
+                response, job.payload.message, provider, agent.model,
+            )
+            if should_notify:
+                from markbot.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response,
+                ))
         return response
     cron.on_job = on_cron_job
-
-    # Create channel manager
+    
     channels = ChannelManager(config, bus)
-
+    
     def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
@@ -400,33 +814,35 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
-
-    # Create heartbeat service
+    
     async def on_heartbeat_execute(tasks: str) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
-
+        
         async def _silent(*_args, **_kwargs):
             pass
-
-        return await agent.process_direct(
+        
+        resp = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
         )
-
+        
+        session = agent.sessions.get_or_create("heartbeat")
+        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+        agent.sessions.save(session)
+        
+        return resp.content if resp else ""
+    
     async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel."""
         from markbot.bus.events import OutboundMessage
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
-            return  # No external channel available to deliver to
+            return
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-
+    
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -436,19 +852,20 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        timezone=config.agents.defaults.timezone,
     )
-
+    
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
-
+    
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
-
+    
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
-
+    
     async def run():
         try:
             await cron.start()
@@ -459,13 +876,17 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except Exception:
+            import traceback
+            console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
+            console.print(traceback.format_exc())
         finally:
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
-
+    
     asyncio.run(run())
 
 
@@ -483,24 +904,35 @@ def agent(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show MarkBot runtime logs during chat"),
+    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show NarkBot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
     from loguru import logger
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
-    from markbot.config.paths import get_cron_dir
     from markbot.cron.service import CronService
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
+    
+    # Setup file logging - always log to file for debugging
+    #log_file = config.workspace_path / "markbot.log"
+    #from loguru import logger
+    #logger.add(
+    #    str(log_file),
+    #    rotation="10 MB",
+    #    retention="7 days",
+    #    level="DEBUG",
+    #    encoding="utf-8",
+    #    filter=lambda record: record["name"].startswith("markbot"),
+    #)
+    #print(f"[日志] 详细日志已保存到: {log_file}")
 
     bus = MessageBus()
     provider = _make_provider(config)
 
-    # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -513,28 +945,20 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+        web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        memory_config=config.memory,
-        search_config=config.search,
+        timezone=config.agents.defaults.timezone,
     )
 
-    # Show spinner when logs are off (no output to miss); skip when logs are on
-    def _thinking_ctx():
-        if logs:
-            from contextlib import nullcontext
-            return nullcontext()
-        # Animated spinner is safe to use with prompt_toolkit input handling
-        return console.status("[dim]Thinking...[/dim]", spinner="dots")
+    # Shared reference for progress callbacks
+    _thinking: ThinkingSpinner | None = None
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
         ch = agent_loop.channels_config
@@ -542,15 +966,25 @@ def agent(
             return
         if ch and not tool_hint and not ch.send_progress:
             return
-        console.print(f"  [dim]↳ {content}[/dim]")
+        _print_cli_progress_line(content, _thinking)
 
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.wait_for_compression()
+            renderer = StreamRenderer(render_markdown=markdown)
+            response = await agent_loop.process_direct(
+                message, session_id,
+                on_progress=_cli_progress,
+                on_stream=renderer.on_delta,
+                on_stream_end=renderer.on_end,
+            )
+            if not renderer.streamed:
+                await renderer.close()
+                _print_agent_response(
+                    response.content if response else "",
+                    render_markdown=markdown,
+                    metadata=response.metadata if response else None,
+                )
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -568,7 +1002,7 @@ def agent(
         def _handle_signal(signum, frame):
             sig_name = signal.Signals(signum).name
             _restore_terminal()
-            console.print(f"\nReceived {sig_name}, goodbye!")
+            # console.print(f"\nReceived {sig_name}, goodbye!")
             sys.exit(0)
 
         signal.signal(signal.SIGINT, _handle_signal)
@@ -585,12 +1019,28 @@ def agent(
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
-            turn_response: list[str] = []
+            turn_response: list[tuple[str, dict]] = []
+            renderer: StreamRenderer | None = None
 
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+
+                        if msg.metadata.get("_stream_delta"):
+                            if renderer:
+                                await renderer.on_delta(msg.content)
+                            continue
+                        if msg.metadata.get("_stream_end"):
+                            if renderer:
+                                await renderer.on_end(
+                                    resuming=msg.metadata.get("_resuming", False),
+                                )
+                            continue
+                        if msg.metadata.get("_streamed"):
+                            turn_done.set()
+                            continue
+
                         if msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
@@ -599,14 +1049,20 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
-                        elif not turn_done.is_set():
+                                await _print_interactive_progress_line(msg.content, _thinking)
+                            continue
+
+                        if not turn_done.is_set():
                             if msg.content:
-                                turn_response.append(msg.content)
+                                turn_response.append((msg.content, dict(msg.metadata or {})))
                             turn_done.set()
                         elif msg.content:
-                            console.print()
-                            _print_agent_response(msg.content, render_markdown=markdown)
+                            await _print_interactive_response(
+                                msg.content,
+                                render_markdown=markdown,
+                                metadata=msg.metadata,
+                            )
+
                     except asyncio.TimeoutError:
                         continue
                     except asyncio.CancelledError:
@@ -630,19 +1086,28 @@ def agent(
 
                         turn_done.clear()
                         turn_response.clear()
+                        renderer = StreamRenderer(render_markdown=markdown)
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
+                            metadata={"_wants_stream": True},
                         ))
 
-                        with _thinking_ctx():
-                            await turn_done.wait()
+                        await turn_done.wait()
 
                         if turn_response:
-                            _print_agent_response(turn_response[0], render_markdown=markdown)
+                            content, meta = turn_response[0]
+                            if content and not meta.get("_streamed"):
+                                if renderer:
+                                    await renderer.close()
+                                _print_agent_response(
+                                    content, render_markdown=markdown, metadata=meta,
+                                )
+                        elif renderer and not renderer.streamed:
+                            await renderer.close()
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
@@ -655,16 +1120,245 @@ def agent(
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.wait_for_compression()
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
 
 
+@gateway_app.command("stop")
+def gateway_stop(
+    force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
+):
+    """Stop the NarkBot gateway service."""
+    import time
+    
+    pid = _read_pid()
+    if not pid:
+        console.print("[yellow]Gateway is not running (no PID file found)[/yellow]")
+        raise typer.Exit(0)
+
+    if not _is_process_running(pid):
+        _remove_pid()
+        console.print("[yellow]Gateway is not running (stale PID file removed)[/yellow]")
+        raise typer.Exit(0)
+
+    # Terminate the process
+    try:
+        if sys.platform == "win32":
+            # Windows
+            import ctypes
+            from ctypes import wintypes
+            
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_TERMINATE = 0x0001
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            
+            if handle == 0:
+                _remove_pid()
+                console.print("[yellow]Gateway process not found (cleaned up PID file)[/yellow]")
+                raise typer.Exit(0)
+            
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                if exit_code.value != 259:  # Not STILL_ACTIVE
+                    _remove_pid()
+                    kernel32.CloseHandle(handle)
+                    console.print("[yellow]Gateway was already stopped.[/yellow]")
+                    raise typer.Exit(0)
+            
+            kernel32.TerminateProcess(handle, 1 if force else 0)
+            kernel32.CloseHandle(handle)
+        else:
+            # Linux/Unix
+            import os
+            import signal
+            
+            if force:
+                os.kill(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        
+        console.print(f"[green]✓[/green] Sent {'force kill' if force else 'terminate'} to gateway (PID: {pid})")
+
+        for _ in range(10):
+            time.sleep(0.5)
+            if not _is_process_running(pid):
+                _remove_pid()
+                console.print("[green]✓[/green] Gateway stopped successfully.")
+                raise typer.Exit(0)
+
+        console.print("[yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
+        raise typer.Exit(1)
+    except Exception as e:
+        _remove_pid()
+        console.print(f"[yellow]Gateway process error: {e} (cleaned up PID file)[/yellow]")
+        raise typer.Exit(0)
+
+
+@gateway_app.command("restart")
+def gateway_restart(
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
+):
+    """Restart the NarkBot gateway service."""
+    import time
+    
+    pid = _read_pid()
+
+    if pid and _is_process_running(pid):
+        console.print(f"[yellow]Stopping gateway (PID: {pid})...[/yellow]")
+        try:
+            if sys.platform == "win32":
+                # Windows
+                import ctypes
+                from ctypes import wintypes
+                
+                kernel32 = ctypes.windll.kernel32
+                PROCESS_TERMINATE = 0x0001
+                handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                
+                if handle != 0:
+                    kernel32.TerminateProcess(handle, 1 if force else 0)
+                    kernel32.CloseHandle(handle)
+            else:
+                # Linux/Unix
+                import os
+                import signal
+                
+                if force:
+                    os.kill(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+
+            for _ in range(10):
+                time.sleep(0.5)
+                if not _is_process_running(pid):
+                    _remove_pid()
+                    console.print("[green]✓[/green] Gateway stopped.")
+                    break
+            else:
+                console.print("[red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
+                raise typer.Exit(1)
+        except Exception as e:
+            _remove_pid()
+            console.print(f"[yellow]Error stopping gateway: {e} (cleaned up)[/yellow]")
+    else:
+        if pid:
+            _remove_pid()
+        console.print("[yellow]Gateway was not running.[/yellow]")
+
+    console.print("[cyan]Starting gateway...[/cyan]")
+    _start_daemon(port, workspace, config, verbose)
+
+
+@gateway_app.command("status")
+def gateway_status():
+    """Check the status of the NarkBot gateway service."""
+    from markbot.config.loader import load_config
+    import json
+    from datetime import datetime
+
+    table = Table(title=f"\n{__logo__} NarkBot Gateway Status", title_justify="left")
+    table.add_column("Component", style="cyan", width=20)
+    table.add_column("Status", style="green", width=20)
+    table.add_column("Details", width=50)
+
+    pid = _read_pid()
+    running = False
+    uptime_str = ""
+
+    if pid:
+        running = _is_process_running(pid)
+        if running:
+            try:
+                import psutil
+                proc = psutil.Process(pid)
+                create_time = datetime.fromtimestamp(proc.create_time())
+                uptime = datetime.now() - create_time
+                days = uptime.days
+                hours, remainder = divmod(uptime.seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+                uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+                mem_mb = proc.memory_info().rss / 1024 / 1024
+                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}, Uptime: {uptime_str}, Memory: {mem_mb:.1f}MB", end_section=True)
+            except ImportError:
+                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
+            except Exception:
+                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
+        else:
+            table.add_row("Process", "[red]● Stopped[/red]", "Stale PID file", end_section=True)
+            _remove_pid()
+    else:
+        table.add_row("Process", "[red]● Stopped[/red]", "No PID file", end_section=True)
+
+    if GATEWAY_LOG_FILE.exists():
+        log_size = GATEWAY_LOG_FILE.stat().st_size / 1024
+        log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        table.add_row("Log File", f"{log_size:.1f}KB", f"Last modified: {log_mtime}")
+    else:
+        table.add_row("Log File", "[yellow]○ Not found[/yellow]", str(GATEWAY_LOG_FILE))
+
+    config = load_config()
+    workspace = config.workspace_path
+    table.add_row("Workspace", "[green]✓[/green]" if workspace.exists() else "[red]✗[/red]", str(workspace), end_section=True)
+
+    table.add_row("Model", config.agents.defaults.model, f"Context: {config.agents.defaults.context_window_tokens}")
+
+    hb_cfg = config.gateway.heartbeat
+    hb_status = "[green]● Enabled[/green]" if hb_cfg.enabled else "[yellow]○ Disabled[/yellow]"
+    table.add_row("Heartbeat", hb_status, f"Interval: {hb_cfg.interval_s}s")
+
+    # Count enabled channels
+    enabled_channels = []
+    channels_config = config.channels
+    if channels_config:
+        for channel_name in ["feishu", "email", "dingtalk"]:
+            section = getattr(channels_config, channel_name, None)
+            if section is not None:
+                if isinstance(section, dict) and section.get("enabled"):
+                    enabled_channels.append(channel_name)
+                elif hasattr(section, "enabled") and getattr(section, "enabled"):
+                    enabled_channels.append(channel_name)
+    
+    channels_str = ", ".join(enabled_channels) if enabled_channels else "None"
+    table.add_row("Channels", str(len(enabled_channels)), channels_str, end_section=True)
+
+    cron_store_path = get_cron_dir(workspace) / "jobs.json"
+    cron_jobs = 0
+    active_jobs = 0
+    if cron_store_path.exists():
+        try:
+            data = json.loads(cron_store_path.read_text())
+            jobs = data.get("jobs", [])
+            cron_jobs = len(jobs)
+            active_jobs = sum(1 for j in jobs if j.get("enabled", True))
+        except Exception:
+            pass
+    table.add_row("Cron Jobs", f"{active_jobs}/{cron_jobs} active", str(cron_store_path))
+
+    sessions_dir = workspace / "sessions"
+    session_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
+    table.add_row("Sessions", str(session_count), str(sessions_dir))
+
+    mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
+    mcp_names = ", ".join(config.tools.mcp_servers.keys()) if mcp_count else "None"
+    table.add_row("MCP Servers", str(mcp_count), mcp_names)
+
+    console.print(table)
+
+    if running:
+        console.print(f"\n[green]✓[/green] Gateway is running normally.")
+    else:
+        console.print(f"\n[yellow]Gateway is not running.[/yellow]")
+        console.print("Use [cyan]markbot gateway start[/cyan] to start it.")
+
+
 # ============================================================================
 # Channel Commands
 # ============================================================================
-
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
@@ -673,41 +1367,159 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status():
     """Show channel status."""
+    from markbot.channels.registry import discover_all
     from markbot.config.loader import load_config
 
     config = load_config()
 
-    table = Table(title="\nChannel Status", title_justify="left")
+    table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
     table.add_column("Enabled", style="green")
-    table.add_column("Configuration", style="yellow")
 
-    # Feishu
-    fs = config.channels.feishu
-    fs_config = f"app_id: {fs.app_id[:10]}..." if fs.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "Feishu",
-        "✓" if fs.enabled else "✗",
-        fs_config
-    )
+    for name, cls in sorted(discover_all().items()):
+        section = getattr(config.channels, name, None)
+        if section is None:
+            enabled = False
+        elif isinstance(section, dict):
+            enabled = section.get("enabled", False)
+        else:
+            enabled = getattr(section, "enabled", False)
+        table.add_row(
+            cls.display_name,
+            "[green]\u2713[/green]" if enabled else "[dim]\u2717[/dim]",
+        )
 
-    # DingTalk
-    dt = config.channels.dingtalk
-    dt_config = f"client_id: {dt.client_id[:10]}..." if dt.client_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "DingTalk",
-        "✓" if dt.enabled else "✗",
-        dt_config
-    )
+    console.print(table)
 
-    # Email
-    em = config.channels.email
-    em_config = em.imap_host if em.imap_host else "[dim]not configured[/dim]"
-    table.add_row(
-        "Email",
-        "✓" if em.enabled else "✗",
-        em_config
-    )
+
+def _get_bridge_dir() -> Path:
+    """Get the bridge directory, setting it up if needed."""
+    import shutil
+    import subprocess
+
+    # User's bridge location
+    from markbot.config.paths import get_bridge_install_dir
+
+    user_bridge = get_bridge_install_dir()
+
+    # Check if already built
+    if (user_bridge / "dist" / "index.js").exists():
+        return user_bridge
+
+    # Check for npm
+    npm_path = shutil.which("npm")
+    if not npm_path:
+        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
+        raise typer.Exit(1)
+
+    # Find source bridge: first check package data, then source dir
+    pkg_bridge = Path(__file__).parent.parent / "bridge"  # markbot/bridge (installed)
+    src_bridge = Path(__file__).parent.parent.parent / "bridge"  # repo root/bridge (dev)
+
+    source = None
+    if (pkg_bridge / "package.json").exists():
+        source = pkg_bridge
+    elif (src_bridge / "package.json").exists():
+        source = src_bridge
+
+    if not source:
+        console.print("[red]Bridge source not found.[/red]")
+        console.print("Try reinstalling: pip install --force-reinstall markbot")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Setting up bridge...")
+
+    # Copy to user directory
+    user_bridge.parent.mkdir(parents=True, exist_ok=True)
+    if user_bridge.exists():
+        shutil.rmtree(user_bridge)
+    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
+
+    # Install and build
+    try:
+        console.print("  Installing dependencies...")
+        subprocess.run([npm_path, "install"], cwd=user_bridge, check=True, capture_output=True)
+
+        console.print("  Building...")
+        subprocess.run([npm_path, "run", "build"], cwd=user_bridge, check=True, capture_output=True)
+
+        console.print("[green]✓[/green] Bridge ready\n")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Build failed: {e}[/red]")
+        if e.stderr:
+            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
+        raise typer.Exit(1)
+
+    return user_bridge
+
+
+@channels_app.command("login")
+def channels_login(
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
+):
+    """Authenticate with a channel via QR code or other interactive login."""
+    from markbot.channels.registry import discover_all
+    from markbot.config.loader import load_config
+
+    config = load_config()
+    channel_cfg = getattr(config.channels, channel_name, None) or {}
+
+    # Validate channel exists
+    all_channels = discover_all()
+    if channel_name not in all_channels:
+        available = ", ".join(all_channels.keys())
+        console.print(f"[red]Unknown channel: {channel_name}[/red]  Available: {available}")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
+
+    channel_cls = all_channels[channel_name]
+    channel = channel_cls(channel_cfg, bus=None)
+
+    success = asyncio.run(channel.login(force=force))
+
+    if not success:
+        raise typer.Exit(1)
+
+
+# ============================================================================
+# Plugin Commands
+# ============================================================================
+
+plugins_app = typer.Typer(help="Manage channel plugins")
+app.add_typer(plugins_app, name="plugins")
+
+
+@plugins_app.command("list")
+def plugins_list():
+    """List all discovered channels (built-in and plugins)."""
+    from markbot.channels.registry import discover_all, discover_channel_names
+    from markbot.config.loader import load_config
+
+    config = load_config()
+    builtin_names = set(discover_channel_names())
+    all_channels = discover_all()
+
+    table = Table(title="Channel Plugins")
+    table.add_column("Name", style="cyan")
+    table.add_column("Source", style="magenta")
+    table.add_column("Enabled", style="green")
+
+    for name in sorted(all_channels):
+        cls = all_channels[name]
+        source = "builtin" if name in builtin_names else "plugin"
+        section = getattr(config.channels, name, None)
+        if section is None:
+            enabled = False
+        elif isinstance(section, dict):
+            enabled = section.get("enabled", False)
+        else:
+            enabled = getattr(section, "enabled", False)
+        table.add_row(
+            cls.display_name,
+            source,
+            "[green]yes[/green]" if enabled else "[dim]no[/dim]",
+        )
 
     console.print(table)
 
@@ -719,14 +1531,14 @@ def channels_status():
 
 @app.command()
 def status():
-    """Show markbot status."""
+    """Show NarkBot status."""
     from markbot.config.loader import get_config_path, load_config
 
     config_path = get_config_path()
     config = load_config()
     workspace = config.workspace_path
 
-    console.print(f"{__logo__} MarkBot Status\n")
+    console.print(f"{__logo__} NarkBot Status\n")
 
     console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
@@ -823,11 +1635,20 @@ def _login_openai_codex() -> None:
 def _login_github_copilot() -> None:
     import asyncio
 
+    from openai import AsyncOpenAI
+
     console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
 
     async def _trigger():
-        from litellm import acompletion
-        await acompletion(model="github_copilot/gpt-4o", messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+        client = AsyncOpenAI(
+            api_key="dummy",
+            base_url="https://api.githubcopilot.com",
+        )
+        await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
 
     try:
         asyncio.run(_trigger())
@@ -837,527 +1658,13 @@ def _login_github_copilot() -> None:
         raise typer.Exit(1)
 
 
-if __name__ == "__main__":
-    app()
-
-
-# ============================================================================
-# Gateway / Server
-# ============================================================================
-
-GATEWAY_PID_DIR = Path.home() / ".markbot" / "gateway"
-GATEWAY_PID_FILE = GATEWAY_PID_DIR / "gateway.pid"
-GATEWAY_LOG_FILE = GATEWAY_PID_DIR / "gateway.log"
-
-
-def _ensure_pid_dir() -> None:
-    GATEWAY_PID_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _read_pid() -> int | None:
-    if not GATEWAY_PID_FILE.exists():
-        return None
-    try:
-        return int(GATEWAY_PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        return None
-
-
-def _write_pid(pid: int) -> None:
-    _ensure_pid_dir()
-    GATEWAY_PID_FILE.write_text(str(pid))
-
-
-def _remove_pid() -> None:
-    if GATEWAY_PID_FILE.exists():
-        GATEWAY_PID_FILE.unlink()
-
-
-def _is_process_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-gateway_app = typer.Typer(
-    name="gateway",
-    help="Manage the MarkBot gateway service (start/stop/restart/status).",
-)
-
-
-@gateway_app.command("start")
-def gateway_start(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-    daemon: bool = typer.Option(True, "--daemon/--foreground", "-d", help="Run as daemon (background)"),
-):
-    """Start the markbot gateway service."""
-    existing_pid = _read_pid()
-    if existing_pid and _is_process_running(existing_pid):
-        console.print(f"[yellow]Gateway is already running (PID: {existing_pid})[/yellow]")
-        console.print("Use [cyan]MarkBot gateway stop[/cyan] to stop it first.")
-        raise typer.Exit(1)
-
-    if daemon:
-        _start_daemon(port, workspace, config, verbose)
-    else:
-        _run_gateway_foreground(port, workspace, config, verbose)
-
-
-def _start_daemon(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
-    _ensure_pid_dir()
-    pid = os.fork()
-    if pid > 0:
-        _write_pid(pid)
-        console.print(f"[green]✓[/green] Gateway started in background (PID: {pid})")
-        console.print(f"  Log file: {GATEWAY_LOG_FILE}")
-        console.print(f"  Use [cyan]MarkBot gateway status[/cyan] to check status.")
-        return
-
-    os.setsid()
-    sys.stdin.close()
-    _ensure_pid_dir()
-    with open(GATEWAY_LOG_FILE, "w") as log_file:
-        os.dup2(log_file.fileno(), sys.stdout.fileno())
-        os.dup2(log_file.fileno(), sys.stderr.fileno())
-    try:
-        _run_gateway_foreground(port, workspace, config, verbose)
-    except Exception as e:
-        print(f"Gateway failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
-    from loguru import logger
-    from markbot.agent.loop import AgentLoop
-    from markbot.bus.queue import MessageBus
-    from markbot.channels.manager import ChannelManager
-    from markbot.config.loader import load_config
-    from markbot.cron.service import CronService
-    from markbot.cron.types import CronJob
-    from markbot.heartbeat.service import HeartbeatService
-    from markbot.session.manager import SessionManager
-
-    # Configure loguru for detailed logging
-    import logging
-    logging.basicConfig(level=logging.WARNING)  # Reduce standard library logging noise
-
-    # Remove default handler and add custom ones with full exception tracing
-    logger.remove()
-    log_level = "DEBUG" if verbose else "INFO"
-
-    # Filter function to exclude noisy logs
-    def log_filter(record):
-        # Filter out websockets ping/pong noise
-        msg = record["message"]
-        if "PING" in msg or "PONG" in msg:
-            if "keepalive" in msg.lower() or "websockets" in record["name"]:
-                return False
-        # Filter out websockets binary/frame noise
-        if record["name"].startswith("websockets"):
-            return False
-        # Filter out urllib3 connection pool noise (keep errors)
-        if record["name"].startswith("urllib3") and record["level"].name == "DEBUG":
-            return False
-        # Filter out httpcore noise (keep errors)
-        if record["name"].startswith("httpcore") and record["level"].name == "DEBUG":
-            return False
-        # Filter out asyncio selector noise
-        if record["name"] == "asyncio" and "selector" in msg.lower():
-            return False
-        return True
-
-    # Console handler - show filtered logs
-    logger.add(
-        sys.stderr,
-        level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        colorize=True,
-        backtrace=True,
-        diagnose=True,
-        catch=True,
-        filter=log_filter,
-    )
-
-    # File handler - log INFO and above (filter noise but keep errors for debugging)
-    logger.add(
-        GATEWAY_LOG_FILE,
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-        rotation="10 MB",
-        retention="7 days",
-        backtrace=True,
-        diagnose=True,
-        catch=True,
-        encoding="utf-8",
-        filter=log_filter,
-    )
-
-    logger.info("Logging configured: level={}, backtrace=True, diagnose=True", log_level)
-
-    # Add global exception hook to catch all unhandled exceptions (including in SDK threads)
-    import traceback
-    import threading
-
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        """Global exception handler for unhandled exceptions."""
-        logger.exception("Unhandled exception: {}:{}",
-                        exc_type.__name__, exc_value,
-                        exc_info=(exc_type, exc_value, exc_traceback))
-
-    def thread_exception_hook(args):
-        """Exception handler for threads."""
-        logger.exception("Unhandled exception in thread {}: {}:{}",
-                        args.thread.name if args.thread else "unknown",
-                        args.exc_type.__name__, args.exc_value,
-                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-    sys.excepthook = handle_exception
-    threading.excepthook = thread_exception_hook
-    logger.info("Global exception hooks installed")
-
-    config_path = Path(config) if config else None
-    config = load_config(config_path)
-    if workspace:
-        config.agents.defaults.workspace = workspace
-
-    console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
-    sync_workspace_templates(config.workspace_path)
-    bus = MessageBus()
-    provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
-
-    cron_store_path = config.workspace_path / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
-
-    agent = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        reasoning_effort=config.agents.defaults.reasoning_effort,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        memory_config=config.memory,
-        search_config=config.search,
-    )
-
-    async def on_cron_job(job: CronJob) -> str | None:
-        from markbot.agent.tools.cron import CronTool
-        from markbot.agent.tools.message import MessageTool
-        reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
-        )
-
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-        try:
-            response = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-            )
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
-        if job.payload.deliver and job.payload.to and response:
-            from markbot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
-        return response
-    cron.on_job = on_cron_job
-
-    channels = ChannelManager(config, bus)
-
-    def _pick_heartbeat_target() -> tuple[str, str]:
-        enabled = set(channels.enabled_channels)
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        return "cli", "direct"
-
-    async def on_heartbeat_execute(tasks: str) -> str:
-        channel, chat_id = _pick_heartbeat_target()
-
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        return await agent.process_direct(
-            tasks,
-            session_key="heartbeat",
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,
-        )
-
-    async def on_heartbeat_notify(response: str) -> None:
-        from markbot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
-            return
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-
-    hb_cfg = config.gateway.heartbeat
-    heartbeat = HeartbeatService(
-        workspace=config.workspace_path,
-        provider=provider,
-        model=agent.model,
-        on_execute=on_heartbeat_execute,
-        on_notify=on_heartbeat_notify,
-        interval_s=hb_cfg.interval_s,
-        enabled=hb_cfg.enabled,
-    )
-
-    if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
-    else:
-        console.print("[yellow]Warning: No channels enabled[/yellow]")
-
-    cron_status = cron.status()
-    if cron_status["jobs"] > 0:
-        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
-
-    console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
-
-    async def run():
-        try:
-            await cron.start()
-            await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
-        except KeyboardInterrupt:
-            console.print("\nShutting down...")
-        finally:
-            await agent.close_mcp()
-            heartbeat.stop()
-            cron.stop()
-            agent.stop()
-            await channels.stop_all()
-
-    asyncio.run(run())
-
-
-@gateway_app.command("stop")
-def gateway_stop(
-    force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
-):
-    """Stop the markbot gateway service."""
-    pid = _read_pid()
-    if not pid:
-        console.print("[yellow]Gateway is not running (no PID file found)[/yellow]")
-        raise typer.Exit(0)
-
-    if not _is_process_running(pid):
-        _remove_pid()
-        console.print("[yellow]Gateway is not running (stale PID file removed)[/yellow]")
-        raise typer.Exit(0)
-
-    try:
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        os.kill(pid, sig)
-        console.print(f"[green]✓[/green] Sent {'SIGKILL' if force else 'SIGTERM'} to gateway (PID: {pid})")
-
-        import time
-        for _ in range(10):
-            time.sleep(0.5)
-            if not _is_process_running(pid):
-                _remove_pid()
-                console.print("[green]✓[/green] Gateway stopped successfully.")
-                raise typer.Exit(0)
-
-        console.print("[yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
-        raise typer.Exit(1)
-    except ProcessLookupError:
-        _remove_pid()
-        console.print("[yellow]Gateway process not found (cleaned up PID file)[/yellow]")
-        raise typer.Exit(0)
-
-
-@gateway_app.command("restart")
-def gateway_restart(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-    force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
-):
-    """Restart the markbot gateway service."""
-    import time
-
-    pid = _read_pid()
-
-    if pid and _is_process_running(pid):
-        console.print(f"[yellow]Stopping gateway (PID: {pid})...[/yellow]")
-        try:
-            sig = signal.SIGKILL if force else signal.SIGTERM
-            os.kill(pid, sig)
-
-            for _ in range(10):
-                time.sleep(0.5)
-                if not _is_process_running(pid):
-                    _remove_pid()
-                    console.print("[green]✓[/green] Gateway stopped.")
-                    break
-            else:
-                console.print("[red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
-                raise typer.Exit(1)
-        except ProcessLookupError:
-            _remove_pid()
-            console.print("[yellow]Gateway process not found (cleaned up)[/yellow]")
-    else:
-        if pid:
-            _remove_pid()
-        console.print("[yellow]Gateway was not running.[/yellow]")
-
-    console.print("[cyan]Starting gateway...[/cyan]")
-    _start_daemon(port, workspace, config, verbose)
-
-
-@gateway_app.command("status")
-def gateway_status():
-    """Check the status of the markbot gateway service."""
-    from markbot.config.loader import load_config
-    import json
-    from datetime import datetime
-
-    table = Table(title=f"\n{__logo__} MarkBot Gateway Status", title_justify="left")
-    table.add_column("Component", style="cyan", width=20)
-    table.add_column("Status", style="green", width=20)
-    table.add_column("Details", width=50)
-
-    pid = _read_pid()
-    running = False
-    uptime_str = ""
-
-    if pid:
-        running = _is_process_running(pid)
-        if running:
-            try:
-                import psutil
-                proc = psutil.Process(pid)
-                create_time = datetime.fromtimestamp(proc.create_time())
-                uptime = datetime.now() - create_time
-                days = uptime.days
-                hours, remainder = divmod(uptime.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-                uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
-                mem_mb = proc.memory_info().rss / 1024 / 1024
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}, Uptime: {uptime_str}, Memory: {mem_mb:.1f}MB", end_section=True)
-            except:
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
-        else:
-            table.add_row("Process", "[red]● Stopped[/red]", "Stale PID file", end_section=True)
-            _remove_pid()
-    else:
-        table.add_row("Process", "[red]● Stopped[/red]", "No PID file", end_section=True)
-
-    if GATEWAY_LOG_FILE.exists():
-        log_size = GATEWAY_LOG_FILE.stat().st_size / 1024
-        log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        table.add_row("Log File", f"{log_size:.1f}KB", f"Last modified: {log_mtime}")
-    else:
-        table.add_row("Log File", "[yellow]○ Not found[/yellow]", str(GATEWAY_LOG_FILE))
-
-    config = load_config()
-    workspace = config.workspace_path
-    table.add_row("Workspace", "[green]✓[/green]" if workspace.exists() else "[red]✗[/red]", str(workspace), end_section=True)
-
-    table.add_row("Model", config.agents.defaults.model, f"Temp: {config.agents.defaults.temperature}, Max tokens: {config.agents.defaults.max_tokens}")
-
-    hb_cfg = config.gateway.heartbeat
-    hb_status = "[green]● Enabled[/green]" if hb_cfg.enabled else "[yellow]○ Disabled[/yellow]"
-    table.add_row("Heartbeat", hb_status, f"Interval: {hb_cfg.interval_s}s")
-
-    channels_config = config.channels
-    enabled_channels = []
-    if channels_config:
-        if channels_config.feishu and channels_config.feishu.enabled:
-            enabled_channels.append("feishu")
-        if channels_config.email and channels_config.email.enabled:
-            enabled_channels.append("email")
-    channels_str = ", ".join(enabled_channels) if enabled_channels else "None"
-    table.add_row("Channels", str(len(enabled_channels)), channels_str, end_section=True)
-
-    cron_store_path = workspace / "cron" / "jobs.json"
-    cron_jobs = 0
-    active_jobs = 0
-    if cron_store_path.exists():
-        try:
-            data = json.loads(cron_store_path.read_text())
-            jobs = data.get("jobs", [])
-            cron_jobs = len(jobs)
-            active_jobs = sum(1 for j in jobs if j.get("enabled", True))
-        except Exception:
-            pass
-    table.add_row("Cron Jobs", f"{active_jobs}/{cron_jobs} active", str(cron_store_path))
-
-    sessions_dir = workspace / "sessions"
-    session_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
-    table.add_row("Sessions", str(session_count), str(sessions_dir))
-
-    mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
-    mcp_names = ", ".join(config.tools.mcp_servers.keys()) if mcp_count else "None"
-    table.add_row("MCP Servers", str(mcp_count), mcp_names)
-
-    from markbot.agent.skills import SkillsLoader
-    skills_loader = SkillsLoader(workspace)
-    all_skills = skills_loader.list_skills(filter_unavailable=False)
-    builtin_skills = [s for s in all_skills if s["source"] == "builtin"]
-    workspace_skills = [s for s in all_skills if s["source"] == "workspace"]
-    skills_detail = f"builtin: {len(builtin_skills)}, workspace: {len(workspace_skills)}"
-    table.add_row("Skills", str(len(all_skills)), skills_detail, end_section=True)
-
-    console.print(table)
-
-    if running:
-        console.print(f"\n[green]✓[/green] Gateway is running normally.")
-    else:
-        console.print(f"\n[yellow]Gateway is not running.[/yellow]")
-        console.print("Use [cyan]markbot gateway start[/cyan] to start it.")
-
-app.add_typer(gateway_app, name="gateway")
-
 # ============================================================================
 # Config Commands
 # ============================================================================
 
 config_app = typer.Typer(
     name="config",
-    help="Manage markbot configuration (get/set values).",
+    help="Manage NarkBot configuration (get/set values).",
 )
 
 
@@ -1411,7 +1718,7 @@ def config_get(
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw value without formatting"),
 ):
     """Get a configuration value."""
-    from markbot.config.loader import get_config_path, load_config
+    from markbot.config.loader import load_config
 
     config = load_config()
     data = config.model_dump(by_alias=True)
@@ -1442,7 +1749,8 @@ def config_set(
 ):
     """Set a configuration value."""
     import json
-    from markbot.config.loader import get_config_path, load_config, save_config
+    from markbot.config.loader import load_config, save_config
+    from markbot.config.schema import Config
 
     config = load_config()
     data = config.model_dump(by_alias=True)
@@ -1498,7 +1806,7 @@ def config_list(
         console.print(f"[yellow]No keys found with prefix '{prefix}'[/yellow]")
         return
 
-    table = Table(title=f"\n{__logo__} MarkBot Configuration", title_justify="left")
+    table = Table(title=f"\n{__logo__} NarkBot Configuration", title_justify="left")
     table.add_column("Key", style="cyan")
     table.add_column("Value", style="green")
 
@@ -1518,171 +1826,6 @@ def config_list(
 
 app.add_typer(config_app, name="config")
 
-pairing_app = typer.Typer(help="Manage channel access pairing requests")
 
-
-@pairing_app.command("list")
-def pairing_list(
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-):
-    """List all pending pairing requests."""
-    from markbot.config.loader import get_config_path, load_config
-
-    config = load_config()
-    ws = Path(workspace) if workspace else config.workspace_path
-
-    from markbot.channels.pairing import PairingManager
-    manager = PairingManager(ws)
-    manager.cleanup_expired()
-
-    pending = manager.list_pairings()
-
-    if not pending:
-        console.print("[yellow]No pending pairing requests[/yellow]")
-        raise typer.Exit(0)
-
-    table = Table(title=f"\n{__logo__} Pending Pairing Requests", title_justify="left")
-    table.add_column("Code", style="cyan")
-    table.add_column("Channel", style="green")
-    table.add_column("Sender ID", style="yellow")
-    table.add_column("Created", style="blue")
-
-    for item in pending:
-        created = item["created_at"][:19] if item.get("created_at") else "N/A"
-        table.add_row(item["code"], item["channel"], item["sender_id"], created)
-
-    console.print(table)
-
-
-@pairing_app.command("approve")
-def pairing_approve(
-    channel: str = typer.Argument(..., help="Channel name (e.g., feishu)"),
-    code: str = typer.Argument(..., help="Pairing code"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-):
-    """Approve a pairing request and add user to allow list."""
-    from markbot.config.loader import get_config_path, load_config, save_config
-
-    config = load_config()
-    ws = Path(workspace) if workspace else config.workspace_path
-
-    from markbot.channels.pairing import PairingManager
-    manager = PairingManager(ws)
-
-    pairing = manager.get_pairing(code)
-    if not pairing:
-        console.print(f"[red]Error: Pairing not found: {code}[/red]")
-        raise typer.Exit(1)
-
-    if not manager.approve_pairing(code):
-        console.print(f"[red]Error: Failed to approve pairing: {code}[/red]")
-        raise typer.Exit(1)
-
-    if pairing["channel"] != channel:
-        console.print(f"[red]Error: Channel mismatch. Expected {pairing['channel']}, got {channel}[/red]")
-        raise typer.Exit(1)
-
-    sender_id = pairing["sender_id"]
-
-    # Add to allow list
-    channel_config = getattr(config.channels, channel, None)
-    if not channel_config:
-        console.print(f"[red]Error: Unknown channel: {channel}[/red]")
-        raise typer.Exit(1)
-
-    allow_list = getattr(channel_config, "allow_from", [])
-    if allow_list == []:
-        allow_list = []
-
-    if sender_id not in allow_list:
-        allow_list.append(sender_id)
-        setattr(channel_config, "allow_from", allow_list)
-        save_config(config)
-
-    console.print(f"[green]✓[/green] Approved pairing for {sender_id} on {channel}")
-    console.print(f"[green]✓[/green] Added to allow list")
-
-    # Auto restart gateway if running
-    pid = _read_pid()
-    if pid and _is_process_running(pid):
-        console.print("[yellow]Restarting gateway...[/yellow]")
-        import time
-        try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(10):
-                time.sleep(0.5)
-                if not _is_process_running(pid):
-                    _remove_pid()
-                    break
-        except ProcessLookupError:
-            _remove_pid()
-
-        # Restart gateway
-        from markbot.config.loader import get_config_path
-        config_path = get_config_path()
-        gateway_start(port=18790, workspace=str(ws), config=str(config_path) if config_path else None, verbose=False, daemon=True)
-        console.print("[green]✓[/green] Gateway restarted")
-    else:
-        console.print("[yellow]Gateway not running. Start it with: markbot gateway start[/yellow]")
-
-
-@pairing_app.command("cancel")
-def pairing_cancel(
-    code: str = typer.Argument(..., help="Pairing code to cancel"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-):
-    """Cancel a pending pairing request."""
-    from markbot.config.loader import load_config
-
-    config = load_config()
-    ws = Path(workspace) if workspace else config.workspace_path
-
-    from markbot.channels.pairing import PairingManager
-    manager = PairingManager(ws)
-
-    if not manager.cancel_pairing(code):
-        console.print(f"[yellow]Pairing code not found: {code}[/yellow]")
-        raise typer.Exit(1)
-
-    console.print(f"[green]✓[/green] Cancelled pairing request: {code}")
-
-
-app.add_typer(pairing_app, name="pairing")
-
-
-def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
-    from markbot.providers.custom_provider import CustomProvider
-    from markbot.providers.litellm_provider import LiteLLMProvider
-    from markbot.providers.openai_codex_provider import OpenAICodexProvider
-
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    from markbot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.markbot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
+if __name__ == "__main__":
+    app()

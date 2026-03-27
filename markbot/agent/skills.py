@@ -1,140 +1,98 @@
-"""Skills loader for agent capabilities."""
+"""Skills loader for agent capabilities.
+
+Enhanced with executable script support. Skills can now define executable
+scripts in their SKILL.md metadata that get automatically registered as tools.
+"""
 
 import json
+import logging
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+from markbot.agent.tools.registry import ToolRegistry
+from markbot.agent.skill_execution import SkillScript, SecurityScanner, ScanResult, Finding
+
+# Import PyYAML for proper YAML parsing
+try:
+    import yaml
+    def _parse_yaml(yaml_content: str) -> dict | None:
+        try:
+            return yaml.safe_load(yaml_content)
+        except Exception:
+            return None
+except ImportError:
+    def _parse_yaml(yaml_content: str) -> dict | None:
+        return None
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
-
-@dataclass
-class SkillDirectory:
-    """Represents a skill's directory structure."""
-
-    name: str
-    path: Path
-    source: str  # "workspace" or "builtin"
-    has_scripts: bool = False
-    has_references: bool = False
-    scripts_tree: dict[str, Any] = field(default_factory=dict)
-    references_tree: dict[str, Any] = field(default_factory=dict)
+logger = logging.getLogger(__name__)
 
 
 class SkillsLoader:
-    """
-    Loader for agent skills.
+    """Enhanced loader for agent skills with executable script support.
 
-    Skills are markdown files (SKILL.md) that teach the agent how to use
-    specific tools or perform certain tasks.
+    Skills are markdown files (SKILL.md) that can declare executable scripts
+    in their YAML frontmatter. These scripts are automatically registered
+    as tools that the agent can invoke.
 
-    A skill directory can contain:
-    - SKILL.md: Main skill definition (required)
-    - scripts/: Python/bash scripts for the skill
-    - references/: Reference files (schemas, templates, etc.)
+    Example SKILL.md format:
+    ---
+    name: my-skill
+    description: "Code analysis tools"
+    metadata:
+      markbot:
+        executable: true
+        scripts:
+          - name: "format"
+            description: "Format code"
+            entry: "scripts/format.py"
+            language: "python"
+            parameters:
+              type: object
+              properties:
+                path:
+                  type: string
+                  description: "Path to format"
+              required: ["path"]
+            sandbox:
+              allowed_paths: ["{workspace}"]
+              timeout: 60
+    ---
     """
 
     def __init__(
         self,
         workspace: Path,
         builtin_skills_dir: Path | None = None,
-        enable_security_scan: bool = True,
+        tool_registry: Optional[ToolRegistry] = None,
     ):
+        """Initialize the skills loader.
+
+        Args:
+            workspace: Workspace directory for user skills
+            builtin_skills_dir: Directory containing built-in skills
+            tool_registry: Registry to register executable scripts as tools
+        """
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
-        self.enable_security_scan = enable_security_scan
-        self._security_scanner: Any | None = None
+        self.tool_registry = tool_registry
+        self._scanner = SecurityScanner()
+        self._loaded_scripts: dict[str, SkillScript] = {}
 
-        # Lazy import security scanner
-        if enable_security_scan:
-            try:
-                from markbot.security import SkillScanner
-
-                self._security_scanner = SkillScanner()
-            except ImportError:
-                pass
-
-    def _get_skill_dir(self, name: str) -> SkillDirectory | None:
-        """Get skill directory info for a skill name.
-
-        Args:
-            name: Skill name.
-
-        Returns:
-            SkillDirectory if found, None otherwise.
-        """
-        # Check workspace first
-        workspace_dir = self.workspace_skills / name
-        if workspace_dir.exists() and (workspace_dir / "SKILL.md").exists():
-            return self._build_skill_directory(name, workspace_dir, "workspace")
-
-        # Check built-in
-        if self.builtin_skills:
-            builtin_dir = self.builtin_skills / name
-            if builtin_dir.exists() and (builtin_dir / "SKILL.md").exists():
-                return self._build_skill_directory(name, builtin_dir, "builtin")
-
-        return None
-
-    def _build_skill_directory(
-        self, name: str, path: Path, source: str
-    ) -> SkillDirectory:
-        """Build SkillDirectory with full directory tree info."""
-        scripts_dir = path / "scripts"
-        references_dir = path / "references"
-
-        return SkillDirectory(
-            name=name,
-            path=path,
-            source=source,
-            has_scripts=scripts_dir.exists() and scripts_dir.is_dir(),
-            has_references=references_dir.exists() and references_dir.is_dir(),
-            scripts_tree=self._build_directory_tree(scripts_dir)
-            if scripts_dir.exists()
-            else {},
-            references_tree=self._build_directory_tree(references_dir)
-            if references_dir.exists()
-            else {},
-        )
-
-    def _build_directory_tree(self, directory: Path) -> dict[str, Any]:
-        """Recursively build a directory tree structure.
-
-        Args:
-            directory: Directory to scan.
-
-        Returns:
-            Dictionary representing the tree structure where:
-            - Files are represented as {filename: None}
-            - Directories are represented as {dirname: {nested_structure}}
-        """
-        tree: dict[str, Any] = {}
-
-        if not directory.exists() or not directory.is_dir():
-            return tree
-
-        for item in sorted(directory.iterdir()):
-            if item.is_file():
-                tree[item.name] = None
-            elif item.is_dir():
-                tree[item.name] = self._build_directory_tree(item)
-
-        return tree
-
-    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, Any]]:
-        """
-        List all available skills.
+    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+        """List all available skills.
 
         Args:
             filter_unavailable: If True, filter out skills with unmet requirements.
 
         Returns:
-            List of skill info dicts with 'name', 'path', 'source', 'has_scripts', 'has_references'.
+            List of skill info dicts with 'name', 'path', 'source', 'executable'.
         """
         skills = []
 
@@ -144,52 +102,68 @@ class SkillsLoader:
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
-                        skill_info = self._build_skill_directory(
-                            skill_dir.name, skill_dir, "workspace"
-                        )
-                        skills.append(
-                            {
-                                "name": skill_dir.name,
-                                "path": str(skill_file),
-                                "source": "workspace",
-                                "has_scripts": skill_info.has_scripts,
-                                "has_references": skill_info.has_references,
-                            }
-                        )
+                        meta = self.get_skill_metadata(skill_dir.name)
+                        executable = self._is_executable_skill(meta)
+                        skills.append({
+                            "name": skill_dir.name,
+                            "path": str(skill_file),
+                            "source": "workspace",
+                            "executable": str(executable).lower(),
+                        })
 
         # Built-in skills
         if self.builtin_skills and self.builtin_skills.exists():
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(
-                        s["name"] == skill_dir.name for s in skills
-                    ):
-                        skill_info = self._build_skill_directory(
-                            skill_dir.name, skill_dir, "builtin"
-                        )
-                        skills.append(
-                            {
-                                "name": skill_dir.name,
-                                "path": str(skill_file),
-                                "source": "builtin",
-                                "has_scripts": skill_info.has_scripts,
-                                "has_references": skill_info.has_references,
-                            }
-                        )
+                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                        meta = self.get_skill_metadata(skill_dir.name)
+                        executable = self._is_executable_skill(meta)
+                        skills.append({
+                            "name": skill_dir.name,
+                            "path": str(skill_file),
+                            "source": "builtin",
+                            "executable": str(executable).lower(),
+                        })
 
         # Filter by requirements
         if filter_unavailable:
-            return [
-                s
-                for s in skills
-                if self._check_requirements(self._get_skill_meta(s["name"]))
-            ]
+            return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
         return skills
 
-    def load_skill(self, name: str) -> str | None:
+    def list_executable_scripts(self, skill_name: Optional[str] = None) -> list[dict[str, Any]]:
+        """List all executable scripts across all skills.
+
+        Args:
+            skill_name: If specified, only list scripts for this skill.
+
+        Returns:
+            List of script info dicts.
         """
-        Load a skill by name.
+        scripts = []
+
+        if skill_name:
+            # Scripts from specific skill
+            meta = self.get_skill_metadata(skill_name)
+            if meta:
+                scripts_info = self._get_scripts_from_metadata(meta, skill_name)
+                for info in scripts_info:
+                    info["skill_name"] = skill_name
+                scripts.extend(scripts_info)
+        else:
+            # Scripts from all skills
+            for skill in self.list_skills():
+                meta = self.get_skill_metadata(skill["name"])
+                if meta and self._is_executable_skill(meta):
+                    scripts_info = self._get_scripts_from_metadata(meta, skill["name"])
+                    for info in scripts_info:
+                        info["skill_name"] = skill["name"]
+                    scripts.extend(scripts_info)
+
+        return scripts
+
+    def load_skill(self, name: str) -> str | None:
+        """Load a skill by name.
 
         Args:
             name: Skill name (directory name).
@@ -210,108 +184,8 @@ class SkillsLoader:
 
         return None
 
-    def load_skill_with_resources(self, name: str) -> dict[str, Any] | None:
-        """Load a skill with all its resources (scripts, references).
-
-        Args:
-            name: Skill name.
-
-        Returns:
-            Dictionary with 'content', 'scripts', 'references', 'directory' or None.
-        """
-        skill_dir = self._get_skill_dir(name)
-        if not skill_dir:
-            return None
-
-        content = self.load_skill(name)
-        if not content:
-            return None
-
-        result = {
-            "content": content,
-            "directory": str(skill_dir.path),
-            "scripts": {},
-            "references": {},
-        }
-
-        # Load scripts
-        if skill_dir.has_scripts:
-            scripts_dir = skill_dir.path / "scripts"
-            result["scripts"] = self._load_directory_contents(scripts_dir)
-
-        # Load references
-        if skill_dir.has_references:
-            references_dir = skill_dir.path / "references"
-            result["references"] = self._load_directory_contents(references_dir)
-
-        return result
-
-    def _load_directory_contents(self, directory: Path) -> dict[str, str]:
-        """Load all file contents from a directory recursively.
-
-        Args:
-            directory: Directory to load.
-
-        Returns:
-            Dictionary mapping relative paths to file contents.
-        """
-        contents: dict[str, str] = {}
-
-        if not directory.exists():
-            return contents
-
-        for item in directory.rglob("*"):
-            if item.is_file():
-                try:
-                    rel_path = str(item.relative_to(directory))
-                    # Skip binary files
-                    if self._is_text_file(item):
-                        contents[rel_path] = item.read_text(encoding="utf-8")
-                    else:
-                        contents[rel_path] = f"[Binary file: {item.name}]"
-                except (OSError, UnicodeDecodeError) as e:
-                    contents[str(item.relative_to(directory))] = f"[Error reading file: {e}]"
-
-        return contents
-
-    def _is_text_file(self, file_path: Path) -> bool:
-        """Check if a file is likely a text file."""
-        text_extensions = {
-            ".py",
-            ".sh",
-            ".bash",
-            ".zsh",
-            ".js",
-            ".ts",
-            ".json",
-            ".yaml",
-            ".yml",
-            ".toml",
-            ".md",
-            ".txt",
-            ".rst",
-            ".ini",
-            ".cfg",
-            ".conf",
-            ".xml",
-            ".html",
-            ".css",
-            ".sql",
-        }
-        if file_path.suffix.lower() in text_extensions:
-            return True
-
-        # Try to read first few bytes
-        try:
-            with open(file_path, "rb") as f:
-                chunk = f.read(1024)
-                return b"\0" not in chunk
-        except OSError:
-            return False
-
     def load_skills_for_context(self, skill_names: list[str]) -> str:
-        """
-        Load specific skills for inclusion in agent context.
+        """Load specific skills for inclusion in agent context.
 
         Args:
             skill_names: List of skill names to load.
@@ -321,29 +195,15 @@ class SkillsLoader:
         """
         parts = []
         for name in skill_names:
-            skill_data = self.load_skill_with_resources(name)
-            if skill_data:
-                content = self._strip_frontmatter(skill_data["content"])
-                section = f"### Skill: {name}\n\n{content}"
-
-                # Add scripts info if present
-                if skill_data.get("scripts"):
-                    section += f"\n\n**Scripts available:** {len(skill_data['scripts'])} files"
-
-                # Add references info if present
-                if skill_data.get("references"):
-                    section += f"\n**References available:** {len(skill_data['references'])} files"
-
-                parts.append(section)
+            content = self.load_skill(name)
+            if content:
+                content = self._strip_frontmatter(content)
+                parts.append(f"### Skill: {name}\n\n{content}")
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
     def build_skills_summary(self) -> str:
-        """
-        Build a summary of all skills (name, description, path, availability).
-
-        This is used for progressive loading - the agent can read the full
-        skill content using read_file when needed.
+        """Build a summary of all skills for agent context.
 
         Returns:
             XML-formatted skills summary.
@@ -362,17 +222,23 @@ class SkillsLoader:
             desc = escape_xml(self._get_skill_description(s["name"]))
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
+            executable = s.get("executable", "false")
 
-            lines.append(f'  <skill available="{str(available).lower()}">')
+            lines.append(f'  <skill available="{str(available).lower()}" executable="{executable}">')
             lines.append(f"    <name>{name}</name>")
             lines.append(f"    <description>{desc}</description>")
             lines.append(f"    <location>{path}</location>")
 
-            # Add scripts/references info
-            if s.get("has_scripts"):
-                lines.append("    <has_scripts>true</has_scripts>")
-            if s.get("has_references"):
-                lines.append("    <has_references>true</has_references>")
+            # List executable scripts
+            if executable == "true":
+                scripts = self.list_executable_scripts(s["name"])
+                if scripts:
+                    lines.append("    <scripts>")
+                    for script in scripts:
+                        script_name = escape_xml(script["name"])
+                        script_desc = escape_xml(script["description"])
+                        lines.append(f'      <script name="{script_name}">{script_desc}</script>')
+                    lines.append("    </scripts>")
 
             # Show missing requirements for unavailable skills
             if not available:
@@ -384,6 +250,271 @@ class SkillsLoader:
         lines.append("</skills>")
 
         return "\n".join(lines)
+
+    def register_executable_scripts(self, skill_name: str) -> list[SkillScript]:
+        """Register all executable scripts from a skill as tools.
+
+        Args:
+            skill_name: Name of the skill.
+
+        Returns:
+            List of registered SkillScript instances.
+        """
+        if self.tool_registry is None:
+            logger.warning("No tool registry provided, cannot register scripts")
+            return []
+
+        meta = self.get_skill_metadata(skill_name)
+        if not meta or not self._is_executable_skill(meta):
+            return []
+
+        skill_path = self._get_skill_path(skill_name)
+        if not skill_path:
+            logger.warning(f"Could not find skill path for: {skill_name}")
+            return []
+
+        scripts = self._get_scripts_from_metadata(meta, skill_name)
+        registered = []
+
+        for script_info in scripts:
+            tool_name = f"{skill_name}.{script_info['name']}"
+
+            # Skip if already registered
+            if tool_name in self._loaded_scripts:
+                continue
+
+            # Resolve entry path
+            entry_path = skill_path / script_info["entry"]
+            if not entry_path.exists():
+                logger.warning(f"Script entry not found: {entry_path}")
+                continue
+
+            # Create SkillScript tool
+            skill_script = SkillScript(
+                name=tool_name,
+                script_name=script_info["name"],
+                description=script_info["description"],
+                entry=entry_path,
+                language=script_info["language"],
+                parameters=script_info.get("parameters", {"type": "object", "properties": {}}),
+                sandbox_config=script_info.get("sandbox"),
+                skill_path=skill_path,
+            )
+
+            # Register with tool registry
+            self.tool_registry.register(skill_script)
+            self._loaded_scripts[tool_name] = skill_script
+            registered.append(skill_script)
+            logger.info(f"Registered skill script: {tool_name}")
+
+        return registered
+
+    def register_all_executable_scripts(self) -> list[SkillScript]:
+        """Register all executable scripts from all available skills.
+        
+        This is called during initialization to make skill scripts available
+        as tools that the agent can invoke.
+        
+        Returns:
+            List of all registered SkillScript instances.
+        """
+        all_registered = []
+        
+        if self.tool_registry is None:
+            logger.debug("No tool registry provided, skipping script registration")
+            return all_registered
+        
+        for skill in self.list_skills(filter_unavailable=True):
+            if skill.get("executable") == "true":
+                try:
+                    scripts = self.register_executable_scripts(skill["name"])
+                    all_registered.extend(scripts)
+                except Exception as e:
+                    logger.warning(f"Failed to register scripts for skill '{skill['name']}': {e}")
+        
+        if all_registered:
+            logger.info(f"Registered {len(all_registered)} skill scripts from {len(set(s.name.split('.')[0] for s in all_registered))} skills")
+        
+        return all_registered
+
+    def scan_script(self, skill_name: str, script_name: str) -> ScanResult:
+        """Scan a script for security issues.
+
+        Args:
+            skill_name: Name of the skill.
+            script_name: Name of the script.
+
+        Returns:
+            ScanResult with findings.
+        """
+        # Find the script
+        scripts = self.list_executable_scripts(skill_name)
+        script_info = None
+
+        for s in scripts:
+            if s["name"] == script_name:
+                script_info = s
+                break
+
+        if not script_info:
+            return ScanResult(
+                is_safe=False,
+                findings=[Finding(
+                    line=0,
+                    pattern="",
+                    severity="critical",
+                    message=f"Script '{script_name}' not found in skill '{skill_name}'",
+                )],
+            )
+
+        skill_path = self._get_skill_path(skill_name)
+        if not skill_path:
+            return ScanResult(
+                is_safe=False,
+                findings=[Finding(
+                    line=0,
+                    pattern="",
+                    severity="critical",
+                    message=f"Skill path not found: {skill_name}",
+                )],
+            )
+
+        entry_path = skill_path / script_info["entry"]
+        return self._scanner.scan(entry_path, script_info["language"])
+
+    def validate_skill(self, skill_name: str) -> list[str]:
+        """Validate a skill's metadata and scripts.
+
+        Args:
+            skill_name: Name of the skill to validate.
+
+        Returns:
+            List of validation errors (empty if valid).
+        """
+        errors = []
+
+        meta = self.get_skill_metadata(skill_name)
+        if not meta:
+            return [f"Skill '{skill_name}' not found"]
+
+        if not self._is_executable_skill(meta):
+            return []  # Not an executable skill, nothing to validate
+
+        skill_path = self._get_skill_path(skill_name)
+        if not skill_path:
+            return [f"Skill path not found: {skill_name}"]
+
+        # Validate scripts
+        scripts = self._get_scripts_from_metadata(meta, skill_name)
+
+        if not scripts:
+            errors.append("No scripts defined in metadata")
+
+        for script in scripts:
+            # Check required fields
+            if not script.get("name"):
+                errors.append("Script missing 'name' field")
+                continue
+
+            if not script.get("entry"):
+                errors.append(f"Script '{script['name']}' missing 'entry' field")
+                continue
+
+            if not script.get("language"):
+                errors.append(f"Script '{script['name']}' missing 'language' field")
+                continue
+
+            # Check entry file exists
+            entry_path = skill_path / script["entry"]
+            if not entry_path.exists():
+                errors.append(f"Script entry not found: {entry_path}")
+
+            # Validate JSON Schema
+            params = script.get("parameters", {})
+            if params and "type" not in params:
+                errors.append(f"Script '{script['name']}' has invalid parameters schema")
+
+        return errors
+
+    def execute_script(
+        self,
+        skill_name: str,
+        script_name: str,
+        args: dict[str, Any],
+    ) -> str:
+        """Execute a skill script with given arguments.
+
+        This is a synchronous wrapper for async execution.
+
+        Args:
+            skill_name: Name of the skill.
+            script_name: Name of the script.
+            args: Arguments to pass to the script.
+
+        Returns:
+            Script output or error message.
+        """
+        import asyncio
+
+        tool_name = f"{skill_name}.{script_name}"
+
+        # Check if already registered
+        if tool_name in self._loaded_scripts:
+            skill_script = self._loaded_scripts[tool_name]
+        else:
+            # Register scripts and find the one we need
+            self.register_executable_scripts(skill_name)
+            skill_script = self._loaded_scripts.get(tool_name)
+
+        if not skill_script:
+            return f"Error: Script '{script_name}' not found in skill '{skill_name}'"
+
+        # Execute
+        try:
+            return asyncio.run(skill_script.execute(**args))
+        except Exception as e:
+            return f"Error: Failed to execute script: {e}"
+
+    def _get_skill_path(self, name: str) -> Path | None:
+        """Get the path to a skill directory."""
+        workspace_skill = self.workspace_skills / name
+        if workspace_skill.exists():
+            return workspace_skill
+
+        if self.builtin_skills:
+            builtin_skill = self.builtin_skills / name
+            if builtin_skill.exists():
+                return builtin_skill
+
+        return None
+
+    def _is_executable_skill(self, meta: dict | None) -> bool:
+        """Check if skill metadata indicates it's executable."""
+        if not meta:
+            return False
+
+        markbot_meta = self._parse_markbot_metadata(meta.get("metadata", ""))
+        return markbot_meta.get("executable", False)
+
+    def _get_scripts_from_metadata(
+        self, meta: dict, skill_name: str
+    ) -> list[dict[str, Any]]:
+        """Extract scripts list from skill metadata."""
+        markbot_meta = self._parse_markbot_metadata(meta.get("metadata", ""))
+        scripts = markbot_meta.get("scripts", [])
+
+        # Convert workspace placeholder in sandbox config
+        skill_path = self._get_skill_path(skill_name)
+        for script in scripts:
+            if "sandbox" in script and skill_path:
+                sandbox_config = script["sandbox"]
+                if "allowed_paths" in sandbox_config:
+                    sandbox_config["allowed_paths"] = [
+                        p.replace("{workspace}", str(self.workspace))
+                        for p in sandbox_config["allowed_paths"]
+                    ]
+
+        return scripts
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""
@@ -402,25 +533,34 @@ class SkillsLoader:
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
             return meta["description"]
-        return name  # Fallback to skill name
+        return name
 
     def _strip_frontmatter(self, content: str) -> str:
         """Remove YAML frontmatter from markdown content."""
         if content.startswith("---"):
             match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
             if match:
-                return content[match.end() :].strip()
+                return content[match.end():].strip()
         return content
 
-    def _parse_skill_metadata(self, raw: str) -> dict:
-        """Parse skill metadata JSON from frontmatter."""
+    def _parse_markbot_metadata(self, raw: str | dict) -> dict:
+        """Parse skill metadata from frontmatter.
+        
+        Handles both JSON string format and nested dictionary format.
+        """
+        # If already a dict, it's from nested YAML
+        if isinstance(raw, dict):
+            return raw.get("markbot", raw.get("openclaw", {}))
+        
+        # Try to parse as JSON string (legacy format)
         try:
-            return json.loads(raw) if raw else {}
+            data = json.loads(raw) if raw else {}
+            return data.get("markbot", data.get("openclaw", {})) if isinstance(data, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
 
     def _check_requirements(self, skill_meta: dict) -> bool:
-        """Check if skill requirements are met (bins, env vars)."""
+        """Check if skill requirements are met."""
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -431,197 +571,258 @@ class SkillsLoader:
         return True
 
     def _get_skill_meta(self, name: str) -> dict:
-        """Get skill metadata from frontmatter."""
+        """Get markbot metadata for a skill."""
         meta = self.get_skill_metadata(name) or {}
-        return self._parse_skill_metadata(meta.get("metadata", ""))
+        return self._parse_markbot_metadata(meta.get("metadata", ""))
 
     def get_always_skills(self) -> list[str]:
         """Get skills marked as always=true that meet requirements."""
         result = []
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
-            if meta.get("always") == "true" or meta.get("always") is True:
+            skill_meta = self._parse_markbot_metadata(meta.get("metadata", ""))
+            if skill_meta.get("always") or meta.get("always"):
                 result.append(s["name"])
         return result
 
     def get_skill_metadata(self, name: str) -> dict | None:
-        """
-        Get metadata from a skill's frontmatter.
-
-        Args:
-            name: Skill name.
-
-        Returns:
-            Metadata dict with standard fields: description, trigger, always, requires.
+        """Get metadata from a skill's frontmatter.
+        
+        Returns a dictionary with both flat key-value pairs and nested structures.
+        For nested YAML like 'metadata:\n  markbot:\n    executable: true',
+        the result will contain both the raw text and parsed structure.
         """
         content = self.load_skill(name)
-        if not content or not content.startswith("---"):
+        if not content:
             return None
 
-        match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-        if not match:
-            return None
+        if content.startswith("---"):
+            match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+            if match:
+                yaml_content = match.group(1)
+                
+                # Use PyYAML if available for proper parsing
+                metadata = _parse_yaml(yaml_content)
+                if metadata and isinstance(metadata, dict):
+                    return metadata
+                # Otherwise fall back to manual parsing
+                
+                # Fallback to manual parser
+                metadata = self._parse_yaml_frontmatter(yaml_content)
+                return metadata
 
+        return None
+    
+    def _parse_yaml_frontmatter(self, yaml_content: str) -> dict:
+        """Parse YAML frontmatter content.
+        
+        Handles:
+        - Simple key: value pairs
+        - Nested structures (metadata: markbot: ...)
+        - Lists (scripts: - name: ...)
+        
+        This is a simplified parser for SKILL.md frontmatter.
+        """
         metadata = {}
-        for line in match.group(1).split("\n"):
-            if ":" not in line:
+        lines = yaml_content.split("\n")
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            
+            # Skip empty lines and comments
+            if not stripped or stripped.startswith("#"):
+                i += 1
                 continue
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip().strip('"\'')
-
-            # Parse requires as JSON if present
-            if key == "requires":
-                metadata[key] = self._parse_skill_metadata(value)
-            else:
-                metadata[key] = value
-
-        return metadata
-
-    # ==================== Security Scanning ====================
-
-    def scan_skill(self, name: str) -> dict[str, Any] | None:
-        """Scan a skill for security issues.
-
-        Args:
-            name: Skill name.
-
-        Returns:
-            Scan result dictionary or None if skill not found or scanner unavailable.
-        """
-        if not self._security_scanner:
-            return None
-
-        skill_dir = self._get_skill_dir(name)
-        if not skill_dir:
-            return None
-
-        result = self._security_scanner.scan_skill(skill_dir.path, name)
-        return {
-            "skill_name": result.skill_name,
-            "is_safe": result.is_safe,
-            "max_severity": result.max_severity.value,
-            "findings_count": len(result.findings),
-            "findings": [
-                {
-                    "severity": f.severity.value,
-                    "category": f.category.value,
-                    "title": f.title,
-                    "description": f.description,
-                    "file_path": f.file_path,
-                    "line_number": f.line_number,
-                    "rule_id": f.rule_id,
-                }
-                for f in result.findings
-            ],
-            "scanned_files": result.scanned_files,
-            "scan_duration_seconds": result.scan_duration_seconds,
-        }
-
-    def is_skill_safe(self, name: str) -> bool:
-        """Quick check if a skill is safe to load.
-
-        Args:
-            name: Skill name.
-
-        Returns:
-            True if safe or scanner unavailable, False if issues found.
-        """
-        if not self._security_scanner:
-            return True
-
-        skill_dir = self._get_skill_dir(name)
-        if not skill_dir:
-            return False
-
-        return self._security_scanner.quick_check(skill_dir.path)
-
-    def install_skill(
-        self,
-        source: str | Path,
-        name: str | None = None,
-        skip_security_check: bool = False,
-    ) -> dict[str, Any]:
-        """Install a skill from a directory or zip file.
-
-        Args:
-            source: Path to skill directory or zip file.
-            name: Optional name for the skill (defaults to directory name).
-            skip_security_check: If True, skip security scanning.
-
-        Returns:
-            Installation result with 'success', 'name', 'path', 'warnings', 'scan_result'.
-        """
-        import shutil
-        import tempfile
-        import zipfile
-
-        source_path = Path(source)
-        result = {
-            "success": False,
-            "name": name or source_path.name,
-            "path": None,
-            "warnings": [],
-            "scan_result": None,
-        }
-
-        # Handle zip files
-        if source_path.suffix == ".zip":
-            temp_dir = tempfile.mkdtemp()
-            try:
-                with zipfile.ZipFile(source_path, "r") as zf:
-                    zf.extractall(temp_dir)
-                # Find skill directory in extracted content
-                skill_dirs = list(Path(temp_dir).glob("*/SKILL.md"))
-                if skill_dirs:
-                    source_path = skill_dirs[0].parent
+            
+            # Check if it's a key-value pair at root level
+            if ":" in line and not line.startswith(" ") and not line.startswith("\t"):
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # If value is empty, it might be a nested structure or list
+                if not value:
+                    # Check what follows
+                    j = i + 1
+                    if j < len(lines):
+                        next_line = lines[j]
+                        # Check if it's a list (starts with -)
+                        if next_line.strip().startswith("-"):
+                            # It's a list
+                            list_items = []
+                            while j < len(lines):
+                                list_line = lines[j]
+                                if not list_line.strip():
+                                    j += 1
+                                    continue
+                                if not list_line.startswith(" ") and not list_line.startswith("\t"):
+                                    break
+                                if list_line.strip().startswith("-"):
+                                    # Extract list item
+                                    item_content = self._extract_list_item(lines, j)
+                                    list_items.append(item_content)
+                                    # Skip consumed lines
+                                    while j < len(lines):
+                                        check_line = lines[j]
+                                        if not check_line.strip():
+                                            j += 1
+                                        elif check_line.startswith(" ") or check_line.startswith("\t"):
+                                            j += 1
+                                        else:
+                                            break
+                                    i = j - 1
+                                else:
+                                    j += 1
+                            metadata[key] = list_items
+                        else:
+                            # Nested structure
+                            nested = {}
+                            while j < len(lines):
+                                next_line = lines[j]
+                                if not next_line.strip():
+                                    j += 1
+                                    continue
+                                if not next_line.startswith(" ") and not next_line.startswith("\t"):
+                                    break
+                                if ":" in next_line:
+                                    nested_content = self._extract_nested_block(lines, j)
+                                    nested.update(nested_content)
+                                    j = self._find_next_line_at_indent(lines, j, 0)
+                                    i = j - 1
+                                else:
+                                    j += 1
+                            metadata[key] = nested
                 else:
-                    result["warnings"].append("No SKILL.md found in zip file")
-                    return result
-            except zipfile.BadZipFile:
-                result["warnings"].append("Invalid zip file")
-                return result
-
-        # Validate source
-        if not source_path.is_dir():
-            result["warnings"].append("Source is not a directory")
-            return result
-
-        skill_md = source_path / "SKILL.md"
-        if not skill_md.exists():
-            result["warnings"].append("SKILL.md not found in source directory")
-            return result
-
-        # Security scan
-        if not skip_security_check and self._security_scanner:
-            scan_result = self._security_scanner.scan_skill(source_path, result["name"])
-            result["scan_result"] = {
-                "is_safe": scan_result.is_safe,
-                "max_severity": scan_result.max_severity.value,
-                "findings_count": len(scan_result.findings),
-            }
-
-            if not scan_result.is_safe:
-                result["warnings"].append(
-                    f"Security scan failed with {scan_result.max_severity.value} severity issues"
-                )
-                return result
-
-        # Install to workspace skills
-        target_name = result["name"]
-        target_path = self.workspace_skills / target_name
-
-        # Ensure workspace skills directory exists
-        self.workspace_skills.mkdir(parents=True, exist_ok=True)
-
-        # Remove existing skill if present
-        if target_path.exists():
-            shutil.rmtree(target_path)
-
-        # Copy skill directory
-        shutil.copytree(source_path, target_path)
-
-        result["success"] = True
-        result["path"] = str(target_path)
-
+                    # Simple key-value
+                    metadata[key] = value.strip('"\'')
+            
+            i += 1
+        
+        return metadata
+    
+    def _extract_list_item(self, lines: list, start: int) -> dict:
+        """Extract a list item (dict) from YAML list."""
+        result = {}
+        i = start
+        base_indent = len(lines[i]) - len(lines[i].lstrip())
+        
+        # Parse the first line (e.g., "- name: value")
+        first_line = lines[i].strip()
+        if first_line.startswith("-"):
+            first_line = first_line[1:].strip()
+        
+        if ":" in first_line:
+            key, value = first_line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value:
+                result[key] = value.strip('"\'')
+        
+        i += 1
+        
+        # Parse subsequent lines at same or greater indent
+        while i < len(lines):
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+            
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= base_indent and line.strip():
+                break
+            
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if not value:
+                    # Nested structure in list item
+                    nested = {}
+                    j = i + 1
+                    while j < len(lines):
+                        sub_line = lines[j]
+                        if not sub_line.strip():
+                            j += 1
+                            continue
+                        sub_indent = len(sub_line) - len(sub_line.lstrip())
+                        if sub_indent <= current_indent and sub_line.strip():
+                            break
+                        if ":" in sub_line:
+                            sub_key, sub_value = sub_line.split(":", 1)
+                            nested[sub_key.strip()] = sub_value.strip().strip('"\'')
+                        j += 1
+                    result[key] = nested
+                    i = j - 1
+                else:
+                    result[key] = value.strip('"\'')
+            
+            i += 1
+        
         return result
+    
+    def _extract_nested_block(self, lines: list, start: int) -> dict:
+        """Extract a nested YAML block."""
+        result = {}
+        i = start
+        base_indent = len(lines[i]) - len(lines[i].lstrip())
+        
+        while i < len(lines):
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+            
+            current_indent = len(line) - len(line.lstrip())
+            
+            if current_indent < base_indent and line.strip():
+                break
+            
+            if current_indent == base_indent and ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if not value:
+                    # Deeper nesting
+                    sub = {}
+                    j = i + 1
+                    while j < len(lines):
+                        sub_line = lines[j]
+                        if not sub_line.strip():
+                            j += 1
+                            continue
+                        
+                        sub_indent = len(sub_line) - len(sub_line.lstrip())
+                        if sub_indent <= current_indent and sub_line.strip():
+                            break
+                        
+                        if sub_indent > current_indent and ":" in sub_line:
+                            sub_key, sub_value = sub_line.split(":", 1)
+                            sub[sub_key.strip()] = sub_value.strip().strip('"\'')
+                        j += 1
+                    
+                    result[key] = sub
+                    i = j - 1
+                else:
+                    result[key] = value.strip('"\'')
+            
+            i += 1
+        
+        return result
+    
+    def _find_next_line_at_indent(self, lines: list, start: int, target_indent: int) -> int:
+        """Find the index of next line at or before target indent level."""
+        i = start
+        while i < len(lines):
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= target_indent:
+                return i
+            i += 1
+        return len(lines)

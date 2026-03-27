@@ -1,7 +1,8 @@
 [project]
-name = "markbot-ai"
-version = "1.9.1"
+name = "markbot"
+version = "2.1.0"
 description = "A lightweight personal AI assistant framework"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
@@ -18,12 +19,13 @@ classifiers = [
 
 dependencies = [
     "typer>=0.20.0,<1.0.0",
-    "litellm>=1.81.5,<2.0.0",
+    "anthropic>=0.45.0,<1.0.0",
     "pydantic>=2.12.0,<3.0.0",
     "pydantic-settings>=2.12.0,<3.0.0",
     "websockets>=16.0,<17.0",
     "websocket-client>=1.9.0,<2.0.0",
     "httpx>=0.28.0,<1.0.0",
+    "ddgs>=9.5.5,<10.0.0",
     "oauth-cli-kit>=0.1.3,<1.0.0",
     "loguru>=0.7.3,<1.0.0",
     "readability-lxml>=0.8.4,<1.0.0",
@@ -37,19 +39,26 @@ dependencies = [
     "qq-botpy>=1.2.0,<2.0.0",
     "python-socks[asyncio]>=2.8.0,<3.0.0",
     "prompt-toolkit>=3.0.50,<4.0.0",
+    "questionary>=2.0.0,<3.0.0",
     "mcp>=1.26.0,<2.0.0",
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
-    "markdownify>=0.11.0,<1.0.0",
-    "tenacity>=8.0.0,<9.0.0",
-    "aiohttp>=3.9.0,<4.0.0",
+    "tiktoken>=0.12.0,<1.0.0",
 ]
 
 [project.optional-dependencies]
+weixin = [
+    "qrcode[pil]>=8.0",
+    "pycryptodome>=3.20.0",
+]
+langsmith = [
+    "langsmith>=0.1.0",
+]
 dev = [
     "pytest>=9.0.0,<10.0.0",
     "pytest-asyncio>=1.3.0,<2.0.0",
+    "pytest-cov>=6.0.0,<7.0.0",
     "ruff>=0.1.0",
 ]
 
@@ -60,21 +69,24 @@ markbot = "markbot.cli.commands:app"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["markbot"]
+[tool.hatch.metadata]
+allow-direct-references = true
 
-[tool.hatch.build.targets.wheel.sources]
-"markbot" = "markbot"
-
-# Include non-Python files in skills and templates
 [tool.hatch.build]
 include = [
     "markbot/**/*.py",
     "markbot/templates/**/*.md",
     "markbot/skills/**/*.md",
     "markbot/skills/**/*.sh",
-    "markbot/web/static/**/*",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["markbot"]
+
+[tool.hatch.build.targets.wheel.sources]
+"markbot" = "markbot"
+
+[tool.hatch.build.targets.wheel.force-include]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -94,3 +106,16 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["markbot"]
+omit = ["tests/*", "**/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

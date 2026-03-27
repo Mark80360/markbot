@@ -3,40 +3,34 @@
 Skill Packager - Creates a distributable .skill file of a skill folder
 
 Usage:
-    python utils/package_skill.py <path/to/skill-folder> [output-directory]
+    python package_skill.py <path/to/skill-folder> [output-directory]
 
 Example:
-    python utils/package_skill.py skills/public/my-skill
-    python utils/package_skill.py skills/public/my-skill ./dist
+    python package_skill.py skills/public/my-skill
+    python package_skill.py skills/public/my-skill ./dist
 """
 
-import fnmatch
 import sys
 import zipfile
 from pathlib import Path
-from scripts.quick_validate import validate_skill
 
-# Patterns to exclude when packaging skills.
-EXCLUDE_DIRS = {"__pycache__", "node_modules"}
-EXCLUDE_GLOBS = {"*.pyc"}
-EXCLUDE_FILES = {".DS_Store"}
-# Directories excluded only at the skill root (not when nested deeper).
-ROOT_EXCLUDE_DIRS = {"evals"}
+from quick_validate import validate_skill
 
 
-def should_exclude(rel_path: Path) -> bool:
-    """Check if a path should be excluded from packaging."""
-    parts = rel_path.parts
-    if any(part in EXCLUDE_DIRS for part in parts):
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
         return True
-    # rel_path is relative to skill_path.parent, so parts[0] is the skill
-    # folder name and parts[1] (if present) is the first subdir.
-    if len(parts) > 1 and parts[1] in ROOT_EXCLUDE_DIRS:
-        return True
-    name = rel_path.name
-    if name in EXCLUDE_FILES:
-        return True
-    return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_GLOBS)
+    except ValueError:
+        return False
+
+
+def _cleanup_partial_archive(skill_filename: Path) -> None:
+    try:
+        if skill_filename.exists():
+            skill_filename.unlink()
+    except OSError:
+        pass
 
 
 def package_skill(skill_path, output_dir=None):
@@ -54,27 +48,27 @@ def package_skill(skill_path, output_dir=None):
 
     # Validate skill folder exists
     if not skill_path.exists():
-        print(f"❌ Error: Skill folder not found: {skill_path}")
+        print(f"[ERROR] Skill folder not found: {skill_path}")
         return None
 
     if not skill_path.is_dir():
-        print(f"❌ Error: Path is not a directory: {skill_path}")
+        print(f"[ERROR] Path is not a directory: {skill_path}")
         return None
 
     # Validate SKILL.md exists
     skill_md = skill_path / "SKILL.md"
     if not skill_md.exists():
-        print(f"❌ Error: SKILL.md not found in {skill_path}")
+        print(f"[ERROR] SKILL.md not found in {skill_path}")
         return None
 
     # Run validation before packaging
-    print("🔍 Validating skill...")
+    print("Validating skill...")
     valid, message = validate_skill(skill_path)
     if not valid:
-        print(f"❌ Validation failed: {message}")
+        print(f"[ERROR] Validation failed: {message}")
         print("   Please fix the validation errors before packaging.")
         return None
-    print(f"✅ {message}\n")
+    print(f"[OK] {message}\n")
 
     # Determine output location
     skill_name = skill_path.name
@@ -86,40 +80,64 @@ def package_skill(skill_path, output_dir=None):
 
     skill_filename = output_path / f"{skill_name}.skill"
 
+    EXCLUDED_DIRS = {".git", ".svn", ".hg", "__pycache__", "node_modules"}
+
+    files_to_package = []
+    resolved_archive = skill_filename.resolve()
+
+    for file_path in skill_path.rglob("*"):
+        # Fail closed on symlinks so the packaged contents are explicit and predictable.
+        if file_path.is_symlink():
+            print(f"[ERROR] Symlink not allowed in packaged skill: {file_path}")
+            _cleanup_partial_archive(skill_filename)
+            return None
+
+        rel_parts = file_path.relative_to(skill_path).parts
+        if any(part in EXCLUDED_DIRS for part in rel_parts):
+            continue
+
+        if file_path.is_file():
+            resolved_file = file_path.resolve()
+            if not _is_within(resolved_file, skill_path):
+                print(f"[ERROR] File escapes skill root: {file_path}")
+                _cleanup_partial_archive(skill_filename)
+                return None
+            # If output lives under skill_path, avoid writing archive into itself.
+            if resolved_file == resolved_archive:
+                print(f"[WARN] Skipping output archive: {file_path}")
+                continue
+            files_to_package.append(file_path)
+
     # Create the .skill file (zip format)
     try:
-        with zipfile.ZipFile(skill_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Walk through the skill directory, excluding build artifacts
-            for file_path in skill_path.rglob('*'):
-                if not file_path.is_file():
-                    continue
-                arcname = file_path.relative_to(skill_path.parent)
-                if should_exclude(arcname):
-                    print(f"  Skipped: {arcname}")
-                    continue
+        with zipfile.ZipFile(skill_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in files_to_package:
+                # Calculate the relative path within the zip.
+                arcname = Path(skill_name) / file_path.relative_to(skill_path)
                 zipf.write(file_path, arcname)
                 print(f"  Added: {arcname}")
 
-        print(f"\n✅ Successfully packaged skill to: {skill_filename}")
+        print(f"\n[OK] Successfully packaged skill to: {skill_filename}")
         return skill_filename
 
     except Exception as e:
-        print(f"❌ Error creating .skill file: {e}")
+        _cleanup_partial_archive(skill_filename)
+        print(f"[ERROR] Error creating .skill file: {e}")
         return None
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python utils/package_skill.py <path/to/skill-folder> [output-directory]")
+        print("Usage: python package_skill.py <path/to/skill-folder> [output-directory]")
         print("\nExample:")
-        print("  python utils/package_skill.py skills/public/my-skill")
-        print("  python utils/package_skill.py skills/public/my-skill ./dist")
+        print("  python package_skill.py skills/public/my-skill")
+        print("  python package_skill.py skills/public/my-skill ./dist")
         sys.exit(1)
 
     skill_path = sys.argv[1]
     output_dir = sys.argv[2] if len(sys.argv) > 2 else None
 
-    print(f"📦 Packaging skill: {skill_path}")
+    print(f"Packaging skill: {skill_path}")
     if output_dir:
         print(f"   Output directory: {output_dir}")
     print()

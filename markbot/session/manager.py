@@ -11,7 +11,6 @@ from loguru import logger
 
 from markbot.config.paths import get_legacy_sessions_dir
 from markbot.utils.helpers import ensure_dir, safe_filename
-from markbot.utils.sanitize import _sanitize_tool_calls
 
 
 @dataclass
@@ -22,7 +21,7 @@ class Session:
     Stores messages in JSONL format for easy reading and persistence.
 
     Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
+    The tiered memory system (Hot/Warm/Cold) handles long-term storage
     but does NOT modify the messages list or get_history() output.
     """
 
@@ -35,75 +34,94 @@ class Session:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
-        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
+        msg = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            **kwargs
+        }
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    @staticmethod
+    def _find_legal_start(messages: list[dict[str, Any]]) -> int:
+        """Find first index where every tool result has a matching assistant tool_call."""
+        declared: set[str] = set()
+        start = 0
+        for i, msg in enumerate(messages):
+            role = msg.get("role")
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        declared.add(str(tc["id"]))
+            elif role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and str(tid) not in declared:
+                    start = i + 1
+                    declared.clear()
+                    for prev in messages[start:i + 1]:
+                        if prev.get("role") == "assistant":
+                            for tc in prev.get("tool_calls") or []:
+                                if isinstance(tc, dict) and tc.get("id"):
+                                    declared.add(str(tc["id"]))
+        return start
+
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a user turn."""
-        unconsolidated = self.messages[self.last_consolidated :]
+        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
+        unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
-        # Drop leading non-user messages to avoid orphaned tool_result blocks
-        for i, m in enumerate(sliced):
-            if m.get("role") == "user":
+        # Drop leading non-user messages to avoid starting mid-turn when possible.
+        for i, message in enumerate(sliced):
+            if message.get("role") == "user":
                 sliced = sliced[i:]
                 break
 
-        # First pass: sanitize tool_calls and collect valid tool_call_ids
-        valid_tool_call_ids: set[str] = set()
-        sanitized_entries: list[dict[str, Any]] = []
+        # Some providers reject orphan tool results if the matching assistant
+        # tool_calls message fell outside the fixed-size history window.
+        start = self._find_legal_start(sliced)
+        if start:
+            sliced = sliced[start:]
 
-        for m in sliced:
-            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
-            for k in ("tool_calls", "tool_call_id", "name"):
-                if k in m:
-                    entry[k] = m[k]
-
-            # Validate and sanitize tool_calls
-            if "tool_calls" in entry:
-                sanitized_tc = _sanitize_tool_calls(entry["tool_calls"])
-                if sanitized_tc:
-                    entry["tool_calls"] = sanitized_tc
-                    # Collect valid tool_call_ids from this assistant message
-                    for tc in sanitized_tc:
-                        tc_id = tc.get("id")
-                        if tc_id:
-                            valid_tool_call_ids.add(tc_id)
-                else:
-                    # All tool_calls were invalid, remove the field entirely
-                    entry.pop("tool_calls", None)
-
-            sanitized_entries.append(entry)
-
-        # Second pass: remove orphaned tool messages without valid tool_call_ids
         out: list[dict[str, Any]] = []
-        for entry in sanitized_entries:
-            if entry.get("role") == "tool":
-                tc_id = entry.get("tool_call_id")
-                if tc_id and tc_id in valid_tool_call_ids:
-                    out.append(entry)
-                else:
-                    logger.warning(
-                        "Dropping orphaned tool message with tool_call_id '{}'",
-                        tc_id,
-                    )
-            else:
-                # For assistant messages, update valid_tool_call_ids
-                if entry.get("role") == "assistant" and entry.get("tool_calls"):
-                    valid_tool_call_ids = set()
-                    for tc in entry["tool_calls"]:
-                        tc_id = tc.get("id")
-                        if tc_id:
-                            valid_tool_call_ids.add(tc_id)
-                out.append(entry)
-
+        for message in sliced:
+            entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
+            for key in ("tool_calls", "tool_call_id", "name"):
+                if key in message:
+                    entry[key] = message[key]
+            out.append(entry)
         return out
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self.updated_at = datetime.now()
+
+    def retain_recent_legal_suffix(self, max_messages: int) -> None:
+        """Keep a legal recent suffix, mirroring get_history boundary rules."""
+        if max_messages <= 0:
+            self.clear()
+            return
+        if len(self.messages) <= max_messages:
+            return
+
+        start_idx = max(0, len(self.messages) - max_messages)
+
+        # If the cutoff lands mid-turn, extend backward to the nearest user turn.
+        while start_idx > 0 and self.messages[start_idx].get("role") != "user":
+            start_idx -= 1
+
+        retained = self.messages[start_idx:]
+
+        # Mirror get_history(): avoid persisting orphan tool results at the front.
+        start = self._find_legal_start(retained)
+        if start:
+            retained = retained[start:]
+
+        dropped = len(self.messages) - len(retained)
+        self.messages = retained
+        self.last_consolidated = max(0, self.last_consolidated - dropped)
         self.updated_at = datetime.now()
 
 
@@ -181,11 +199,7 @@ class SessionManager:
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
-                        created_at = (
-                            datetime.fromisoformat(data["created_at"])
-                            if data.get("created_at")
-                            else None
-                        )
+                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -195,7 +209,7 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated,
+                last_consolidated=last_consolidated
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -212,7 +226,7 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated,
+                "last_consolidated": session.last_consolidated
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
@@ -242,14 +256,12 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append(
-                                {
-                                    "key": key,
-                                    "created_at": data.get("created_at"),
-                                    "updated_at": data.get("updated_at"),
-                                    "path": str(path),
-                                }
-                            )
+                            sessions.append({
+                                "key": key,
+                                "created_at": data.get("created_at"),
+                                "updated_at": data.get("updated_at"),
+                                "path": str(path)
+                            })
             except Exception:
                 continue
 

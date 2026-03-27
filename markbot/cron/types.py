@@ -25,8 +25,16 @@ class CronPayload:
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
-    channel: str | None = None  # e.g. "dingtalk", "feishu", "email"
-    to: str | None = None  # e.g. phone number, email address
+    to: str | None = None  # e.g. phone number
+
+
+@dataclass
+class CronRunRecord:
+    """A single execution record for a cron job."""
+    run_at_ms: int
+    status: Literal["ok", "error", "skipped"]
+    duration_ms: int = 0
+    error: str | None = None
 
 
 @dataclass
@@ -36,6 +44,7 @@ class CronJobState:
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
     last_error: str | None = None
+    run_history: list[CronRunRecord] = field(default_factory=list)
 
 
 @dataclass

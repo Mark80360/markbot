@@ -84,12 +84,10 @@ class AskUserQuestionTool(Tool):
             "required": ["question", "options"]
         }
 
-    async def execute(
-        self,
-        question: str,
-        options: list[dict[str, str]],
-        **kwargs: Any
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        question = kwargs.get("question", "")
+        options = kwargs.get("options", [])
+        
         if not self._send_callback:
             return "Error: Message sending not configured"
 
@@ -109,7 +107,7 @@ class AskUserQuestionTool(Tool):
         question_id = str(uuid.uuid4())
 
         # Format message based on channel capabilities
-        content = self._format_question(question, options, channel)
+        content = self._format_question(question, options)
 
         # Send question
         msg = OutboundMessage(
@@ -150,7 +148,7 @@ class AskUserQuestionTool(Tool):
                 self._pending_questions.pop(question_id, None)
                 return f"Error waiting for response: {str(e)}"
 
-    def _format_question(self, question: str, options: list[dict[str, str]], channel: str) -> str:
+    def _format_question(self, question: str, options: list[dict[str, str]]) -> str:
         """Format question based on channel capabilities."""
 
         # For channels with interactive capabilities (feishu, dingtalk)

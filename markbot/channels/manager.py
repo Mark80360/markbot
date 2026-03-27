@@ -12,13 +12,18 @@ from markbot.bus.queue import MessageBus
 from markbot.channels.base import BaseChannel
 from markbot.config.schema import Config
 
+# Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
+_SEND_RETRY_DELAYS = (1, 2, 4)
+
+# Health check interval in seconds
+_HEALTH_CHECK_INTERVAL_S = 60
+
 
 class ChannelManager:
     """
     Manages chat channels and coordinates message routing.
 
     Responsibilities:
-    - Initialize enabled channels (DingTalk, Feishu, Email, etc.)
     - Start/stop channels
     - Route outbound messages
     """
@@ -28,53 +33,42 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._health_check_task: asyncio.Task | None = None
 
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
+        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+        from markbot.channels.registry import discover_all
 
-        # Feishu channel
-        if self.config.channels.feishu.enabled:
-            try:
-                from markbot.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
-                )
-                logger.info("Feishu channel enabled")
-            except ImportError as e:
-                logger.warning("Feishu channel not available: {}", e)
+        groq_key = self.config.providers.groq.api_key
 
-        # DingTalk channel
-        if self.config.channels.dingtalk.enabled:
+        for name, cls in discover_all().items():
+            section = getattr(self.config.channels, name, None)
+            if section is None:
+                continue
+            enabled = (
+                section.get("enabled", False)
+                if isinstance(section, dict)
+                else getattr(section, "enabled", False)
+            )
+            if not enabled:
+                continue
             try:
-                from markbot.channels.dingtalk import DingTalkChannel
-                self.channels["dingtalk"] = DingTalkChannel(
-                    self.config.channels.dingtalk, self.bus
-                )
-                logger.info("DingTalk channel enabled")
-            except ImportError as e:
-                logger.warning("DingTalk channel not available: {}", e)
-
-        # Email channel
-        if self.config.channels.email.enabled:
-            try:
-                from markbot.channels.email import EmailChannel
-                self.channels["email"] = EmailChannel(
-                    self.config.channels.email, self.bus
-                )
-                logger.info("Email channel enabled")
-            except ImportError as e:
-                logger.warning("Email channel not available: {}", e)
+                channel = cls(section, self.bus)
+                channel.transcription_api_key = groq_key
+                self.channels[name] = channel
+                logger.info("{} channel enabled", cls.display_name)
+            except Exception as e:
+                logger.warning("{} channel not available: {}", name, e)
 
         self._validate_allow_from()
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
             if getattr(ch.config, "allow_from", None) == []:
-                logger.warning(
-                    f'"{name}" has empty allowFrom (denies all). '
+                raise SystemExit(
+                    f'Error: "{name}" has empty allowFrom (denies all). '
                     f'Set ["*"] to allow everyone, or add specific user IDs.'
                 )
 
@@ -94,6 +88,9 @@ class ChannelManager:
         # Start outbound dispatcher
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
 
+        # Start health check loop
+        self._health_check_task = asyncio.create_task(self._health_check_loop())
+
         # Start channels
         tasks = []
         for name, channel in self.channels.items():
@@ -112,6 +109,14 @@ class ChannelManager:
             self._dispatch_task.cancel()
             try:
                 await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop health check loop
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
             except asyncio.CancelledError:
                 pass
 
@@ -142,10 +147,7 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
-                    try:
-                        await channel.send(msg)
-                    except Exception as e:
-                        logger.error("Error sending to {}: {}", msg.channel, e)
+                    await self._send_with_retry(channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
 
@@ -153,6 +155,44 @@ class ChannelManager:
                 continue
             except asyncio.CancelledError:
                 break
+
+    @staticmethod
+    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
+        """Send one outbound message without retry policy."""
+        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+        elif not msg.metadata.get("_streamed"):
+            await channel.send(msg)
+
+    async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
+        """Send a message with retry on failure using exponential backoff.
+
+        Note: CancelledError is re-raised to allow graceful shutdown.
+        """
+        max_attempts = max(self.config.channels.send_max_retries, 1)
+
+        for attempt in range(max_attempts):
+            try:
+                await self._send_once(channel, msg)
+                return  # Send succeeded
+            except asyncio.CancelledError:
+                raise  # Propagate cancellation for graceful shutdown
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    logger.error(
+                        "Failed to send to {} after {} attempts: {} - {}",
+                        msg.channel, max_attempts, type(e).__name__, e
+                    )
+                    return
+                delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
+                    msg.channel, attempt + 1, max_attempts, type(e).__name__, delay
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation during sleep
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
@@ -172,3 +212,29 @@ class ChannelManager:
     def enabled_channels(self) -> list[str]:
         """Get list of enabled channel names."""
         return list(self.channels.keys())
+
+    async def _health_check_loop(self) -> None:
+        """Periodically check health of all channels."""
+        await asyncio.sleep(10)  # Wait 10s for channels to start
+
+        while True:
+            try:
+                for name, channel in self.channels.items():
+                    try:
+                        result = await channel.health_check()
+                        if not result.get("healthy", False):
+                            logger.warning(
+                                "Health check failed for {}: {}",
+                                name, result.get("error", "Unknown error")
+                            )
+                        else:
+                            logger.debug("Health check passed for {}", name)
+                    except Exception as e:
+                        logger.error("Health check error for {}: {}", name, e)
+
+                await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Health check loop error: {}", e)
+                await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)

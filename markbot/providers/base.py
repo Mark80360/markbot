@@ -3,6 +3,7 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,10 +13,10 @@ from loguru import logger
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""
-
     id: str
     name: str
     arguments: dict[str, Any]
+    extra_content: dict[str, Any] | None = None
     provider_specific_fields: dict[str, Any] | None = None
     function_provider_specific_fields: dict[str, Any] | None = None
 
@@ -29,26 +30,25 @@ class ToolCallRequest:
                 "arguments": json.dumps(self.arguments, ensure_ascii=False),
             },
         }
+        if self.extra_content:
+            tool_call["extra_content"] = self.extra_content
         if self.provider_specific_fields:
             tool_call["provider_specific_fields"] = self.provider_specific_fields
         if self.function_provider_specific_fields:
-            tool_call["function"]["provider_specific_fields"] = (
-                self.function_provider_specific_fields
-            )
+            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
         return tool_call
 
 
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
-
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-
+    
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -73,13 +73,12 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-
+    
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _CHAT_TIMEOUT = 120.0  # seconds
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -94,14 +93,6 @@ class LLMProvider(ABC):
         "server error",
         "temporarily unavailable",
     )
-    _IMAGE_UNSUPPORTED_MARKERS = (
-        "image_url is only supported",
-        "does not support image",
-        "images are not supported",
-        "image input is not supported",
-        "image_url is not supported",
-        "unsupported image input",
-    )
 
     _SENTINEL = object()
 
@@ -112,53 +103,37 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace empty text content that causes provider 400 errors.
-
-        Empty content can appear when MCP tools return nothing. Most providers
-        reject empty-string content or empty text blocks in list content.
-        Also converts tool_calls arguments from dict to JSON string.
-        """
+        """Sanitize message content: fix empty blocks, strip internal _meta fields."""
         result: list[dict[str, Any]] = []
         for msg in messages:
-            msg = dict(msg)
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if isinstance(tc, dict):
-                        func = tc.get("function", {})
-                        if isinstance(func, dict) and "arguments" in func:
-                            args = func["arguments"]
-                            if isinstance(args, dict):
-                                func["arguments"] = json.dumps(args, ensure_ascii=False)
-                            elif not isinstance(args, str):
-                                func["arguments"] = (
-                                    json.dumps(args, ensure_ascii=False) if args else "{}"
-                                )
             content = msg.get("content")
 
             if isinstance(content, str) and not content:
                 clean = dict(msg)
-                clean["content"] = (
-                    None
-                    if (msg.get("role") == "assistant" and msg.get("tool_calls"))
-                    else "(empty)"
-                )
+                clean["content"] = None if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
                 result.append(clean)
                 continue
 
             if isinstance(content, list):
-                filtered = [
-                    item
-                    for item in content
-                    if not (
+                new_items: list[Any] = []
+                changed = False
+                for item in content:
+                    if (
                         isinstance(item, dict)
                         and item.get("type") in ("text", "input_text", "output_text")
                         and not item.get("text")
-                    )
-                ]
-                if len(filtered) != len(content):
+                    ):
+                        changed = True
+                        continue
+                    if isinstance(item, dict) and "_meta" in item:
+                        new_items.append({k: v for k, v in item.items() if k != "_meta"})
+                        changed = True
+                    else:
+                        new_items.append(item)
+                if changed:
                     clean = dict(msg)
-                    if filtered:
-                        clean["content"] = filtered
+                    if new_items:
+                        clean["content"] = new_items
                     elif msg.get("role") == "assistant" and msg.get("tool_calls"):
                         clean["content"] = None
                     else:
@@ -202,7 +177,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-
+        
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -210,7 +185,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-
+        
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -220,11 +195,6 @@ class LLMProvider(ABC):
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
-
-    @classmethod
-    def _is_image_unsupported_error(cls, content: str | None) -> bool:
-        err = (content or "").lower()
-        return any(marker in err for marker in cls._IMAGE_UNSUPPORTED_MARKERS)
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
@@ -237,7 +207,9 @@ class LLMProvider(ABC):
                 new_content = []
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "image_url":
-                        new_content.append({"type": "text", "text": "[image omitted]"})
+                        path = (b.get("_meta") or {}).get("path", "")
+                        placeholder = f"[image: {path}]" if path else "[image omitted]"
+                        new_content.append({"type": "text", "text": placeholder})
                         found = True
                     else:
                         new_content.append(b)
@@ -246,7 +218,16 @@ class LLMProvider(ABC):
                 result.append(msg)
         return result if found else None
 
-    async def chat_with_retry(
+    async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
+        """Call chat() and convert unexpected exceptions to error responses."""
+        try:
+            return await self.chat(**kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+
+    async def chat_stream(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
@@ -254,70 +235,132 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
-        timeout: float | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Call chat() with retry on transient provider failures.
+        """Stream a chat completion, calling *on_content_delta* for each text chunk.
 
-        Args:
-            timeout: Optional timeout in seconds. Defaults to _CHAT_TIMEOUT (120s).
+        Returns the same ``LLMResponse`` as :meth:`chat`.  The default
+        implementation falls back to a non-streaming call and delivers the
+        full content as a single delta.  Providers that support native
+        streaming should override this method.
         """
-        effective_timeout = timeout if timeout is not None else self._CHAT_TIMEOUT
+        response = await self.chat(
+            messages=messages, tools=tools, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+        )
+        if on_content_delta and response.content:
+            await on_content_delta(response.content)
+        return response
 
-        async def _call_chat() -> LLMResponse:
-            return await self.chat(
-                messages=messages,
-                tools=tools,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-            )
+    async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
+        """Call chat_stream() and convert unexpected exceptions to error responses."""
+        try:
+            return await self.chat_stream(**kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+
+    async def chat_stream_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: object = _SENTINEL,
+        temperature: object = _SENTINEL,
+        reasoning_effort: object = _SENTINEL,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Call chat_stream() with retry on transient provider failures."""
+        if max_tokens is self._SENTINEL:
+            max_tokens = self.generation.max_tokens
+        if temperature is self._SENTINEL:
+            temperature = self.generation.temperature
+        if reasoning_effort is self._SENTINEL:
+            reasoning_effort = self.generation.reasoning_effort
+
+        kw: dict[str, Any] = dict(
+            messages=messages, tools=tools, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            on_content_delta=on_content_delta,
+        )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
-            try:
-                response = await asyncio.wait_for(_call_chat(), timeout=effective_timeout)
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                response = LLMResponse(
-                    content=f"LLM request timed out after {effective_timeout}s",
-                    finish_reason="error",
-                )
-            except Exception as exc:
-                response = LLMResponse(
-                    content=f"Error calling LLM: {exc}",
-                    finish_reason="error",
-                )
+            response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
                 return response
+
             if not self._is_transient_error(response.content):
+                stripped = self._strip_image_content(messages)
+                if stripped is not None:
+                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
-            err = (response.content or "").lower()
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt,
-                len(self._CHAT_RETRY_DELAYS),
-                delay,
-                err[:120],
+                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                (response.content or "")[:120].lower(),
             )
             await asyncio.sleep(delay)
 
-        try:
-            return await asyncio.wait_for(_call_chat(), timeout=effective_timeout)
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            return LLMResponse(
-                content=f"LLM request timed out after {effective_timeout}s",
-                finish_reason="error",
+        return await self._safe_chat_stream(**kw)
+
+    async def chat_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: object = _SENTINEL,
+        temperature: object = _SENTINEL,
+        reasoning_effort: object = _SENTINEL,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        """Call chat() with retry on transient provider failures.
+
+        Parameters default to ``self.generation`` when not explicitly passed,
+        so callers no longer need to thread temperature / max_tokens /
+        reasoning_effort through every layer.
+        """
+        if max_tokens is self._SENTINEL:
+            max_tokens = self.generation.max_tokens
+        if temperature is self._SENTINEL:
+            temperature = self.generation.temperature
+        if reasoning_effort is self._SENTINEL:
+            reasoning_effort = self.generation.reasoning_effort
+
+        kw: dict[str, Any] = dict(
+            messages=messages, tools=tools, model=model,
+            max_tokens=max_tokens, temperature=temperature,
+            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+        )
+
+        for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            response = await self._safe_chat(**kw)
+
+            if response.finish_reason != "error":
+                return response
+
+            if not self._is_transient_error(response.content):
+                stripped = self._strip_image_content(messages)
+                if stripped is not None:
+                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    return await self._safe_chat(**{**kw, "messages": stripped})
+                return response
+
+            logger.warning(
+                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
+                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                (response.content or "")[:120].lower(),
             )
-        except Exception as exc:
-            return LLMResponse(
-                content=f"Error calling LLM: {exc}",
-                finish_reason="error",
-            )
+            await asyncio.sleep(delay)
+
+        return await self._safe_chat(**kw)
 
     @abstractmethod
     def get_default_model(self) -> str:
