@@ -6,22 +6,55 @@ An advanced AI-powered automation and development assistant designed for develop
 
 - **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
 - **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
-- **Multi-Modal Integration**: Seamlessly interact with various platforms and services through a unified interface
+- **Tiered Memory System**: Multi-layered memory architecture (Hot/Warm/Cold) for context-aware responses
 - **Extensible Architecture**: Customize and extend capabilities through a powerful skills system
 
 ## Features
 
-- **Multiple LLM Providers**: OpenAI, Azure OpenAI, Anthropic, DeepSeek, Groq, and 15+ providers
-- **Multi-channel Support**: DingTalk, Feishu, Email, and more
-- **Advanced Agent Framework**: Sophisticated agent loop with tools, memory, and sub-agent delegation
+- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Groq, and more
+- **Multi-Channel Support**: DingTalk, Feishu, Discord, QQ, WeChat, Email, and more
+- **Tiered Memory Architecture**: Hot (working), Warm (session), Cold (persistent) memory layers
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
-- **Heartbeat Service**: Maintain persistent connections and real-time monitoring
 - **MCP Support**: Model Context Protocol for seamless tool integration
-- **Structured Memory System**: LLM-powered memory extraction with deduplication
 - **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents
 - **Web Integration**: Built-in web browsing, content extraction, and API interaction
-- **Code Analysis**: Deep codebase understanding and intelligent code navigation
+- **Command Router**: Built-in commands like `/new`, `/help`, `/stop`
+- **Skill Execution**: Run skill scripts in sandboxed environments
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Channels                               │
+│  (DingTalk, Feishu, Discord, QQ, WeChat, Email, etc.)     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Agent Loop                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │   Context   │  │   Memory    │  │      Tools         │ │
+│  │   Builder   │  │   Manager   │  │   (Filesystem,     │ │
+│  │             │  │             │  │    Shell, Web,     │ │
+│  │             │  │             │  │    Spawn, etc.)    │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              Tiered Memory System                    │   │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────────────┐    │   │
+│  │  │   Hot   │→│  Warm   │→│      Cold       │    │   │
+│  │  │(Working) │  │(Session)│  │   (Persistent)  │    │   │
+│  │  └─────────┘  └─────────┘  └─────────────────┘    │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Providers                               │
+│        (Anthropic, OpenAI, Azure, DeepSeek, etc.)          │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ## Installation
 
@@ -29,12 +62,6 @@ An advanced AI-powered automation and development assistant designed for develop
 
 - Python 3.11 or higher
 - pip package manager
-
-### Install from PyPI
-
-```bash
-pip install markbot-ai
-```
 
 ### Install from Source
 
@@ -47,398 +74,194 @@ pip install -e .
 ### Development Installation
 
 ```bash
-pip install markbot-ai[dev]
+pip install -e ".[dev]"
 ```
-
-This installs additional development dependencies including pytest and ruff.
 
 ## Quick Start
 
 ### Step 1: Initialize Configuration
 
-Run the onboard command to create the default configuration and workspace:
-
 ```bash
 markbot onboard
 ```
 
-This creates:
-- Configuration file at `~/.markbot/config.json`
-- Workspace directory at `~/.markbot/workspace`
-- Template files for agent prompts and memory
-
 ### Step 2: Configure Your Provider
 
-Edit the configuration file to set up your LLM provider:
-
-```bash
-markbot config set providers.openai.apiKey your-api-key
-```
-
-Or edit `~/.markbot/config.json` directly:
+Edit `~/.markbot/config.json`:
 
 ```json
 {
   "providers": {
-    "openai": {
-      "apiKey": "your-api-key"
+    "anthropic": {
+      "apiKey": "sk-ant-..."
     }
   }
 }
 ```
 
-### Step 3: Interactive Chat
-
-Start an interactive chat session:
+### Step 3: Start Chatting
 
 ```bash
 markbot agent
 ```
 
-### Step 4: Send a Message (Non-interactive)
-
-Send a single message without entering interactive mode:
+Or send a single message:
 
 ```bash
 markbot agent -m "Hello!"
 ```
 
-### Step 5: Start Gateway Server
-
-Start the gateway service to enable multi-channel support:
+### Step 4: Start Gateway Server
 
 ```bash
 markbot gateway start
 ```
 
-Custom options:
-
-```bash
-markbot gateway start --port 8080  # Custom port
-markbot gateway start -v           # Verbose output
-```
-
-**Windows:** Use `--foreground` to run in the foreground:
-
-```bash
-markbot gateway start --foreground
-```
-
-## Commands Reference
+## Commands
 
 ### Gateway Management
 
-Manage the MarkBot gateway service:
-
 ```bash
-markbot gateway start    # Start the gateway service
-markbot gateway status   # Check gateway status
-markbot gateway stop     # Stop the gateway service
-markbot gateway restart  # Restart the gateway service
+markbot gateway start    # Start the gateway
+markbot gateway status   # Check status
+markbot gateway stop     # Stop the gateway
+markbot gateway restart  # Restart
 ```
 
-**Options for `gateway start`:**
-- `--port, -p`: Set the gateway port (default: 18790)
-- `--workspace, -w`: Specify workspace directory
-- `--config, -c`: Specify config file path
-- `--verbose, -v`: Enable verbose output
-- `--daemon, -d`: Run as daemon (default)
-- `--foreground`: Run in foreground (useful for Windows)
+### Agent Commands (in chat)
 
-### Check Status
+| Command | Description |
+|---------|-------------|
+| `/new` | Start a new session with memory consolidation |
+| `/help` | Show available commands |
+| `/stop` | Stop current request |
 
-View MarkBot status and configuration:
+### Configuration
 
 ```bash
-markbot status
+markbot config list                              # List all config
+markbot config get agents.defaults.model          # Get value
+markbot config set agents.defaults.model claude-3-5-sonnet  # Set value
 ```
 
-This displays:
-- Configuration file location
-- Workspace directory
-- Current model
-- Provider API key status
+## Memory System
 
-### Provider Management
+MarkBot uses a **tiered memory architecture** with three layers:
 
-Authenticate with OAuth providers:
+| Layer | Purpose | Retention |
+|-------|---------|-----------|
+| **Hot Memory** | Working context, whiteboard | Per-turn |
+| **Warm Memory** | Session context, recent facts | Per session |
+| **Cold Memory** | Long-term storage, profiles | Persistent |
 
-```bash
-markbot provider login openai-codex
-markbot provider login github-copilot
+### Cold Memory Structure
+
+```
+~/.markbot/workspace/
+├── memory/
+│   ├── memories/           # Structured memories by category
+│   │   ├── profile/        # User profile
+│   │   ├── preferences/     # User preferences
+│   │   ├── entities/       # Tracked entities
+│   │   ├── events/         # Events
+│   │   ├── cases/          # Cases
+│   │   └── patterns/       # Patterns
+│   └── HISTORY.md          # Append-only event log
 ```
 
-### Configuration Management
+### Memory Extraction
 
-Manage your MarkBot configuration:
+Memories are automatically extracted from conversations and stored in structured markdown files. The system uses LLM-powered extraction with deduplication to avoid redundancy.
 
-```bash
-markbot config list                              # List all configuration
-markbot config list --prefix agents              # Filter by prefix
-markbot config get agents.defaults.model         # Get specific value
-markbot config set agents.defaults.model anthropic/claude-opus-4-5  # Set value
-markbot config get providers.openai.apiKey --raw  # Get raw value
+## Skills
+
+Skills extend MarkBot's capabilities with specialized instructions and tools.
+
+### Built-in Skills
+
+| Skill | Description |
+|-------|-------------|
+| `skill-creator` | Create new skills from scratch |
+| `summarize` | Summarize URLs, files, YouTube videos |
+| `memory` | Structured memory management |
+| `cron` | Schedule reminders and recurring tasks |
+| `github` | GitHub interaction via `gh` CLI |
+| `tmux` | Remote-control tmux sessions |
+| `weather` | Weather information |
+| `clawhub` | Search skills from ClawHub registry |
+
+### Creating Custom Skills
+
+Skills are directories containing a `SKILL.md` file:
+
+```
+~/.markbot/workspace/skills/my-skill/
+└── SKILL.md          # Skill definition
 ```
 
-**Note:** Configuration keys use camelCase format in the JSON file (e.g., `apiKey`, `maxTokens`), but can be accessed using dot notation in CLI commands.
+Example `SKILL.md`:
 
-### Channel Management
+```yaml
+---
+name: my-skill
+description: What this skill does
+---
 
-Check channel status:
+# My Skill
 
-```bash
-markbot channels status
+Instructions for using this skill...
 ```
-
-### Pairing Management
-
-Manage channel access pairing requests:
-
-```bash
-markbot pairing list              # List pending requests
-markbot pairing approve <request-id>   # Approve a request
-markbot pairing cancel <request-id>    # Cancel a request
-```
-
-## Configuration
-
-MarkBot uses a JSON configuration file. Default location: `~/.markbot/config.json`.
 
 ## Project Structure
 
 ```
 markbot/
-├── agent/              # Agent core components
-│   ├── loop.py         # Main agent execution loop
-│   ├── memory.py       # Memory management
-│   ├── context.py      # Context handling
-│   ├── skills.py       # Skill system
-│   ├── subagent.py     # Sub-agent delegation
-│   └── tools/          # Built-in tools
-├── channels/           # Message channel integrations
-├── providers/          # LLM provider implementations
-├── skills/             # Built-in skills
-├── cli/                # CLI commands
-├── config/             # Configuration management
-├── cron/               # Scheduled task service
-├── heartbeat/          # Heartbeat monitoring
-├── bus/                # Message bus
-├── session/            # Session management
-├── templates/          # Agent prompt templates
-├── utils/              # Utility functions
-├── __init__.py         # Package initialization
-└── __main__.py         # Entry point
-```
-
-## Workspace
-
-MarkBot uses a workspace directory to store your data and customizations. Default location: `~/.markbot/workspace`.
-
-### Workspace Structure
-
-```
-~/.markbot/workspace/
-├── AGENTS.md          # Agent system prompt (customizable)
-├── SOUL.md            # Agent personality (customizable)
-├── USER.md            # User instructions (customizable)
-├── HEARTBEAT.md       # Heartbeat system prompt (customizable)
-├── TOOLS.md           # Tool descriptions (customizable)
-├── memory/
-│   ├── MEMORY.md      # Legacy long-term memory (compatibility mode)
-│   ├── HISTORY.md     # Append-only event log
-│   └── memories/      # Structured memory files
-│       ├── profile.md         # User profile
-│       ├── preferences/       # User preferences
-│       ├── entities/          # Tracked entities
-│       ├── events/            # Events
-│       ├── cases/             # Cases
-│       └── patterns/          # Patterns
-└── skills/            # Custom skills directory
-```
-
-### Customizing Agent Behavior
-
-Edit the template files in your workspace to customize agent behavior:
-
-- **AGENTS.md**: Define the agent's role, capabilities, and behavior
-- **SOUL.md**: Set the agent's personality and communication style
-- **USER.md**: Provide context about yourself and your preferences
-
-### Memory System
-
-MarkBot uses a structured memory system with LLM-powered extraction:
-
-**Memory Categories:**
-
-| Category | Description |
-|----------|-------------|
-| Profile | User identity and core information |
-| Preferences | User preferences and settings |
-| Entities | Tracked people, projects, topics |
-| Events | Important events and occurrences |
-| Cases | Specific cases or scenarios |
-| Patterns | Learned patterns and behaviors |
-
-**Features:**
-
-- **LLM-powered Extraction**: Memories are automatically extracted from conversations
-- **Deduplication**: Similar memories are merged to avoid redundancy
-- **Structured Storage**: Each memory is stored as a markdown file
-- **Memory Index**: Fast access via L0 index layer
-
-**Storage Files:**
-
-- `memory/memories/`: Structured memory files organized by category
-- `MEMORY.md`: Legacy long-term memory (compatibility mode)
-- `HISTORY.md`: Append-only event log
-
-## Skills
-
-MarkBot includes a variety of built-in skills that extend its capabilities. Skills are modular and can be easily created or customized.
-
-### Built-in Skills
-
-| Skill | Description | Usage |
-|-------|-------------|-------|
-| `skill-creator` | Create new skills from scratch | Ask the agent to create a new skill |
-| `summarize` | Summarize URLs, files, and YouTube videos | "Summarize this URL: https://example.com" |
-| `cron` | Schedule reminders and recurring tasks | "Remind me to take a break every 2 hours" |
-| `github` | Interact with GitHub using the `gh` CLI | "Check the status of my pull requests" |
-| `memory` | Structured memory with LLM-powered extraction and deduplication | "Remember that I prefer Python for data analysis" |
-| `tmux` | Remote-control tmux sessions | "List all tmux sessions" |
-| `weather` | Get weather info using wttr.in and Open-Meteo | "What's the weather in Tokyo?" |
-| `clawhub` | Search and install skills from ClawHub registry | "Search for a skill for task management" |
-
-### Using Skills
-
-Skills are automatically loaded and available in chat. Simply ask the agent to use a skill:
-
-```bash
-markbot agent
-> Summarize this article: https://example.com/article
-> Set a reminder for 3pm: "Meeting with team"
-> Check the weather in New York
-```
-
-### Creating Custom Skills
-
-Use the `skill-creator` skill to create new skills:
-
-```bash
-markbot agent
-> Create a new skill for managing my todo list
-```
-
-The skill-creator will guide you through the process and generate a new skill directory with the required `SKILL.md` file.
-
-### Skill Format
-
-Each skill is a directory containing a `SKILL.md` file with:
-
-1. **YAML Frontmatter**: Metadata (name, description, etc.)
-2. **Markdown Instructions**: Detailed instructions for the agent
-
-Example:
-
-```yaml
----
-name: my-skill
-description: A brief description of what this skill does
----
-
-# My Skill
-
-Instructions for the agent on how to use this skill...
+├── agent/
+│   ├── loop.py              # Main agent execution loop
+│   ├── context.py           # Context building
+│   ├── tiered_memory/       # Tiered memory system
+│   │   ├── hot_memory.py    # Working memory
+│   │   ├── warm_memory.py   # Session memory
+│   │   ├── cold_memory.py   # Persistent memory
+│   │   └── manager.py       # Memory manager
+│   ├── skill_execution/     # Skill script runner
+│   │   ├── sandbox.py       # Sandboxed execution
+│   │   └── scanner.py       # Skill scanner
+│   └── tools/               # Built-in tools
+├── channels/                # Channel integrations
+│   ├── feishu.py           # Feishu/Lark
+│   ├── dingtalk.py         # DingTalk
+│   ├── discord.py          # Discord
+│   └── ...
+├── providers/               # LLM providers
+│   ├── anthropic_provider.py
+│   ├── openai_compat_provider.py
+│   └── ...
+├── command/                 # Built-in commands
+├── skills/                  # Built-in skills
+├── templates/               # Agent templates
+├── cli/                     # CLI commands
+└── config/                  # Configuration
 ```
 
 ## Development
 
-### Setting Up Development Environment
-
 ```bash
-# Clone the repository
+# Setup
 git clone https://github.com/mickletang/markbot.git
 cd markbot
-
-# Create a virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install with dev dependencies
 pip install -e ".[dev]"
-```
 
-### Running Tests
-
-```bash
-# Run all tests
+# Run tests
 pytest
 
-# Run specific test file
-pytest tests/test_agent.py
-
-# Run with coverage
-pytest --cov=markbot --cov-report=html
-```
-
-### Code Quality
-
-```bash
 # Format code
 ruff format .
 
-# Lint code
+# Lint
 ruff check .
-
-# Fix linting issues
-ruff check --fix .
 ```
 
-### Running CLI
-
-```bash
-# Run from source
-python -m markbot
-
-# Run specific command
-python -m markbot agent
-python -m markbot gateway start
-```
-
-### Building Package
-
-```bash
-# Build wheel and source distribution
-python -m build
-
-# Install built package
-pip install dist/markbot_ai-*.whl
-```
-
-### Project Architecture
-
-MarkBot is built with a modular architecture:
-
-- **Agent Loop**: Core execution engine that manages conversation flow
-- **Tool System**: Extensible tools for various capabilities
-- **Provider Layer**: Abstraction for different LLM providers
-- **Channel Layer**: Integration with various messaging platforms
-- **Skill System**: Modular capabilities that can be loaded/unloaded
-- **Memory System**: Structured memory with LLM-powered extraction and deduplication
-- **Cron Service**: Scheduled task execution
-- **Heartbeat Service**: Maintains persistent connections
-
-### Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Run tests and linting
-6. Submit a pull request
-
-### License
+## License
 
 AGPL-3.0 License
