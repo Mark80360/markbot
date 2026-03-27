@@ -239,8 +239,27 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        extra_system_context: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list for an LLM call.
+        
+        Args:
+            history: 历史消息列表
+            current_message: 当前用户消息内容
+            skill_names: 要启用的技能名称列表
+            media: 媒体文件路径列表
+            channel: 消息渠道
+            chat_id: 聊天ID
+            current_role: 当前消息角色
+            extra_system_context: 额外的系统上下文（如墓碑标记恢复的上下文）
+        """
+        # 构建系统提示词
+        system_content = self.build_system_prompt(skill_names)
+        
+        # 如果有额外的系统上下文，追加到系统提示词
+        if extra_system_context:
+            system_content = f"{system_content}\n\n{extra_system_context}"
+        
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
         user_content = self._build_user_content(current_message, media)
 
@@ -252,7 +271,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": system_content},
             *history,
             {"role": current_role, "content": merged},
         ]

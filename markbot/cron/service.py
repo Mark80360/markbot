@@ -90,7 +90,14 @@ class CronService:
 
         if self.store_path.exists():
             try:
-                data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                # Try UTF-8 first, fallback to reading bytes and handling errors gracefully
+                try:
+                    content = self.store_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    # File corrupted, try to read with error replacement
+                    content = self.store_path.read_bytes().decode("utf-8", errors="replace")
+                    logger.warning("Cron store file has encoding issues, attempting to recover")
+                data = json.loads(content)
                 jobs = []
                 for j in data.get("jobs", []):
                     jobs.append(CronJob(
@@ -132,8 +139,8 @@ class CronService:
                     ))
                 self._store = CronStore(jobs=jobs)
             except Exception as e:
-                logger.warning("Failed to load cron store: {}", e)
-                self._store = CronStore()
+                logger.error("Failed to load cron store from {}: {}", self.store_path, e)
+                raise RuntimeError(f"Cannot load cron jobs from {self.store_path}: {e}") from e
         else:
             self._store = CronStore()
 

@@ -8,8 +8,10 @@ import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from uuid import uuid4
 
 from loguru import logger
 
@@ -518,6 +520,10 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             
+            # === 墓碑标记：设置墓碑 ===
+            turn_id = self._set_tombstone(session, msg.content)
+            self.sessions.save(session)
+            
             # Start tiered memory loop
             self.tiered_memory.start_loop(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
@@ -528,14 +534,22 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-            )
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            try:
+                final_content, _, all_msgs = await self._run_agent_loop(
+                    messages, channel=channel, chat_id=chat_id,
+                    message_id=msg.metadata.get("message_id"),
+                )
+                self._save_turn(session, all_msgs, 1 + len(history))
+                # === 墓碑标记：成功完成，清除标记 ===
+                self._clear_tombstone(session, turn_id)
+                self.sessions.save(session)
+            except Exception as e:
+                # === 墓碑标记：失败，更新状态 ===
+                self._mark_turn_failed(session, turn_id, str(e))
+                self.sessions.save(session)
+                raise
             
-            # Save to tiered memory
+            # Save to tiered memory (只在成功时保存)
             try:
                 self.tiered_memory.save_turn(
                     chat_id=key,
@@ -558,6 +572,18 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         
+        # === 墓碑标记：清理过期的未完成标记 ===
+        self._cleanup_stale_tombstones(session)
+        
+        # === 墓碑标记：检查并处理未完成的轮次 ===
+        context_note = self._check_and_handle_incomplete_turn(session, msg)
+        if context_note:
+            logger.info("[AgentLoop] Detected incomplete turn, adding context note for session {}", key)
+        
+        # === 墓碑标记：设置新的墓碑，表示本轮次开始处理 ===
+        turn_id = self._set_tombstone(session, msg.content)
+        self.sessions.save(session)  # 立即持久化标记
+        
         # Start tiered memory loop
         logger.debug("[AgentLoop] Starting tiered memory loop for key={}", key)
         self.tiered_memory.start_loop(key)
@@ -579,6 +605,7 @@ class AgentLoop:
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            extra_system_context=context_note,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -590,24 +617,34 @@ class AgentLoop:
             ))
 
         logger.info("[AgentLoop] Calling _run_agent_loop...")
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
-        
-        logger.info("[AgentLoop] _run_agent_loop returned: final_content_length={}", len(final_content or ""))
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+            
+            logger.info("[AgentLoop] _run_agent_loop returned: final_content_length={}", len(final_content or ""))
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-            logger.warning("[AgentLoop] final_content was None, using default message")
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
+                logger.warning("[AgentLoop] final_content was None, using default message")
 
-        logger.info("[AgentLoop] Saving session with {} messages", len(all_msgs))
-        self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+            logger.info("[AgentLoop] Saving session with {} messages", len(all_msgs))
+            self._save_turn(session, all_msgs, 1 + len(history))
+            # === 墓碑标记：成功完成，清除标记 ===
+            self._clear_tombstone(session, turn_id)
+            self.sessions.save(session)
+        except Exception as e:
+            # === 墓碑标记：失败，标记状态 ===
+            logger.error("[AgentLoop] _run_agent_loop failed with exception: {}", e)
+            self._mark_turn_failed(session, turn_id, str(e))
+            self.sessions.save(session)
+            # 重新抛出异常，让上层处理
+            raise
         
         # Save to tiered memory (compact triggered automatically when > 8 turns)
         try:
@@ -718,6 +755,142 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    # === 墓碑标记（Tombstone）机制 - 用于检测和处理未完成对话 ===
+
+    def _set_tombstone(self, session: Session, user_input: str) -> str:
+        """设置墓碑标记，表示新一轮对话开始处理。
+        
+        如果存在之前的未完成轮次，会被覆盖。
+        
+        Args:
+            session: 当前会话
+            user_input: 用户的输入内容
+            
+        Returns:
+            turn_id: 本轮次的唯一标识符
+        """
+        turn_id = str(uuid4())[:8]
+        session.metadata["active_turn"] = {
+            "turn_id": turn_id,
+            "user_input": user_input,
+            "started_at": datetime.now().isoformat(),
+            "status": "running",
+            "original_history_len": len(session.get_history()),
+        }
+        logger.debug(f"[Tombstone] Set turn {turn_id} for session {session.key}")
+        return turn_id
+
+    def _clear_tombstone(self, session: Session, turn_id: str) -> None:
+        """清除墓碑标记，表示轮次成功完成。
+        
+        Args:
+            session: 当前会话
+            turn_id: 要清除的轮次ID（用于验证）
+        """
+        active = session.metadata.get("active_turn")
+        if active and active.get("turn_id") == turn_id:
+            del session.metadata["active_turn"]
+            logger.debug(f"[Tombstone] Cleared turn {turn_id} for session {session.key}")
+
+    def _mark_turn_failed(self, session: Session, turn_id: str, error: str) -> None:
+        """标记轮次为失败状态。
+        
+        Args:
+            session: 当前会话
+            turn_id: 失败的轮次ID
+            error: 错误信息
+        """
+        active = session.metadata.get("active_turn")
+        if active and active.get("turn_id") == turn_id:
+            active["status"] = "failed"
+            active["error"] = error
+            active["failed_at"] = datetime.now().isoformat()
+            logger.warning(f"[Tombstone] Marked turn {turn_id} as failed: {error}")
+
+    def _check_and_handle_incomplete_turn(self, session: Session, msg: InboundMessage) -> str | None:
+        """检查是否存在未完成的轮次，并生成上下文提示。
+        
+        用于在下一轮对话开始时，告知 AI 上轮对话异常中断。
+        
+        Args:
+            session: 当前会话
+            msg: 用户的新消息
+            
+        Returns:
+            如果需要恢复上下文，返回提示文本；否则返回 None
+        """
+        active = session.metadata.get("active_turn")
+        if not active:
+            return None
+        
+        # 检查用户是否发送了简短的"继续"类消息
+        user_msg_clean = msg.content.strip()
+        short_indicators = [
+            "继续", "continue", "go on", "more", 
+            "接着", "说下去", "完成", "finish",
+            "kontynuuj", "fortsetzen", "continuer",
+        ]
+        is_likely_continue = (
+            len(user_msg_clean) <= 20 and 
+            any(indicator in user_msg_clean.lower() for indicator in short_indicators)
+        )
+        
+        status = active.get("status", "unknown")
+        previous_input = active.get("user_input", "")
+        
+        if status == "failed":
+            # 上一轮失败
+            context_note = (
+                f"[系统提示：上一轮对话在处理用户请求时异常中断。\n"
+                f"之前的请求：'{previous_input}'\n"
+                f"由于对话未正常完成，请注意上下文可能不完整。"
+            )
+            if is_likely_continue:
+                context_note += "用户很可能希望继续完成之前的任务。]"
+            else:
+                context_note += "]"
+            
+            logger.info(f"[Tombstone] Detected incomplete turn with failed status for session {session.key}")
+            return context_note
+            
+        elif status == "running":
+            # 程序崩溃或重启后遗留的标记
+            context_note = (
+                f"[系统提示：检测到未完成的对话轮次（可能是程序异常退出导致）。\n"
+                f"上一轮用户请求：'{previous_input}'\n"
+                f"状态：未完成（status={status}）"
+            )
+            if is_likely_continue:
+                context_note += "用户当前简短的回复可能与此请求相关。]"
+            else:
+                context_note += "]"
+            
+            logger.info(f"[Tombstone] Detected incomplete turn with running status for session {session.key}")
+            return context_note
+        
+        return None
+
+    def _cleanup_stale_tombstones(self, session: Session, max_age_hours: int = 24) -> None:
+        """清理过期的墓碑标记。
+        
+        Args:
+            session: 当前会话
+            max_age_hours: 最大保留时间（小时），默认 24 小时
+        """
+        active = session.metadata.get("active_turn")
+        if not active:
+            return
+        
+        try:
+            started = datetime.fromisoformat(active["started_at"])
+            if datetime.now() - started > timedelta(hours=max_age_hours):
+                logger.info(f"[Tombstone] Auto-cleaning stale tombstone from {active['started_at']} for session {session.key}")
+                del session.metadata["active_turn"]
+        except (KeyError, ValueError, TypeError):
+            # 无效数据，直接删除
+            if "active_turn" in session.metadata:
+                del session.metadata["active_turn"]
 
     async def process_direct(
         self,
