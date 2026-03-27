@@ -12,7 +12,7 @@ An advanced AI-powered automation and development assistant designed for develop
 ## Features
 
 - **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Groq, and more
-- **Multi-Channel Support**: DingTalk, Feishu, Discord, QQ, WeChat, Email, and more
+- **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat, Email, and more
 - **Tiered Memory Architecture**: Hot (working), Warm (session), Cold (persistent) memory layers
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
@@ -27,7 +27,7 @@ An advanced AI-powered automation and development assistant designed for develop
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Channels                               │
-│  (DingTalk, Feishu, Discord, QQ, WeChat, Email, etc.)     │
+│  (DingTalk, Feishu, QQ, WeChat, Email, etc.)              │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -231,7 +231,7 @@ markbot/
 ├── channels/                # Channel integrations
 │   ├── feishu.py           # Feishu/Lark
 │   ├── dingtalk.py         # DingTalk
-│   ├── discord.py          # Discord
+│   ├── weixin.py           # WeChat
 │   └── ...
 ├── providers/               # LLM providers
 │   ├── anthropic_provider.py
