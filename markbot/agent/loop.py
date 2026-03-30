@@ -27,6 +27,9 @@ from markbot.agent.tools.search import GlobTool, GrepTool
 from markbot.agent.tools.shell import ExecTool
 from markbot.agent.tools.spawn import SpawnTool
 from markbot.agent.tools.web import WebFetchTool, WebSearchTool
+from markbot.agent.tools.think import ThinkTool
+from markbot.agent.tools.plan import PlanTool
+from markbot.agent.tools.reflect import ReflectTool
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.command import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
@@ -115,10 +118,7 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         # Initialize tiered memory manager (now the only memory system)
-        self.tiered_memory = TieredMemoryManager(
-            str(workspace),
-            enable_cold=True
-        )
+        self.tiered_memory = TieredMemoryManager(str(workspace), enable_cold=True)
         logger.info("Tiered memory system initialized")
         self._register_default_tools()
         # Register skill executable scripts as tools
@@ -130,23 +130,32 @@ class AgentLoop:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
+        self.tools.register(
+            ReadFileTool(
+                workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
+            )
+        )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         if self.exec_config.enable:
-            self.tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
+            self.tools.register(
+                ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    path_append=self.exec_config.path_append,
+                )
+            )
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        
+        self.tools.register(ThinkTool())
+        self.tools.register(PlanTool())
+        self.tools.register(ReflectTool())
+
         # Register question tool with response handling setup
         self.question_tool = AskUserQuestionTool(send_callback=self.bus.publish_outbound)
         self.question_tool.set_context("", "")  # Will be set per message
@@ -159,6 +168,7 @@ class AgentLoop:
     def _register_skill_scripts(self) -> None:
         """Register executable skill scripts as tools."""
         from loguru import logger
+
         registered = self.context.skills.register_all_executable_scripts()
         if registered:
             logger.info(f"Agent has {len(registered)} skill scripts available")
@@ -169,6 +179,7 @@ class AgentLoop:
             return
         self._mcp_connecting = True
         from markbot.agent.tools.mcp import connect_mcp_servers
+
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
@@ -192,7 +203,7 @@ class AgentLoop:
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
         # Update question tool context
-        if hasattr(self, 'question_tool') and self.question_tool:
+        if hasattr(self, "question_tool") and self.question_tool:
             self.question_tool.set_context(channel, chat_id)
 
     @staticmethod
@@ -201,17 +212,20 @@ class AgentLoop:
         if not text:
             return None
         from markbot.utils.helpers import strip_think
+
         return strip_think(text) or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
+
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     async def _run_agent_loop(
@@ -236,8 +250,10 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
-        
-        logger.info("[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages))
+
+        logger.info(
+            "[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages)
+        )
 
         # Wrap on_stream with stateful think-tag filter so downstream
         # consumers (CLI, channels) never see  <think>  blocks.
@@ -247,21 +263,30 @@ class AgentLoop:
         async def _filtered_stream(delta: str) -> None:
             nonlocal _stream_buf
             from markbot.utils.helpers import strip_think
+
             prev_clean = strip_think(_stream_buf)
             _stream_buf += delta
             new_clean = strip_think(_stream_buf)
-            incremental = new_clean[len(prev_clean):]
+            incremental = new_clean[len(prev_clean) :]
             if incremental and _raw_stream:
                 await _raw_stream(incremental)
 
         while iteration < self.max_iterations:
             iteration += 1
-            logger.info("[AgentLoop] === Iteration {}/{} (channel={}, chat_id={}) ===", 
-                       iteration, self.max_iterations, channel, chat_id)
+            logger.info(
+                "[AgentLoop] === Iteration {}/{} (channel={}, chat_id={}) ===",
+                iteration,
+                self.max_iterations,
+                channel,
+                chat_id,
+            )
             logger.info("[AgentLoop] Current message count: {}", len(messages))
 
             tool_defs = self.tools.get_definitions()
-            logger.debug("[AgentLoop] Available tools: {}", [t.get('function', {}).get('name') for t in tool_defs[:5]])
+            logger.debug(
+                "[AgentLoop] Available tools: {}",
+                [t.get("function", {}).get("name") for t in tool_defs[:5]],
+            )
 
             if on_stream:
                 logger.info("[AgentLoop] Calling LLM with streaming...")
@@ -278,9 +303,13 @@ class AgentLoop:
                     tools=tool_defs,
                     model=self.model,
                 )
-            
-            logger.info("[AgentLoop] LLM response received: finish_reason={}, has_tool_calls={}, content_length={}",
-                       response.finish_reason, response.has_tool_calls, len(response.content or ""))
+
+            logger.info(
+                "[AgentLoop] LLM response received: finish_reason={}, has_tool_calls={}, content_length={}",
+                response.finish_reason,
+                response.has_tool_calls,
+                len(response.content or ""),
+            )
 
             usage = response.usage or {}
             self._last_usage = {
@@ -289,10 +318,12 @@ class AgentLoop:
             }
 
             if response.has_tool_calls:
-                logger.info("[AgentLoop] LLM requested {} tool call(s): {}",
-                           len(response.tool_calls), 
-                           [tc.name for tc in response.tool_calls])
-                
+                logger.info(
+                    "[AgentLoop] LLM requested {} tool call(s): {}",
+                    len(response.tool_calls),
+                    [tc.name for tc in response.tool_calls],
+                )
+
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=True)
                     _stream_buf = ""
@@ -306,16 +337,18 @@ class AgentLoop:
                     tool_hint = self._strip_think(tool_hint)
                     await on_progress(tool_hint, tool_hint=True)
 
-                tool_call_dicts = [
-                    tc.to_openai_tool_call()
-                    for tc in response.tool_calls
-                ]
+                tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
-                logger.debug("[AgentLoop] Added assistant message with tool calls, total messages: {}", len(messages))
+                logger.debug(
+                    "[AgentLoop] Added assistant message with tool calls, total messages: {}",
+                    len(messages),
+                )
 
                 for tc in response.tool_calls:
                     tools_used.append(tc.name)
@@ -331,23 +364,32 @@ class AgentLoop:
                 # return_exceptions=True ensures all results are collected
                 # even if one tool is cancelled or raises BaseException.
                 logger.info("[AgentLoop] Executing {} tool calls...", len(response.tool_calls))
-                results = await asyncio.gather(*(
-                    self.tools.execute(tc.name, tc.arguments)
-                    for tc in response.tool_calls
-                ), return_exceptions=True)
+                results = await asyncio.gather(
+                    *(self.tools.execute(tc.name, tc.arguments) for tc in response.tool_calls),
+                    return_exceptions=True,
+                )
                 logger.info("[AgentLoop] Tool execution completed, {} results", len(results))
 
                 for idx, (tool_call, result) in enumerate(zip(response.tool_calls, results)):
                     if isinstance(result, BaseException):
-                        logger.error("[AgentLoop] Tool {} failed with exception: {}", tool_call.name, result)
+                        logger.error(
+                            "[AgentLoop] Tool {} failed with exception: {}", tool_call.name, result
+                        )
                         result = f"Error: {type(result).__name__}: {result}"
                     else:
-                        result_preview = str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
-                        logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, result_preview)
+                        result_preview = (
+                            str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
+                        )
+                        logger.info(
+                            "[AgentLoop] Tool {} result: {}", tool_call.name, result_preview
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-                logger.info("[AgentLoop] Added {} tool results to messages, continue to next iteration", len(results))
+                logger.info(
+                    "[AgentLoop] Added {} tool results to messages, continue to next iteration",
+                    len(results),
+                )
             else:
                 logger.info("[AgentLoop] LLM returned final response (no tool calls)")
                 if on_stream and on_stream_end:
@@ -356,11 +398,15 @@ class AgentLoop:
 
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
-                    logger.error("[AgentLoop] LLM returned error finish_reason: {}", (clean or "")[:200])
+                    logger.error(
+                        "[AgentLoop] LLM returned error finish_reason: {}", (clean or "")[:200]
+                    )
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
+                    messages,
+                    clean,
+                    reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
@@ -373,9 +419,13 @@ class AgentLoop:
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
-        
-        logger.info("[AgentLoop] Loop ended: iterations={}, tools_used={}, has_final_content={}",
-                   iteration, len(tools_used), final_content is not None)
+
+        logger.info(
+            "[AgentLoop] Loop ended: iterations={}, tools_used={}, has_final_content={}",
+            iteration,
+            len(tools_used),
+            final_content is not None,
+        )
 
         return final_content, tools_used, messages
 
@@ -409,7 +459,12 @@ class AgentLoop:
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            task.add_done_callback(
+                lambda t, k=msg.session_key: self._active_tasks.get(k, [])
+                and self._active_tasks[k].remove(t)
+                if t in self._active_tasks.get(k, [])
+                else None
+            )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -420,37 +475,55 @@ class AgentLoop:
                 try:
                     on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
+
                         async def on_stream(delta: str) -> None:
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta, metadata={"_stream_delta": True},
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata={"_stream_delta": True},
+                                )
+                            )
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="", metadata={"_stream_end": True, "_resuming": resuming},
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content="",
+                                    metadata={"_stream_end": True, "_resuming": resuming},
+                                )
+                            )
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=msg.metadata or {},
+                            )
+                        )
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", msg.session_key)
                     raise
                 except Exception:
                     logger.exception("Error processing message for session {}", msg.session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        )
+                    )
         finally:
             # Clean up lock if no active tasks remain for this session
             if msg.session_key in self._active_tasks:
@@ -485,18 +558,18 @@ class AgentLoop:
 
     def _handle_question_response(self, msg: InboundMessage) -> bool:
         """Check if message is a response to a pending question and handle it.
-        
+
         Returns True if the message was handled as a question response.
         """
         question_id = msg.metadata.get("question_response_for")
         if not question_id:
             return False
-        
-        if hasattr(self, 'question_tool') and self.question_tool:
+
+        if hasattr(self, "question_tool") and self.question_tool:
             logger.debug("Handling response to question {}", question_id)
             self.question_tool.handle_response(question_id, msg.content)
             return True
-        
+
         return False
 
     async def _process_message(
@@ -511,19 +584,20 @@ class AgentLoop:
         # Check if this is a response to a pending question
         if self._handle_question_response(msg):
             return None
-        
+
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
+            channel, chat_id = (
+                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
+            )
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            
+
             # === 墓碑标记：设置墓碑 ===
             turn_id = self._set_tombstone(session, msg.content)
             self.sessions.save(session)
-            
+
             # Start tiered memory loop
             self.tiered_memory.start_loop(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
@@ -531,12 +605,16 @@ class AgentLoop:
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
                 current_role=current_role,
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
-                    messages, channel=channel, chat_id=chat_id,
+                    messages,
+                    channel=channel,
+                    chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
                 )
                 self._save_turn(session, all_msgs, 1 + len(history))
@@ -548,42 +626,51 @@ class AgentLoop:
                 self._mark_turn_failed(session, turn_id, str(e))
                 self.sessions.save(session)
                 raise
-            
+
             # Save to tiered memory (只在成功时保存)
             try:
                 self.tiered_memory.save_turn(
                     chat_id=key,
                     user_input=msg.content,
                     assistant_response=final_content or "Background task completed.",
-                    session=session
+                    session=session,
                 )
                 self.tiered_memory.end_loop(key)
             except Exception as e:
                 logger.warning(f"Tiered memory save failed: {e}")
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "Background task completed.",
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        logger.info("[AgentLoop] _process_message started for channel={}, chat_id={}, content={}...",
-                   msg.channel, msg.chat_id, msg.content[:50])
-        
+        logger.info(
+            "[AgentLoop] _process_message started for channel={}, chat_id={}, content={}...",
+            msg.channel,
+            msg.chat_id,
+            msg.content[:50],
+        )
+
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
-        
+
         # === 墓碑标记：清理过期的未完成标记 ===
         self._cleanup_stale_tombstones(session)
-        
+
         # === 墓碑标记：检查并处理未完成的轮次 ===
         context_note = self._check_and_handle_incomplete_turn(session, msg)
         if context_note:
-            logger.info("[AgentLoop] Detected incomplete turn, adding context note for session {}", key)
-        
+            logger.info(
+                "[AgentLoop] Detected incomplete turn, adding context note for session {}", key
+            )
+
         # === 墓碑标记：设置新的墓碑，表示本轮次开始处理 ===
         turn_id = self._set_tombstone(session, msg.content)
         self.sessions.save(session)  # 立即持久化标记
-        
+
         # Start tiered memory loop
         logger.debug("[AgentLoop] Starting tiered memory loop for key={}", key)
         self.tiered_memory.start_loop(key)
@@ -604,7 +691,8 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
             extra_system_context=context_note,
         )
 
@@ -612,9 +700,14 @@ class AgentLoop:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=meta,
+                )
+            )
 
         logger.info("[AgentLoop] Calling _run_agent_loop...")
         try:
@@ -623,11 +716,15 @@ class AgentLoop:
                 on_progress=on_progress or _bus_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
-                channel=msg.channel, chat_id=msg.chat_id,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
-            
-            logger.info("[AgentLoop] _run_agent_loop returned: final_content_length={}", len(final_content or ""))
+
+            logger.info(
+                "[AgentLoop] _run_agent_loop returned: final_content_length={}",
+                len(final_content or ""),
+            )
 
             if final_content is None:
                 final_content = "I've completed processing but have no response to give."
@@ -645,7 +742,7 @@ class AgentLoop:
             self.sessions.save(session)
             # 重新抛出异常，让上层处理
             raise
-        
+
         # Save to tiered memory (compact triggered automatically when > 8 turns)
         try:
             logger.debug("[AgentLoop] Saving to tiered memory...")
@@ -653,7 +750,7 @@ class AgentLoop:
                 chat_id=key,
                 user_input=msg.content,
                 assistant_response=final_content,
-                session=session
+                session=session,
             )
             self.tiered_memory.end_loop(key)
             logger.debug("[AgentLoop] Tiered memory saved successfully")
@@ -670,10 +767,12 @@ class AgentLoop:
         meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
-        
+
         logger.info("[AgentLoop] _process_message completed, returning response")
         return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
             metadata=meta,
         )
 
@@ -705,17 +804,16 @@ class AgentLoop:
             ):
                 continue
 
-            if (
-                block.get("type") == "image_url"
-                and block.get("image_url", {}).get("url", "").startswith("data:image/")
-            ):
+            if block.get("type") == "image_url" and block.get("image_url", {}).get(
+                "url", ""
+            ).startswith("data:image/"):
                 filtered.append(self._image_placeholder(block))
                 continue
 
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 text = block["text"]
                 if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
-                    text = text[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                    text = text[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
                 filtered.append({**block, "text": text})
                 continue
 
@@ -726,6 +824,7 @@ class AgentLoop:
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -733,14 +832,16 @@ class AgentLoop:
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":
                 if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                    entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
                 elif isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
                     if not filtered:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                if isinstance(content, str) and content.startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
@@ -760,13 +861,13 @@ class AgentLoop:
 
     def _set_tombstone(self, session: Session, user_input: str) -> str:
         """设置墓碑标记，表示新一轮对话开始处理。
-        
+
         如果存在之前的未完成轮次，会被覆盖。
-        
+
         Args:
             session: 当前会话
             user_input: 用户的输入内容
-            
+
         Returns:
             turn_id: 本轮次的唯一标识符
         """
@@ -783,7 +884,7 @@ class AgentLoop:
 
     def _clear_tombstone(self, session: Session, turn_id: str) -> None:
         """清除墓碑标记，表示轮次成功完成。
-        
+
         Args:
             session: 当前会话
             turn_id: 要清除的轮次ID（用于验证）
@@ -795,7 +896,7 @@ class AgentLoop:
 
     def _mark_turn_failed(self, session: Session, turn_id: str, error: str) -> None:
         """标记轮次为失败状态。
-        
+
         Args:
             session: 当前会话
             turn_id: 失败的轮次ID
@@ -808,37 +909,46 @@ class AgentLoop:
             active["failed_at"] = datetime.now().isoformat()
             logger.warning(f"[Tombstone] Marked turn {turn_id} as failed: {error}")
 
-    def _check_and_handle_incomplete_turn(self, session: Session, msg: InboundMessage) -> str | None:
+    def _check_and_handle_incomplete_turn(
+        self, session: Session, msg: InboundMessage
+    ) -> str | None:
         """检查是否存在未完成的轮次，并生成上下文提示。
-        
+
         用于在下一轮对话开始时，告知 AI 上轮对话异常中断。
-        
+
         Args:
             session: 当前会话
             msg: 用户的新消息
-            
+
         Returns:
             如果需要恢复上下文，返回提示文本；否则返回 None
         """
         active = session.metadata.get("active_turn")
         if not active:
             return None
-        
+
         # 检查用户是否发送了简短的"继续"类消息
         user_msg_clean = msg.content.strip()
         short_indicators = [
-            "继续", "continue", "go on", "more", 
-            "接着", "说下去", "完成", "finish",
-            "kontynuuj", "fortsetzen", "continuer",
+            "继续",
+            "continue",
+            "go on",
+            "more",
+            "接着",
+            "说下去",
+            "完成",
+            "finish",
+            "kontynuuj",
+            "fortsetzen",
+            "continuer",
         ]
-        is_likely_continue = (
-            len(user_msg_clean) <= 20 and 
-            any(indicator in user_msg_clean.lower() for indicator in short_indicators)
+        is_likely_continue = len(user_msg_clean) <= 20 and any(
+            indicator in user_msg_clean.lower() for indicator in short_indicators
         )
-        
+
         status = active.get("status", "unknown")
         previous_input = active.get("user_input", "")
-        
+
         if status == "failed":
             # 上一轮失败
             context_note = (
@@ -850,10 +960,12 @@ class AgentLoop:
                 context_note += "用户很可能希望继续完成之前的任务。]"
             else:
                 context_note += "]"
-            
-            logger.info(f"[Tombstone] Detected incomplete turn with failed status for session {session.key}")
+
+            logger.info(
+                f"[Tombstone] Detected incomplete turn with failed status for session {session.key}"
+            )
             return context_note
-            
+
         elif status == "running":
             # 程序崩溃或重启后遗留的标记
             context_note = (
@@ -865,15 +977,17 @@ class AgentLoop:
                 context_note += "用户当前简短的回复可能与此请求相关。]"
             else:
                 context_note += "]"
-            
-            logger.info(f"[Tombstone] Detected incomplete turn with running status for session {session.key}")
+
+            logger.info(
+                f"[Tombstone] Detected incomplete turn with running status for session {session.key}"
+            )
             return context_note
-        
+
         return None
 
     def _cleanup_stale_tombstones(self, session: Session, max_age_hours: int = 24) -> None:
         """清理过期的墓碑标记。
-        
+
         Args:
             session: 当前会话
             max_age_hours: 最大保留时间（小时），默认 24 小时
@@ -881,11 +995,13 @@ class AgentLoop:
         active = session.metadata.get("active_turn")
         if not active:
             return
-        
+
         try:
             started = datetime.fromisoformat(active["started_at"])
             if datetime.now() - started > timedelta(hours=max_age_hours):
-                logger.info(f"[Tombstone] Auto-cleaning stale tombstone from {active['started_at']} for session {session.key}")
+                logger.info(
+                    f"[Tombstone] Auto-cleaning stale tombstone from {active['started_at']} for session {session.key}"
+                )
                 del session.metadata["active_turn"]
         except (KeyError, ValueError, TypeError):
             # 无效数据，直接删除
@@ -906,6 +1022,9 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress,
-            on_stream=on_stream, on_stream_end=on_stream_end,
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
         )

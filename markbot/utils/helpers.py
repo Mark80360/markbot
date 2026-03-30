@@ -88,7 +88,7 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
 
     Args:
         content: The text content to split.
-        max_len: Maximum length per chunk (default 2000 for Discord compatibility).
+        max_len: Maximum length per chunk (default 2000).
 
     Returns:
         List of message chunks, each within max_len.
