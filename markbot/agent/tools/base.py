@@ -1,13 +1,34 @@
 """Base class for agent tools."""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+
+class PermissionResult(Enum):
+    """Result of permission check."""
+    ALLOW = "allow"
+    DENY = "deny"
+    ASK = "ask"
+
+
+@dataclass
+class ToolProgress:
+    """Progress data for tool execution."""
+    tool_use_id: str
+    progress_type: str
+    message: str
+    percentage: Optional[float] = None
+
+
+ToolProgressCallback = Callable[[ToolProgress], None]
 
 
 class Tool(ABC):
     """
     Abstract base class for agent tools.
-
+    
     Tools are capabilities that the agent can use to interact with
     the environment, such as reading files, executing commands, etc.
     """
@@ -42,10 +63,20 @@ class Tool(ABC):
         pass
 
     @property
+    def aliases(self) -> list[str]:
+        """Optional aliases for backwards compatibility when a tool is renamed."""
+        return []
+
+    @property
     @abstractmethod
     def description(self) -> str:
         """Description of what the tool does."""
         pass
+
+    @property
+    def search_hint(self) -> Optional[str]:
+        """One-line capability phrase used for keyword matching."""
+        return None
 
     @property
     @abstractmethod
@@ -54,7 +85,10 @@ class Tool(ABC):
         pass
 
     @abstractmethod
-    async def execute(self, **kwargs: Any) -> Any:
+    async def execute(
+        self, 
+        **kwargs: Any
+    ) -> Any:
         """
         Execute the tool with given parameters.
 
@@ -65,6 +99,46 @@ class Tool(ABC):
             Result of the tool execution (string or list of content blocks).
         """
         pass
+
+    def is_enabled(self) -> bool:
+        """Check if tool is enabled. Defaults to True."""
+        return True
+
+    def is_read_only(self, **kwargs: Any) -> bool:
+        """Check if tool operation is read-only. Defaults to False."""
+        return False
+
+    def is_destructive(self, **kwargs: Any) -> bool:
+        """Check if tool performs irreversible operations. Defaults to False."""
+        return False
+
+    def is_concurrency_safe(self, **kwargs: Any) -> bool:
+        """Check if tool is safe to run concurrently. Defaults to True."""
+        return True
+
+    def requires_permission(self, **kwargs: Any) -> bool:
+        """Check if tool requires permission before execution. Defaults to False."""
+        return not self.is_read_only(**kwargs)
+
+    async def check_permissions(self, **kwargs: Any) -> PermissionResult:
+        """
+        Check if tool has permission to run.
+        Returns ALLOW, DENY, or ASK (need user confirmation).
+        """
+        if self.is_read_only(**kwargs):
+            return PermissionResult.ALLOW
+        return PermissionResult.ASK
+
+    def interrupt_behavior(self) -> str:
+        """
+        What should happen when user submits new message while tool is running.
+        Returns 'cancel' or 'block'. Defaults to 'block'.
+        """
+        return "block"
+
+    def get_activity_description(self, **kwargs: Any) -> Optional[str]:
+        """Get human-readable activity description for display."""
+        return None
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""

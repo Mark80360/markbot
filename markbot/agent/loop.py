@@ -18,6 +18,8 @@ from loguru import logger
 from markbot.agent.context import ContextBuilder
 from markbot.agent.tiered_memory import TieredMemoryManager
 from markbot.agent.subagent import SubagentManager
+from markbot.agent.tokens import TokenTracker
+from markbot.agent.compact import ConversationCompactor
 from markbot.agent.tools.cron import CronTool
 from markbot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from markbot.agent.tools.message import MessageTool
@@ -89,6 +91,9 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        
+        self.token_tracker = TokenTracker()
+        self.compactor = ConversationCompactor(llm_client=None)
 
         self.tools = ToolRegistry()
         self.context = ContextBuilder(workspace, timezone=timezone, tool_registry=self.tools)
@@ -281,6 +286,29 @@ class AgentLoop:
                 chat_id,
             )
             logger.info("[AgentLoop] Current message count: {}", len(messages))
+            
+            from markbot.agent.tokens import token_count_with_estimation
+            current_tokens = token_count_with_estimation(messages)
+            logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
+            
+            if self.compactor.should_compact(
+                messages, 
+                current_tokens, 
+                self.context_window_tokens
+            ):
+                logger.info(
+                    "[AgentLoop] Context size {} exceeds threshold, triggering compaction",
+                    current_tokens
+                )
+                summary, recent_messages = self.compactor.compact_conversation(messages)
+                if summary:
+                    compact_msg = self.compactor.create_compact_message(summary)
+                    messages = [compact_msg] + recent_messages
+                    logger.info(
+                        "[AgentLoop] Compacted messages: {} -> {}",
+                        len(initial_messages),
+                        len(messages)
+                    )
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -316,6 +344,8 @@ class AgentLoop:
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
             }
+            
+            self.token_tracker.update_from_response(response)
 
             if response.has_tool_calls:
                 logger.info(
@@ -425,6 +455,15 @@ class AgentLoop:
             iteration,
             len(tools_used),
             final_content is not None,
+        )
+        
+        token_summary = self.token_tracker.get_summary()
+        logger.info(
+            "[AgentLoop] Token usage - Total: input={}, output={}, cache_creation={}, cache_read={}",
+            token_summary["total"]["input_tokens"],
+            token_summary["total"]["output_tokens"],
+            token_summary["total"]["cache_creation_input_tokens"],
+            token_summary["total"]["cache_read_input_tokens"],
         )
 
         return final_content, tools_used, messages

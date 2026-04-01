@@ -206,7 +206,7 @@ class SkillsLoader:
         """Build a summary of all skills for agent context.
 
         Returns:
-            XML-formatted skills summary.
+            XML-formatted skills summary with when_to_use information.
         """
         all_skills = self.list_skills(filter_unavailable=False)
         if not all_skills:
@@ -220,6 +220,7 @@ class SkillsLoader:
             name = escape_xml(s["name"])
             path = s["path"]
             desc = escape_xml(self._get_skill_description(s["name"]))
+            when_to_use = self._get_when_to_use(s["name"])
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
             executable = s.get("executable", "false")
@@ -227,6 +228,8 @@ class SkillsLoader:
             lines.append(f'  <skill available="{str(available).lower()}" executable="{executable}">')
             lines.append(f"    <name>{name}</name>")
             lines.append(f"    <description>{desc}</description>")
+            if when_to_use:
+                lines.append(f"    <when_to_use>{escape_xml(when_to_use)}</when_to_use>")
             lines.append(f"    <location>{path}</location>")
 
             # List executable scripts
@@ -534,6 +537,16 @@ class SkillsLoader:
         if meta and meta.get("description"):
             return meta["description"]
         return name
+
+    def _get_when_to_use(self, name: str) -> str:
+        """Get the when_to_use field of a skill from its frontmatter.
+        
+        This field tells AI when to invoke this skill.
+        """
+        meta = self.get_skill_metadata(name)
+        if meta and meta.get("when_to_use"):
+            return meta["when_to_use"]
+        return ""
 
     def _strip_frontmatter(self, content: str) -> str:
         """Remove YAML frontmatter from markdown content."""
