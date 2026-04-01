@@ -128,6 +128,10 @@ class ExecToolConfig(Base):
     enable: bool = True
     timeout: int = 60
     path_append: str = ""
+    allowed_internal_ips: list[str] = Field(
+        default_factory=list,
+        description="List of internal IPs to skip SSRF check in shell commands",
+    )
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""

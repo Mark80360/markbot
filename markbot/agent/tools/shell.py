@@ -23,6 +23,7 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
         path_append: str = "",
+        allowed_internal_ips: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -40,6 +41,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
+        self.allowed_internal_ips = allowed_internal_ips or []
 
     @property
     def name(self) -> str:
@@ -169,7 +171,7 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
         from markbot.security.network import contains_internal_url
-        if contains_internal_url(cmd):
+        if contains_internal_url(cmd, self.allowed_internal_ips):
             return "Error: Command blocked by safety guard (internal/private URL detected)"
 
         if self.restrict_to_workspace:

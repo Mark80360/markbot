@@ -94,11 +94,38 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-def contains_internal_url(command: str) -> bool:
-    """Return True if the command string contains a URL targeting an internal/private address."""
+def contains_internal_url(command: str, allowed_ips: list[str] | None = None) -> bool:
+    """Return True if the command string contains a URL targeting an internal/private address.
+
+    Args:
+        command: The command string to check.
+        allowed_ips: Optional list of IPs to skip SSRF check (whitelist).
+    """
+    allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    if allowed_ips:
+        for ip_str in allowed_ips:
+            try:
+                network = ipaddress.ip_network(ip_str, strict=False)
+                allowed_networks.append(network)
+            except ValueError:
+                try:
+                    addr = ipaddress.ip_address(ip_str)
+                    allowed_networks.append(ipaddress.ip_network(str(addr), strict=False))
+                except ValueError:
+                    pass
+
     for m in _URL_RE.finditer(command):
         url = m.group(0)
         ok, _ = validate_url_target(url)
         if not ok:
+            p = urlparse(url)
+            hostname = p.hostname
+            if hostname and allowed_networks:
+                try:
+                    addr = ipaddress.ip_address(hostname)
+                    if any(addr in net for net in allowed_networks):
+                        continue
+                except ValueError:
+                    pass
             return True
     return False
