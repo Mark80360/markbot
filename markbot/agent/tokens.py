@@ -50,7 +50,7 @@ class TokenUsage:
 class TokenTracker:
     """Tracks token usage across conversation.
     
-    Reference: Claude Code token tracking
+    Reference: MarkBot token tracking
     """
     
     def __init__(self):
@@ -245,7 +245,7 @@ def token_count_with_estimation(messages: list[dict[str, Any]]) -> int:
     Uses the last API response's token count plus estimates for
     any messages added since.
     
-    Reference: Claude Code tokenCountWithEstimation()
+    Reference: MarkBot tokenCountWithEstimation()
     
     Args:
         messages: List of message dicts

@@ -1,6 +1,6 @@
 """Conversation context compression service.
 
-Reference: Claude Code compact service
+Reference: MarkBot compact service
 - Summarizes conversation history to reduce token usage
 - Preserves important context and technical details
 - Supports partial compression (keep recent messages)

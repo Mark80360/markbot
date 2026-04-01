@@ -105,7 +105,7 @@ class CronTool(Tool):
             "required": ["action"],
         }
 
-    async def execute(
+    async def _legacy_execute(
         self,
         action: str,
         message: str = "",

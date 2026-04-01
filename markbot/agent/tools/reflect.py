@@ -36,7 +36,7 @@ class ReflectTool(Tool):
             "required": ["task", "result"],
         }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         task = kwargs.get("task", "")
         result = kwargs.get("result", "")
         expected = kwargs.get("expected", "")

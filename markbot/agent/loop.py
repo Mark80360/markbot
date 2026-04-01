@@ -1,4 +1,7 @@
-"""Agent loop: the core processing engine."""
+"""Agent loop: the core processing engine.
+
+Refactored to use new core types and skill system inspired by MarkBot.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from markbot.agent.tools.registry import ToolRegistry
 from markbot.agent.tools.search import GlobTool, GrepTool
 from markbot.agent.tools.shell import ExecTool
 from markbot.agent.tools.spawn import SpawnTool
+from markbot.agent.tools.subagent_progress import CheckSubagentTool, ListSubagentsTool
 from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.agent.tools.think import ThinkTool
 from markbot.agent.tools.plan import PlanTool
@@ -37,6 +41,9 @@ from markbot.command import CommandContext, CommandRouter, register_builtin_comm
 from markbot.bus.queue import MessageBus
 from markbot.providers.base import LLMProvider
 from markbot.session.manager import Session, SessionManager
+from markbot.core.skills import SkillRegistry
+from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.state import get_app_state
 
 if TYPE_CHECKING:
     from markbot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
@@ -95,8 +102,13 @@ class AgentLoop:
         self.token_tracker = TokenTracker()
         self.compactor = ConversationCompactor(llm_client=None)
 
+        # Initialize tool registry
         self.tools = ToolRegistry()
-        self.context = ContextBuilder(workspace, timezone=timezone, tool_registry=self.tools)
+
+        # Initialize skill registry (new system)
+        self.skill_registry = SkillRegistry(workspace, tool_registry=self.tools)
+        self.skill_registry.load_all()
+
         self.sessions = session_manager or SessionManager(workspace)
         self.subagents = SubagentManager(
             provider=provider,
@@ -125,9 +137,18 @@ class AgentLoop:
         # Initialize tiered memory manager (now the only memory system)
         self.tiered_memory = TieredMemoryManager(str(workspace), enable_cold=True)
         logger.info("Tiered memory system initialized")
+
+        # Initialize context builder with tiered_memory
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            tool_registry=self.tools,
+            skill_registry=self.skill_registry,
+            tiered_memory=self.tiered_memory,
+        )
         self._register_default_tools()
-        # Register skill executable scripts as tools
-        self._register_skill_scripts()
+        # Skills are now registered via SkillRegistry
+        logger.info(f"Agent has {len(self.tools)} tools available")
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -160,6 +181,8 @@ class AgentLoop:
         self.tools.register(ThinkTool())
         self.tools.register(PlanTool())
         self.tools.register(ReflectTool())
+        self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
+        self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
 
         # Register question tool with response handling setup
         self.question_tool = AskUserQuestionTool(send_callback=self.bus.publish_outbound)
@@ -170,13 +193,7 @@ class AgentLoop:
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
 
-    def _register_skill_scripts(self) -> None:
-        """Register executable skill scripts as tools."""
-        from loguru import logger
 
-        registered = self.context.skills.register_all_executable_scripts()
-        if registered:
-            logger.info(f"Agent has {len(registered)} skill scripts available")
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -648,6 +665,7 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 current_role=current_role,
+                session_key=key,
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
@@ -733,6 +751,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             extra_system_context=context_note,
+            session_key=key,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:

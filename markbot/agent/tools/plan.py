@@ -38,7 +38,7 @@ class PlanTool(Tool):
             "required": ["task"],
         }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         task = kwargs.get("task", "")
         constraints = kwargs.get("constraints", "")
         detail_level = kwargs.get("detail_level", "medium")

@@ -19,7 +19,8 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
 - **MCP Support**: Model Context Protocol for seamless tool integration
-- **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents
+- **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents with real-time progress tracking
+- **Subagent Progress Tracking**: Monitor subagent execution with activity logs, token counts, and output files
 - **Web Integration**: Built-in web browsing, content extraction, and API interaction
 - **Command Router**: Built-in commands like `/new`, `/help`, `/stop`
 - **Skill Execution**: Run skill scripts in sandboxed environments
@@ -183,6 +184,68 @@ MarkBot uses a **tiered memory architecture** with three layers:
 
 Memories are automatically extracted from conversations and stored in structured markdown files. The system uses LLM-powered extraction with deduplication to avoid redundancy.
 
+### Memory Context Injection
+
+Memory context is automatically injected into the system prompt for every conversation turn:
+
+```
+System Prompt
+├── Identity & Bootstrap Files
+├── Skills (always-active + summary)
+├── Memory Context          ← Injected here
+│   ├── Whiteboard (L1)     # Current loop state
+│   ├── Session (L1.5)      # Recent conversation
+│   ├── Hot (L2)            # Important facts
+│   ├── Warm (L3)           # Recent activity
+│   └── Cold (L4)           # Semantic search results
+└── Runtime Context
+```
+
+This ensures the agent has access to relevant context from all memory layers when processing each message.
+
+## Subagent System
+
+MarkBot supports spawning background subagents for complex, time-consuming tasks.
+
+### Spawning a Subagent
+
+```
+spawn(task="Analyze the codebase and generate documentation", label="docs-gen")
+```
+
+Returns: `Subagent [docs-gen] started (id: abc123). I'll notify you when it completes.`
+
+### Progress Tracking
+
+Monitor subagent execution in real-time:
+
+```
+# Check status
+check_subagent(task_id="abc123", action="status")
+
+# View full output
+check_subagent(task_id="abc123", action="output")
+
+# View last 50 lines
+check_subagent(task_id="abc123", action="tail")
+
+# List all active subagents
+list_subagents()
+```
+
+### Output Files
+
+Subagent outputs are saved to disk for later reference:
+
+```
+.markbot/tasks/
+├── abc123.output    # Task output log
+├── def456.output    # Another task
+└── ...
+```
+
+Output files persist after task completion, allowing you to review results at any time.
+
 ## Skills
 
 Skills extend MarkBot's capabilities with specialized instructions and tools.
@@ -228,9 +291,11 @@ Instructions for using this skill...
 markbot/
 ├── agent/
 │   ├── loop.py              # Main agent execution loop
-│   ├── context.py           # Context building
+│   ├── context.py           # Context building with memory injection
 │   ├── compact.py           # Conversation compression
 │   ├── tokens.py            # Token usage tracking
+│   ├── subagent.py          # Subagent manager
+│   ├── subagent_progress.py # Progress tracking system
 │   ├── tiered_memory/       # Tiered memory system
 │   │   ├── hot_memory.py    # Working memory
 │   │   ├── warm_memory.py   # Session memory
@@ -240,6 +305,14 @@ markbot/
 │   │   ├── sandbox.py       # Sandboxed execution
 │   │   └── scanner.py       # Skill scanner
 │   └── tools/               # Built-in tools
+│       ├── filesystem.py    # File operations
+│       ├── shell.py         # Command execution
+│       ├── spawn.py         # Subagent spawning
+│       ├── subagent_progress.py  # Progress checking tools
+│       └── ...
+├── core/
+│   ├── types.py             # Core type definitions
+│   └── skills/              # Skill system (registry, loader, tool)
 ├── channels/                # Channel integrations
 │   ├── feishu.py           # Feishu/Lark
 │   ├── dingtalk.py         # DingTalk

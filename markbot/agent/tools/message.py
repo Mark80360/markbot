@@ -74,7 +74,7 @@ class MessageTool(Tool):
             "required": ["content"]
         }
 
-    async def execute(
+    async def _legacy_execute(
         self,
         content: str,
         channel: str | None = None,

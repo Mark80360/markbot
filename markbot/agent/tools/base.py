@@ -1,34 +1,25 @@
-"""Base class for agent tools."""
+"""Base class for agent tools.
+
+Refactored to use new core types inspired by MarkBot.
+"""
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
-from dataclasses import dataclass
-from enum import Enum
+from typing import Any, Optional
+
+from markbot.core.types import (
+    PermissionDecision,
+    PermissionMode,
+    ToolContext,
+    ToolDefinition,
+    ToolParameter,
+)
 
 
-class PermissionResult(Enum):
-    """Result of permission check."""
-    ALLOW = "allow"
-    DENY = "deny"
-    ASK = "ask"
-
-
-@dataclass
-class ToolProgress:
-    """Progress data for tool execution."""
-    tool_use_id: str
-    progress_type: str
-    message: str
-    percentage: Optional[float] = None
-
-
-ToolProgressCallback = Callable[[ToolProgress], None]
-
-
-class Tool(ABC):
+class BaseTool(ABC):
     """
     Abstract base class for agent tools.
-    
+
+    Refactored to align with MarkBot's tool system.
     Tools are capabilities that the agent can use to interact with
     the environment, such as reading files, executing commands, etc.
     """
@@ -42,234 +33,267 @@ class Tool(ABC):
         "object": dict,
     }
 
-    @staticmethod
-    def _resolve_type(t: Any) -> str | None:
-        """Resolve JSON Schema type to a simple string.
-
-        JSON Schema allows ``"type": ["string", "null"]`` (union types).
-        We extract the first non-null type so validation/casting works.
-        """
-        if isinstance(t, list):
-            for item in t:
-                if item != "null":
-                    return item
-            return None
-        return t
-
     @property
     @abstractmethod
-    def name(self) -> str:
-        """Tool name used in function calls."""
+    def definition(self) -> ToolDefinition:
+        """Tool definition including name, description, and parameters."""
         pass
 
     @property
-    def aliases(self) -> list[str]:
-        """Optional aliases for backwards compatibility when a tool is renamed."""
-        return []
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Description of what the tool does."""
-        pass
-
-    @property
-    def search_hint(self) -> Optional[str]:
-        """One-line capability phrase used for keyword matching."""
-        return None
-
-    @property
-    @abstractmethod
-    def parameters(self) -> dict[str, Any]:
-        """JSON Schema for tool parameters."""
-        pass
-
-    @abstractmethod
-    async def execute(
-        self, 
-        **kwargs: Any
-    ) -> Any:
-        """
-        Execute the tool with given parameters.
-
-        Args:
-            **kwargs: Tool-specific parameters.
-
-        Returns:
-            Result of the tool execution (string or list of content blocks).
-        """
-        pass
-
     def is_enabled(self) -> bool:
         """Check if tool is enabled. Defaults to True."""
         return True
 
-    def is_read_only(self, **kwargs: Any) -> bool:
+    def is_read_only(self, params: dict[str, Any]) -> bool:
         """Check if tool operation is read-only. Defaults to False."""
-        return False
+        return self.definition.is_read_only
 
-    def is_destructive(self, **kwargs: Any) -> bool:
+    def is_destructive(self, params: dict[str, Any]) -> bool:
         """Check if tool performs irreversible operations. Defaults to False."""
-        return False
+        return self.definition.is_destructive
 
-    def is_concurrency_safe(self, **kwargs: Any) -> bool:
-        """Check if tool is safe to run concurrently. Defaults to True."""
-        return True
-
-    def requires_permission(self, **kwargs: Any) -> bool:
-        """Check if tool requires permission before execution. Defaults to False."""
-        return not self.is_read_only(**kwargs)
-
-    async def check_permissions(self, **kwargs: Any) -> PermissionResult:
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
         """
         Check if tool has permission to run.
-        Returns ALLOW, DENY, or ASK (need user confirmation).
-        """
-        if self.is_read_only(**kwargs):
-            return PermissionResult.ALLOW
-        return PermissionResult.ASK
 
-    def interrupt_behavior(self) -> str:
+        Returns ALLOW for read-only tools, ASK for others.
+        Override for custom permission logic.
         """
-        What should happen when user submits new message while tool is running.
-        Returns 'cancel' or 'block'. Defaults to 'block'.
-        """
-        return "block"
+        if self.is_read_only(params):
+            return PermissionDecision(behavior="allow")
 
-    def get_activity_description(self, **kwargs: Any) -> Optional[str]:
+        # Check permission context rules
+        tool_name = self.definition.name
+        ctx = context.tool_permission_context
+
+        if tool_name in ctx.always_deny:
+            return PermissionDecision(behavior="deny", reason="Tool in always-deny list")
+
+        if tool_name in ctx.always_allow:
+            return PermissionDecision(behavior="allow", reason="Tool in always-allow list")
+
+        if tool_name in ctx.always_ask:
+            return PermissionDecision(behavior="ask")
+
+        # Check permission mode
+        if context.permission_mode == PermissionMode.ACCEPT_EDITS:
+            # In accept_edits mode, allow file operations
+            if not self.is_destructive(params):
+                return PermissionDecision(behavior="allow")
+
+        if context.permission_mode == PermissionMode.BYPASS:
+            if ctx.is_bypass_available:
+                return PermissionDecision(behavior="allow", reason="Bypass mode active")
+
+        return PermissionDecision(behavior="ask")
+
+    @abstractmethod
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        """
+        Execute the tool with given parameters.
+
+        Args:
+            params: Tool-specific parameters (already validated and cast)
+            context: Execution context
+
+        Returns:
+            Result of the tool execution (string or list of content blocks)
+        """
+        pass
+
+    def get_activity_description(self, params: dict[str, Any]) -> Optional[str]:
         """Get human-readable activity description for display."""
-        return None
+        return f"Using {self.definition.name}"
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
-        schema = self.parameters or {}
-        if schema.get("type", "object") != "object":
-            return params
-
-        return self._cast_object(params, schema)
-
-    def _cast_object(self, obj: Any, schema: dict[str, Any]) -> dict[str, Any]:
-        """Cast an object (dict) according to schema."""
-        if not isinstance(obj, dict):
-            return obj
-
-        props = schema.get("properties", {})
         result = {}
-
-        for key, value in obj.items():
-            if key in props:
-                result[key] = self._cast_value(value, props[key])
-            else:
-                result[key] = value
-
+        for param in self.definition.parameters:
+            if param.name in params:
+                result[param.name] = self._cast_value(params[param.name], param.type)
+            elif param.default is not None:
+                result[param.name] = param.default
         return result
 
-    def _cast_value(self, val: Any, schema: dict[str, Any]) -> Any:
-        """Cast a single value according to schema."""
-        target_type = self._resolve_type(schema.get("type"))
-
-        if target_type == "boolean" and isinstance(val, bool):
-            return val
-        if target_type == "integer" and isinstance(val, int) and not isinstance(val, bool):
-            return val
-        if target_type in self._TYPE_MAP and target_type not in ("boolean", "integer", "array", "object"):
-            expected = self._TYPE_MAP[target_type]
-            if isinstance(val, expected):
-                return val
-
-        if target_type == "integer" and isinstance(val, str):
-            try:
-                return int(val)
-            except ValueError:
-                return val
-
-        if target_type == "number" and isinstance(val, str):
-            try:
-                return float(val)
-            except ValueError:
-                return val
+    def _cast_value(self, val: Any, target_type: str) -> Any:
+        """Cast a single value to target type."""
+        if val is None:
+            return None
 
         if target_type == "string":
-            return val if val is None else str(val)
+            return str(val)
 
-        if target_type == "boolean" and isinstance(val, str):
-            val_lower = val.lower()
-            if val_lower in ("true", "1", "yes"):
-                return True
-            if val_lower in ("false", "0", "no"):
-                return False
+        if target_type == "integer":
+            if isinstance(val, bool):
+                return 1 if val else 0
+            if isinstance(val, int):
+                return val
+            if isinstance(val, str):
+                try:
+                    return int(val)
+                except ValueError:
+                    return val
+            return val
+
+        if target_type == "number":
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                try:
+                    return float(val)
+                except ValueError:
+                    return val
+            return val
+
+        if target_type == "boolean":
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                val_lower = val.lower()
+                if val_lower in ("true", "1", "yes"):
+                    return True
+                if val_lower in ("false", "0", "no"):
+                    return False
             return val
 
         if target_type == "array" and isinstance(val, list):
-            item_schema = schema.get("items")
-            return [self._cast_value(item, item_schema) for item in val] if item_schema else val
+            return val
 
         if target_type == "object" and isinstance(val, dict):
-            return self._cast_object(val, schema)
+            return val
 
         return val
 
     def validate_params(self, params: dict[str, Any]) -> list[str]:
-        """Validate tool parameters against JSON schema. Returns error list (empty if valid)."""
-        if not isinstance(params, dict):
-            return [f"parameters must be an object, got {type(params).__name__}"]
-        schema = self.parameters or {}
-        if schema.get("type", "object") != "object":
-            raise ValueError(f"Schema must be object type, got {schema.get('type')!r}")
-        return self._validate(params, {**schema, "type": "object"}, "")
-
-    def _validate(self, val: Any, schema: dict[str, Any], path: str) -> list[str]:
-        raw_type = schema.get("type")
-        nullable = (isinstance(raw_type, list) and "null" in raw_type) or schema.get(
-            "nullable", False
-        )
-        t, label = self._resolve_type(raw_type), path or "parameter"
-        if nullable and val is None:
-            return []
-        if t == "integer" and (not isinstance(val, int) or isinstance(val, bool)):
-            return [f"{label} should be integer"]
-        if t == "number" and (
-            not isinstance(val, self._TYPE_MAP[t]) or isinstance(val, bool)
-        ):
-            return [f"{label} should be number"]
-        if t in self._TYPE_MAP and t not in ("integer", "number") and not isinstance(val, self._TYPE_MAP[t]):
-            return [f"{label} should be {t}"]
-
+        """Validate tool parameters. Returns error list (empty if valid)."""
         errors = []
-        if "enum" in schema and val not in schema["enum"]:
-            errors.append(f"{label} must be one of {schema['enum']}")
-        if t in ("integer", "number"):
-            if "minimum" in schema and val < schema["minimum"]:
-                errors.append(f"{label} must be >= {schema['minimum']}")
-            if "maximum" in schema and val > schema["maximum"]:
-                errors.append(f"{label} must be <= {schema['maximum']}")
-        if t == "string":
-            if "minLength" in schema and len(val) < schema["minLength"]:
-                errors.append(f"{label} must be at least {schema['minLength']} chars")
-            if "maxLength" in schema and len(val) > schema["maxLength"]:
-                errors.append(f"{label} must be at most {schema['maxLength']} chars")
-        if t == "object":
-            props = schema.get("properties", {})
-            for k in schema.get("required", []):
-                if k not in val:
-                    errors.append(f"missing required {path + '.' + k if path else k}")
-            for k, v in val.items():
-                if k in props:
-                    errors.extend(self._validate(v, props[k], path + "." + k if path else k))
-        if t == "array" and "items" in schema:
-            for i, item in enumerate(val):
-                errors.extend(
-                    self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]")
-                )
+
+        # Check required parameters
+        for param in self.definition.parameters:
+            if param.required and param.name not in params:
+                errors.append(f"Missing required parameter: {param.name}")
+
+        # Check types
+        for param in self.definition.parameters:
+            if param.name in params:
+                val = params[param.name]
+                if val is None and not param.required:
+                    continue
+
+                type_errors = self._validate_type(val, param.type, param.name)
+                errors.extend(type_errors)
+
+                # Check enum
+                if param.enum and val not in param.enum:
+                    errors.append(f"{param.name} must be one of {param.enum}")
+
         return errors
 
-    def to_schema(self) -> dict[str, Any]:
-        """Convert tool to OpenAI function schema format."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
+    def _validate_type(self, val: Any, expected_type: str, name: str) -> list[str]:
+        """Validate a value's type."""
+        if val is None:
+            return []
+
+        type_map = {
+            "string": str,
+            "integer": int,
+            "number": (int, float),
+            "boolean": bool,
+            "array": list,
+            "object": dict,
         }
+
+        expected = type_map.get(expected_type)
+        if expected is None:
+            return []
+
+        if expected_type == "integer":
+            if not isinstance(val, int) or isinstance(val, bool):
+                return [f"{name} should be integer, got {type(val).__name__}"]
+        elif expected_type == "number":
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                return [f"{name} should be number, got {type(val).__name__}"]
+        elif not isinstance(val, expected):
+            return [f"{name} should be {expected_type}, got {type(val).__name__}"]
+
+        return []
+
+    def to_openai_schema(self) -> dict[str, Any]:
+        """Convert to OpenAI function schema format."""
+        return self.definition.to_openai_schema()
+
+    def to_anthropic_schema(self) -> dict[str, Any]:
+        """Convert to Anthropic tool schema format."""
+        return self.definition.to_anthropic_schema()
+
+
+class Tool(BaseTool):
+    """
+    Backward-compatible tool base class.
+
+    This class adapts the old-style tool interface to the new BaseTool system.
+    Existing tools that define name, description, and parameters properties
+    can continue to work without modification.
+    """
+
+    @property
+    def definition(self) -> ToolDefinition:
+        """Build ToolDefinition from legacy properties."""
+        params = []
+        raw_params = self.parameters.get("properties", {})
+        required = set(self.parameters.get("required", []))
+
+        for name, schema in raw_params.items():
+            param = ToolParameter(
+                name=name,
+                description=schema.get("description", ""),
+                type=schema.get("type", "string"),
+                required=name in required,
+                default=schema.get("default"),
+                enum=schema.get("enum"),
+            )
+            params.append(param)
+
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=params,
+            is_read_only=getattr(self, "is_read_only", False),
+            is_destructive=getattr(self, "is_destructive", False),
+        )
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tool name."""
+        pass
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Tool description."""
+        pass
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict[str, Any]:
+        """Tool parameters in JSON Schema format."""
+        pass
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        """Execute with legacy signature adaptation."""
+        # Cast and validate
+        casted = self.cast_params(params)
+        errors = self.validate_params(casted)
+        if errors:
+            return f"Error: {'; '.join(errors)}"
+
+        # Call legacy execute method
+        return await self._legacy_execute(**casted)
+
+    @abstractmethod
+    async def _legacy_execute(self, **kwargs: Any) -> Any:
+        """Legacy execute method - override in subclasses."""
+        pass

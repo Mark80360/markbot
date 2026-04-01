@@ -41,7 +41,7 @@ class ThinkTool(Tool):
             "required": ["question"]
         }
     
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         question = kwargs.get("question", "")
         mode = kwargs.get("mode", "analyze")
         context = kwargs.get("context", "")

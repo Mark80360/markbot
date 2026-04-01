@@ -8,7 +8,8 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.agent.skills import BUILTIN_SKILLS_DIR
+from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.agent.subagent_progress import ProgressTracker, SubagentProgressManager
 from markbot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from markbot.agent.tools.registry import ToolRegistry
 from markbot.agent.tools.search import GlobTool, GrepTool
@@ -47,6 +48,9 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        
+        # Initialize progress manager
+        self.progress_manager = SubagentProgressManager(workspace)
 
     async def spawn(
         self,
@@ -89,6 +93,9 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        
+        # Create progress tracker
+        tracker = await self.progress_manager.create_tracker(task_id, label)
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -129,6 +136,13 @@ class SubagentManager:
                     tools=tools.get_definitions(),
                     model=self.model,
                 )
+                
+                # Record token usage
+                if response.usage:
+                    await tracker.record_tokens(
+                        input_tokens=response.usage.get("input_tokens", 0),
+                        output_tokens=response.usage.get("output_tokens", 0),
+                    )
 
                 if response.has_tool_calls:
                     tool_call_dicts = [
@@ -142,10 +156,25 @@ class SubagentManager:
                         thinking_blocks=response.thinking_blocks,
                     ))
 
-                    # Execute tools
+                    # Execute tools and record activities
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                        
+                        # Determine activity type
+                        is_search = tool_call.name in ["glob", "grep", "web_search"]
+                        is_read = tool_call.name in ["read_file", "web_fetch"]
+                        
+                        # Record activity before execution
+                        description = self._get_activity_description(tool_call.name, tool_call.arguments)
+                        await tracker.record_tool_use(
+                            tool_name=tool_call.name,
+                            input_args=tool_call.arguments,
+                            description=description,
+                            is_search=is_search,
+                            is_read=is_read,
+                        )
+                        
                         result = await tools.execute(tool_call.name, tool_call.arguments)
                         messages.append({
                             "role": "tool",
@@ -160,13 +189,46 @@ class SubagentManager:
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
 
+            # Mark as completed
+            await tracker.complete(final_result)
+            
             logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            
+            # Get progress for announcement
+            progress = tracker.get_progress()
+            await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+            await tracker.fail(error_msg)
+            progress = tracker.get_progress()
+            await self._announce_result(task_id, label, task, error_msg, origin, "error", progress)
+        finally:
+            # Clean up tracker
+            await self.progress_manager.remove_tracker(task_id)
+    
+    def _get_activity_description(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Generate a human-readable description for a tool activity."""
+        descriptions = {
+            "read_file": lambda a: f"Reading {a.get('path', 'file')}",
+            "write_file": lambda a: f"Writing {a.get('path', 'file')}",
+            "edit_file": lambda a: f"Editing {a.get('path', 'file')}",
+            "list_dir": lambda a: f"Listing {a.get('path', 'directory')}",
+            "glob": lambda a: f"Searching files: {a.get('pattern', '*')}",
+            "grep": lambda a: f"Searching text: {a.get('pattern', '')[:30]}...",
+            "exec": lambda a: f"Executing: {a.get('command', 'command')[:40]}...",
+            "web_search": lambda a: f"Web search: {a.get('query', '')[:40]}...",
+            "web_fetch": lambda a: f"Fetching: {a.get('url', 'URL')[:50]}...",
+        }
+        
+        if tool_name in descriptions:
+            try:
+                return descriptions[tool_name](args)
+            except Exception:
+                pass
+        
+        return f"Using {tool_name}"
 
     async def _announce_result(
         self,
@@ -176,13 +238,28 @@ class SubagentManager:
         result: str,
         origin: dict[str, str],
         status: str,
+        progress: Any = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        from markbot.agent.subagent_progress import SubagentProgress
+        
         status_text = "completed successfully" if status == "ok" else "failed"
+        
+        # Build progress summary
+        progress_info = ""
+        if isinstance(progress, SubagentProgress):
+            progress_info = f"""
+<task_info>
+<task_id>{task_id}</task_id>
+<duration_seconds>{progress.duration_seconds:.1f}</duration_seconds>
+<total_tokens>{progress.total_tokens}</total_tokens>
+<tool_uses>{progress.tool_use_count}</tool_uses>
+<output_file>{self.progress_manager.get_output_file(task_id)}</output_file>
+</task_info>"""
 
         announce_content = f"""[Subagent '{label}' {status_text}]
 
-Task: {task}
+Task: {task}{progress_info}
 
 Result:
 {result}
@@ -203,7 +280,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from markbot.agent.context import ContextBuilder
-        from markbot.agent.skills import SkillsLoader
+        from markbot.core.skills import SkillRegistry
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [f"""# Subagent
@@ -218,7 +295,10 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 ## Workspace
 {self.workspace}"""]
 
-        skills_summary = SkillsLoader(self.workspace).build_skills_summary()
+        # Use SkillRegistry instead of deprecated SkillsLoader
+        registry = SkillRegistry(self.workspace)
+        registry.load_all()
+        skills_summary = registry.build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 

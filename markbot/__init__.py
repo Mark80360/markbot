@@ -1,6 +1,6 @@
 """
-markbot - A lightweight AI agent framework
+MarkBot - A lightweight AI agent framework
 """
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __logo__ = "🦞"

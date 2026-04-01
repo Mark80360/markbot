@@ -78,7 +78,7 @@ class ExecTool(Tool):
             "required": ["command"],
         }
 
-    async def execute(
+    async def _legacy_execute(
         self, command: str, working_dir: str | None = None,
         timeout: int | None = None, **kwargs: Any,
     ) -> str:

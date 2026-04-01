@@ -62,7 +62,7 @@ class GlobTool(Tool):
             "required": ["pattern"]
         }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         pattern = kwargs.get("pattern", "")
         path = kwargs.get("path")
         
@@ -150,13 +150,13 @@ class GrepTool(Tool):
             "required": ["pattern"]
         }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         pattern = kwargs.get("pattern", "")
         path = kwargs.get("path")
         include = kwargs.get("include")
         case_insensitive = kwargs.get("case_insensitive", False)
         context_lines = kwargs.get("context_lines", 0)
-        
+
         try:
             search_path = _resolve_path(path or ".", self._workspace, self._allowed_dir)
             if not search_path.exists():

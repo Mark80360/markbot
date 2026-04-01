@@ -93,7 +93,7 @@ class ReadFileTool(_FsTool):
             "required": ["path"],
         }
 
-    async def execute(self, path: str | None = None, offset: int = 1, limit: int | None = None, **kwargs: Any) -> Any:
+    async def _legacy_execute(self, path: str | None = None, offset: int = 1, limit: int | None = None, **kwargs: Any) -> Any:
         try:
             if not path:
                 return "Error reading file: Unknown path"
@@ -176,7 +176,7 @@ class WriteFileTool(_FsTool):
             "required": ["path", "content"],
         }
 
-    async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
+    async def _legacy_execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
         try:
             if not path:
                 raise ValueError("Unknown path")
@@ -253,7 +253,7 @@ class EditFileTool(_FsTool):
             "required": ["path", "old_text", "new_text"],
         }
 
-    async def execute(
+    async def _legacy_execute(
         self, path: str | None = None, old_text: str | None = None,
         new_text: str | None = None,
         replace_all: bool = False, **kwargs: Any,
@@ -363,7 +363,7 @@ class ListDirTool(_FsTool):
             "required": ["path"],
         }
 
-    async def execute(
+    async def _legacy_execute(
         self, path: str | None = None, recursive: bool = False,
         max_entries: int | None = None, **kwargs: Any,
     ) -> str:

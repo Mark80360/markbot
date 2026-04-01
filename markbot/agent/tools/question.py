@@ -84,7 +84,7 @@ class AskUserQuestionTool(Tool):
             "required": ["question", "options"]
         }
 
-    async def execute(self, **kwargs: Any) -> str:
+    async def _legacy_execute(self, **kwargs: Any) -> str:
         question = kwargs.get("question", "")
         options = kwargs.get("options", [])
         

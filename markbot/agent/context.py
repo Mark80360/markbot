@@ -1,4 +1,7 @@
-"""Context builder for assembling agent prompts."""
+"""Context builder for assembling agent prompts.
+
+Refactored to use new skill system inspired.
+"""
 
 import base64
 import mimetypes
@@ -6,15 +9,18 @@ import platform
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
 from markbot.utils.helpers import current_time_str
 
-from markbot.agent.skills import SkillsLoader
-from markbot.agent.tools.registry import ToolRegistry
 from markbot.utils.helpers import build_assistant_message, detect_image_mime
+
+if TYPE_CHECKING:
+    from markbot.agent.tools.registry import ToolRegistry
+    from markbot.skills import SkillRegistry
+    from markbot.agent.tiered_memory import TieredMemoryManager
 
 
 class ContextBuilder:
@@ -32,11 +38,15 @@ class ContextBuilder:
         self,
         workspace: Path,
         timezone: str | None = None,
-        tool_registry: Optional[ToolRegistry] = None,
+        tool_registry: Optional["ToolRegistry"] = None,
+        skill_registry: Optional["SkillRegistry"] = None,
+        tiered_memory: Optional["TieredMemoryManager"] = None,
     ):
         self.workspace = workspace
         self.timezone = timezone
-        self.skills = SkillsLoader(workspace, tool_registry=tool_registry)
+        self.tool_registry = tool_registry
+        self.skill_registry = skill_registry
+        self.tiered_memory = tiered_memory
         self._context_cache = {}
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
@@ -44,22 +54,23 @@ class ContextBuilder:
         cache_key = f"system_prompt_{skill_names}"
         if cache_key in self._context_cache:
             return self._context_cache[cache_key]
-        
+
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+        # Add always-active skills content
+        if self.skill_registry:
+            always_content = self.skill_registry.get_always_active_content()
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                parts.append(always_content)
 
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
-            parts.append(f"""# Skills
+            # Add skills summary
+            skills_summary = self.skill_registry.build_skills_summary()
+            if skills_summary:
+                parts.append(f"""# Skills
 
 Skills extend your capabilities with specialized tools and domain knowledge.
 
@@ -90,7 +101,7 @@ Skills extend your capabilities with specialized tools and domain knowledge.
         Get system-level context (git status, environment info).
         This context is cached for the duration of the conversation.
         
-        Reference: Claude Code getSystemContext()
+        Reference: getSystemContext()
         """
         cache_key = "system_context"
         if cache_key in self._context_cache:
@@ -107,10 +118,10 @@ Skills extend your capabilities with specialized tools and domain knowledge.
 
     def get_user_context(self) -> dict[str, str]:
         """
-        Get user-level context (CLAUDE.md files, current date).
+        Get user-level context (USER.md files, current date).
         This context is cached for the duration of the conversation.
         
-        Reference: Claude Code getUserContext()
+        Reference: MarkBot getUserContext()
         """
         cache_key = "user_context"
         if cache_key in self._context_cache:
@@ -118,9 +129,9 @@ Skills extend your capabilities with specialized tools and domain knowledge.
         
         context = {}
         
-        claude_md = self._get_claude_md()
-        if claude_md:
-            context["claudeMd"] = claude_md
+        user_md = self._get_user_md()
+        if user_md:
+            context["userMd"] = user_md
         
         from datetime import datetime
         context["currentDate"] = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}."
@@ -186,14 +197,14 @@ Recent commits:
             logger.debug(f"Failed to get git status: {e}")
             return None
 
-    def _get_claude_md(self) -> str | None:
-        """Get CLAUDE.md content from workspace."""
-        claude_md_path = self.workspace / "CLAUDE.md"
+    def _get_user_md(self) -> str | None:
+        """Get USER.md content from workspace."""
+        claude_md_path = self.workspace / "USER.md"
         if claude_md_path.exists():
             try:
                 return claude_md_path.read_text(encoding="utf-8").strip()
             except Exception as e:
-                logger.debug(f"Failed to read CLAUDE.md: {e}")
+                logger.debug(f"Failed to read USER.md: {e}")
         return None
 
     def clear_cache(self):
@@ -458,6 +469,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         chat_id: str | None = None,
         current_role: str = "user",
         extra_system_context: str | None = None,
+        session_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -470,9 +482,25 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             chat_id: 聊天ID
             current_role: 当前消息角色
             extra_system_context: 额外的系统上下文（如墓碑标记恢复的上下文）
+            session_key: 会话标识，用于获取记忆上下文
         """
         # 构建系统提示词
         system_content = self.build_system_prompt(skill_names)
+
+        # 注入记忆上下文
+        if self.tiered_memory and session_key:
+            from markbot.session.manager import Session
+            # 获取当前会话（如果存在）
+            memory_context = self.tiered_memory.assemble_context(
+                chat_id=session_key,
+                user_input=current_message,
+                session=None,  # 会话对象会在 save_turn 时传递
+                include_whiteboard=True
+            )
+            if not memory_context.is_empty():
+                memory_prompt = memory_context.to_prompt()
+                if memory_prompt:
+                    system_content = f"{system_content}\n\n# Memory Context\n\n{memory_prompt}"
 
         # 如果有额外的系统上下文，追加到系统提示词
         if extra_system_context:
