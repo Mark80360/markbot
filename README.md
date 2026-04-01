@@ -14,6 +14,8 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Groq, and more
 - **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat, Email, and more
 - **Tiered Memory Architecture**: Hot (working), Warm (session), Cold (persistent) memory layers
+- **Token Tracking**: Real-time token usage monitoring with cache token support
+- **Conversation Compression**: Automatic summarization of old conversation turns to optimize context
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
 - **MCP Support**: Model Context Protocol for seamless tool integration
@@ -46,6 +48,14 @@ An advanced AI-powered automation and development assistant designed for develop
 │  │  │   Hot   │→│  Warm   │→│      Cold       │    │   │
 │  │  │(Working) │  │(Session)│  │   (Persistent)  │    │   │
 │  │  └─────────┘  └─────────┘  └─────────────────┘    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │          Token Management (v2.1.1)                    │   │
+│  │  ┌─────────────────┐  ┌─────────────────────┐    │   │
+│  │  │  Token Tracker  │  │    Compactor       │    │   │
+│  │  │  (Usage Monitor) │  │ (Context Compress) │    │   │
+│  │  └─────────────────┘  └─────────────────────┘    │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -219,6 +229,8 @@ markbot/
 ├── agent/
 │   ├── loop.py              # Main agent execution loop
 │   ├── context.py           # Context building
+│   ├── compact.py           # Conversation compression
+│   ├── tokens.py            # Token usage tracking
 │   ├── tiered_memory/       # Tiered memory system
 │   │   ├── hot_memory.py    # Working memory
 │   │   ├── warm_memory.py   # Session memory
