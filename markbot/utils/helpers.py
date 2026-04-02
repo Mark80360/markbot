@@ -260,12 +260,12 @@ def build_status_content(
     ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
     ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
     return "\n".join([
-        f"\U0001f408 markbot v{version}",
+        f"\U0001f99e MarkBot v{version}",
         f"\U0001f9e0 Model: {model}",
         f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
         f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
         f"\U0001f4ac Session: {session_msg_count} messages",
-        f"\u23f1 Uptime: {uptime}",
+        f"\U0001f551 Uptime: {uptime}",
     ])
 
 

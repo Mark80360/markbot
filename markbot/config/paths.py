@@ -19,9 +19,9 @@ def get_runtime_subdir(name: str) -> Path:
 
 
 def get_media_dir(channel: str | None = None) -> Path:
-    """Return the media directory, optionally namespaced per channel."""
-    base = get_runtime_subdir("media")
-    return ensure_dir(base / channel) if channel else base
+    """Return the media directory under workspace, optionally namespaced per channel."""
+    base = get_workspace_path() / "media"
+    return ensure_dir(base / channel) if channel else ensure_dir(base)
 
 
 def get_cron_dir(workspace: str | Path | None = None) -> Path:
