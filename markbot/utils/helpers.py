@@ -241,10 +241,17 @@ def build_status_content(
     version: str,
     model: str,
     start_time: float,
-    last_usage: dict[str, int],
     context_window_tokens: int,
+    context_tokens: int,
     session_msg_count: int,
-    context_tokens_estimate: int,
+    session_history_count: int,
+    tool_count: int,
+    last_usage: dict[str, int],
+    cumulative_input: int = 0,
+    cumulative_output: int = 0,
+    cumulative_cache_creation: int = 0,
+    cumulative_cache_read: int = 0,
+    api_calls: int = 0,
 ) -> str:
     """Build a human-readable runtime status snapshot."""
     uptime_s = int(time.time() - start_time)
@@ -253,20 +260,42 @@ def build_status_content(
         if uptime_s >= 3600
         else f"{uptime_s // 60}m {uptime_s % 60}s"
     )
+
+    ctx_total = max(context_window_tokens, 0)
+    ctx_pct = int((context_tokens / ctx_total) * 100) if ctx_total > 0 else 0
+    ctx_used = f"{context_tokens // 1000}k" if context_tokens >= 1000 else str(context_tokens)
+    ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
+
     last_in = last_usage.get("prompt_tokens", 0)
     last_out = last_usage.get("completion_tokens", 0)
-    ctx_total = max(context_window_tokens, 0)
-    ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
-    ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
-    ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
-    return "\n".join([
+    last_cache_create = last_usage.get("cache_creation_input_tokens", 0)
+    last_cache_read = last_usage.get("cache_read_input_tokens", 0)
+
+    def _fmt(n: int) -> str:
+        return f"{n // 1000}k" if n >= 1000 else str(n)
+
+    tokens_parts = [f"last: {_fmt(last_in)} in / {_fmt(last_out)} out"]
+    if cumulative_input or cumulative_output:
+        tokens_parts.append(f"total: {_fmt(cumulative_input)} in / {_fmt(cumulative_output)} out")
+    cache_parts = []
+    if last_cache_create or last_cache_read:
+        cache_parts.append(f"last: +{_fmt(last_cache_create)} cr / {_fmt(last_cache_read)} rd")
+    if cumulative_cache_creation or cumulative_cache_read:
+        cache_parts.append(f"total: +{_fmt(cumulative_cache_creation)} cr / {_fmt(cumulative_cache_read)} rd")
+
+    lines = [
         f"\U0001f99e MarkBot v{version}",
         f"\U0001f9e0 Model: {model}",
-        f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
-        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
-        f"\U0001f4ac Session: {session_msg_count} messages",
-        f"\U0001f551 Uptime: {uptime}",
+        f"\U0001f4ca Tokens: {' | '.join(tokens_parts)}",
+    ]
+    if cache_parts:
+        lines.append(f"   \U0001f4be Cache: {' | '.join(cache_parts)}")
+    lines.extend([
+        f"\U0001f4da Context: {ctx_used}/{ctx_total_str} ({ctx_pct}%)",
+        f"\U0001f4ac Session: {session_msg_count} stored ({session_history_count} active) | {tool_count} tools",
+        f"\U0001f551 Uptime: {uptime} | API calls: {api_calls}",
     ])
+    return "\n".join(lines)
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:

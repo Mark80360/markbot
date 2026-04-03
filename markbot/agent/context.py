@@ -470,6 +470,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
         extra_system_context: str | None = None,
         session_key: str | None = None,
+        session: Any = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -483,18 +484,17 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             current_role: 当前消息角色
             extra_system_context: 额外的系统上下文（如墓碑标记恢复的上下文）
             session_key: 会话标识，用于获取记忆上下文
+            session: 会话对象，用于组装记忆上下文中的会话历史
         """
         # 构建系统提示词
         system_content = self.build_system_prompt(skill_names)
 
         # 注入记忆上下文
         if self.tiered_memory and session_key:
-            from markbot.session.manager import Session
-            # 获取当前会话（如果存在）
             memory_context = self.tiered_memory.assemble_context(
                 chat_id=session_key,
                 user_input=current_message,
-                session=None,  # 会话对象会在 save_turn 时传递
+                session=session,
                 include_whiteboard=True
             )
             if not memory_context.is_empty():

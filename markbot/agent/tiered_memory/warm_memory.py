@@ -153,38 +153,38 @@ class WarmMemory(BaseMemoryLayer):
         role = metadata.get("role", "assistant")
         self.add_event(chat_id, role, content, metadata)
     
-    def get_context(self, query: Optional[str] = None, limit: int = 10) -> str:
-        """Get recent warm memory context."""
-        files = self.list_files(days=1)[:1]  # Just today
+    def get_context(self, query: Optional[str] = None, limit: int = 10,
+                    chat_id: Optional[str] = None) -> str:
+        """Get recent warm memory context.
+
+        Args:
+            query: Optional query string (unused, kept for interface compat)
+            limit: Max entries to return
+            chat_id: If provided, only return entries for this session
+        """
+        files = self.list_files(days=3)[:3]
         if not files:
             return ""
-        
-        content = files[0].read_text(encoding="utf-8")
-        lines = content.split('\n')
-        
-        # Get last N entries
-        entries = []
-        current_entry = []
-        
-        for line in reversed(lines):
-            if line.startswith("## ["):
-                if current_entry:
-                    entries.append('\n'.join(reversed(current_entry)))
-                    current_entry = []
-                if len(entries) >= limit:
-                    break
-            current_entry.append(line)
-        
-        if current_entry:
-            entries.append('\n'.join(reversed(current_entry)))
-        
-        if not entries:
+
+        all_entries = []
+        for file_path in files:
+            content = file_path.read_text(encoding="utf-8")
+            entries = content.split("\n## ")
+            for entry in entries[1:]:
+                if chat_id and f"Session: {chat_id}" not in entry:
+                    continue
+                all_entries.append("## " + entry)
+
+        if not all_entries:
             return ""
-        
-        context = ["## Recent Activity (Today)"]
-        context.extend(reversed(entries))
-        
-        return '\n'.join(context)
+
+        recent = all_entries[-limit:]
+        context = ["## Recent Activity (Last 3 Days)"]
+        if chat_id:
+            context[0] += f" [Session: {chat_id}]"
+        context.extend(recent)
+
+        return "\n".join(context)
     
     def clear(self) -> None:
         """Clear all warm memory files."""

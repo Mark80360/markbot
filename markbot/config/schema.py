@@ -159,10 +159,10 @@ class TieredMemoryConfig(Base):
     
     enabled: bool = True  # Tiered memory is now the default
     enable_cold: bool = True  # Enable L4 semantic memory (requires chromadb)
-    session_window: int = 8  # L1.5: Session sliding window size
-    hot_max_entries: int = 20  # L2: Max entries in hot memory
+    session_window: int = 20  # L1.5: Session sliding window size
+    hot_max_entries: int = 30  # L2: Max entries in hot memory
     warm_ttl_days: int = 30  # L3: Days to retain warm memory
-    compact_threshold: int = 8  # Trigger compact when session exceeds this
+    compact_threshold: int = 35  # Trigger compact when session exceeds this
 
 
 class Config(BaseSettings):

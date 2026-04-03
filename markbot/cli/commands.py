@@ -223,7 +223,7 @@ async def _read_interactive_input_async() -> str:
     try:
         with patch_stdout():
             return await _PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblue'>></b> "),
+                HTML("<b fg='ansiblue'>❯</b> "),
             )
     except EOFError as exc:
         raise KeyboardInterrupt from exc
@@ -753,6 +753,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        tiered_memory_config=config.tiered_memory,
     )
     
     async def on_cron_job(job: CronJob) -> str | None:
@@ -955,6 +956,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        tiered_memory_config=config.tiered_memory,
     )
 
     # Shared reference for progress callbacks

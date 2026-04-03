@@ -81,6 +81,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
+        tiered_memory_config=None,
     ):
         from markbot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -98,6 +99,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._last_context_tokens: int = 0
         
         self.token_tracker = TokenTracker()
         self.compactor = ConversationCompactor(llm_client=None)
@@ -135,7 +137,15 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         # Initialize tiered memory manager (now the only memory system)
-        self.tiered_memory = TieredMemoryManager(str(workspace), enable_cold=True)
+        tm_cfg = tiered_memory_config
+        self.tiered_memory = TieredMemoryManager(
+            str(workspace),
+            enable_cold=True if not tm_cfg else tm_cfg.enable_cold,
+            session_window=tm_cfg.session_window if tm_cfg else None,
+            hot_capacity=tm_cfg.hot_max_entries if tm_cfg else None,
+            warm_ttl_days=tm_cfg.warm_ttl_days if tm_cfg else None,
+            compact_threshold=tm_cfg.compact_threshold if tm_cfg else None,
+        )
         logger.info("Tiered memory system initialized")
 
         # Initialize context builder with tiered_memory
@@ -308,10 +318,10 @@ class AgentLoop:
             from markbot.agent.tokens import token_count_with_estimation
             current_tokens = token_count_with_estimation(messages)
             logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
-            
+
             if self.compactor.should_compact(
-                messages, 
-                current_tokens, 
+                messages,
+                current_tokens,
                 self.context_window_tokens
             ):
                 logger.info(
@@ -327,6 +337,7 @@ class AgentLoop:
                         len(initial_messages),
                         len(messages)
                     )
+                    current_tokens = token_count_with_estimation(messages)
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -361,8 +372,12 @@ class AgentLoop:
             self._last_usage = {
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
             }
-            
+            self._last_context_tokens = current_tokens
+
             self.token_tracker.update_from_response(response)
 
             if response.has_tool_calls:
@@ -667,6 +682,7 @@ class AgentLoop:
                 chat_id=chat_id,
                 current_role=current_role,
                 session_key=key,
+                session=session,
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
@@ -693,6 +709,8 @@ class AgentLoop:
                     assistant_response=final_content or "Background task completed.",
                     session=session,
                 )
+                # Compaction may have truncated session.messages, re-persist
+                self.sessions.save(session)
                 self.tiered_memory.end_loop(key)
             except Exception as e:
                 logger.warning(f"Tiered memory save failed: {e}")
@@ -753,6 +771,7 @@ class AgentLoop:
             chat_id=msg.chat_id,
             extra_system_context=context_note,
             session_key=key,
+            session=session,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -811,6 +830,8 @@ class AgentLoop:
                 assistant_response=final_content,
                 session=session,
             )
+            # Compaction may have truncated session.messages, re-persist
+            self.sessions.save(session)
             self.tiered_memory.end_loop(key)
             logger.debug("[AgentLoop] Tiered memory saved successfully")
         except Exception as e:
