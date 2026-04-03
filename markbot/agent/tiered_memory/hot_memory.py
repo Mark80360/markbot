@@ -18,14 +18,14 @@ class HotMemory(BaseMemoryLayer):
     - Categories: Past, Present, Future, Todo
     - Stores: Key facts, important info, TODOs, future plans
     
-    File: workspace/memory/hot_memory.md
+    File: workspace/memory/MEMORY.md
     """
     
     MAX_ENTRIES = 20
     
     def __init__(self, workspace_path: str, max_entries: int = None):
         super().__init__(MemoryTier.HOT, workspace_path)
-        self.file_path = Path(workspace_path) / "memory" / "hot_memory.md"
+        self.file_path = Path(workspace_path) / "memory" / "MEMORY.md"
         self.max_entries = max_entries or self.MAX_ENTRIES
         self._ensure_file()
     

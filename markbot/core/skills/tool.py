@@ -45,8 +45,8 @@ class SkillTool(BaseTool):
     async def check_permission(
         self, params: dict[str, Any], context: ToolContext
     ) -> PermissionDecision:
-        """Skills require explicit permission."""
-        # Skills run in sandbox but still need permission
+        if context.is_non_interactive:
+            return PermissionDecision(behavior="allow", reason="Non-interactive mode")
         return PermissionDecision(behavior="ask")
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:

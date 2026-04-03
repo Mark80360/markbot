@@ -25,7 +25,7 @@ Tiered memory system with 4 layers (L1-L4) for efficient context management.
 ### L2 Hot - Global Important Facts
 - **Purpose**: Critical user preferences and project facts
 - **Lifetime**: Permanent, max 20 items (configurable)
-- **Storage**: `memory/hot.json`
+- **Storage**: `memory/MEMORY.md`
 - **Use for**: User preferences, key relationships, project context
 - **Auto-loaded**: ✅ Always included in LLM context
 
@@ -37,18 +37,15 @@ Tiered memory system with 4 layers (L1-L4) for efficient context management.
 ### L3 Warm - Daily Activity Log
 - **Purpose**: Append-only chronological activity log
 - **Lifetime**: 30 days retention (configurable)
-- **Storage**: `memory/HISTORY.md`
+- **Storage**: `memory/warm/YYYY-MM-DD.md` (one file per day)
 - **Use for**: Event tracking, activity history, audit trail
 - **Auto-loaded**: ❌ Search on demand
 
 **Search methods:**
 
-For small HISTORY.md: Use `read_file` + in-memory search
+For recent days: Use `read_file` on `memory/warm/YYYY-MM-DD.md`
 
-For large files: Use targeted search:
-- **Linux/macOS:** `grep -i "keyword" memory/HISTORY.md`
-- **Windows:** `findstr /i "keyword" memory\HISTORY.md`
-- **Python:** `python -c "from pathlib import Path; text = Path('memory/HISTORY.md').read_text(); print('\n'.join([l for l in text.splitlines() if 'keyword' in l.lower()][-20:]))"`
+For searching across multiple days: Use `grep` with `path="memory/warm"` and appropriate patterns
 
 ### L4 Cold - Semantic Long-term Storage
 - **Purpose**: Vector-based semantic search for large history
@@ -61,7 +58,7 @@ For large files: Use targeted search:
 
 When conversations grow large, the system automatically:
 1. Summarizes old session turns
-2. Appends to L3 Warm (HISTORY.md)
+2. Appends to L3 Warm (memory/warm/)
 3. Extracts long-term facts → L2 Hot
 4. Clears L1 Whiteboard
 
@@ -72,7 +69,7 @@ This happens transparently every 8 turns (configurable).
 | Layer | Type | Persistence | Search | Auto-Context |
 |-------|------|-------------|---------|--------------|
 | L1 Whiteboard | Temporary | Single turn | - | Yes |
-| L1.5 Session | History | 8 turns | - | Yes |
+| L1.5 Session | History | Session window | - | Yes |
 | L2 Hot | Facts | Permanent | Key-based | ✅ Always |
-| L3 Warm | Events | 30 days | Grep/text | On demand |
+| L3 Warm | Events | 30 days | File/Grep | On demand |
 | L4 Cold | Semantic | Permanent | Vector similarity | On demand |
