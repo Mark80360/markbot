@@ -5,7 +5,9 @@ import json
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -29,6 +31,15 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+# Stale message threshold: drop Feishu retry deliveries older than this (ms)
+# Feishu retries failed deliveries at 5s, 5min, 1h, 6h intervals.
+FEISHU_STALE_MSG_THRESHOLD_MS = 20 * 1000
+
+# WebSocket reconnection backoff settings
+FEISHU_WS_INITIAL_RETRY_DELAY = 1.0
+FEISHU_WS_MAX_RETRY_DELAY = 60.0
+FEISHU_WS_BACKOFF_FACTOR = 2
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -279,6 +290,8 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_reactions: dict[str, str] = {}  # message_id -> reaction_id (guaranteed cleanup)
+        self._clock_offset: int = 0  # Clock offset (ms) = server_time - local_time
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -342,20 +355,29 @@ class FeishuChannel(BaseChannel):
         # instead of the already-running main asyncio loop, which would cause
         # "This event loop is already running" errors.
         def run_ws():
-            import time
+            import time as _time
             import lark_oapi.ws.client as _lark_ws_client
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
-            # Patch the module-level loop used by lark's ws Client.start()
             _lark_ws_client.loop = ws_loop
+            retry_delay = FEISHU_WS_INITIAL_RETRY_DELAY
             try:
                 while self._running:
                     try:
                         self._ws_client.start()
+                        retry_delay = FEISHU_WS_INITIAL_RETRY_DELAY  # Reset on clean exit
                     except Exception as e:
                         logger.warning("Feishu WebSocket error: {}", e)
                     if self._running:
-                        time.sleep(5)
+                        logger.info(
+                            "Feishu WebSocket reconnecting in {:.1f}s...",
+                            retry_delay,
+                        )
+                        _time.sleep(retry_delay)
+                        retry_delay = min(
+                            retry_delay * FEISHU_WS_BACKOFF_FACTOR,
+                            FEISHU_WS_MAX_RETRY_DELAY,
+                        )
             finally:
                 ws_loop.close()
 
@@ -979,6 +1001,13 @@ class FeishuChannel(BaseChannel):
         # Extract reaction info before try block for cleanup in finally
         reaction_id = msg.metadata.get("reaction_id")
         message_id = msg.metadata.get("message_id")
+        is_progress = msg.metadata.get("_progress", False)
+        is_tool_hint = msg.metadata.get("_tool_hint", False)
+
+        # Only clean up typing reaction on FINAL messages, not progress/hint updates.
+        # Progress messages are intermediate — removing the typing indicator early
+        # makes it look like processing finished before it actually did.
+        should_cleanup_reaction = reaction_id and message_id and not is_progress and not is_tool_hint
 
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
@@ -986,7 +1015,7 @@ class FeishuChannel(BaseChannel):
 
             # Handle tool hint messages as code blocks in interactive cards.
             # These are progress-only messages and should bypass normal reply routing.
-            if msg.metadata.get("_tool_hint"):
+            if is_tool_hint:
                 if msg.content and msg.content.strip():
                     await self._send_tool_hint_card(
                         receive_id_type, msg.chat_id, msg.content.strip()
@@ -999,7 +1028,7 @@ class FeishuChannel(BaseChannel):
             reply_message_id: str | None = None
             if (
                 self.config.reply_to_message
-                and not msg.metadata.get("_progress", False)
+                and not is_progress
             ):
                 reply_message_id = msg.metadata.get("message_id") or None
             # For topic group messages, always reply to keep context in thread
@@ -1075,12 +1104,19 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu message: {}", e)
             raise
         finally:
-            # Always remove reaction after processing to indicate completion
-            if reaction_id and message_id:
+            # Remove typing reaction only on final (non-progress) messages
+            if should_cleanup_reaction:
+                self._pending_reactions.pop(message_id, None)
                 try:
                     await self._remove_reaction(message_id, reaction_id)
                 except Exception:
                     pass  # Ignore cleanup errors
+            # On successful final send, add DONE reaction to indicate completion (CoPaw pattern)
+            elif message_id and not is_progress and not is_tool_hint:
+                try:
+                    await self._add_reaction(message_id, "DONE")
+                except Exception:
+                    pass
 
     def _on_message_sync(self, data: Any) -> None:
         """
@@ -1088,6 +1124,20 @@ class FeishuChannel(BaseChannel):
         Schedules async handling in the main event loop.
         """
         if self._loop and self._loop.is_running():
+            # Drop stale messages from Feishu retry mechanism.
+            # Feishu retries failed deliveries at 5s, 5min, 1h, 6h intervals.
+            # Messages older than 20 seconds are likely stale retries.
+            header = getattr(data, "header", None)
+            create_time = getattr(header, "create_time", None) if header else None
+            if create_time:
+                now_ms = int(time.time() * 1000) + self._clock_offset
+                age_ms = now_ms - int(create_time)
+                if age_ms > FEISHU_STALE_MSG_THRESHOLD_MS:
+                    logger.debug(
+                        "Feishu: dropping stale message age=%.1fs (retry)",
+                        age_ms / 1000,
+                    )
+                    return
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
 
     async def _on_message(self, data: Any) -> None:
@@ -1096,7 +1146,7 @@ class FeishuChannel(BaseChannel):
             event = data.event
             message = event.message
             sender = event.sender
-            
+
             # Deduplication check
             message_id = message.message_id
             if message_id in self._processed_message_ids:
@@ -1125,8 +1175,12 @@ class FeishuChannel(BaseChannel):
                 logger.debug("Feishu: skipping group message (not mentioned)")
                 return
 
-            # Add reaction and capture reaction_id
+            # Add reaction and track for later cleanup by send().
+            # Cleanup is intentionally NOT done here because _handle_message()
+            # returns immediately after publishing to bus (before agent processes).
             reaction_id = await self._add_reaction(message_id, self.config.react_emoji)
+            if reaction_id:
+                self._pending_reactions[message_id] = reaction_id
 
             # Parse content
             content_parts = []
@@ -1146,7 +1200,6 @@ class FeishuChannel(BaseChannel):
                 text, image_keys = _extract_post_content(content_json)
                 if text:
                     content_parts.append(text)
-                # Download images embedded in post
                 for img_key in image_keys:
                     file_path, content_text = await self._download_and_save_media(
                         "image", {"image_key": img_key}, message_id
@@ -1168,7 +1221,6 @@ class FeishuChannel(BaseChannel):
                 content_parts.append(content_text)
 
             elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
-                # Handle share cards and interactive messages
                 text = _extract_share_card_content(content_json, msg_type)
                 if text:
                     content_parts.append(text)
@@ -1176,12 +1228,10 @@ class FeishuChannel(BaseChannel):
             else:
                 content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
 
-            # Extract reply context (parent/root message IDs)
             parent_id = getattr(message, "parent_id", None) or None
             root_id = getattr(message, "root_id", None) or None
             thread_id = getattr(message, "thread_id", None) or None
 
-            # Prepend quoted message text when the user replied to another message
             if parent_id and self._client:
                 loop = asyncio.get_running_loop()
                 reply_ctx = await loop.run_in_executor(
@@ -1193,9 +1243,15 @@ class FeishuChannel(BaseChannel):
             content = "\n".join(content_parts) if content_parts else ""
 
             if not content and not media_paths:
+                # No content to process — clean up reaction immediately since send() won't be called.
+                if message_id in self._pending_reactions:
+                    self._pending_reactions.pop(message_id)
+                    try:
+                        await self._remove_reaction(message_id, reaction_id)
+                    except Exception:
+                        pass
                 return
 
-            # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
             await self._handle_message(
                 sender_id=sender_id,
@@ -1215,6 +1271,15 @@ class FeishuChannel(BaseChannel):
 
         except Exception as e:
             logger.error("Error processing Feishu message: {}", e)
+            # On any exception, attempt to clean up pending reaction
+            if 'message_id' in dir() and message_id and message_id in self._pending_reactions:
+                self._pending_reactions.pop(message_id)
+                try:
+                    rid = self._pending_reactions.get(message_id) or reaction_id
+                    if rid:
+                        await self._remove_reaction(message_id, rid)
+                except Exception:
+                    pass
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""

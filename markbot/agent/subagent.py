@@ -10,14 +10,10 @@ from loguru import logger
 
 from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
 from markbot.agent.subagent_progress import ProgressTracker, SubagentProgressManager
-from markbot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from markbot.agent.tools.registry import ToolRegistry
-from markbot.agent.tools.search import GlobTool, GrepTool
-from markbot.agent.tools.shell import ExecTool
-from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.config.schema import ExecToolConfig
+from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
 from markbot.providers.base import LLMProvider
 from markbot.utils.helpers import build_assistant_message
 
@@ -34,10 +30,9 @@ class SubagentManager:
         web_search_config: "WebSearchConfig | None" = None,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
+        filesystem_config: "FilesystemToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
-        from markbot.config.schema import ExecToolConfig, WebSearchConfig
-
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -45,6 +40,7 @@ class SubagentManager:
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.filesystem_config = filesystem_config or FilesystemToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -98,25 +94,21 @@ class SubagentManager:
         tracker = await self.progress_manager.create_tracker(task_id, label)
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            from markbot.agent.loop import AgentLoop
+
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-                allowed_internal_ips=self.exec_config.allowed_internal_ips,
-            ))
-            tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-            tools.register(WebFetchTool(proxy=self.web_proxy))
-            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            AgentLoop._register_base_tools(
+                tools,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=extra_read,
+                workspace=self.workspace,
+                web_search_config=self.web_search_config,
+                web_proxy=self.web_proxy,
+                exec_config=self.exec_config,
+                filesystem_config=self.filesystem_config,
+            )
             
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [

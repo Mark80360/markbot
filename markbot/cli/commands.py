@@ -37,7 +37,7 @@ from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.cli.skills import app as skills_app
 from markbot.config.paths import get_cron_dir, get_workspace_path, is_default_workspace
 from markbot.config.schema import Config
-from markbot.utils.helpers import sync_workspace_templates
+from markbot.utils.helpers import sync_workspace_templates, strip_ansi
 
 app = typer.Typer(
     name="markbot",
@@ -53,12 +53,28 @@ console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PROCESS_STOP_RETRIES = 10
+PROCESS_STOP_WAIT_INTERVAL = 0.5
+DAEMON_STARTUP_WAIT = 0.5
+
+# ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
 
 _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
+def _markbot_banner():
+    console.print("\nooo        ooooo                    oooo        oooooooooo.                .   ")
+    console.print("`88.       .888'                    `888        `888'   `Y8b             .o8   ")
+    console.print(" 888b     d'888   .oooo.   oooo d8b  888  oooo   888     888  .ooooo.  .o888oo  ")
+    console.print(" 8 Y88. .P  888  `P  )88b  `888\"\"8P  888 .8P'    888oooo888' d88' `88b   888  ")
+    console.print(" 8  `888'   888   .oP\"888   888      888888.     888    `88b 888   888   888   ")
+    console.print(" 8    Y     888  d8(  888   888      888 `88b.   888    .88P 888   888   888 .  ")
+    console.print(f"o8o        o888o `Y888\"\"8o d888b    o888o o888o o888bood8P'  `Y8bod8P'   \"888\"  \n")
 
 def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""
@@ -553,6 +569,58 @@ def _is_process_running(pid: int) -> bool:
         return False
 
 
+def _terminate_process(pid: int, force: bool = False) -> bool:
+    """Terminate a process by PID (cross-platform).
+
+    Args:
+        pid: Process ID to terminate.
+        force: If True, use SIGKILL (Unix) or force terminate (Windows).
+              If False, use SIGTERM (Unix) or graceful terminate (Windows).
+
+    Returns:
+        True if process was terminated successfully, False otherwise.
+    """
+    import time
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_TERMINATE = 0x0001
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+
+            if handle == 0:
+                return False
+
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                if exit_code.value != 259:  # Not STILL_ACTIVE
+                    kernel32.CloseHandle(handle)
+                    return True
+
+            kernel32.TerminateProcess(handle, 1 if force else 0)
+            kernel32.CloseHandle(handle)
+        else:
+            import os
+            import signal
+
+            if force:
+                os.kill(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGTERM)
+
+        for _ in range(PROCESS_STOP_RETRIES):
+            time.sleep(PROCESS_STOP_WAIT_INTERVAL)
+            if not _is_process_running(pid):
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
 @gateway_app.command("start")
 def gateway_start(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
@@ -576,6 +644,7 @@ def gateway_start(
 
 def _start_daemon(port: int, workspace: str | None, config_path: str | None, verbose: bool) -> None:
     """Start the gateway as a daemon process (cross-platform)."""
+    _markbot_banner()
     _ensure_pid_dir()
     
     if sys.platform == "win32":
@@ -611,7 +680,7 @@ def _start_daemon(port: int, workspace: str | None, config_path: str | None, ver
             )
         
         import time
-        time.sleep(0.5)
+        time.sleep(DAEMON_STARTUP_WAIT)
         
         if process.poll() is not None:
             console.print("[red]Failed to start gateway daemon.[/red]")
@@ -688,10 +757,16 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         filter=log_filter,
     )
     
+    # Custom formatter that strips ANSI codes from the message
+    def _file_format(record):
+        time_str = record["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        level_str = f"{record['level'].name: <8}"
+        return f"{time_str} | {level_str} | {record['name']}:{record['function']}:{record['line']} - {strip_ansi(record['message'])}\n"
+
     logger.add(
         GATEWAY_LOG_FILE,
         level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        format=_file_format,
         rotation="10 MB",
         retention="7 days",
         backtrace=True,
@@ -747,6 +822,8 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        filesystem_config=config.tools.filesystem,
+        memory_config=config.tools.memory,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
@@ -754,6 +831,10 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         tiered_memory_config=config.tiered_memory,
+        compaction_config=config.compaction,
+        max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
+        warn_threshold_usd=config.budget.warn_threshold_usd,
+        budget_config=config.budget if config.budget.enabled else None,
     )
     
     async def on_cron_job(job: CronJob) -> str | None:
@@ -883,7 +964,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             console.print(traceback.format_exc())
         finally:
             await agent.close_mcp()
-            heartbeat.stop()
+            await heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
@@ -916,19 +997,6 @@ def agent(
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
-    
-    # Setup file logging - always log to file for debugging
-    #log_file = config.workspace_path / "markbot.log"
-    #from loguru import logger
-    #logger.add(
-    #    str(log_file),
-    #    rotation="10 MB",
-    #    retention="7 days",
-    #    level="DEBUG",
-    #    encoding="utf-8",
-    #    filter=lambda record: record["name"].startswith("markbot"),
-    #)
-    #print(f"[日志] 详细日志已保存到: {log_file}")
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -951,12 +1019,18 @@ def agent(
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        filesystem_config=config.tools.filesystem,
+        memory_config=config.tools.memory,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         tiered_memory_config=config.tiered_memory,
+        compaction_config=config.compaction,
+        max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
+        warn_threshold_usd=config.budget.warn_threshold_usd,
+        budget_config=config.budget if config.budget.enabled else None,
     )
 
     # Shared reference for progress callbacks
@@ -994,7 +1068,9 @@ def agent(
         # Interactive mode — route through bus like other channels
         from markbot.bus.events import InboundMessage
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+
+        _markbot_banner()
+        console.print(f"{__logo__} MarkBot v{__version__} (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
 
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
@@ -1132,8 +1208,6 @@ def gateway_stop(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
 ):
     """Stop the MarkBot gateway service."""
-    import time
-    
     pid = _read_pid()
     if not pid:
         console.print("[yellow]Gateway is not running (no PID file found)[/yellow]")
@@ -1144,57 +1218,15 @@ def gateway_stop(
         console.print("[yellow]Gateway is not running (stale PID file removed)[/yellow]")
         raise typer.Exit(0)
 
-    # Terminate the process
-    try:
-        if sys.platform == "win32":
-            # Windows
-            import ctypes
-            from ctypes import wintypes
-            
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_TERMINATE = 0x0001
-            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-            
-            if handle == 0:
-                _remove_pid()
-                console.print("[yellow]Gateway process not found (cleaned up PID file)[/yellow]")
-                raise typer.Exit(0)
-            
-            exit_code = wintypes.DWORD()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                if exit_code.value != 259:  # Not STILL_ACTIVE
-                    _remove_pid()
-                    kernel32.CloseHandle(handle)
-                    console.print("[yellow]Gateway was already stopped.[/yellow]")
-                    raise typer.Exit(0)
-            
-            kernel32.TerminateProcess(handle, 1 if force else 0)
-            kernel32.CloseHandle(handle)
-        else:
-            # Linux/Unix
-            import os
-            import signal
-            
-            if force:
-                os.kill(pid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGTERM)
-        
-        console.print(f"[green]✓[/green] Sent {'force kill' if force else 'terminate'} to gateway (PID: {pid})")
+    console.print(f"[green]✓[/green] Sent {'force kill' if force else 'terminate'} to gateway (PID: {pid})")
 
-        for _ in range(10):
-            time.sleep(0.5)
-            if not _is_process_running(pid):
-                _remove_pid()
-                console.print("[green]✓[/green] Gateway stopped successfully.")
-                raise typer.Exit(0)
-
-        console.print("[yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
-        raise typer.Exit(1)
-    except Exception as e:
+    if _terminate_process(pid, force):
         _remove_pid()
-        console.print(f"[yellow]Gateway process error: {e} (cleaned up PID file)[/yellow]")
+        console.print("[green]✓[/green] Gateway stopped successfully.")
         raise typer.Exit(0)
+
+    console.print("[yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
+    raise typer.Exit(1)
 
 
 @gateway_app.command("restart")
@@ -1206,47 +1238,17 @@ def gateway_restart(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
 ):
     """Restart the MarkBot gateway service."""
-    import time
-    
     pid = _read_pid()
 
     if pid and _is_process_running(pid):
         console.print(f"[yellow]Stopping gateway (PID: {pid})...[/yellow]")
-        try:
-            if sys.platform == "win32":
-                # Windows
-                import ctypes
-                from ctypes import wintypes
-                
-                kernel32 = ctypes.windll.kernel32
-                PROCESS_TERMINATE = 0x0001
-                handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-                
-                if handle != 0:
-                    kernel32.TerminateProcess(handle, 1 if force else 0)
-                    kernel32.CloseHandle(handle)
-            else:
-                # Linux/Unix
-                import os
-                import signal
-                
-                if force:
-                    os.kill(pid, signal.SIGKILL)
-                else:
-                    os.kill(pid, signal.SIGTERM)
-
-            for _ in range(10):
-                time.sleep(0.5)
-                if not _is_process_running(pid):
-                    _remove_pid()
-                    console.print("[green]✓[/green] Gateway stopped.")
-                    break
-            else:
-                console.print("[red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
-                raise typer.Exit(1)
-        except Exception as e:
+        if _terminate_process(pid, force):
             _remove_pid()
-            console.print(f"[yellow]Error stopping gateway: {e} (cleaned up)[/yellow]")
+            console.print("[green]✓[/green] Gateway stopped.")
+        else:
+            _remove_pid()
+            console.print("[red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
+            raise typer.Exit(1)
     else:
         if pid:
             _remove_pid()
@@ -1263,7 +1265,8 @@ def gateway_status():
     import json
     from datetime import datetime
 
-    table = Table(title=f"\n{__logo__} MarkBot Gateway Status", title_justify="left")
+    _markbot_banner()
+    table = Table(title=f"{__logo__} MarkBot Gateway Status", title_justify="left")
     table.add_column("Component", style="cyan", width=20)
     table.add_column("Status", style="green", width=20)
     table.add_column("Details", width=50)

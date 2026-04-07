@@ -1,38 +1,24 @@
-"""File system tools: read, write, edit, list."""
+"""File system tools: read, write, edit, list, delete.
+
+Enhanced with:
+- Unified ignore directories (shared constants)
+- Automatic backup before write/edit operations
+- Delete file tool with safety checks
+- Improved error messages and validation
+"""
 
 import difflib
 import mimetypes
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from markbot.agent.tools.base import Tool
+from markbot.agent.tools.base import Tool, _resolve_path, _is_under
+from markbot.utils.constants import IGNORE_DIRS as _SHARED_IGNORE_DIRS
 from markbot.utils.helpers import build_image_content_blocks, detect_image_mime
 
-
-def _resolve_path(
-    path: str,
-    workspace: Path | None = None,
-    allowed_dir: Path | None = None,
-    extra_allowed_dirs: list[Path] | None = None,
-) -> Path:
-    """Resolve path against workspace (if relative) and enforce directory restriction."""
-    p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = workspace / p
-    resolved = p.resolve()
-    if allowed_dir:
-        all_dirs = [allowed_dir] + (extra_allowed_dirs or [])
-        if not any(_is_under(resolved, d) for d in all_dirs):
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
-    return resolved
-
-
-def _is_under(path: Path, directory: Path) -> bool:
-    try:
-        path.relative_to(directory.resolve())
-        return True
-    except ValueError:
-        return False
+_DEFAULT_BACKUP_DIR = "~/.markbot/.markbot_backups"
+_DEFAULT_MAX_BACKUPS = 50
 
 
 class _FsTool(Tool):
@@ -43,10 +29,14 @@ class _FsTool(Tool):
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
+        backup_dir: str | None = None,
+        max_backups: int | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        self._backup_dir = Path(backup_dir).expanduser() if backup_dir else Path(_DEFAULT_BACKUP_DIR).expanduser()
+        self._max_backups = max_backups or _DEFAULT_MAX_BACKUPS
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
@@ -183,9 +173,15 @@ class WriteFileTool(_FsTool):
             if content is None:
                 raise ValueError("Unknown content")
             fp = self._resolve(path)
+
+            backup_msg = ""
+            if fp.exists():
+                self._create_backup(fp)
+                backup_msg = " (backup created)"
+
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} bytes to {fp}"
+            return f"Successfully wrote {len(content)} bytes to {fp}{backup_msg}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -270,6 +266,8 @@ class EditFileTool(_FsTool):
             if not fp.exists():
                 return f"Error: File not found: {path}"
 
+            self._create_backup(fp)
+
             raw = fp.read_bytes()
             uses_crlf = b"\r\n" in raw
             content = raw.decode("utf-8").replace("\r\n", "\n")
@@ -326,11 +324,6 @@ class ListDirTool(_FsTool):
     """List directory contents with optional recursion."""
 
     _DEFAULT_MAX = 200
-    _IGNORE_DIRS = {
-        ".git", "node_modules", "__pycache__", ".venv", "venv",
-        "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
-        ".ruff_cache", ".coverage", "htmlcov",
-    }
 
     @property
     def name(self) -> str:
@@ -382,7 +375,7 @@ class ListDirTool(_FsTool):
 
             if recursive:
                 for item in sorted(dp.rglob("*")):
-                    if any(p in self._IGNORE_DIRS for p in item.parts):
+                    if any(p in _SHARED_IGNORE_DIRS for p in item.parts):
                         continue
                     total += 1
                     if len(items) < cap:
@@ -390,7 +383,7 @@ class ListDirTool(_FsTool):
                         items.append(f"{rel}/" if item.is_dir() else str(rel))
             else:
                 for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
+                    if item.name in _SHARED_IGNORE_DIRS:
                         continue
                     total += 1
                     if len(items) < cap:
@@ -408,3 +401,143 @@ class ListDirTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
+
+    def _create_backup(self, file_path: Path) -> None:
+        """Create a backup of file before modification."""
+        try:
+            backup_root = self._backup_dir
+
+            backup_root.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rel_path = file_path.name
+            backup_name = f"{timestamp}_{rel_path}.bak"
+            backup_path = backup_root / backup_name
+
+            import shutil
+            shutil.copy2(file_path, backup_path)
+
+            self._cleanup_old_backups(backup_root)
+        except Exception as e:
+            pass
+
+    @staticmethod
+    def _cleanup_old_backups(backup_dir: Path) -> None:
+        """Keep only the most recent backups."""
+        try:
+            backups = sorted(backup_dir.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old_backup in backups[self._max_backups:]:
+                old_backup.unlink()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# delete_file
+# ---------------------------------------------------------------------------
+
+class DeleteFileTool(_FsTool):
+    """Delete a file with safety checks and optional safe-delete (recycle bin) mode."""
+
+    def __init__(self, *args, safe_delete: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._safe_delete = safe_delete
+
+    @property
+    def name(self) -> str:
+        return "delete_file"
+
+    @property
+    def description(self) -> str:
+        mode = "safe mode (moved to trash)" if self._safe_delete else "permanent deletion"
+        return (
+            f"Delete a file ({mode}). Requires explicit confirmation. "
+            f"{'Files are moved to backup_dir/trash/, not permanently deleted.' if self._safe_delete else 'Permanently deletes the file with optional backup.'}"
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The file path to delete"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true to confirm deletion (safety guard)",
+                    "default": False,
+                },
+            },
+            "required": ["path", "confirm"],
+        }
+
+    async def _legacy_execute(
+        self,
+        path: str | None = None,
+        confirm: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        try:
+            if not path:
+                raise ValueError("Unknown path")
+
+            if not confirm:
+                return (
+                    "Error: Deletion requires confirmation. "
+                    "Set confirm=true to proceed with deletion of '{path}'. "
+                    "This is a safety measure to prevent accidental data loss."
+                )
+
+            fp = self._resolve(path)
+
+            if not fp.exists():
+                return f"Error: File not found: {path}"
+
+            if not fp.is_file():
+                return f"Error: Not a file (use list_dir to see contents): {path}"
+
+            if self._safe_delete:
+                return self._safe_delete_file(fp)
+            else:
+                return self._permanent_delete(fp)
+
+        except PermissionError as e:
+            return f"Permission denied: {e}"
+        except Exception as e:
+            return f"Error deleting file: {e}"
+
+    def _safe_delete_file(self, file_path: Path) -> str:
+        """Move file to backup directory (recycle bin mode)."""
+        try:
+            backup_root = self._backup_dir / "trash"
+            backup_root.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            original_name = file_path.name
+
+            dest_path = backup_root / f"{timestamp}_{original_name}"
+            counter = 1
+            while dest_path.exists():
+                dest_path = backup_root / f"{timestamp}_{original_name}_{counter}"
+                counter += 1
+
+            import shutil
+            shutil.move(str(file_path), str(dest_path))
+
+            rel_dest = dest_path.relative_to(backup_root)
+            return (
+                f"Safely deleted (moved to trash): {file_path}\n"
+                f"Location: .markbot_backups/trash/{rel_dest}\n"
+                f"To restore: cp \"{dest_path}\" \"{file_path}\""
+            )
+
+        except Exception as e:
+            return f"Error during safe delete: {e}. File was not modified."
+
+    def _permanent_delete(self, file_path: Path) -> str:
+        """Permanently delete the file with optional backup."""
+        try:
+            self._create_backup(file_path)
+            file_path.unlink()
+            return f"Permanently deleted: {file_path} (backup saved)"
+        except Exception as e:
+            return f"Error deleting file: {e}"

@@ -4,6 +4,7 @@ Refactored to use new core types inspired by MarkBot.
 """
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Optional
 
 from markbot.core.types import (
@@ -13,6 +14,33 @@ from markbot.core.types import (
     ToolDefinition,
     ToolParameter,
 )
+
+
+def _resolve_path(
+    path: str,
+    workspace: Path | None = None,
+    allowed_dir: Path | None = None,
+    extra_allowed_dirs: list[Path] | None = None,
+) -> Path:
+    """Resolve path against workspace (if relative) and enforce directory restriction."""
+    p = Path(path).expanduser()
+    if not p.is_absolute() and workspace:
+        p = workspace / p
+    resolved = p.resolve()
+    if allowed_dir:
+        all_dirs = [allowed_dir] + (extra_allowed_dirs or [])
+        if not any(_is_under(resolved, d) for d in all_dirs):
+            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+    return resolved
+
+
+def _is_under(path: Path, directory: Path) -> bool:
+    """Check if path is within directory."""
+    try:
+        path.relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 class BaseTool(ABC):

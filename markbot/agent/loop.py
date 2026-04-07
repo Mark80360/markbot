@@ -7,14 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
-from uuid import uuid4
 
 from loguru import logger
 
@@ -22,9 +20,10 @@ from markbot.agent.context import ContextBuilder
 from markbot.agent.tiered_memory import TieredMemoryManager
 from markbot.agent.subagent import SubagentManager
 from markbot.agent.tokens import TokenTracker
-from markbot.agent.compact import ConversationCompactor
+from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
+from markbot.agent.cost_tracker import CostTracker, BudgetExceededError
 from markbot.agent.tools.cron import CronTool
-from markbot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from markbot.agent.tools.filesystem import DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from markbot.agent.tools.message import MessageTool
 from markbot.agent.tools.question import AskUserQuestionTool
 from markbot.agent.tools.registry import ToolRegistry
@@ -34,8 +33,16 @@ from markbot.agent.tools.spawn import SpawnTool
 from markbot.agent.tools.subagent_progress import CheckSubagentTool, ListSubagentsTool
 from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.agent.tools.think import ThinkTool
-from markbot.agent.tools.plan import PlanTool
-from markbot.agent.tools.reflect import ReflectTool
+from markbot.agent.tools.memory import SearchHistoryTool
+from markbot.agent.tools.explore import ExploreTool
+from markbot.agent.services.turn_lifecycle import TurnLifecycle
+from markbot.agent.services.tool_executor import ToolExecutor
+from markbot.agent.services.message_pipeline import MessagePipeline, ProcessContext
+from markbot.agent.services.middleware import (
+    TombstoneMiddleware,
+    QuestionResponseMiddleware,
+    MemoryLifecycleMiddleware,
+)
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.command import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
@@ -43,10 +50,9 @@ from markbot.providers.base import LLMProvider
 from markbot.session.manager import Session, SessionManager
 from markbot.core.skills import SkillRegistry
 from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.state import get_app_state
 
 if TYPE_CHECKING:
-    from markbot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from markbot.config.schema import ChannelsConfig, ExecToolConfig, FilesystemToolConfig, WebSearchConfig
     from markbot.cron.service import CronService
 
 
@@ -62,8 +68,6 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 16_000
-
     def __init__(
         self,
         bus: MessageBus,
@@ -75,6 +79,8 @@ class AgentLoop:
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        filesystem_config: FilesystemToolConfig | None = None,
+        memory_config=None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -82,9 +88,11 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         tiered_memory_config=None,
+        compaction_config: CompactionConfig | None = None,
+        max_budget_usd: float | None = None,
+        warn_threshold_usd: float = 0.5,
+        budget_config=None,
     ):
-        from markbot.config.schema import ExecToolConfig, WebSearchConfig
-
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -95,6 +103,11 @@ class AgentLoop:
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.filesystem_config = filesystem_config or FilesystemToolConfig()
+        
+        from markbot.config.schema import MemoryToolsConfig
+        self.memory_config = memory_config or MemoryToolsConfig()
+        
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -102,7 +115,20 @@ class AgentLoop:
         self._last_context_tokens: int = 0
         
         self.token_tracker = TokenTracker()
-        self.compactor = ConversationCompactor(llm_client=None)
+        _compaction_cfg = compaction_config or CompactionConfig()
+        self.compactor = MultiLevelCompactor(provider=provider, config=_compaction_cfg)
+        _pricing: PricingTable | None = None
+        if budget_config and getattr(budget_config, 'custom_pricing', None):
+            from markbot.agent.cost_tracker import ModelPricing as _MP
+            _custom = {
+                k: _MP(**v) for k, v in budget_config.custom_pricing.items()
+            }
+            _pricing = PricingTable(custom=_custom)
+        self.cost_tracker = CostTracker(
+            max_budget_usd=max_budget_usd,
+            warn_threshold_usd=warn_threshold_usd,
+            pricing=_pricing,
+        )
 
         # Initialize tool registry
         self.tools = ToolRegistry()
@@ -120,6 +146,7 @@ class AgentLoop:
             web_search_config=self.web_search_config,
             web_proxy=web_proxy,
             exec_config=self.exec_config,
+            filesystem_config=self.filesystem_config,
             restrict_to_workspace=restrict_to_workspace,
         )
 
@@ -162,49 +189,93 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+        # Initialize decoupled services (extracted from monolithic loop)
+        self.turn_lifecycle = TurnLifecycle()
+        self.tool_executor = ToolExecutor(self.tools)
+        self._setup_pipeline()
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-        self.tools.register(
-            ReadFileTool(
-                workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
-            )
+        self._register_base_tools(
+            self.tools,
+            allowed_dir=allowed_dir,
+            extra_allowed_dirs=extra_read,
+            workspace=self.workspace,
+            web_search_config=self.web_search_config,
+            web_proxy=self.web_proxy,
+            exec_config=self.exec_config,
+            filesystem_config=self.filesystem_config,
         )
-        for cls in (WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        if self.exec_config.enable:
-            self.tools.register(
-                ExecTool(
-                    working_dir=str(self.workspace),
-                    timeout=self.exec_config.timeout,
-                    restrict_to_workspace=self.restrict_to_workspace,
-                    path_append=self.exec_config.path_append,
-                    allowed_internal_ips=self.exec_config.allowed_internal_ips,
-                )
-            )
-        self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-        self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
-        self.tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ThinkTool())
-        self.tools.register(PlanTool())
-        self.tools.register(ReflectTool())
+        self.tools.register(SearchHistoryTool(memory_manager=self.tiered_memory))
+        self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
         self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
 
-        # Register question tool with response handling setup
         self.question_tool = AskUserQuestionTool(send_callback=self.bus.publish_outbound)
-        self.question_tool.set_context("", "")  # Will be set per message
+        self.question_tool.set_context("", "")
         self.tools.register(self.question_tool)
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
 
+    @staticmethod
+    def _register_base_tools(
+        tools: "ToolRegistry",
+        allowed_dir: Path | None = None,
+        extra_allowed_dirs: list[Path] | None = None,
+        workspace: Path | None = None,
+        web_search_config: Any = None,
+        web_proxy: str | None = None,
+        exec_config: Any = None,
+        filesystem_config: Any = None,
+    ) -> None:
+        """Register base filesystem/web/shell tools (shared between AgentLoop and SubagentManager)."""
+        from markbot.agent.tools.filesystem import DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+        from markbot.agent.tools.search import GlobTool, GrepTool
+        from markbot.agent.tools.shell import ExecTool
+        from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 
+        if workspace is None:
+            raise ValueError("workspace must be provided")
+
+        fs_backup_dir = getattr(filesystem_config, 'backup_dir', None) if filesystem_config else None
+        fs_max_backups = getattr(filesystem_config, 'max_backups', None) if filesystem_config else None
+        fs_safe_delete = getattr(filesystem_config, 'safe_delete', True) if filesystem_config else True
+
+        tools.register(ReadFileTool(workspace=workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_allowed_dirs))
+        for cls in (WriteFileTool, EditFileTool, ListDirTool):
+            tools.register(cls(workspace=workspace, allowed_dir=allowed_dir, backup_dir=fs_backup_dir, max_backups=fs_max_backups))
+        tools.register(DeleteFileTool(workspace=workspace, allowed_dir=allowed_dir, backup_dir=fs_backup_dir, max_backups=fs_max_backups, safe_delete=fs_safe_delete))
+        if exec_config and exec_config.enable:
+            tools.register(
+                ExecTool(
+                    working_dir=str(workspace),
+                    timeout=exec_config.timeout,
+                    restrict_to_workspace=getattr(exec_config, 'restrict_to_workspace', False),
+                    path_append=exec_config.path_append,
+                    allowed_internal_ips=exec_config.allowed_internal_ips,
+                )
+            )
+        tools.register(WebSearchTool(config=web_search_config, proxy=web_proxy))
+        tools.register(WebFetchTool(proxy=web_proxy))
+        tools.register(GlobTool(workspace=workspace, allowed_dir=allowed_dir))
+        tools.register(GrepTool(workspace=workspace, allowed_dir=allowed_dir))
+
+    def _setup_pipeline(self) -> None:
+        """Initialize the message processing pipeline with middleware."""
+        self.pipeline = MessagePipeline()
+        self.pipeline.use(TombstoneMiddleware(self.turn_lifecycle))
+        self.pipeline.use(
+            QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool)
+        )
+        self.pipeline.use(MemoryLifecycleMiddleware(self.tiered_memory))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -319,25 +390,21 @@ class AgentLoop:
             current_tokens = token_count_with_estimation(messages)
             logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
 
-            if self.compactor.should_compact(
-                messages,
-                current_tokens,
-                self.context_window_tokens
-            ):
+            messages, compact_result = await self.compactor.maybe_compact(
+                messages, current_tokens, self.context_window_tokens
+            )
+            if compact_result.action != CompactAction.NONE:
                 logger.info(
-                    "[AgentLoop] Context size {} exceeds threshold, triggering compaction",
-                    current_tokens
+                    "[AgentLoop] Compaction applied: action={}, "
+                    "messages: {} -> {}, tokens: {} -> {}{}",
+                    compact_result.action.value,
+                    compact_result.messages_before,
+                    compact_result.messages_after,
+                    compact_result.tokens_before,
+                    compact_result.tokens_after,
+                    f", summary={compact_result.summary[:100]}..." if compact_result.summary else "",
                 )
-                summary, recent_messages = self.compactor.compact_conversation(messages)
-                if summary:
-                    compact_msg = self.compactor.create_compact_message(summary)
-                    messages = [compact_msg] + recent_messages
-                    logger.info(
-                        "[AgentLoop] Compacted messages: {} -> {}",
-                        len(initial_messages),
-                        len(messages)
-                    )
-                    current_tokens = token_count_with_estimation(messages)
+                current_tokens = compact_result.tokens_after
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -380,6 +447,26 @@ class AgentLoop:
 
             self.token_tracker.update_from_response(response)
 
+            try:
+                call_cost = self.cost_tracker.update_from_response(response, model=self.model)
+                if call_cost > 0:
+                    logger.debug("[AgentLoop] API cost this call: ${:.6f}", call_cost)
+                    ct = self.cost_tracker
+                    if (ct.warn_threshold_usd > 0
+                            and not ct._warn_emitted
+                            and ct.total_cost >= ct.warn_threshold_usd):
+                        ct._warn_emitted = True
+                        logger.warning(
+                            "[AgentLoop] Cost warning: ${:.6f} (threshold=${:.2f})",
+                            ct.total_cost,
+                            ct.warn_threshold_usd,
+                        )
+            except BudgetExceededError as exc:
+                logger.error(
+                    "[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc
+                )
+                break
+
             if response.has_tool_calls:
                 logger.info(
                     "[AgentLoop] LLM requested {} tool call(s): {}",
@@ -416,7 +503,8 @@ class AgentLoop:
                 for tc in response.tool_calls:
                     tools_used.append(tc.name)
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tc.name, args_str[:200])
+                    safe_args = args_str[:200].replace("{", "{{").replace("}", "}}")
+                    logger.info("Tool call: {}({})", tc.name, safe_args)
 
                 # Re-bind tool context right before execution so that
                 # concurrent sessions don't clobber each other's routing.
@@ -443,8 +531,9 @@ class AgentLoop:
                         result_preview = (
                             str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
                         )
+                        safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
                         logger.info(
-                            "[AgentLoop] Tool {} result: {}", tool_call.name, result_preview
+                            "[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview
                         )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -461,8 +550,9 @@ class AgentLoop:
 
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
+                    safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
                     logger.error(
-                        "[AgentLoop] LLM returned error finish_reason: {}", (clean or "")[:200]
+                        "[AgentLoop] LLM returned error finish_reason: {}", safe_clean
                     )
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
@@ -497,6 +587,15 @@ class AgentLoop:
             token_summary["total"]["output_tokens"],
             token_summary["total"]["cache_creation_input_tokens"],
             token_summary["total"]["cache_read_input_tokens"],
+        )
+
+        cost_summary = self.cost_tracker.get_summary()
+        logger.info(
+            "[AgentLoop] Cost - total=${:.6f}, calls={}, budget={}{}",
+            cost_summary["total_cost_usd"],
+            cost_summary["total_api_calls"],
+            f"${cost_summary['budget_limit_usd']}" if cost_summary["budget_limit_usd"] else "unlimited",
+            ", OVER BUDGET" if cost_summary["over_budget"] else "",
         )
 
         return final_content, tools_used, messages
@@ -575,13 +674,15 @@ class AgentLoop:
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli":
+                    else:
+                        # _process_message returned None (e.g., MessageTool sent directly).
+                        # Publish a minimal outbound to trigger reaction cleanup in the channel.
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content="",
-                                metadata=msg.metadata or {},
+                                metadata=dict(msg.metadata or {}),
                             )
                         )
                 except asyncio.CancelledError:
@@ -594,6 +695,7 @@ class AgentLoop:
                             channel=msg.channel,
                             chat_id=msg.chat_id,
                             content="Sorry, I encountered an error.",
+                            metadata=dict(msg.metadata or {}),
                         )
                     )
         finally:
@@ -628,21 +730,19 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    def _handle_question_response(self, msg: InboundMessage) -> bool:
-        """Check if message is a response to a pending question and handle it.
+    def get_cost_summary(self) -> dict[str, Any]:
+        """Return cost tracking summary including per-model breakdown."""
+        return self.cost_tracker.get_summary()
 
-        Returns True if the message was handled as a question response.
-        """
-        question_id = msg.metadata.get("question_response_for")
-        if not question_id:
-            return False
+    @property
+    def total_cost_usd(self) -> float:
+        """Total cost in USD for this session."""
+        return self.cost_tracker.total_cost
 
-        if hasattr(self, "question_tool") and self.question_tool:
-            logger.debug("Handling response to question {}", question_id)
-            self.question_tool.handle_response(question_id, msg.content)
-            return True
-
-        return False
+    @property
+    def is_over_budget(self) -> bool:
+        """Check if budget has been exceeded."""
+        return self.cost_tracker.is_over_budget()
 
     async def _process_message(
         self,
@@ -653,10 +753,6 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # Check if this is a response to a pending question
-        if self._handle_question_response(msg):
-            return None
-
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (
@@ -667,11 +763,11 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
 
             # === 墓碑标记：设置墓碑 ===
-            turn_id = self._set_tombstone(session, msg.content)
+            turn_id = self.turn_lifecycle.begin_turn(session, msg.content)
             self.sessions.save(session)
 
-            # Start tiered memory loop
-            self.tiered_memory.start_loop(key)
+            # Start tiered memory session
+            self.tiered_memory.create_session(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -683,6 +779,7 @@ class AgentLoop:
                 current_role=current_role,
                 session_key=key,
                 session=session,
+                memory_config=self.memory_config,
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
@@ -691,29 +788,39 @@ class AgentLoop:
                     chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
                 )
-                self._save_turn(session, all_msgs, 1 + len(history))
+                self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
                 # === 墓碑标记：成功完成，清除标记 ===
-                self._clear_tombstone(session, turn_id)
+                self.turn_lifecycle.complete_turn(session, turn_id)
                 self.sessions.save(session)
             except Exception as e:
                 # === 墓碑标记：失败，更新状态 ===
-                self._mark_turn_failed(session, turn_id, str(e))
+                self.turn_lifecycle.fail_turn(session, turn_id, str(e))
                 self.sessions.save(session)
+                # 保存 checkpoint 用于恢复
+                try:
+                    self.tiered_memory.close_session(key)
+                except Exception as checkpoint_err:
+                    logger.warning(f"Failed to close session: {checkpoint_err}")
                 raise
 
             # Save to tiered memory (只在成功时保存)
             try:
-                self.tiered_memory.save_turn(
+                self.tiered_memory.process_turn(
                     chat_id=key,
                     user_input=msg.content,
                     assistant_response=final_content or "Background task completed.",
-                    session=session,
+                    turn_number=len(history) + 1,
                 )
                 # Compaction may have truncated session.messages, re-persist
                 self.sessions.save(session)
-                self.tiered_memory.end_loop(key)
+                self.tiered_memory.close_session(key)
             except Exception as e:
                 logger.warning(f"Tiered memory save failed: {e}")
+                # 保存 checkpoint 以防数据丢失
+                try:
+                    self.tiered_memory.close_session(key)
+                except Exception as checkpoint_err:
+                    logger.warning(f"Failed to close session after memory save error: {checkpoint_err}")
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
@@ -734,22 +841,22 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
 
         # === 墓碑标记：清理过期的未完成标记 ===
-        self._cleanup_stale_tombstones(session)
+        self.turn_lifecycle.cleanup_stale(session)
 
         # === 墓碑标记：检查并处理未完成的轮次 ===
-        context_note = self._check_and_handle_incomplete_turn(session, msg)
+        context_note = self.turn_lifecycle.check_incomplete(session, msg)
         if context_note:
             logger.info(
                 "[AgentLoop] Detected incomplete turn, adding context note for session {}", key
             )
 
         # === 墓碑标记：设置新的墓碑，表示本轮次开始处理 ===
-        turn_id = self._set_tombstone(session, msg.content)
+        turn_id = self.turn_lifecycle.begin_turn(session, msg.content)
         self.sessions.save(session)  # 立即持久化标记
 
-        # Start tiered memory loop
-        logger.debug("[AgentLoop] Starting tiered memory loop for key={}", key)
-        self.tiered_memory.start_loop(key)
+        # Start tiered memory session
+        logger.debug("[AgentLoop] Starting tiered memory session for key={}", key)
+        self.tiered_memory.create_session(key)
 
         # Slash commands
         raw = msg.content.strip()
@@ -772,6 +879,7 @@ class AgentLoop:
             extra_system_context=context_note,
             session_key=key,
             session=session,
+            memory_config=self.memory_config,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -809,40 +917,51 @@ class AgentLoop:
                 logger.warning("[AgentLoop] final_content was None, using default message")
 
             logger.info("[AgentLoop] Saving session with {} messages", len(all_msgs))
-            self._save_turn(session, all_msgs, 1 + len(history))
+            self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
             # === 墓碑标记：成功完成，清除标记 ===
-            self._clear_tombstone(session, turn_id)
+            self.turn_lifecycle.complete_turn(session, turn_id)
             self.sessions.save(session)
         except Exception as e:
             # === 墓碑标记：失败，标记状态 ===
             logger.error("[AgentLoop] _run_agent_loop failed with exception: {}", e)
-            self._mark_turn_failed(session, turn_id, str(e))
+            self.turn_lifecycle.fail_turn(session, turn_id, str(e))
             self.sessions.save(session)
+            # 保存 checkpoint 用于恢复
+            try:
+                self.tiered_memory.close_session(key)
+            except Exception as checkpoint_err:
+                logger.warning(f"[AgentLoop] Failed to close session: {checkpoint_err}")
             # 重新抛出异常，让上层处理
             raise
 
         # Save to tiered memory (compact triggered automatically when > 8 turns)
         try:
             logger.debug("[AgentLoop] Saving to tiered memory...")
-            self.tiered_memory.save_turn(
+            self.tiered_memory.process_turn(
                 chat_id=key,
                 user_input=msg.content,
                 assistant_response=final_content,
-                session=session,
+                turn_number=len(history) + 1,
             )
             # Compaction may have truncated session.messages, re-persist
             self.sessions.save(session)
-            self.tiered_memory.end_loop(key)
+            self.tiered_memory.close_session(key)
             logger.debug("[AgentLoop] Tiered memory saved successfully")
         except Exception as e:
             logger.warning(f"[AgentLoop] Tiered memory save failed: {e}")
+            # 保存 checkpoint 以防数据丢失
+            try:
+                self.tiered_memory.close_session(key)
+            except Exception as checkpoint_err:
+                logger.warning(f"[AgentLoop] Failed to save checkpoint after memory save error: {checkpoint_err}")
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             logger.info("[AgentLoop] MessageTool sent in turn, returning None")
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("[AgentLoop] Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        safe_preview = preview.replace("{", "{{").replace("}", "}}")
+        logger.info("[AgentLoop] Response to {}:{}: {}", msg.channel, msg.sender_id, safe_preview)
 
         meta = dict(msg.metadata or {})
         if on_stream is not None:
@@ -861,232 +980,6 @@ class AgentLoop:
         """Convert an inline image block into a compact text placeholder."""
         path = (block.get("_meta") or {}).get("path", "")
         return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
-
-    def _sanitize_persisted_blocks(
-        self,
-        content: list[dict[str, Any]],
-        *,
-        truncate_text: bool = False,
-        drop_runtime: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Strip volatile multimodal payloads before writing session history."""
-        filtered: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                filtered.append(block)
-                continue
-
-            if (
-                drop_runtime
-                and block.get("type") == "text"
-                and isinstance(block.get("text"), str)
-                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
-            ):
-                continue
-
-            if block.get("type") == "image_url" and block.get("image_url", {}).get(
-                "url", ""
-            ).startswith("data:image/"):
-                filtered.append(self._image_placeholder(block))
-                continue
-
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text = block["text"]
-                if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
-                    text = text[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                filtered.append({**block, "text": text})
-                continue
-
-            filtered.append(block)
-
-        return filtered
-
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
-        from datetime import datetime
-
-        for m in messages[skip:]:
-            entry = dict(m)
-            role, content = entry.get("role"), entry.get("content")
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
-            if role == "tool":
-                if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                elif isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-            elif role == "user":
-                if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
-                ):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = parts[1]
-                    else:
-                        continue
-                if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-            entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
-        session.updated_at = datetime.now()
-
-    # === 墓碑标记（Tombstone）机制 - 用于检测和处理未完成对话 ===
-
-    def _set_tombstone(self, session: Session, user_input: str) -> str:
-        """设置墓碑标记，表示新一轮对话开始处理。
-
-        如果存在之前的未完成轮次，会被覆盖。
-
-        Args:
-            session: 当前会话
-            user_input: 用户的输入内容
-
-        Returns:
-            turn_id: 本轮次的唯一标识符
-        """
-        turn_id = str(uuid4())[:8]
-        session.metadata["active_turn"] = {
-            "turn_id": turn_id,
-            "user_input": user_input,
-            "started_at": datetime.now().isoformat(),
-            "status": "running",
-            "original_history_len": len(session.get_history()),
-        }
-        logger.debug(f"[Tombstone] Set turn {turn_id} for session {session.key}")
-        return turn_id
-
-    def _clear_tombstone(self, session: Session, turn_id: str) -> None:
-        """清除墓碑标记，表示轮次成功完成。
-
-        Args:
-            session: 当前会话
-            turn_id: 要清除的轮次ID（用于验证）
-        """
-        active = session.metadata.get("active_turn")
-        if active and active.get("turn_id") == turn_id:
-            del session.metadata["active_turn"]
-            logger.debug(f"[Tombstone] Cleared turn {turn_id} for session {session.key}")
-
-    def _mark_turn_failed(self, session: Session, turn_id: str, error: str) -> None:
-        """标记轮次为失败状态。
-
-        Args:
-            session: 当前会话
-            turn_id: 失败的轮次ID
-            error: 错误信息
-        """
-        active = session.metadata.get("active_turn")
-        if active and active.get("turn_id") == turn_id:
-            active["status"] = "failed"
-            active["error"] = error
-            active["failed_at"] = datetime.now().isoformat()
-            logger.warning(f"[Tombstone] Marked turn {turn_id} as failed: {error}")
-
-    def _check_and_handle_incomplete_turn(
-        self, session: Session, msg: InboundMessage
-    ) -> str | None:
-        """检查是否存在未完成的轮次，并生成上下文提示。
-
-        用于在下一轮对话开始时，告知 AI 上轮对话异常中断。
-
-        Args:
-            session: 当前会话
-            msg: 用户的新消息
-
-        Returns:
-            如果需要恢复上下文，返回提示文本；否则返回 None
-        """
-        active = session.metadata.get("active_turn")
-        if not active:
-            return None
-
-        # 检查用户是否发送了简短的"继续"类消息
-        user_msg_clean = msg.content.strip()
-        short_indicators = [
-            "继续",
-            "continue",
-            "go on",
-            "more",
-            "接着",
-            "说下去",
-            "完成",
-            "finish",
-            "kontynuuj",
-            "fortsetzen",
-            "continuer",
-        ]
-        is_likely_continue = len(user_msg_clean) <= 20 and any(
-            indicator in user_msg_clean.lower() for indicator in short_indicators
-        )
-
-        status = active.get("status", "unknown")
-        previous_input = active.get("user_input", "")
-
-        if status == "failed":
-            # 上一轮失败
-            context_note = (
-                f"[系统提示：上一轮对话在处理用户请求时异常中断。\n"
-                f"之前的请求：'{previous_input}'\n"
-                f"由于对话未正常完成，请注意上下文可能不完整。"
-            )
-            if is_likely_continue:
-                context_note += "用户很可能希望继续完成之前的任务。]"
-            else:
-                context_note += "]"
-
-            logger.info(
-                f"[Tombstone] Detected incomplete turn with failed status for session {session.key}"
-            )
-            return context_note
-
-        elif status == "running":
-            # 程序崩溃或重启后遗留的标记
-            context_note = (
-                f"[系统提示：检测到未完成的对话轮次（可能是程序异常退出导致）。\n"
-                f"上一轮用户请求：'{previous_input}'\n"
-                f"状态：未完成（status={status}）"
-            )
-            if is_likely_continue:
-                context_note += "用户当前简短的回复可能与此请求相关。]"
-            else:
-                context_note += "]"
-
-            logger.info(
-                f"[Tombstone] Detected incomplete turn with running status for session {session.key}"
-            )
-            return context_note
-
-        return None
-
-    def _cleanup_stale_tombstones(self, session: Session, max_age_hours: int = 24) -> None:
-        """清理过期的墓碑标记。
-
-        Args:
-            session: 当前会话
-            max_age_hours: 最大保留时间（小时），默认 24 小时
-        """
-        active = session.metadata.get("active_turn")
-        if not active:
-            return
-
-        try:
-            started = datetime.fromisoformat(active["started_at"])
-            if datetime.now() - started > timedelta(hours=max_age_hours):
-                logger.info(
-                    f"[Tombstone] Auto-cleaning stale tombstone from {active['started_at']} for session {session.key}"
-                )
-                del session.metadata["active_turn"]
-        except (KeyError, ValueError, TypeError):
-            # 无效数据，直接删除
-            if "active_turn" in session.metadata:
-                del session.metadata["active_turn"]
 
     async def process_direct(
         self,

@@ -133,6 +133,46 @@ class ExecToolConfig(Base):
         description="List of internal IPs to skip SSRF check in shell commands",
     )
 
+
+class FilesystemToolConfig(Base):
+    """File system tools configuration."""
+
+    backup_dir: str = "~/.markbot/.markbot_backups"  # Backup directory for file operations
+    max_backups: int = Field(default=50, ge=10, le=500)  # Maximum number of backups to retain
+    safe_delete: bool = Field(
+        default=True,
+        description="If true, deleted files are moved to backup_dir (recycle bin mode). If false, files are permanently deleted."
+    )
+
+class MemoryToolsConfig(Base):
+    """Memory search and auto-injection configuration (OpenHarness-inspired)."""
+
+    auto_inject: bool = Field(
+        default=True,
+        description="Automatically inject relevant memories into context based on user input"
+    )
+    max_relevant_memories: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum number of relevant memories to auto-inject per query"
+    )
+    max_memory_chars: int = Field(
+        default=8000,
+        ge=1000,
+        le=20000,
+        description="Max characters per injected memory entry"
+    )
+    enable_keyword_search: bool = Field(
+        default=True,
+        description="Enable lightweight keyword-based memory search"
+    )
+    enable_semantic_search: bool = Field(
+        default=True,
+        description="Enable semantic embedding-based memory search (requires cold memory)"
+    )
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -150,6 +190,8 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
+    memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -165,6 +207,79 @@ class TieredMemoryConfig(Base):
     compact_threshold: int = 35  # Trigger compact when session exceeds this
 
 
+class CompactionConfig(Base):
+    """Multi-level context compaction configuration."""
+
+    collapse_tool_result_chars: int = Field(
+        default=4_000,
+        ge=1_000,
+        le=50_000,
+        description="Max chars per tool_result block before collapse truncation",
+    )
+    micro_compact_keep_turns: int = Field(
+        default=6,
+        ge=2,
+        le=20,
+        description="Number of recent tool-result turns to preserve during micro-compact",
+    )
+    auto_compact_keep_recent: int = Field(
+        default=5,
+        ge=2,
+        le=15,
+        description="Number of recent message pairs to keep after auto-compaction (LLM summary)",
+    )
+    snip_keep_messages: int = Field(
+        default=10,
+        ge=3,
+        le=30,
+        description="Minimum messages to keep when history snip (last resort)",
+    )
+    threshold_ratio: float = Field(
+        default=0.85,
+        ge=0.5,
+        le=0.99,
+        description="Trigger compaction when context exceeds this fraction of window",
+    )
+    max_compact_output_tokens: int = Field(
+        default=4_000,
+        ge=1_000,
+        le=16_000,
+        description="Max tokens for LLM-generated compaction summary",
+    )
+    reserved_output_tokens: int = Field(
+        default=8_000,
+        ge=1_000,
+        le=32_000,
+        description="Tokens reserved for LLM output when calculating compaction threshold",
+    )
+    auto_compact_buffer: int = Field(
+        default=13_000,
+        ge=1_000,
+        le=50_000,
+        description="Extra buffer tokens subtracted from window before auto-compaction trigger",
+    )
+
+
+class BudgetConfig(Base):
+    """Cost tracking and budget control configuration."""
+
+    enabled: bool = True
+    max_budget_usd: float | None = Field(
+        default=None,
+        ge=0.01,
+        description="Per-session budget cap in USD. None = unlimited",
+    )
+    warn_threshold_usd: float = Field(
+        default=0.5,
+        ge=0.01,
+        description="Log a warning when cost exceeds this amount",
+    )
+    custom_pricing: dict[str, dict[str, float]] | None = Field(
+        default=None,
+        description="Override per-model pricing: {model_name: {input_per_1k, output_per_1k, ...}}",
+    )
+
+
 class Config(BaseSettings):
     """Root configuration for markbot."""
 
@@ -174,6 +289,8 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     tiered_memory: TieredMemoryConfig = Field(default_factory=TieredMemoryConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
 
     @property
     def workspace_path(self) -> Path:

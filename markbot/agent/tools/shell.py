@@ -1,4 +1,4 @@
-"""Shell execution tool."""
+"""Shell execution tool with enhanced security."""
 
 import asyncio
 import os
@@ -10,6 +10,8 @@ from typing import Any
 from loguru import logger
 
 from markbot.agent.tools.base import Tool
+from markbot.utils.constants import DANGEROUS_COMMAND_PATTERNS
+from markbot.utils.helpers import strip_ansi
 
 
 class ExecTool(Tool):
@@ -27,17 +29,7 @@ class ExecTool(Tool):
     ):
         self.timeout = timeout
         self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
-            r"\b(mkfs|diskpart)\b",          # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
-        ]
+        self.deny_patterns = deny_patterns or DANGEROUS_COMMAND_PATTERNS
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
@@ -126,10 +118,10 @@ class ExecTool(Tool):
             output_parts = []
 
             if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
+                output_parts.append(strip_ansi(stdout.decode("utf-8", errors="replace")))
 
             if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
+                stderr_text = strip_ansi(stderr.decode("utf-8", errors="replace"))
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
 

@@ -79,9 +79,11 @@ class HeartbeatService:
     def _read_heartbeat_file(self) -> str | None:
         if self.heartbeat_file.exists():
             try:
-                return self.heartbeat_file.read_text(encoding="utf-8")
+                text = self.heartbeat_file.read_text(encoding="utf-8")
+                if text.strip():
+                    return text
             except Exception:
-                return None
+                pass
         return None
 
     async def _decide(self, content: str) -> tuple[str, str]:
@@ -123,11 +125,15 @@ class HeartbeatService:
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Heartbeat started (every {}s)", self.interval_s)
 
-    def stop(self) -> None:
-        """Stop the heartbeat service."""
+    async def stop(self) -> None:
+        """Stop the heartbeat service and wait for the task to finish."""
         self._running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._task = None
 
     async def _run_loop(self) -> None:
@@ -177,11 +183,20 @@ class HeartbeatService:
             logger.exception("Heartbeat execution failed")
 
     async def trigger_now(self) -> str | None:
-        """Manually trigger a heartbeat."""
+        """Manually trigger a heartbeat (full pipeline including evaluate & notify)."""
+        from markbot.utils.evaluator import evaluate_response
+
         content = self._read_heartbeat_file()
         if not content:
             return None
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        response = await self.on_execute(tasks)
+        if response and self.on_notify:
+            should_notify = await evaluate_response(
+                response, tasks, self.provider, self.model,
+            )
+            if should_notify:
+                await self.on_notify(response)
+        return response

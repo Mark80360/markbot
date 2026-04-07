@@ -30,7 +30,7 @@ class ContextBuilder:
     - Provides clear organization of context components
     """
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     MAX_GIT_STATUS_CHARS = 2000
 
@@ -116,29 +116,6 @@ Skills extend your capabilities with specialized tools and domain knowledge.
         self._context_cache[cache_key] = context
         return context
 
-    def get_user_context(self) -> dict[str, str]:
-        """
-        Get user-level context (USER.md files, current date).
-        This context is cached for the duration of the conversation.
-        
-        Reference: MarkBot getUserContext()
-        """
-        cache_key = "user_context"
-        if cache_key in self._context_cache:
-            return self._context_cache[cache_key]
-        
-        context = {}
-        
-        user_md = self._get_user_md()
-        if user_md:
-            context["userMd"] = user_md
-        
-        from datetime import datetime
-        context["currentDate"] = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}."
-        
-        self._context_cache[cache_key] = context
-        return context
-
     def _get_git_status(self) -> str | None:
         """Get git status for the workspace."""
         import subprocess
@@ -196,16 +173,6 @@ Recent commits:
         except Exception as e:
             logger.debug(f"Failed to get git status: {e}")
             return None
-
-    def _get_user_md(self) -> str | None:
-        """Get USER.md content from workspace."""
-        claude_md_path = self.workspace / "USER.md"
-        if claude_md_path.exists():
-            try:
-                return claude_md_path.read_text(encoding="utf-8").strip()
-            except Exception as e:
-                logger.debug(f"Failed to read USER.md: {e}")
-        return None
 
     def clear_cache(self):
         """Clear the context cache."""
@@ -345,6 +312,45 @@ Your workspace is at: {workspace_path}
 - Don't design for hypothetical future requirements
 - The right amount of complexity is what the task actually requires
 
+## Deep Research Methodology (深度研究方法论)
+When researching a codebase, project, or technical topic, follow this structured approach:
+
+### Phase 1: Planning (规划阶段)
+1. Use `think` with `mode="research-plan"` to create a structured exploration plan
+2. Identify key questions and what you need to understand
+3. Determine the scope and depth of research needed
+
+### Phase 2: Exploration (探索阶段)
+- **ALWAYS start with `explore` tool** - this is your primary code analysis tool:
+  - `explore(mode="overview")` - Get project structure, tech stack, architecture patterns
+  - `explore(mode="trace", target="symbol_name")` - Track functions/classes across files
+  - `explore(mode="analyze", target="file_path")` - Deep dive into specific files
+  - `explore(mode="dependencies")` - Map module relationships and dependencies
+- Use `think` with `mode="code-analysis"` for structured code reasoning
+- Follow the exploration plan systematically
+
+### Phase 3: Analysis (分析阶段)
+- Trace data flow: How does input → processing → output?
+- Identify patterns: Design patterns, anti-patterns, conventions
+- Map relationships: Module dependencies, class hierarchies, function calls
+- Evaluate quality: Code organization, error handling, test coverage
+
+### Phase 4: Synthesis (综合阶段)
+- Connect findings into coherent insights
+- Identify strengths, weaknesses, opportunities
+- Provide actionable recommendations
+- Document discoveries with specific file references and line numbers
+
+### Critical Rules for Research Tasks
+- **NEVER rely solely on README or markdown files** - always verify with actual code
+- **Use `explore` before individual read_file/grep/glob calls** - it's more efficient
+- **Trace symbols across files** to understand full implementation
+- **Look at actual implementations**, not just interfaces/type definitions
+- **Check tests** to understand expected behavior
+- **Verify assumptions by reading code** - don't guess based on names
+- **Provide specific evidence**: file paths, line numbers, code snippets
+- **Go deep enough** to understand the "why", not just the "what"
+
 ## Tool Usage Strategy
 - Do NOT use `exec` to run commands when a relevant dedicated tool is provided
 - Use `read_file` instead of `cat`, `head`, `tail`, or `sed`
@@ -475,6 +481,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         extra_system_context: str | None = None,
         session_key: str | None = None,
         session: Any = None,
+        memory_config: Any = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -489,22 +496,31 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             extra_system_context: 额外的系统上下文（如墓碑标记恢复的上下文）
             session_key: 会话标识，用于获取记忆上下文
             session: 会话对象，用于组装记忆上下文中的会话历史
+            memory_config: MemoryToolsConfig 配置（用于自动注入相关记忆）
         """
         # 构建系统提示词
         system_content = self.build_system_prompt(skill_names)
 
         # 注入记忆上下文
         if self.tiered_memory and session_key:
-            memory_context = self.tiered_memory.assemble_context(
+            memory_context = self.tiered_memory.get_full_context(
                 chat_id=session_key,
-                user_input=current_message,
-                session=session,
-                include_whiteboard=True
+                query=current_message,
             )
-            if not memory_context.is_empty():
-                memory_prompt = memory_context.to_prompt()
-                if memory_prompt:
-                    system_content = f"{system_content}\n\n# Memory Context\n\n{memory_prompt}"
+            if memory_context:
+                system_content = f"{system_content}\n\n# Memory Context\n\n{memory_context}"
+
+        # OpenHarness-style: 自动注入相关记忆（基于用户当前输入动态搜索）
+        if (memory_config and getattr(memory_config, 'auto_inject', True)
+            and self.tiered_memory and current_message):
+            
+            relevant_memories = self._find_and_inject_relevant_memories(
+                query=current_message,
+                config=memory_config
+            )
+            
+            if relevant_memories:
+                system_content = f"{system_content}\n\n{relevant_memories}"
 
         # 如果有额外的系统上下文，追加到系统提示词
         if extra_system_context:
@@ -525,6 +541,192 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             *history,
             {"role": current_role, "content": merged},
         ]
+
+    def _find_and_inject_relevant_memories(self, query: str, config: Any) -> str | None:
+        """Find and format relevant memories for auto-injection (OpenHarness-inspired).
+
+        Args:
+            query: User's current input message (used as search query)
+            config: MemoryToolsConfig instance with search settings
+
+        Returns:
+            Formatted memory section string, or None if no relevant memories found
+        """
+        if not query or not self.tiered_memory:
+            return None
+
+        max_results = getattr(config, 'max_relevant_memories', 5)
+        max_chars = getattr(config, 'max_memory_chars', 8000)
+        enable_keyword = getattr(config, 'enable_keyword_search', True)
+        enable_semantic = getattr(config, 'enable_semantic_search', True)
+
+        results = []
+
+        # Strategy 1: Keyword-based search (fast, lightweight - OpenHarness style)
+        if enable_keyword:
+            keyword_results = self._keyword_memory_search(query, max_results)
+            results.extend(keyword_results)
+
+        # Strategy 2: Semantic search (accurate, uses embeddings - MarkBot enhanced)
+        if enable_semantic:
+            semantic_results = self._semantic_memory_search(query, max_results)
+            results.extend(semantic_results)
+
+        # Deduplicate and rank
+        unique_results = self._deduplicate_and_rank(results, max_results)
+
+        if not unique_results:
+            return None
+
+        return self._format_relevant_memories(unique_results, max_chars)
+
+    def _keyword_memory_search(self, query: str, limit: int) -> list[dict]:
+        """Lightweight keyword-based memory search (inspired by OpenHarness).
+
+        Extracts tokens from query and matches against memory titles/content.
+        Fast but less accurate than semantic search.
+        """
+        tokens = {token for token in re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]+", query.lower())
+                  if len(token) >= 2}
+
+        if not tokens or not self.tiered_memory:
+            return []
+
+        scored = []
+
+        # Search warm memory (recent activity logs)
+        if hasattr(self.tiered_memory, 'warm') and self.tiered_memory.warm:
+            try:
+                warm = self.tiered_memory.warm
+                if hasattr(warm, 'search_recent'):
+                    warm_results = warm.search_recent(query=query, days=30, limit=20)
+                    for r in warm_results:
+                        header = r.get("header", "")
+                        preview = r.get("preview", "")
+                        haystack = f"{header} {preview}".lower()
+                        score = sum(1 for token in tokens if token in haystack)
+                        if score > 0:
+                            scored.append((score, {
+                                "source": "warm_memory",
+                                "title": header or f"Activity - {r.get('date', '')}",
+                                "content": preview or "",
+                                "date": r.get("date", ""),
+                            }))
+            except Exception:
+                pass
+
+        # Search hot memory (current context)
+        if hasattr(self.tiered_memory, 'hot') and self.tiered_memory.hot:
+            try:
+                hot_context = self.tiered_memory.hot.get_context()
+                if hot_context:
+                    score = sum(1 for token in tokens if token in hot_context.lower())
+                    if score > 0:
+                        scored.append((score, {
+                            "source": "hot_memory",
+                            "title": "Current Context",
+                            "content": hot_context,
+                        }))
+            except Exception:
+                pass
+
+        # Sort by relevance score (descending)
+        scored.sort(key=lambda x: -x[0])
+        return [item for _, item in scored[:limit]]
+
+    def _semantic_memory_search(self, query: str, limit: int) -> list[dict]:
+        """Semantic embedding-based memory search (MarkBot enhanced).
+
+        Uses vector similarity to find semantically related memories.
+        More accurate than keyword search but requires cold memory to be available.
+        """
+        if not self.tiered_memory:
+            return []
+
+        if not hasattr(self.tiered_memory, 'search_cold_memory'):
+            return []
+
+        try:
+            results = self.tiered_memory.search_cold_memory(query, limit=limit)
+            return [
+                {
+                    "source": "cold_memory",
+                    "title": r.get("metadata", {}).get("title", r.get("title", "Archived Memory")),
+                    "content": r.get("content", ""),
+                    "score": round((1 - r.get("distance", 1)) * 10, 2) if r.get("distance") is not None else r.get("score", 5),
+                    "date": r.get("metadata", {}).get("date", r.get("date", "")),
+                }
+                for r in results
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _deduplicate_and_rank(results: list[dict], limit: int) -> list[dict]:
+        """Remove duplicate memories and return top results by relevance.
+
+        Uses content hashing to detect duplicates and keeps the highest scoring version.
+        """
+        seen_hashes = set()
+        unique = []
+
+        for result in results:
+            content = result.get("content", "")[:500]
+            content_hash = hash(content)
+
+            if content_hash not in seen_hashes:
+                seen_hashes.add(content_hash)
+                unique.append(result)
+
+        # Sort by score/relevance if available
+        def get_score(r):
+            return r.get("score") or r.get("relevance") or 0
+
+        unique.sort(key=get_score, reverse=True)
+        return unique[:limit]
+
+    @staticmethod
+    def _format_relevant_memories(memories: list[dict], max_chars: int = 8000) -> str:
+        """Format relevant memories into a prompt-injectable section.
+
+        Creates a structured markdown section with memory details
+        that can be directly appended to system prompt.
+        """
+        lines = [
+            "# Relevant Historical Context",
+            "",
+            "The following memories were automatically found to be **relevant** to your current request:",
+            "Use this historical context to provide more accurate, informed, and consistent responses.",
+            "",
+        ]
+
+        for idx, mem in enumerate(memories, 1):
+            title = mem.get("title", f"Memory {idx}")
+            content = mem.get("content", "")
+            source = mem.get("source", "memory")
+            date = mem.get("date", "")
+            score = mem.get("score") or mem.get("relevance")
+
+            lines.extend([
+                f"## {idx}. {title}",
+                f"- **Source**: {source}",
+                (f"- **Date**: {date}" if date else ""),
+                (f"- **Relevance**: {score}/10" if score else ""),
+                "- **Content**:",
+                "```",
+            ])
+
+            # Truncate long contents
+            if len(content) > max_chars:
+                content = content[:max_chars] + "\n... [truncated]"
+
+            lines.append(content)
+            lines.extend(["``", ""])
+
+        lines.append("---")
+        lines.append("*This context was auto-injected based on semantic/keyword relevance to your current query.*")
+
+        return "\n".join(lines)
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

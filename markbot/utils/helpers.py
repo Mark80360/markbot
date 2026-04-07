@@ -12,10 +12,18 @@ import tiktoken
 
 
 def strip_think(text: str) -> str:
-    """Remove <think>…</think> blocks and any unclosed trailing <think> tag."""
+    """Remove  blocks and any unclosed trailing <think> tag."""
     text = re.sub(r"<think>[\s\S]*?</think>", "", text)
     text = re.sub(r"<think>[\s\S]*$", "", text)
     return text.strip()
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b_P[^\x1b]*\x1b\\|\x1b\][^\x00]*\x00")
+
+
+def strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes from text (color, cursor, etc.)."""
+    return _ANSI_RE.sub("", text)
 
 
 def detect_image_mime(data: bytes) -> str | None:
