@@ -39,6 +39,10 @@ class Middleware(Protocol):
         """Run after main handler. Can modify or replace response."""
         ...
 
+    async def on_error(self, ctx: ProcessContext, error: Exception) -> None:
+        """Called when the handler or a later middleware raises an exception."""
+        ...
+
 
 class MessagePipeline:
     """Composable message processing pipeline.
@@ -82,6 +86,11 @@ class MessagePipeline:
             response = await handler(ctx)
         except Exception as e:
             logger.error(f"[Pipeline] Handler failed: {e}")
+            for mw in reversed(self._middlewares):
+                try:
+                    await mw.on_error(ctx, e)
+                except Exception:
+                    pass
             raise
 
         for mw in reversed(self._middlewares):

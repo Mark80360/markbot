@@ -1,0 +1,83 @@
+"""Agent Markdown manager for reading and writing markdown files in working and memory directories."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+
+class AgentMdManager:
+    """Manager for reading and writing markdown files in working and memory directories."""
+
+    def __init__(self, working_dir: str | Path):
+        self.working_dir: Path = Path(working_dir)
+        self.working_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_dir: Path = self.working_dir / "memory"
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+    def list_working_mds(self) -> list[dict]:
+        md_files = list(self.working_dir.glob("*.md"))
+        result = []
+        for f in md_files:
+            if f.is_file():
+                stat = f.stat()
+                result.append({
+                    "filename": f.name,
+                    "size": stat.st_size,
+                    "path": str(f),
+                    "created_time": datetime.fromtimestamp(stat.ctime).isoformat(),
+                    "modified_time": datetime.fromtimestamp(stat.mtime).isoformat(),
+                })
+        return result
+
+    def read_working_md(self, md_name: str) -> str:
+        if not md_name.endswith(".md"):
+            md_name += ".md"
+        file_path = self.working_dir / md_name
+        if not file_path.exists():
+            raise FileNotFoundError(f"Working md file not found: {md_name}")
+        return self._read_text(file_path)
+
+    def write_working_md(self, md_name: str, content: str):
+        if not md_name.endswith(".md"):
+            md_name += ".md"
+        file_path = self.working_dir / md_name
+        file_path.write_text(content, encoding="utf-8")
+
+    def list_memory_mds(self) -> list[dict]:
+        md_files = list(self.memory_dir.glob("*.md"))
+        result = []
+        for f in md_files:
+            if f.is_file():
+                stat = f.stat()
+                result.append({
+                    "filename": f.name,
+                    "size": stat.st_size,
+                    "path": str(f),
+                    "created_time": datetime.fromtimestamp(stat.ctime).isoformat(),
+                    "modified_time": datetime.fromtimestamp(stat.mtime).isoformat(),
+                })
+        return result
+
+    def read_memory_md(self, md_name: str) -> str:
+        if not md_name.endswith(".md"):
+            md_name += ".md"
+        file_path = self.memory_dir / md_name
+        if not file_path.exists():
+            raise FileNotFoundError(f"Memory md file not found: {md_name}")
+        return self._read_text(file_path)
+
+    def write_memory_md(self, md_name: str, content: str):
+        if not md_name.endswith(".md"):
+            md_name += ".md"
+        file_path = self.memory_dir / md_name
+        file_path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _read_text(file_path: Path) -> str:
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return file_path.read_text(encoding=enc).strip()
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        return file_path.read_text(encoding="utf-8", errors="replace").strip()

@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.agent.context import ContextBuilder
-from markbot.agent.tiered_memory import TieredMemoryManager
+from markbot.agent.memory.manager import ReMeLightMemoryManager
+from markbot.agent.memory.hooks.bootstrap import BootstrapHook
+from markbot.agent.memory.hooks.compaction import MemoryCompactionHook
 from markbot.agent.subagent import SubagentManager
 from markbot.agent.tokens import TokenTracker
 from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
@@ -33,16 +35,15 @@ from markbot.agent.tools.spawn import SpawnTool
 from markbot.agent.tools.subagent_progress import CheckSubagentTool, ListSubagentsTool
 from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.agent.tools.think import ThinkTool
-from markbot.agent.tools.memory import SearchHistoryTool
+from markbot.agent.tools.memory import MemorySearchTool
 from markbot.agent.tools.explore import ExploreTool
-from markbot.agent.services.turn_lifecycle import TurnLifecycle
 from markbot.agent.services.tool_executor import ToolExecutor
 from markbot.agent.services.message_pipeline import MessagePipeline, ProcessContext
 from markbot.agent.services.middleware import (
-    TombstoneMiddleware,
     QuestionResponseMiddleware,
     MemoryLifecycleMiddleware,
 )
+from markbot.agent.memory.daily_log import DailyLogManager
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.command import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
@@ -87,7 +88,6 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
-        tiered_memory_config=None,
         compaction_config: CompactionConfig | None = None,
         max_budget_usd: float | None = None,
         warn_threshold_usd: float = 0.5,
@@ -158,30 +158,68 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
-        # MARKBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
-        # Initialize tiered memory manager (now the only memory system)
-        tm_cfg = tiered_memory_config
-        self.tiered_memory = TieredMemoryManager(
-            str(workspace),
-            enable_cold=True if not tm_cfg else tm_cfg.enable_cold,
-            session_window=tm_cfg.session_window if tm_cfg else None,
-            hot_capacity=tm_cfg.hot_max_entries if tm_cfg else None,
-            warm_ttl_days=tm_cfg.warm_ttl_days if tm_cfg else None,
-            compact_threshold=tm_cfg.compact_threshold if tm_cfg else None,
-        )
-        logger.info("Tiered memory system initialized")
 
-        # Initialize context builder with tiered_memory
+        memory_cfg = self.memory_config
+        embedding_config = {}
+        if memory_cfg:
+            embedding_config = {
+                "backend": getattr(memory_cfg, "embedding_backend", "openai"),
+                "api_key": getattr(memory_cfg, "embedding_api_key", ""),
+                "base_url": getattr(memory_cfg, "embedding_base_url", ""),
+                "model_name": getattr(memory_cfg, "embedding_model_name", ""),
+            }
+
+        llm_config = {
+            "backend": "openai",
+            "api_key": provider.api_key or "",
+            "base_url": provider.api_base or "",
+            "model_name": self.model or provider.get_default_model(),
+        }
+
+        self.memory_manager = ReMeLightMemoryManager(
+            working_dir=str(workspace),
+            agent_id="markbot",
+            provider=provider,
+            model=self.model,
+            embedding_config=embedding_config,
+            llm_config=llm_config,
+            language="zh",
+            timezone=timezone,
+            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
+            memory_compact_ratio=getattr(memory_cfg, "memory_compact_ratio", 0.75),
+            memory_reserve_ratio=getattr(memory_cfg, "memory_reserve_ratio", 0.1),
+            compact_with_thinking_block=True,
+            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
+            force_memory_search=getattr(memory_cfg, "force_memory_search", False),
+            force_max_results=getattr(memory_cfg, "force_max_results", 1),
+            force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
+        )
+        logger.info("Memory manager initialized (ReMeLight)")
+
+        self.bootstrap_hook = BootstrapHook(
+            working_dir=workspace,
+            language="zh",
+        )
+
+        memory_compact_threshold = int(context_window_tokens * 0.75)
+        self.compaction_hook = MemoryCompactionHook(
+            memory_manager=self.memory_manager,
+            memory_compact_threshold=memory_compact_threshold,
+            memory_compact_reserve=getattr(memory_cfg, "memory_compact_reserve", 10000),
+            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
+            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
+        )
+
         self.context = ContextBuilder(
             workspace,
             timezone=timezone,
             tool_registry=self.tools,
             skill_registry=self.skill_registry,
-            tiered_memory=self.tiered_memory,
+            memory_manager=self.memory_manager,
         )
         self._register_default_tools()
         # Skills are now registered via SkillRegistry
@@ -190,7 +228,6 @@ class AgentLoop:
         register_builtin_commands(self.commands)
 
         # Initialize decoupled services (extracted from monolithic loop)
-        self.turn_lifecycle = TurnLifecycle()
         self.tool_executor = ToolExecutor(self.tools)
         self._setup_pipeline()
 
@@ -212,7 +249,7 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ThinkTool())
-        self.tools.register(SearchHistoryTool(memory_manager=self.tiered_memory))
+        self.tools.register(MemorySearchTool(memory_manager=self.memory_manager))
         self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
         self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
@@ -271,11 +308,15 @@ class AgentLoop:
     def _setup_pipeline(self) -> None:
         """Initialize the message processing pipeline with middleware."""
         self.pipeline = MessagePipeline()
-        self.pipeline.use(TombstoneMiddleware(self.turn_lifecycle))
         self.pipeline.use(
             QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool)
         )
-        self.pipeline.use(MemoryLifecycleMiddleware(self.tiered_memory))
+        self._daily_log = DailyLogManager(workspace=self.workspace)
+        self.pipeline.use(MemoryLifecycleMiddleware(
+            memory_manager=self.memory_manager,
+            daily_log=self._daily_log,
+            session_manager=self.sessions,
+        ))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -354,6 +395,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        _budget_exceeded = False
 
         logger.info(
             "[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages)
@@ -385,7 +427,7 @@ class AgentLoop:
                 chat_id,
             )
             logger.info("[AgentLoop] Current message count: {}", len(messages))
-            
+
             from markbot.agent.tokens import token_count_with_estimation
             current_tokens = token_count_with_estimation(messages)
             logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
@@ -405,6 +447,35 @@ class AgentLoop:
                     f", summary={compact_result.summary[:100]}..." if compact_result.summary else "",
                 )
                 current_tokens = compact_result.tokens_after
+
+            # memory compaction: run pre-reasoning hook
+            system_msg = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
+            new_summary = await self.compaction_hook(
+                messages=messages,
+                system_prompt=system_msg,
+            )
+            if new_summary:
+                logger.info("[AgentLoop] Memory compaction applied, summary updated")
+
+            if self.memory_manager.force_memory_search and iteration == 1:
+                try:
+                    ms_tool = self.tools.get("memory_search")
+                    if ms_tool and hasattr(ms_tool, "get_forced_context"):
+                        user_query = ""
+                        for m in reversed(initial_messages):
+                            if m.get("role") == "user":
+                                c = m.get("content", "")
+                                user_query = c if isinstance(c, str) else str(c)
+                                break
+                        if user_query:
+                            forced_ctx = await ms_tool.get_forced_context(user_query)
+                            if forced_ctx:
+                                for m in messages:
+                                    if m.get("role") == "system":
+                                        m["content"] = m.get("content", "") + "\n\n" + forced_ctx
+                                        break
+                except Exception as e:
+                    logger.warning(f"[AgentLoop] force_memory_search failed: {e}")
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -465,6 +536,7 @@ class AgentLoop:
                 logger.error(
                     "[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc
                 )
+                _budget_exceeded = True
                 break
 
             if response.has_tool_calls:
@@ -566,7 +638,15 @@ class AgentLoop:
                 logger.info("[AgentLoop] Final response captured, length={}", len(clean or ""))
                 break
 
-        if final_content is None and iteration >= self.max_iterations:
+        if final_content is None and _budget_exceeded:
+            cost_summary = self.cost_tracker.get_summary()
+            final_content = (
+                f"Budget limit reached (${cost_summary['total_cost_usd']:.4f} / "
+                f"${cost_summary['budget_limit_usd']:.2f}). "
+                "I've stopped to avoid exceeding the spending limit. "
+                "You can increase the budget or break the task into smaller steps."
+            )
+        elif final_content is None and iteration >= self.max_iterations:
             logger.warning("[AgentLoop] Max iterations ({}) reached", self.max_iterations)
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
@@ -579,7 +659,7 @@ class AgentLoop:
             len(tools_used),
             final_content is not None,
         )
-        
+
         token_summary = self.token_tracker.get_summary()
         logger.info(
             "[AgentLoop] Token usage - Total: input={}, output={}, cache_creation={}, cache_read={}",
@@ -604,6 +684,11 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        try:
+            await self.memory_manager.start()
+            logger.info("Memory manager started")
+        except Exception as e:
+            logger.warning(f"Memory manager start failed: {e}")
         logger.info("Agent loop started")
 
         while self._running:
@@ -630,82 +715,80 @@ class AgentLoop:
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(
-                lambda t, k=msg.session_key: self._active_tasks.get(k, [])
-                and self._active_tasks[k].remove(t)
-                if t in self._active_tasks.get(k, [])
-                else None
-            )
+
+            def _cleanup_task(t: asyncio.Task, k: str = msg.session_key) -> None:
+                tasks = self._active_tasks.get(k)
+                if tasks is None:
+                    self._session_locks.pop(k, None)
+                    return
+                try:
+                    tasks.remove(t)
+                except ValueError:
+                    pass
+                if not tasks:
+                    self._active_tasks.pop(k, None)
+                    self._session_locks.pop(k, None)
+
+            task.add_done_callback(_cleanup_task)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
-        try:
-            async with lock, gate:
-                try:
-                    on_stream = on_stream_end = None
-                    if msg.metadata.get("_wants_stream"):
+        async with lock, gate:
+            try:
+                on_stream = on_stream_end = None
+                if msg.metadata.get("_wants_stream"):
 
-                        async def on_stream(delta: str) -> None:
-                            await self.bus.publish_outbound(
-                                OutboundMessage(
-                                    channel=msg.channel,
-                                    chat_id=msg.chat_id,
-                                    content=delta,
-                                    metadata={"_stream_delta": True},
-                                )
+                    async def on_stream(delta: str) -> None:
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=delta,
+                                metadata={"_stream_delta": True},
                             )
+                        )
 
-                        async def on_stream_end(*, resuming: bool = False) -> None:
-                            await self.bus.publish_outbound(
-                                OutboundMessage(
-                                    channel=msg.channel,
-                                    chat_id=msg.chat_id,
-                                    content="",
-                                    metadata={"_stream_end": True, "_resuming": resuming},
-                                )
-                            )
-
-                    response = await self._process_message(
-                        msg,
-                        on_stream=on_stream,
-                        on_stream_end=on_stream_end,
-                    )
-                    if response is not None:
-                        await self.bus.publish_outbound(response)
-                    else:
-                        # _process_message returned None (e.g., MessageTool sent directly).
-                        # Publish a minimal outbound to trigger reaction cleanup in the channel.
+                    async def on_stream_end(*, resuming: bool = False) -> None:
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content="",
-                                metadata=dict(msg.metadata or {}),
+                                metadata={"_stream_end": True, "_resuming": resuming},
                             )
                         )
-                except asyncio.CancelledError:
-                    logger.info("Task cancelled for session {}", msg.session_key)
-                    raise
-                except Exception:
-                    logger.exception("Error processing message for session {}", msg.session_key)
+
+                response = await self._process_message(
+                    msg,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
+                )
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+                else:
                     await self.bus.publish_outbound(
                         OutboundMessage(
                             channel=msg.channel,
                             chat_id=msg.chat_id,
-                            content="Sorry, I encountered an error.",
+                            content="",
                             metadata=dict(msg.metadata or {}),
                         )
                     )
-        finally:
-            # Clean up lock if no active tasks remain for this session
-            if msg.session_key in self._active_tasks:
-                active = [t for t in self._active_tasks[msg.session_key] if not t.done()]
-                if not active:
-                    # No more active tasks for this session, safe to remove lock
-                    self._session_locks.pop(msg.session_key, None)
-                    self._active_tasks.pop(msg.session_key, None)
+            except asyncio.CancelledError:
+                logger.info("Task cancelled for session {}", msg.session_key)
+                raise
+            except Exception:
+                logger.exception("Error processing message for session {}", msg.session_key)
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="Sorry, I encountered an error.",
+                        metadata=dict(msg.metadata or {}),
+                    )
+                )
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -728,6 +811,12 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        try:
+            for task in self.memory_manager.summary_tasks:
+                if not task.done():
+                    task.cancel()
+        except Exception:
+            pass
         logger.info("Agent loop stopping")
 
     def get_cost_summary(self) -> dict[str, Any]:
@@ -753,21 +842,51 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
-        if msg.channel == "system":
+        channel = msg.channel
+        chat_id = msg.chat_id
+
+        if channel == "system":
             channel, chat_id = (
-                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
+                chat_id.split(":", 1) if ":" in chat_id else ("cli", chat_id)
             )
-            logger.info("Processing system message from {}", msg.sender_id)
+
+        key = session_key or msg.session_key
+        if channel == "system":
             key = f"{channel}:{chat_id}"
+
+        pctx = ProcessContext(
+            msg=msg,
+            session_key=key,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        async def _handler(ctx: ProcessContext) -> OutboundMessage | None:
+            return await self._handle_message(
+                ctx, on_progress=on_progress, on_stream=on_stream, on_stream_end=on_stream_end,
+            )
+
+        return await self.pipeline.process(pctx, _handler)
+
+    async def _handle_message(
+        self,
+        ctx: ProcessContext,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Core message handling logic, executed inside the pipeline."""
+        await self._connect_mcp()
+        msg = ctx.msg
+        channel = ctx.channel
+        chat_id = ctx.chat_id
+        key = ctx.session_key
+
+        if channel == "system":
+            logger.info("Processing system message from {}", msg.sender_id)
             session = self.sessions.get_or_create(key)
+            ctx.session = session
 
-            # === 墓碑标记：设置墓碑 ===
-            turn_id = self.turn_lifecycle.begin_turn(session, msg.content)
-            self.sessions.save(session)
-
-            # Start tiered memory session
-            self.tiered_memory.create_session(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -779,7 +898,6 @@ class AgentLoop:
                 current_role=current_role,
                 session_key=key,
                 session=session,
-                memory_config=self.memory_config,
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
@@ -789,38 +907,9 @@ class AgentLoop:
                     message_id=msg.metadata.get("message_id"),
                 )
                 self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
-                # === 墓碑标记：成功完成，清除标记 ===
-                self.turn_lifecycle.complete_turn(session, turn_id)
-                self.sessions.save(session)
-            except Exception as e:
-                # === 墓碑标记：失败，更新状态 ===
-                self.turn_lifecycle.fail_turn(session, turn_id, str(e))
-                self.sessions.save(session)
-                # 保存 checkpoint 用于恢复
-                try:
-                    self.tiered_memory.close_session(key)
-                except Exception as checkpoint_err:
-                    logger.warning(f"Failed to close session: {checkpoint_err}")
+            except Exception:
                 raise
 
-            # Save to tiered memory (只在成功时保存)
-            try:
-                self.tiered_memory.process_turn(
-                    chat_id=key,
-                    user_input=msg.content,
-                    assistant_response=final_content or "Background task completed.",
-                    turn_number=len(history) + 1,
-                )
-                # Compaction may have truncated session.messages, re-persist
-                self.sessions.save(session)
-                self.tiered_memory.close_session(key)
-            except Exception as e:
-                logger.warning(f"Tiered memory save failed: {e}")
-                # 保存 checkpoint 以防数据丢失
-                try:
-                    self.tiered_memory.close_session(key)
-                except Exception as checkpoint_err:
-                    logger.warning(f"Failed to close session after memory save error: {checkpoint_err}")
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
@@ -828,43 +917,27 @@ class AgentLoop:
             )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Processing message from {}:{}: {}", channel, msg.sender_id, preview)
 
         logger.info(
             "[AgentLoop] _process_message started for channel={}, chat_id={}, content={}...",
-            msg.channel,
-            msg.chat_id,
+            channel,
+            chat_id,
             msg.content[:50],
         )
 
-        key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        ctx.session = session
 
-        # === 墓碑标记：清理过期的未完成标记 ===
-        self.turn_lifecycle.cleanup_stale(session)
-
-        # === 墓碑标记：检查并处理未完成的轮次 ===
-        context_note = self.turn_lifecycle.check_incomplete(session, msg)
-        if context_note:
-            logger.info(
-                "[AgentLoop] Detected incomplete turn, adding context note for session {}", key
-            )
-
-        # === 墓碑标记：设置新的墓碑，表示本轮次开始处理 ===
-        turn_id = self.turn_lifecycle.begin_turn(session, msg.content)
-        self.sessions.save(session)  # 立即持久化标记
-
-        # Start tiered memory session
-        logger.debug("[AgentLoop] Starting tiered memory session for key={}", key)
-        self.tiered_memory.create_session(key)
+        logger.debug("[AgentLoop] Starting memory session for key={}", key)
 
         # Slash commands
         raw = msg.content.strip()
-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
+        cmd_ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if result := await self.commands.dispatch(cmd_ctx):
             return result
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -874,13 +947,19 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            extra_system_context=context_note,
+            channel=channel,
+            chat_id=chat_id,
             session_key=key,
             session=session,
-            memory_config=self.memory_config,
         )
+
+        # Bootstrap hook: prepend guidance on first interaction
+        bootstrap_guidance = self.bootstrap_hook.check_and_inject(initial_messages)
+        if bootstrap_guidance:
+            for m in initial_messages:
+                if m.get("role") == "user":
+                    m["content"] = bootstrap_guidance + m.get("content", "")
+                    break
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -888,8 +967,8 @@ class AgentLoop:
             meta["_tool_hint"] = tool_hint
             await self.bus.publish_outbound(
                 OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
+                    channel=channel,
+                    chat_id=chat_id,
                     content=content,
                     metadata=meta,
                 )
@@ -897,13 +976,13 @@ class AgentLoop:
 
         logger.info("[AgentLoop] Calling _run_agent_loop...")
         try:
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, tools_used, all_msgs = await self._run_agent_loop(
                 initial_messages,
                 on_progress=on_progress or _bus_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
-                channel=msg.channel,
-                chat_id=msg.chat_id,
+                channel=channel,
+                chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
 
@@ -918,42 +997,9 @@ class AgentLoop:
 
             logger.info("[AgentLoop] Saving session with {} messages", len(all_msgs))
             self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
-            # === 墓碑标记：成功完成，清除标记 ===
-            self.turn_lifecycle.complete_turn(session, turn_id)
-            self.sessions.save(session)
         except Exception as e:
-            # === 墓碑标记：失败，标记状态 ===
             logger.error("[AgentLoop] _run_agent_loop failed with exception: {}", e)
-            self.turn_lifecycle.fail_turn(session, turn_id, str(e))
-            self.sessions.save(session)
-            # 保存 checkpoint 用于恢复
-            try:
-                self.tiered_memory.close_session(key)
-            except Exception as checkpoint_err:
-                logger.warning(f"[AgentLoop] Failed to close session: {checkpoint_err}")
-            # 重新抛出异常，让上层处理
             raise
-
-        # Save to tiered memory (compact triggered automatically when > 8 turns)
-        try:
-            logger.debug("[AgentLoop] Saving to tiered memory...")
-            self.tiered_memory.process_turn(
-                chat_id=key,
-                user_input=msg.content,
-                assistant_response=final_content,
-                turn_number=len(history) + 1,
-            )
-            # Compaction may have truncated session.messages, re-persist
-            self.sessions.save(session)
-            self.tiered_memory.close_session(key)
-            logger.debug("[AgentLoop] Tiered memory saved successfully")
-        except Exception as e:
-            logger.warning(f"[AgentLoop] Tiered memory save failed: {e}")
-            # 保存 checkpoint 以防数据丢失
-            try:
-                self.tiered_memory.close_session(key)
-            except Exception as checkpoint_err:
-                logger.warning(f"[AgentLoop] Failed to save checkpoint after memory save error: {checkpoint_err}")
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             logger.info("[AgentLoop] MessageTool sent in turn, returning None")
@@ -961,7 +1007,7 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         safe_preview = preview.replace("{", "{{").replace("}", "}}")
-        logger.info("[AgentLoop] Response to {}:{}: {}", msg.channel, msg.sender_id, safe_preview)
+        logger.info("[AgentLoop] Response to {}:{}: {}", channel, msg.sender_id, safe_preview)
 
         meta = dict(msg.metadata or {})
         if on_stream is not None:
@@ -969,8 +1015,8 @@ class AgentLoop:
 
         logger.info("[AgentLoop] _process_message completed, returning response")
         return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+            channel=channel,
+            chat_id=chat_id,
             content=final_content,
             metadata=meta,
         )

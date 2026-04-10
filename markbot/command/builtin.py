@@ -74,15 +74,95 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session."""
+    """Start a fresh session with memory summarization."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    mm = getattr(loop, "memory_manager", None)
+    if mm and session.messages:
+        mm.add_async_summary_task(
+            messages=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in session.messages if m.get("content")],
+        )
+    if mm:
+        mm.set_compressed_summary("")
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="New session started.",
+        content="New session started. Summary task dispatched in background.",
+    )
+
+
+async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
+    """Manually trigger memory compaction."""
+    loop = ctx.loop
+    mm = getattr(loop, "memory_manager", None)
+    if not mm:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Memory manager is not available.",
+        )
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    history = session.get_history(max_messages=0)
+    if not history:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="No messages to compact.",
+        )
+    mm.add_async_summary_task(
+        messages=history,
+    )
+    summary = await mm.compact_memory(
+        messages=history,
+        previous_summary=mm._compressed_summary,
+    )
+    if summary:
+        mm._compressed_summary = summary
+        session.messages = session.messages[-2:] if len(session.messages) > 2 else session.messages
+        loop.sessions.save(session)
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=f"Compact complete!\n\n**Compressed Summary:**\n{summary}",
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content="Compact failed. Check logs for details.",
+    )
+
+
+async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
+    """Show the current compressed summary."""
+    loop = ctx.loop
+    mm = getattr(loop, "memory_manager", None)
+    if not mm:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Memory manager is not available.",
+        )
+    summary = mm._compressed_summary
+    if not summary:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="No compressed summary yet. Use /compact or wait for auto-compaction.",
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=f"**Compressed Summary:**\n\n{summary}",
+    )
+
+
+async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
+    """Clear conversation history and compressed summary."""
+    loop = ctx.loop
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    mm = getattr(loop, "memory_manager", None)
+    if mm:
+        mm._compressed_summary = ""
+    session.clear()
+    loop.sessions.save(session)
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content="History cleared. Compressed summary reset.",
     )
 
 
@@ -90,7 +170,10 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     lines = [
         "🦞 MarkBot commands:",
-        "/new — Start a new conversation",
+        "/new — Start a new conversation (saves summary first)",
+        "/compact — Manually compact conversation into summary",
+        "/compact_str — View current compressed summary",
+        "/clear — Clear history and compressed summary",
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
@@ -110,5 +193,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/compact", cmd_compact)
+    router.exact("/compact_str", cmd_compact_str)
+    router.exact("/clear", cmd_clear)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)

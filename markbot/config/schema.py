@@ -145,31 +145,41 @@ class FilesystemToolConfig(Base):
     )
 
 class MemoryToolsConfig(Base):
-    """Memory search and auto-injection configuration (OpenHarness-inspired)."""
+    """Memory system configuration (ReMeLight)."""
 
-    auto_inject: bool = Field(
+    embedding_backend: str = Field(
+        default="openai",
+        description="Embedding backend: openai or ollama"
+    )
+    embedding_api_key: str = Field(
+        default="",
+        description="API key for embedding model (leave empty for local models)"
+    )
+    embedding_base_url: str = Field(
+        default="",
+        description="Base URL for embedding API (leave empty for default)"
+    )
+    embedding_model_name: str = Field(
+        default="",
+        description="Embedding model name (leave empty for default)"
+    )
+    memory_compact_threshold: int = Field(
+        default=0,
+        ge=0,
+        description="Token threshold to trigger compaction (0 = auto: 75% of context window)"
+    )
+    memory_compact_reserve: int = Field(
+        default=10_000,
+        ge=1_000,
+        description="Tokens to reserve after compaction for new messages"
+    )
+    memory_summary_enabled: bool = Field(
         default=True,
-        description="Automatically inject relevant memories into context based on user input"
+        description="Enable async memory summarization to MEMORY.md"
     )
-    max_relevant_memories: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="Maximum number of relevant memories to auto-inject per query"
-    )
-    max_memory_chars: int = Field(
-        default=8000,
-        ge=1000,
-        le=20000,
-        description="Max characters per injected memory entry"
-    )
-    enable_keyword_search: bool = Field(
+    context_compact_enabled: bool = Field(
         default=True,
-        description="Enable lightweight keyword-based memory search"
-    )
-    enable_semantic_search: bool = Field(
-        default=True,
-        description="Enable semantic embedding-based memory search (requires cold memory)"
+        description="Enable automatic context compaction when threshold exceeded"
     )
 
 
@@ -194,17 +204,6 @@ class ToolsConfig(Base):
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
-
-
-class TieredMemoryConfig(Base):
-    """Tiered memory system configuration (L1-L4)."""
-    
-    enabled: bool = True  # Tiered memory is now the default
-    enable_cold: bool = True  # Enable L4 semantic memory (requires chromadb)
-    session_window: int = 20  # L1.5: Session sliding window size
-    hot_max_entries: int = 30  # L2: Max entries in hot memory
-    warm_ttl_days: int = 30  # L3: Days to retain warm memory
-    compact_threshold: int = 35  # Trigger compact when session exceeds this
 
 
 class CompactionConfig(Base):
@@ -288,7 +287,6 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    tiered_memory: TieredMemoryConfig = Field(default_factory=TieredMemoryConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
 

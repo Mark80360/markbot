@@ -2,62 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from markbot.agent.services.message_pipeline import Middleware, ProcessContext
-from markbot.agent.services.turn_lifecycle import TurnLifecycle
-from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.bus.events import OutboundMessage
 
-
-class TombstoneMiddleware(Middleware):
-    """Manages turn lifecycle with tombstone markers.
-
-    Runs before handler to check/cleanup stale markers and set new ones.
-    Runs after handler to clear markers on success or mark failure on error.
-    """
-
-    def __init__(self, lifecycle: TurnLifecycle):
-        self._lifecycle = lifecycle
-
-    async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
-        if not ctx.session:
-            return None
-
-        self._lifecycle.cleanup_stale(ctx.session)
-        context_note = self._lifecycle.check_incomplete(ctx.session, ctx.msg)
-        if context_note:
-            ctx.extra["context_note"] = context_note
-            logger.info(
-                f"[TombstoneMW] Detected incomplete turn for session {ctx.session.key}"
-            )
-
-        turn_id = self._lifecycle.begin_turn(ctx.session, ctx.msg.content)
-        ctx.extra["turn_id"] = turn_id
-        ctx.session.save()
-        return None
-
-    async def after(
-        self, ctx: ProcessContext, response: OutboundMessage | None
-    ) -> OutboundMessage | None:
-        if not ctx.session:
-            return response
-
-        turn_id = ctx.extra.get("turn_id")
-        if turn_id:
-            self._lifecycle.complete_turn(ctx.session, turn_id)
-            ctx.session.save()
-        return response
-
-    def mark_failed(self, ctx: ProcessContext, error: str) -> None:
-        """Call from exception handler when handler fails."""
-        if not ctx.session:
-            return
-        turn_id = ctx.extra.get("turn_id")
-        if turn_id:
-            self._lifecycle.fail_turn(ctx.session, turn_id, error)
-            ctx.session.save()
+if TYPE_CHECKING:
+    from markbot.agent.memory.daily_log import DailyLogManager
 
 
 class QuestionResponseMiddleware(Middleware):
@@ -66,7 +19,7 @@ class QuestionResponseMiddleware(Middleware):
     Short-circuits processing if message is a question response.
     """
 
-    def __init__(self, get_question_tool: Any = None):
+    def __init__(self, get_question_tool: object = None):
         self._get_question_tool = get_question_tool
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
@@ -92,7 +45,8 @@ class QuestionResponseMiddleware(Middleware):
             return OutboundMessage(
                 channel=ctx.channel,
                 chat_id=ctx.chat_id,
-                content=None,
+                content="",
+                metadata=dict(ctx.msg.metadata or {}),
             )
 
         return None
@@ -102,23 +56,29 @@ class QuestionResponseMiddleware(Middleware):
     ) -> OutboundMessage | None:
         return response
 
+    async def on_error(self, ctx: ProcessContext, error: Exception) -> None:
+        pass
+
 
 class MemoryLifecycleMiddleware(Middleware):
-    """Bridges TieredMemory operations into the pipeline.
+    """Bridges MemoryManager operations into the pipeline.
 
-    Handles start_loop/end_loop/save_turn calls around agent execution.
+    - Appends raw interaction logs to daily markdown files (no LLM cost).
+    - Summary is only triggered during context compaction (MemoryCompactionHook)
+      or manual commands (/compact, /new), matching CoPaw's strategy.
     """
 
-    def __init__(self, tiered_memory: Any = None):
-        self._memory = tiered_memory
+    def __init__(
+        self,
+        memory_manager: object = None,
+        daily_log: "DailyLogManager | None" = None,
+        session_manager: object = None,
+    ):
+        self._memory = memory_manager
+        self._daily_log = daily_log
+        self._session_manager = session_manager
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
-        key = ctx.session_key or ctx.msg.session_key
-        if self._memory and key:
-            try:
-                self._memory.create_session(key)
-            except Exception as e:
-                logger.warning(f"[MemoryMW] Failed to create session: {e}")
         return None
 
     async def after(
@@ -126,40 +86,36 @@ class MemoryLifecycleMiddleware(Middleware):
         ctx: ProcessContext,
         response: OutboundMessage | None,
     ) -> OutboundMessage | None:
-        key = ctx.session_key or ctx.msg.session_key
         final_content = response.content if response else None
 
-        if self._memory and key and ctx.session and final_content is not None:
+        if self._daily_log and final_content is not None:
             try:
-                self._memory.process_turn(
-                    chat_id=key,
-                    user_input=ctx.msg.content,
-                    assistant_response=final_content,
-                    turn_number=0,
+                self._daily_log.append_turn(
+                    user_content=ctx.msg.content,
+                    assistant_content=final_content,
+                    channel=ctx.channel,
+                    chat_id=ctx.chat_id,
                 )
-                if ctx.session:
-                    ctx.session.save()
-                self._memory.close_session(key)
             except Exception as e:
-                logger.warning(f"[MemoryMW] Process turn failed: {e}")
-                try:
-                    if self._memory:
-                        self._memory.close_session(key)
-                except Exception as close_err:
-                    logger.warning(f"[MemoryMW] Close session failed: {close_err}")
-        elif self._memory and key:
+                logger.warning(f"[MemoryMW] Daily log append failed: {e}")
+
+        if ctx.session:
             try:
-                self._memory.close_session(key)
+                if self._session_manager and hasattr(self._session_manager, 'save'):
+                    self._session_manager.save(ctx.session)
+                elif hasattr(ctx.session, 'save'):
+                    ctx.session.save()
             except Exception as e:
-                logger.debug(f"[MemoryMW] Close session (no-op): {e}")
+                logger.warning(f"[MemoryMW] Session save failed: {e}")
 
         return response
 
-    def handle_failure(self, ctx: ProcessContext) -> None:
-        """Call when main handler raises an exception."""
-        key = ctx.session_key or ctx.msg.session_key
-        if self._memory and key:
+    async def on_error(self, ctx: ProcessContext, error: Exception) -> None:
+        if ctx.session:
             try:
-                self._memory.close_session(key)
+                if self._session_manager and hasattr(self._session_manager, 'save'):
+                    self._session_manager.save(ctx.session)
+                elif hasattr(ctx.session, 'save'):
+                    ctx.session.save()
             except Exception as e:
-                logger.warning(f"[MemoryMW] Failure close failed: {e}")
+                logger.warning(f"[MemoryMW] Session save on error failed: {e}")

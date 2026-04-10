@@ -1,12 +1,11 @@
 """CLI commands for markbot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +28,14 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.table import Table
 from rich.text import Text
 
 from markbot import __logo__, __version__
-from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.cli.skills import app as skills_app
-from markbot.config.paths import get_cron_dir, get_workspace_path, is_default_workspace
+from markbot.cli.stream import StreamRenderer, ThinkingSpinner
+from markbot.config.paths import get_cron_dir, get_workspace_path
 from markbot.config.schema import Config
-from markbot.utils.helpers import sync_workspace_templates, strip_ansi
+from markbot.utils.helpers import strip_ansi, sync_workspace_templates
 
 app = typer.Typer(
     name="markbot",
@@ -68,13 +66,12 @@ _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
 def _markbot_banner():
-    console.print("\nooo        ooooo                    oooo        oooooooooo.                .   ")
-    console.print("`88.       .888'                    `888        `888'   `Y8b             .o8   ")
-    console.print(" 888b     d'888   .oooo.   oooo d8b  888  oooo   888     888  .ooooo.  .o888oo  ")
-    console.print(" 8 Y88. .P  888  `P  )88b  `888\"\"8P  888 .8P'    888oooo888' d88' `88b   888  ")
-    console.print(" 8  `888'   888   .oP\"888   888      888888.     888    `88b 888   888   888   ")
-    console.print(" 8    Y     888  d8(  888   888      888 `88b.   888    .88P 888   888   888 .  ")
-    console.print(f"o8o        o888o `Y888\"\"8o d888b    o888o o888o o888bood8P'  `Y8bod8P'   \"888\"  \n")
+    console.print("\n  ███╗   ███╗ █████╗ ██████╗ ██╗  ██╗██████╗  ██████╗ ████████╗")
+    console.print("  ████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔══██╗██╔═══██╗╚══██╔══╝")
+    console.print("  ██╔████╔██║███████║██████╔╝█████╔╝ ██████╔╝██║   ██║   ██║   ")
+    console.print("  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══██╗██║   ██║   ██║   ")
+    console.print("  ██║ ╚═╝ ██║██║  ██║██████╔╝██║  ██╗██████╔╝╚██████╔╝   ██║   ")
+    console.print("  ╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═════╝  ╚═════╝    ╚═╝   ")
 
 def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""
@@ -483,6 +480,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from markbot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -543,19 +541,19 @@ def _is_process_running(pid: int) -> bool:
         if sys.platform == "win32":
             import ctypes
             from ctypes import wintypes
-            
+
             kernel32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            
+
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if handle == 0:
                 return False
-                
+
             exit_code = wintypes.DWORD()
             if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 kernel32.CloseHandle(handle)
                 return exit_code.value == 259  # STILL_ACTIVE
-            
+
             kernel32.CloseHandle(handle)
             return True
         else:
@@ -644,32 +642,51 @@ def gateway_start(
 
 def _start_daemon(port: int, workspace: str | None, config_path: str | None, verbose: bool) -> None:
     """Start the gateway as a daemon process (cross-platform)."""
-    _markbot_banner()
+    from rich.text import Text
+
     _ensure_pid_dir()
-    
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
     if sys.platform == "win32":
         # Windows: use subprocess
         import subprocess
-        
+
         cmd = [
             sys.executable, "-m", "markbot",
             "gateway", "start",
             "--port", str(port),
             "--foreground",
         ]
-        
+
         if workspace:
             cmd.extend(["--workspace", workspace])
         if config_path:
             cmd.extend(["--config", config_path])
         if verbose:
             cmd.append("--verbose")
-        
+
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP |
             subprocess.CREATE_NO_WINDOW
         )
-        
+
         with open(GATEWAY_LOG_FILE, "w") as log_file:
             process = subprocess.Popen(
                 cmd,
@@ -678,25 +695,34 @@ def _start_daemon(port: int, workspace: str | None, config_path: str | None, ver
                 creationflags=creationflags,
                 cwd=str(Path.cwd()),
             )
-        
+
         import time
         time.sleep(DAEMON_STARTUP_WAIT)
-        
+
         if process.poll() is not None:
-            console.print("[red]Failed to start gateway daemon.[/red]")
+            section("Status", "red")
+            console.print("  [red]✗[/red] Failed to start gateway daemon")
+            console.print()
             raise typer.Exit(1)
-        
+
         _write_pid(process.pid)
-        console.print(f"[green]✓[/green] Gateway started in background (PID: {process.pid})")
-        
+        section("Status", "green")
+        kv("State", "[bold green]● RUNNING[/bold green]")
+        kv("PID", str(process.pid))
+        divider()
+        console.print()
+
     else:
         # Linux/Unix: use os.fork()
         pid = os.fork()
         if pid > 0:
             _write_pid(pid)
-            console.print(f"[green]✓[/green] Gateway started in background (PID: {pid})")
-            console.print(f"  Log file: {GATEWAY_LOG_FILE}")
-            console.print(f"  Use [cyan]markbot gateway status[/cyan] to check status.")
+            section("Status", "green")
+            kv("State", "[bold green]● RUNNING[/bold green]")
+            kv("PID", str(pid))
+            kv("Log File", str(GATEWAY_LOG_FILE))
+            divider()
+            console.print()
             return
 
         os.setsid()
@@ -714,7 +740,11 @@ def _start_daemon(port: int, workspace: str | None, config_path: str | None, ver
 
 def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
     """Run the gateway in foreground mode."""
+    # Configure logging
+    import logging
+
     from loguru import logger
+
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
@@ -723,14 +753,11 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     from markbot.cron.types import CronJob
     from markbot.heartbeat.service import HeartbeatService
     from markbot.session.manager import SessionManager
-
-    # Configure logging
-    import logging
     logging.basicConfig(level=logging.WARNING)
-    
+
     logger.remove()
     log_level = "DEBUG" if verbose else "INFO"
-    
+
     def log_filter(record):
         msg = record["message"]
         if "PING" in msg or "PONG" in msg:
@@ -745,7 +772,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         if record["name"] == "asyncio" and "selector" in msg.lower():
             return False
         return True
-    
+
     logger.add(
         sys.stderr,
         level=log_level,
@@ -756,7 +783,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         catch=True,
         filter=log_filter,
     )
-    
+
     # Custom formatter that strips ANSI codes from the message
     def _file_format(record):
         time_str = record["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -775,43 +802,42 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         encoding="utf-8",
         filter=log_filter,
     )
-    
+
     logger.info("Logging configured: level={}, backtrace=True, diagnose=True", log_level)
-    
+
     # Global exception hooks
-    import traceback
     import threading
-    
+
     def handle_exception(exc_type, exc_value, exc_traceback):
         logger.exception("Unhandled exception: {}:{}",
                         exc_type.__name__, exc_value,
                         exc_info=(exc_type, exc_value, exc_traceback))
-    
+
     def thread_exception_hook(args):
         logger.exception("Unhandled exception in thread {}: {}:{}",
                         args.thread.name if args.thread else "unknown",
                         args.exc_type.__name__, args.exc_value,
                         exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-    
+
     sys.excepthook = handle_exception
     threading.excepthook = thread_exception_hook
     logger.info("Global exception hooks installed")
-    
+
     config_path = Path(config) if config else None
     config = load_config(config_path)
     if workspace:
         config.agents.defaults.workspace = workspace
-    
+
     console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
-    
+
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
-    
+
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
     cron = CronService(cron_store_path)
-    
+
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -830,24 +856,23 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
-        tiered_memory_config=config.tiered_memory,
         compaction_config=config.compaction,
         max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
         warn_threshold_usd=config.budget.warn_threshold_usd,
         budget_config=config.budget if config.budget.enabled else None,
     )
-    
+
     async def on_cron_job(job: CronJob) -> str | None:
         from markbot.agent.tools.cron import CronTool
         from markbot.agent.tools.message import MessageTool
         from markbot.utils.evaluator import evaluate_response
-        
+
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
             f"Scheduled instruction: {job.payload.message}"
         )
-        
+
         cron_tool = agent.tools.get("cron")
         cron_token = None
         if isinstance(cron_tool, CronTool):
@@ -862,13 +887,13 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
-        
+
         response = resp.content if resp else ""
-        
+
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
-        
+
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
                 response, job.payload.message, provider, agent.model,
@@ -882,9 +907,9 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
                 ))
         return response
     cron.on_job = on_cron_job
-    
+
     channels = ChannelManager(config, bus)
-    
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         enabled = set(channels.enabled_channels)
         for item in session_manager.list_sessions():
@@ -897,13 +922,13 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             if channel in enabled and chat_id:
                 return channel, chat_id
         return "cli", "direct"
-    
+
     async def on_heartbeat_execute(tasks: str) -> str:
         channel, chat_id = _pick_heartbeat_target()
-        
+
         async def _silent(*_args, **_kwargs):
             pass
-        
+
         resp = await agent.process_direct(
             tasks,
             session_key="heartbeat",
@@ -911,21 +936,48 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             chat_id=chat_id,
             on_progress=_silent,
         )
-        
+
         session = agent.sessions.get_or_create("heartbeat")
         session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
         agent.sessions.save(session)
-        
+
         return resp.content if resp else ""
-    
+
     async def on_heartbeat_notify(response: str) -> None:
         from markbot.bus.events import OutboundMessage
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-    
+
     hb_cfg = config.gateway.heartbeat
+
+    # Create memory summarization callback for auto-generating MEMORY.md at 12:00 and 23:59
+    async def _summarize_memory_for_heartbeat():
+        try:
+            from datetime import datetime as _dt
+            _today = _dt.now().strftime("%Y-%m-%d")
+            _log_path = config.workspace_path / "memory" / f"{_today}.md"
+            if not _log_path.exists():
+                return False
+            _content = _log_path.read_text(encoding="utf-8")
+            if not _content.strip():
+                return False
+            _messages = [{"role": "user", "content": (
+                "请根据以下每日交互日志，生成一份精炼的记忆摘要写入 MEMORY.md。\n"
+                "要求：提取关键信息和重要决策，合并相同主题，保留具体事实，控制在4000字以内。\n\n"
+                f"{_content}"
+            )}]
+            _summary = await agent.memory_manager.summary_memory(messages=_messages)
+            if _summary:
+                _mem_path = config.workspace_path / "memory" / "MEMORY.md"
+                _mem_path.write_text(_summary[:12000], encoding="utf-8")
+                logger.info(f"MEMORY.md updated via heartbeat summarization")
+                return True
+        except Exception as e:
+            logger.warning(f"Heartbeat memory summarization failed: {e}")
+        return False
+
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
@@ -935,19 +987,20 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
+        memory_summarizer=_summarize_memory_for_heartbeat,
     )
-    
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
-    
+
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
-    
+
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
-    
+
     async def run():
         try:
             await cron.start()
@@ -968,7 +1021,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             cron.stop()
             agent.stop()
             await channels.stop_all()
-    
+
     asyncio.run(run())
 
 
@@ -1026,7 +1079,6 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
-        tiered_memory_config=config.tiered_memory,
         compaction_config=config.compaction,
         max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
         warn_threshold_usd=config.budget.warn_threshold_usd,
@@ -1208,24 +1260,62 @@ def gateway_stop(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
 ):
     """Stop the MarkBot gateway service."""
+    from rich.text import Text
+
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
     pid = _read_pid()
     if not pid:
-        console.print("[yellow]Gateway is not running (no PID file found)[/yellow]")
+        section("Status", "yellow")
+        console.print("  [yellow]○ Gateway is not running (no PID file found)[/yellow]")
+        divider()
+        console.print()
         raise typer.Exit(0)
 
     if not _is_process_running(pid):
         _remove_pid()
-        console.print("[yellow]Gateway is not running (stale PID file removed)[/yellow]")
+        section("Status", "yellow")
+        console.print("  [yellow]○ Gateway is not running (stale PID file removed)[/yellow]")
+        divider()
+        console.print()
         raise typer.Exit(0)
 
-    console.print(f"[green]✓[/green] Sent {'force kill' if force else 'terminate'} to gateway (PID: {pid})")
+    section("Status", "cyan")
+    kv("State", f"[bold cyan]● STOPPING[/bold cyan] (PID: {pid})")
+    kv("Action", "Force kill" if force else "Graceful terminate")
+    console.print()
 
     if _terminate_process(pid, force):
         _remove_pid()
-        console.print("[green]✓[/green] Gateway stopped successfully.")
+        section("Status", "green")
+        kv("State", "[bold green]● STOPPED[/bold green]")
+        divider()
+        console.print()
         raise typer.Exit(0)
 
-    console.print("[yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
+    section("Status", "red")
+    kv("State", "[bold red]● FAILED[/bold red]")
+    console.print("  [yellow]Gateway did not stop gracefully. Use --force to kill it.[/yellow]")
+    divider()
+    console.print()
     raise typer.Exit(1)
 
 
@@ -1238,127 +1328,252 @@ def gateway_restart(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
 ):
     """Restart the MarkBot gateway service."""
+    from rich.text import Text
+
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
     pid = _read_pid()
 
     if pid and _is_process_running(pid):
-        console.print(f"[yellow]Stopping gateway (PID: {pid})...[/yellow]")
+        section("Stop", "cyan")
+        kv("PID", str(pid))
+        kv("Action", "Force kill" if force else "Graceful terminate")
+        console.print()
+
         if _terminate_process(pid, force):
             _remove_pid()
-            console.print("[green]✓[/green] Gateway stopped.")
+            section("Stop", "green")
+            kv("State", "[bold green]● STOPPED[/bold green]")
+            divider()
+            console.print()
         else:
             _remove_pid()
-            console.print("[red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
+            section("Stop", "red")
+            kv("State", "[bold red]● FAILED[/bold red]")
+            console.print("  [red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
+            divider()
+            console.print()
             raise typer.Exit(1)
     else:
         if pid:
             _remove_pid()
-        console.print("[yellow]Gateway was not running.[/yellow]")
+        section("Stop", "yellow")
+        console.print("  [yellow]○ Gateway was not running[/yellow]")
+        divider()
+        console.print()
 
-    console.print("[cyan]Starting gateway...[/cyan]")
     _start_daemon(port, workspace, config, verbose)
 
 
 @gateway_app.command("status")
 def gateway_status():
     """Check the status of the MarkBot gateway service."""
-    from markbot.config.loader import load_config
     import json
+    import platform
     from datetime import datetime
 
-    _markbot_banner()
-    table = Table(title=f"{__logo__} MarkBot Gateway Status", title_justify="left")
-    table.add_column("Component", style="cyan", width=20)
-    table.add_column("Status", style="green", width=20)
-    table.add_column("Details", width=50)
+    from markbot.config.loader import load_config
 
+    _markbot_banner()
+
+    config = load_config()
+    workspace = config.workspace_path
+
+    # ── Gather all data ─────────────────────────────────────────────────────
     pid = _read_pid()
     running = False
-    uptime_str = ""
-
+    proc = None
     if pid:
         running = _is_process_running(pid)
         if running:
             try:
                 import psutil
                 proc = psutil.Process(pid)
-                create_time = datetime.fromtimestamp(proc.create_time())
-                uptime = datetime.now() - create_time
-                days = uptime.days
-                hours, remainder = divmod(uptime.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-                uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
-                mem_mb = proc.memory_info().rss / 1024 / 1024
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}, Uptime: {uptime_str}, Memory: {mem_mb:.1f}MB", end_section=True)
-            except ImportError:
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
             except Exception:
-                table.add_row("Process", "[green]● Running[/green]", f"PID: {pid}", end_section=True)
-        else:
-            table.add_row("Process", "[red]● Stopped[/red]", "Stale PID file", end_section=True)
-            _remove_pid()
-    else:
-        table.add_row("Process", "[red]● Stopped[/red]", "No PID file", end_section=True)
+                proc = None
 
-    if GATEWAY_LOG_FILE.exists():
-        log_size = GATEWAY_LOG_FILE.stat().st_size / 1024
-        log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        table.add_row("Log File", f"{log_size:.1f}KB", f"Last modified: {log_mtime}")
-    else:
-        table.add_row("Log File", "[yellow]○ Not found[/yellow]", str(GATEWAY_LOG_FILE))
+    _has_psutil = False
+    cpu_cores = cpu_logical = cpu_pct = 0
+    mem_used_gb = mem_total_gb = mem_pct = 0
+    try:
+        import psutil as _ps
+        _has_psutil = True
+        cpu_cores = _ps.cpu_count(logical=False) or 0
+        cpu_logical = _ps.cpu_count(logical=True) or 0
+        cpu_pct = _ps.cpu_percent(interval=0.1)
+        mem = _ps.virtual_memory()
+        mem_total_gb = mem.total / (1024**3)
+        mem_used_gb = mem.used / (1024**3)
+        mem_pct = mem.percent
+    except Exception:
+        pass
 
-    config = load_config()
-    workspace = config.workspace_path
-    table.add_row("Workspace", "[green]✓[/green]" if workspace.exists() else "[red]✗[/red]", str(workspace), end_section=True)
-
-    table.add_row("Model", config.agents.defaults.model, f"Context: {config.agents.defaults.context_window_tokens}")
-
-    hb_cfg = config.gateway.heartbeat
-    hb_status = "[green]● Enabled[/green]" if hb_cfg.enabled else "[yellow]○ Disabled[/yellow]"
-    table.add_row("Heartbeat", hb_status, f"Interval: {hb_cfg.interval_s}s")
-
-    # Count enabled channels
     enabled_channels = []
     channels_config = config.channels
     if channels_config:
-        for channel_name in ["feishu", "email", "dingtalk"]:
-            section = getattr(channels_config, channel_name, None)
-            if section is not None:
-                if isinstance(section, dict) and section.get("enabled"):
-                    enabled_channels.append(channel_name)
-                elif hasattr(section, "enabled") and getattr(section, "enabled"):
-                    enabled_channels.append(channel_name)
-    
-    channels_str = ", ".join(enabled_channels) if enabled_channels else "None"
-    table.add_row("Channels", str(len(enabled_channels)), channels_str, end_section=True)
+        for ch in ["feishu", "email", "dingtalk", "weixin", "qq"]:
+            sec = getattr(channels_config, ch, None)
+            if sec is None:
+                continue
+            if isinstance(sec, dict) and sec.get("enabled"):
+                enabled_channels.append(ch)
+            elif hasattr(sec, "enabled") and getattr(sec, "enabled"):
+                enabled_channels.append(ch)
 
-    cron_store_path = get_cron_dir(workspace) / "jobs.json"
-    cron_jobs = 0
-    active_jobs = 0
-    if cron_store_path.exists():
+    cron_jobs = active_jobs = 0
+    cron_path = get_cron_dir(workspace) / "jobs.json"
+    if cron_path.exists():
         try:
-            data = json.loads(cron_store_path.read_text())
+            data = json.loads(cron_path.read_text())
             jobs = data.get("jobs", [])
             cron_jobs = len(jobs)
             active_jobs = sum(1 for j in jobs if j.get("enabled", True))
         except Exception:
             pass
-    table.add_row("Cron Jobs", f"{active_jobs}/{cron_jobs} active", str(cron_store_path))
 
-    sessions_dir = workspace / "sessions"
-    session_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
-    table.add_row("Sessions", str(session_count), str(sessions_dir))
+    log_exists = GATEWAY_LOG_FILE.exists()
+    log_size_kb = 0.0
+    log_mtime = ""
+    if log_exists:
+        log_size_kb = GATEWAY_LOG_FILE.stat().st_size / 1024
+        log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
-    mcp_names = ", ".join(config.tools.mcp_servers.keys()) if mcp_count else "None"
-    table.add_row("MCP Servers", str(mcp_count), mcp_names)
 
-    console.print(table)
+    # ─ Skills ──────────────────────────────────────────────────────────────
+    from markbot.core.skills.loader import SkillLoader
+    skill_loader = SkillLoader(workspace)
+    all_skills = skill_loader.load_all()
+    skill_count = len(all_skills)
 
-    if running:
-        console.print(f"\n[green]✓[/green] Gateway is running normally.")
+    def dir_info(path: Path, pattern="*") -> str:
+        if not path.exists():
+            return "[red]✗[/red] missing"
+        count = len(list(path.glob(pattern)))
+        size_kb = sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1024
+        return f"[green]✓[/green] {count} files ({size_kb:.0f} KB)"
+
+    ws_raw = str(workspace)
+    if ws_raw.startswith("/home/marktang/"):
+        ws_str = "~/" + ws_raw[len("/home/marktang/"):]
     else:
-        console.print(f"\n[yellow]Gateway is not running.[/yellow]")
-        console.print("Use [cyan]markbot gateway start[/cyan] to start it.")
+        ws_str = ws_raw
+
+    # ── Render ─────────────────────────────────────────────────────────────
+    console.print()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    # ─ Process ──────────────────────────────────────────────────────────────
+    section("Process", "green" if running else "red")
+    if running and proc:
+        try:
+            uptime = datetime.now() - datetime.fromtimestamp(proc.create_time())
+            days, r = divmod(uptime.seconds, 3600)
+            hours, minutes = divmod(r, 60)
+            uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+            mem_mb = proc.memory_info().rss / 1024 / 1024
+            cpu_pct_val = proc.cpu_percent(interval=0.1)
+            threads = proc.num_threads()
+            # line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%  |  {threads} threads[/dim]")
+            line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%[/dim]")
+        except Exception:
+            line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  (psutil error)[/dim]")
+    elif running:
+        line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  (psutil not installed)[/dim]")
+    else:
+        line = Text.from_markup("  [bold red]●  STOPPED[/bold red]   [dim]Gateway is not running[/dim]")
+    console.print(line)
+
+    divider()
+
+    # ─ System ────────────────────────────────────────────────────────────────
+    section("System", "cyan")
+    kv("OS", f"{platform.system()} {platform.release()}")
+    kv("Python", platform.python_version())
+    kv("Hostname", platform.node())
+    if _has_psutil:
+        kv("CPU", f"{cpu_cores} cores / {cpu_logical} logical  |  {cpu_pct:.0f}% used")
+        kv("RAM", f"{mem_used_gb:.1f} / {mem_total_gb:.1f} GB  |  {mem_pct:.0f}% used")
+    else:
+        console.print("  [dim]CPU & RAM metrics unavailable  (run: pip install psutil)[/dim]")
+
+    divider()
+
+    # ─ Workspace ─────────────────────────────────────────────────────────────
+    section("Workspace", "blue")
+    kv("Path", ws_str)
+    kv("Memory", dir_info(workspace / "memory"))
+    kv("Sessions", dir_info(workspace / "sessions", "*.json"))
+    kv("Cron", dir_info(get_cron_dir(workspace), "*.json"))
+
+    divider()
+
+    # ─ Runtime ───────────────────────────────────────────────────────────────
+    section("Runtime", "magenta")
+    kv("Model", config.agents.defaults.model)
+    kv("Context Window", f"{config.agents.defaults.context_window_tokens} tokens")
+    hb_on = config.gateway.heartbeat.enabled
+    kv("Heartbeat", f"[green]●[/green] Enabled every {config.gateway.heartbeat.interval_s}s" if hb_on else "[yellow]○[/yellow] Disabled")
+    kv("Channels", f"{len(enabled_channels)} enabled  ({', '.join(enabled_channels) or 'none'})")
+    kv("Cron Jobs", f"[yellow]{active_jobs}[/yellow] / {cron_jobs} active")
+
+    divider()
+
+    # ─ Log File ──────────────────────────────────────────────────────────
+    section("Log File", "yellow" if log_exists else "dim")
+    if log_exists:
+        kv("Path", str(GATEWAY_LOG_FILE))
+        kv("Size", f"{log_size_kb:.1f} KB")
+        kv("Modified", log_mtime)
+    else:
+        console.print(Text.from_markup("  [dim]No log file found[/dim]"))
+
+    divider()
+
+    # ─ Servers & Skills ────────────────────────────────────────────────────
+    section("Servers & Skills", "cyan")
+    kv("MCP Servers", str(mcp_count))
+    kv("Skills", str(skill_count))
+
+    divider()
+    console.print()
+    # if running:
+    #     console.print(Text.from_markup(f"  [bold green]✓ Gateway is running[/bold green]   [dim](stop: markbot gateway stop)[/dim]"))
+    # else:
+    #     console.print(Text.from_markup(f"  [bold yellow]⚠ Gateway is stopped[/bold yellow]   [dim](start: markbot gateway start)[/dim]"))
 
 
 # ============================================================================
@@ -1372,29 +1587,64 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status():
     """Show channel status."""
+    from rich.text import Text
+
     from markbot.channels.registry import discover_all
     from markbot.config.loader import load_config
 
     config = load_config()
 
-    table = Table(title="Channel Status")
-    table.add_column("Channel", style="cyan")
-    table.add_column("Enabled", style="green")
+    _markbot_banner()
 
-    for name, cls in sorted(discover_all().items()):
-        section = getattr(config.channels, name, None)
-        if section is None:
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ Channel Status ────────────────────────────────────────────────────────
+    section("Channels", "cyan")
+
+    all_channels = discover_all()
+    enabled_count = 0
+
+    for name, cls in sorted(all_channels.items()):
+        section_cfg = getattr(config.channels, name, None)
+        if section_cfg is None:
             enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
+        elif isinstance(section_cfg, dict):
+            enabled = section_cfg.get("enabled", False)
         else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            "[green]\u2713[/green]" if enabled else "[dim]\u2717[/dim]",
-        )
+            enabled = getattr(section_cfg, "enabled", False)
 
-    console.print(table)
+        if enabled:
+            enabled_count += 1
+            kv(cls.display_name, "[green]● Enabled[/green]")
+        else:
+            kv(cls.display_name, "[dim]○ Disabled[/dim]")
+
+    divider()
+
+    # ─ Summary ───────────────────────────────────────────────────────────────
+    section("Summary", "blue")
+    kv("Total", str(len(all_channels)))
+    kv("Enabled", f"[green]{enabled_count}[/green]")
+    kv("Disabled", f"[dim]{len(all_channels) - enabled_count}[/dim]")
+
+    divider()
+    console.print()
 
 
 def _get_bridge_dir() -> Path:
@@ -1464,6 +1714,8 @@ def channels_login(
     force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
 ):
     """Authenticate with a channel via QR code or other interactive login."""
+    from rich.text import Text
+
     from markbot.channels.registry import discover_all
     from markbot.config.loader import load_config
 
@@ -1473,11 +1725,39 @@ def channels_login(
     # Validate channel exists
     all_channels = discover_all()
     if channel_name not in all_channels:
-        available = ", ".join(all_channels.keys())
-        console.print(f"[red]Unknown channel: {channel_name}[/red]  Available: {available}")
+        _markbot_banner()
+        console.print()
+        console.print(f"  [red]✗[/red] Unknown channel: [cyan]{channel_name}[/cyan]")
+        console.print(f"  Available: {', '.join(all_channels.keys())}")
+        console.print()
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ Login Info ────────────────────────────────────────────────────────────
+    section(f"{all_channels[channel_name].display_name} Login", "cyan")
+    kv("Channel", channel_name)
+    kv("Force", "Yes" if force else "No")
+    divider()
+    console.print()
 
     channel_cls = all_channels[channel_name]
     channel = channel_cls(channel_cfg, bus=None)
@@ -1485,7 +1765,16 @@ def channels_login(
     success = asyncio.run(channel.login(force=force))
 
     if not success:
+        section("Result", "red")
+        console.print("  [red]✗[/red] Login failed")
+        divider()
+        console.print()
         raise typer.Exit(1)
+
+    section("Result", "green")
+    console.print("  [green]✓[/green] Login successful")
+    divider()
+    console.print()
 
 
 # ============================================================================
@@ -1499,6 +1788,8 @@ app.add_typer(plugins_app, name="plugins")
 @plugins_app.command("list")
 def plugins_list():
     """List all discovered channels (built-in and plugins)."""
+    from rich.text import Text
+
     from markbot.channels.registry import discover_all, discover_channel_names
     from markbot.config.loader import load_config
 
@@ -1506,28 +1797,66 @@ def plugins_list():
     builtin_names = set(discover_channel_names())
     all_channels = discover_all()
 
-    table = Table(title="Channel Plugins")
-    table.add_column("Name", style="cyan")
-    table.add_column("Source", style="magenta")
-    table.add_column("Enabled", style="green")
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ Plugins ───────────────────────────────────────────────────────────────
+    section("Plugins", "cyan")
+
+    builtin_count = 0
+    plugin_count = 0
+    enabled_count = 0
 
     for name in sorted(all_channels):
         cls = all_channels[name]
         source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
-        if section is None:
+        section_cfg = getattr(config.channels, name, None)
+        if section_cfg is None:
             enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
+        elif isinstance(section_cfg, dict):
+            enabled = section_cfg.get("enabled", False)
         else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            source,
-            "[green]yes[/green]" if enabled else "[dim]no[/dim]",
-        )
+            enabled = getattr(section_cfg, "enabled", False)
 
-    console.print(table)
+        if source == "builtin":
+            builtin_count += 1
+        else:
+            plugin_count += 1
+        if enabled:
+            enabled_count += 1
+
+        status_str = "[green]● Enabled[/green]" if enabled else "[dim]○ Disabled[/dim]"
+        source_str = f"[dim]({source})[/dim]"
+        kv(cls.display_name, f"{status_str} {source_str}")
+
+    divider()
+
+    # ─ Summary ───────────────────────────────────────────────────────────────
+    section("Summary", "blue")
+    kv("Total", str(len(all_channels)))
+    kv("Built-in", str(builtin_count))
+    kv("External", str(plugin_count))
+    kv("Enabled", f"[green]{enabled_count}[/green]")
+
+    divider()
+    console.print()
 
 
 # ============================================================================
@@ -1538,38 +1867,72 @@ def plugins_list():
 @app.command()
 def status():
     """Show MarkBot status."""
+    import platform
+
+    from rich.text import Text
+
     from markbot.config.loader import get_config_path, load_config
+    from markbot.providers.registry import PROVIDERS
 
     config_path = get_config_path()
     config = load_config()
     workspace = config.workspace_path
 
-    console.print(f"{__logo__} MarkBot Status\n")
+    _markbot_banner()
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    W = 72  # total width
 
-    if config_path.exists():
-        from markbot.providers.registry import PROVIDERS
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
 
-        console.print(f"Model: {config.agents.defaults.model}")
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
 
-        # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
-            if p is None:
-                continue
-            if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
-            elif spec.is_local:
-                # Local deployments show api_base instead of api_key
-                if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
-                else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ System ────────────────────────────────────────────────────────────────
+    section("System", "cyan")
+    kv("OS", f"{platform.system()} {platform.release()}")
+    kv("Python", platform.python_version())
+    kv("Hostname", platform.node())
+
+    divider()
+
+    # ─ Configuration ─────────────────────────────────────────────────────────
+    section("Configuration", "blue")
+    kv("Config Path", f"{config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
+    kv("Workspace", f"{workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    kv("Model", config.agents.defaults.model)
+
+    divider()
+
+    # ─ Providers ─────────────────────────────────────────────────────────────
+    section("Providers", "magenta")
+    for spec in PROVIDERS:
+        p = getattr(config.providers, spec.name, None)
+        if p is None:
+            continue
+        if spec.is_oauth:
+            kv(spec.label, "[green]✓[/green] (OAuth)")
+        elif spec.is_local:
+            if p.api_base:
+                kv(spec.label, f"[green]✓[/green] {p.api_base}")
             else:
-                has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                kv(spec.label, "[dim]not set[/dim]")
+        else:
+            has_key = bool(p.api_key)
+            kv(spec.label, "[green]✓[/green]" if has_key else "[dim]not set[/dim]")
+
+    divider()
+    console.print()
 
 
 # ============================================================================
@@ -1595,21 +1958,55 @@ def provider_login(
     provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
 ):
     """Authenticate with an OAuth provider."""
+    from rich.text import Text
+
     from markbot.providers.registry import PROVIDERS
+
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
 
     key = provider.replace("-", "_")
     spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
     if not spec:
-        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
+        section("Error", "red")
+        console.print(f"  [red]✗[/red] Unknown OAuth provider: [cyan]{provider}[/cyan]")
+        kv("Supported", ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth))
+        divider()
+        console.print()
         raise typer.Exit(1)
 
     handler = _LOGIN_HANDLERS.get(spec.name)
     if not handler:
-        console.print(f"[red]Login not implemented for {spec.label}[/red]")
+        section("Error", "red")
+        console.print(f"  [red]✗[/red] Login not implemented for [cyan]{spec.label}[/cyan]")
+        divider()
+        console.print()
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
+    # ─ OAuth Login ───────────────────────────────────────────────────────────
+    section(f"{spec.label} Login", "cyan")
+    kv("Provider", spec.name.replace("_", "-"))
+    kv("Type", "OAuth")
+    divider()
+    console.print()
+
     handler()
 
 
@@ -1724,6 +2121,8 @@ def config_get(
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw value without formatting"),
 ):
     """Get a configuration value."""
+    from rich.text import Text
+
     from markbot.config.loader import load_config
 
     config = load_config()
@@ -1731,7 +2130,10 @@ def config_get(
     value = _get_nested_value(data, key)
 
     if value is None:
-        console.print(f"[yellow]Key '{key}' not found or is null[/yellow]")
+        _markbot_banner()
+        console.print()
+        console.print(f"  [yellow]○[/yellow] Key '{key}' not found or is null")
+        console.print()
         raise typer.Exit(1)
 
     if raw:
@@ -1741,11 +2143,39 @@ def config_get(
         else:
             print(value)
     else:
+        _markbot_banner()
+
+        W = 72  # total width
+
+        def section(title: str, color: str = "cyan") -> None:
+            title_text = f"  {title}  "
+            pad = W - len(title_text) - 2
+            line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+            console.print(line)
+
+        def kv(k: str, v: str, key_w: int = 14) -> None:
+            line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
+            console.print(line)
+
+        def divider() -> None:
+            line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+            console.print(line)
+
+        console.print()
+
+        # ─ Config Value ──────────────────────────────────────────────────────────
+        section("Configuration", "cyan")
+        kv("Key", key)
+
         if isinstance(value, (dict, list)):
             import json
-            console.print(json.dumps(value, indent=2, ensure_ascii=False))
+            value_str = json.dumps(value, indent=2, ensure_ascii=False)
+            kv("Value", value_str)
         else:
-            console.print(f"[green]{key}[/green] = [cyan]{value}[/cyan]")
+            kv("Value", str(value))
+
+        divider()
+        console.print()
 
 
 @config_app.command("set")
@@ -1755,32 +2185,72 @@ def config_set(
 ):
     """Set a configuration value."""
     import json
+
+    from rich.text import Text
+
     from markbot.config.loader import load_config, save_config
     from markbot.config.schema import Config
 
     config = load_config()
     data = config.model_dump(by_alias=True)
 
-    if _get_nested_value(data, key) is None:
-        console.print(f"[yellow]Warning: Key '{key}' does not exist in config schema[/yellow]")
-
     parsed_value = _parse_value(value)
+
+    if _get_nested_value(data, key) is None:
+        _markbot_banner()
+        console.print()
+        console.print(f"  [yellow]⚠[/yellow] Warning: Key '{key}' does not exist in config schema")
+        console.print()
+
     if not _set_nested_value(data, key, parsed_value):
-        console.print(f"[red]Error: Failed to set '{key}'. Check if the path is valid.[/red]")
+        _markbot_banner()
+        console.print()
+        console.print(f"  [red]✗[/red] Error: Failed to set '{key}'. Check if the path is valid.")
+        console.print()
         raise typer.Exit(1)
 
     try:
         new_config = Config.model_validate(data)
     except Exception as e:
-        console.print(f"[red]Error: Invalid value for '{key}': {e}[/red]")
+        _markbot_banner()
+        console.print()
+        console.print(f"  [red]✗[/red] Error: Invalid value for '{key}': {e}")
+        console.print()
         raise typer.Exit(1)
 
     save_config(new_config)
 
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(k: str, v: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ Config Set ────────────────────────────────────────────────────────────
+    section("Configuration", "green")
+    kv("Key", key)
+
     if isinstance(parsed_value, (dict, list)):
-        console.print(f"[green]✓[/green] Set {key} = {json.dumps(parsed_value, ensure_ascii=False)}")
+        kv("Value", json.dumps(parsed_value, ensure_ascii=False))
     else:
-        console.print(f"[green]✓[/green] Set {key} = [cyan]{parsed_value}[/cyan]")
+        kv("Value", str(parsed_value))
+
+    divider()
+    console.print()
 
 
 @config_app.command("list")
@@ -1789,6 +2259,9 @@ def config_list(
 ):
     """List all configuration keys and values."""
     import json
+
+    from rich.text import Text
+
     from markbot.config.loader import load_config
 
     config = load_config()
@@ -1809,25 +2282,56 @@ def config_list(
         items = [(k, v) for k, v in items if k.startswith(prefix)]
 
     if not items:
-        console.print(f"[yellow]No keys found with prefix '{prefix}'[/yellow]")
+        _markbot_banner()
+        console.print()
+        console.print(f"  [yellow]○[/yellow] No keys found with prefix '{prefix}'")
+        console.print()
         return
 
-    table = Table(title=f"\n{__logo__} MarkBot Configuration", title_justify="left")
-    table.add_column("Key", style="cyan")
-    table.add_column("Value", style="green")
+    _markbot_banner()
+
+    W = 72  # total width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(k: str, v: str, key_w: int = 20) -> None:
+        line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    console.print()
+
+    # ─ Configuration ─────────────────────────────────────────────────────────
+    section("Configuration", "cyan")
 
     for key, value in sorted(items):
         if isinstance(value, (dict, list)):
             value_str = json.dumps(value, ensure_ascii=False)
-            if len(value_str) > 50:
-                value_str = value_str[:47] + "..."
+            if len(value_str) > 45:
+                value_str = value_str[:42] + "..."
         else:
             value_str = str(value)
-            if len(value_str) > 50:
-                value_str = value_str[:47] + "..."
-        table.add_row(key, value_str)
+            if len(value_str) > 45:
+                value_str = value_str[:42] + "..."
+        kv(key, value_str)
 
-    console.print(table)
+    divider()
+
+    # ─ Summary ───────────────────────────────────────────────────────────────
+    section("Summary", "blue")
+    kv("Total Keys", str(len(items)))
+    if prefix:
+        kv("Filter", f"prefix='{prefix}'")
+
+    divider()
+    console.print()
 
 
 app.add_typer(config_app, name="config")

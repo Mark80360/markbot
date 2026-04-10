@@ -156,7 +156,9 @@ class SkillScript(Tool):
 
         # Step 4: Execute in sandbox
         try:
-            logger.info(f"Executing skill script: {self._name} with args: {kwargs}")
+            logger.info(
+                "Executing skill script: {} with args: {}", self._name, kwargs,
+            )
 
             result = await self._sandbox.run(
                 script=self._entry.resolve(),

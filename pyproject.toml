@@ -1,6 +1,6 @@
 [project]
 name = "markbot"
-version = "2.1.6"
+version = "2.1.8"
 description = "A lightweight personal AI assistant framework"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -44,6 +44,8 @@ dependencies = [
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",
+    "reme-ai==0.3.1.8",
+    "agentscope>=1.0.0",
 ]
 
 [project.optional-dependencies]

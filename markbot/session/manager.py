@@ -98,44 +98,6 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
 
-    def cleanup_tombstones(self, max_age_hours: int = 24) -> bool:
-        """清理过期的墓碑标记（未完成轮次标记）。
-        
-        当对话异常中断时，墓碑标记会保留在 metadata 中。
-        这个方法会自动清理超过指定时间的过期标记。
-        
-        Args:
-            max_age_hours: 墓碑最大保留时间（小时），默认 24 小时
-            
-        Returns:
-            bool: 如果清理了墓碑返回 True，否则返回 False
-        """
-        from datetime import timedelta
-        
-        active = self.metadata.get("active_turn")
-        if not active:
-            return False
-        
-        try:
-            started = datetime.fromisoformat(active["started_at"])
-            if datetime.now() - started > timedelta(hours=max_age_hours):
-                logger.info(
-                    f"[Tombstone Cleanup] Auto-cleaning stale tombstone "
-                    f"from {active['started_at']} for session {self.key}"
-                )
-                del self.metadata["active_turn"]
-                self.updated_at = datetime.now()
-                return True
-        except (KeyError, ValueError, TypeError) as e:
-            # 数据无效或损坏，直接删除
-            logger.warning(f"[Tombstone Cleanup] Invalid tombstone data for session {self.key}: {e}")
-            if "active_turn" in self.metadata:
-                del self.metadata["active_turn"]
-                self.updated_at = datetime.now()
-                return True
-        
-        return False
-
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
         """Keep a legal recent suffix, mirroring get_history boundary rules."""
         if max_messages <= 0:
@@ -197,17 +159,11 @@ class SessionManager:
             The session.
         """
         if key in self._cache:
-            session = self._cache[key]
-            # 清理缓存中 session 的过期墓碑
-            session.cleanup_tombstones()
-            return session
+            return self._cache[key]
 
         session = self._load(key)
         if session is None:
             session = Session(key=key)
-        else:
-            # 加载后立即清理过期墓碑
-            session.cleanup_tombstones()
 
         self._cache[key] = session
         return session

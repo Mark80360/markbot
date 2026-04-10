@@ -262,47 +262,32 @@ markbot version                  # Show version info
 
 ## Memory System
 
-MarkBot uses a **tiered memory architecture** with three layers:
+MarkBot uses a **ReMeLight memory architecture** with three core components:
 
-| Layer | Purpose | Retention |
-|-------|---------|-----------|
-| **Hot Memory** | Working context, whiteboard | Per-turn |
-| **Warm Memory** | Session context, recent facts | Per session |
-| **Cold Memory** | Long-term storage, profiles | Persistent |
+| Component | Purpose | Storage |
+|-----------|---------|---------|
+| **MEMORY.md** | Curated long-term memory (preferences, decisions, lessons) | Markdown file |
+| **memory/YYYY-MM-DD.md** | Daily conversation summaries | Markdown files |
+| **Compressed Summary** | Context window management (in-memory) | Per session |
 
-### Cold Memory Structure
+### Memory Operations
 
-```
-~/.markbot/workspace/
-├── memory/
-│   ├── memories/           # Structured memories by category
-│   │   ├── profile/        # User profile
-│   │   ├── preferences/     # User preferences
-│   │   ├── entities/       # Tracked entities
-│   │   ├── events/         # Events
-│   │   ├── cases/          # Cases
-│   │   └── patterns/       # Patterns
-│   └── HISTORY.md          # Append-only event log
-```
-
-### Memory Extraction
-
-Memories are automatically extracted from conversations and stored in structured markdown files. The system uses LLM-powered extraction with deduplication to avoid redundancy.
+- **Automatic Compaction**: When context exceeds 75% of window, older messages are summarized
+- **Async Summarization**: After each turn, background task writes daily notes
+- **Semantic Search**: `memory_search` tool searches MEMORY.md and daily notes via vector search
+- **Bootstrap Guidance**: First interaction triggers BOOTSTRAP.md setup
 
 ### Memory Context Injection
 
-Memory context is automatically injected into the system prompt for every conversation turn:
+Memory context is automatically injected into the system prompt:
 
 ```
 System Prompt
-├── Identity & Bootstrap Files
+├── Identity & Bootstrap Files (AGENTS.md, SOUL.md, PROFILE.md)
 ├── Skills (always-active + summary)
 ├── Memory Context          ← Injected here
-│   ├── Whiteboard (L1)     # Current loop state
-│   ├── Session (L1.5)      # Recent conversation
-│   ├── Hot (L2)            # Important facts
-│   ├── Warm (L3)           # Recent activity
-│   └── Cold (L4)           # Semantic search results
+│   ├── MEMORY.md           # Curated long-term memory
+│   └── Compressed Summary  # Current conversation summary
 └── Runtime Context
 ```
 
@@ -361,7 +346,7 @@ Skills extend MarkBot's capabilities with specialized instructions and tools.
 |-------|-------------|
 | `skill-creator` | Create new skills from scratch with evaluation and benchmarking |
 | `summarize` | Summarize URLs, files, YouTube videos |
-| `memory` | L1-L4 tiered memory system inspired by Swarmbot architecture |
+| `memory` | ReMeLight memory system with compaction, summarization, and semantic search |
 | `cron` | Schedule reminders and recurring tasks |
 | `github` | GitHub interaction via `gh` CLI |
 | `tmux` | Remote-control tmux sessions |
@@ -403,13 +388,10 @@ markbot/
 │   ├── cost_tracker.py      # Cost tracking for API usage
 │   ├── subagent.py          # Subagent manager
 │   ├── subagent_progress.py # Progress tracking system
-│   ├── tiered_memory/       # Tiered memory system
-│   │   ├── hot_memory.py    # Working memory
-│   │   ├── warm_memory.py   # Session memory
-│   │   ├── cold_memory.py   # Persistent memory
-│   │   ├── whiteboard.py    # Whiteboard memory
-│   │   ├── manager.py       # Memory manager
-│   │   └── memory_sanitizer.py  # Memory sanitization
+│   ├── memory/              # ReMeLight memory system
+│   │   ├── manager.py       # Memory manager (compaction, search, summary)
+│   │   ├── compaction.py    # Context compaction hook
+│   │   └── bootstrap.py     # First-run bootstrap hook
 │   ├── skill_execution/     # Skill script runner
 │   │   ├── sandbox.py       # Sandboxed execution
 │   │   ├── scanner.py       # Skill scanner

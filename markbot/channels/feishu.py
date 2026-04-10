@@ -1111,7 +1111,7 @@ class FeishuChannel(BaseChannel):
                     await self._remove_reaction(message_id, reaction_id)
                 except Exception:
                     pass  # Ignore cleanup errors
-            # On successful final send, add DONE reaction to indicate completion (CoPaw pattern)
+            # On successful final send, add DONE reaction to indicate completion (markbot pattern)
             elif message_id and not is_progress and not is_tool_hint:
                 try:
                     await self._add_reaction(message_id, "DONE")

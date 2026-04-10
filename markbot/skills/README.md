@@ -20,7 +20,7 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `clawhub` | Search and install skills from ClawHub registry |
 | `cron` | Schedule reminders and recurring tasks |
 | `github` | Interact with GitHub using the `gh` CLI |
-| `memory` | L1-L4 tiered memory system inspired by Swarmbot architecture |
+| `memory` | ReMeLight memory system with compaction, summarization, and semantic search |
 | `skill-creator` | Create new skills |
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `surprise-me` | Create delightful unexpected experiences by combining skills dynamically |

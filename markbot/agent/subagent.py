@@ -1,7 +1,6 @@
 """Subagent manager for background task execution."""
 
 import asyncio
-import json
 import uuid
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,7 @@ from typing import Any
 from loguru import logger
 
 from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.agent.subagent_progress import ProgressTracker, SubagentProgressManager
+from markbot.agent.subagent_progress import SubagentProgressManager
 from markbot.agent.tools.registry import ToolRegistry
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
@@ -149,16 +148,9 @@ class SubagentManager:
                         thinking_blocks=response.thinking_blocks,
                     ))
 
-                    # Execute tools and record activities
                     for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                        
-                        # Determine activity type
                         is_search = tool_call.name in ["glob", "grep", "web_search"]
                         is_read = tool_call.name in ["read_file", "web_fetch"]
-                        
-                        # Record activity before execution
                         description = self._get_activity_description(tool_call.name, tool_call.arguments)
                         await tracker.record_tool_use(
                             tool_name=tool_call.name,
@@ -167,8 +159,18 @@ class SubagentManager:
                             is_search=is_search,
                             is_read=is_read,
                         )
-                        
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
+
+                    results = await asyncio.gather(
+                        *(tools.execute(tc.name, tc.arguments) for tc in response.tool_calls),
+                        return_exceptions=True,
+                    )
+
+                    for tool_call, result in zip(response.tool_calls, results):
+                        if isinstance(result, BaseException):
+                            logger.error(
+                                "Subagent [{}] tool {} failed: {}", task_id, tool_call.name, result
+                            )
+                            result = f"Error: {type(result).__name__}: {result}"
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
