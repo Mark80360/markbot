@@ -628,6 +628,8 @@ def gateway_start(
     daemon: bool = typer.Option(True, "--daemon/--foreground", "-d", help="Run as daemon (background)"),
 ):
     """Start the markbot gateway service."""
+    _markbot_banner()
+
     existing_pid = _read_pid()
     if existing_pid and _is_process_running(existing_pid):
         console.print(f"[yellow]Gateway is already running (PID: {existing_pid})[/yellow]")
@@ -1356,21 +1358,19 @@ def gateway_restart(
         section("Stop", "cyan")
         kv("PID", str(pid))
         kv("Action", "Force kill" if force else "Graceful terminate")
-        console.print()
+        divider()
 
         if _terminate_process(pid, force):
             _remove_pid()
             section("Stop", "green")
             kv("State", "[bold green]● STOPPED[/bold green]")
             divider()
-            console.print()
         else:
             _remove_pid()
             section("Stop", "red")
             kv("State", "[bold red]● FAILED[/bold red]")
             console.print("  [red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
             divider()
-            console.print()
             raise typer.Exit(1)
     else:
         if pid:
@@ -1378,7 +1378,6 @@ def gateway_restart(
         section("Stop", "yellow")
         console.print("  [yellow]○ Gateway was not running[/yellow]")
         divider()
-        console.print()
 
     _start_daemon(port, workspace, config, verbose)
 
