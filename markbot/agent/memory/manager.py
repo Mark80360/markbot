@@ -58,6 +58,19 @@ class _MessageWrapper:
             metadata=msg.get("metadata", {}),
         )
 
+    def get_content_blocks(self) -> list[dict]:
+        """Return content as a list of content blocks for reme-ai compatibility.
+
+        Returns a list of dict blocks. If content is a string, wraps it in a text block.
+        If content is already a list, returns it as-is.
+        """
+        if isinstance(self.content, str):
+            return [{"type": "text", "text": self.content}]
+        elif isinstance(self.content, list):
+            return self.content
+        else:
+            return [{"type": "text", "text": str(self.content)}]
+
 
 class ReMeLightMemoryManager(BaseMemoryManager):
     """Memory manager wrapping ReMeLight for markbot via composition.
@@ -541,6 +554,72 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             parts.append(f"## Compressed Summary\n\n{self._compressed_summary}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def list_memory_entries(self) -> list[dict]:
+        """List all memory entries for context explorer catalog.
+
+        Returns a list of memory sources with metadata for display
+        in the explore_context_catalog tool. This enables AI-driven
+        dynamic loading of relevant context.
+        """
+        from datetime import datetime
+
+        entries = []
+
+        memory_dir = Path(self.working_dir) / "memory"
+
+        if not memory_dir.exists():
+            return entries
+
+        memory_md = memory_dir / "MEMORY.md"
+        if memory_md.exists():
+            try:
+                stat = memory_md.stat()
+                content = memory_md.read_text(encoding='utf-8')
+                preview_lines = content.split('\n')[:3]
+                preview = '\n'.join(preview_lines)[:200]
+
+                entries.append({
+                    'title': 'MEMORY.md',
+                    'source': 'memory',
+                    'date': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d'),
+                    'preview': preview,
+                    'content': content,
+                    'size_kb': round(stat.st_size / 1024, 1),
+                })
+            except Exception as e:
+                logger.warning(f"Failed to read MEMORY.md for catalog: {e}")
+
+        daily_logs_dir = memory_dir / "daily_logs"
+        if daily_logs_dir.exists():
+            try:
+                log_files = sorted(
+                    daily_logs_dir.glob("*.md"),
+                    key=lambda f: f.stat().st_mtime,
+                    reverse=True
+                )[:5]
+
+                for log_file in log_files:
+                    try:
+                        stat = log_file.stat()
+                        content = log_file.read_text(encoding='utf-8')
+                        preview_lines = content.split('\n')[:3]
+                        preview = '\n'.join(preview_lines)[:200]
+
+                        entries.append({
+                            'title': f'Daily Log: {log_file.stem}',
+                            'source': 'memory',
+                            'date': log_file.stem,
+                            'preview': preview,
+                            'content': content,
+                            'size_kb': round(stat.st_size / 1024, 1),
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to read daily log {log_file}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to list daily logs: {e}")
+
+        return entries
 
     async def restart_embedding_model(self):
         self._warn_if_version_mismatch()

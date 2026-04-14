@@ -101,7 +101,7 @@ class MemoryCompactionHook:
 
             if not isinstance(messages_to_compact, list):
                 logger.warning(
-                    "check_context returned unexpected type for messages_to_compact: {}",
+                    "check_context returned unexpected type for messages_to_compact: %s",
                     type(messages_to_compact).__name__,
                 )
                 return None

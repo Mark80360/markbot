@@ -37,6 +37,11 @@ from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.agent.tools.think import ThinkTool
 from markbot.agent.tools.memory import MemorySearchTool
 from markbot.agent.tools.explore import ExploreTool
+from markbot.agent.tools.context_explorer import (
+    ExploreContextCatalogTool,
+    SearchContextTool,
+    LoadContextTool,
+)
 from markbot.agent.services.tool_executor import ToolExecutor
 from markbot.agent.services.message_pipeline import MessagePipeline, ProcessContext
 from markbot.agent.services.middleware import (
@@ -44,6 +49,7 @@ from markbot.agent.services.middleware import (
     MemoryLifecycleMiddleware,
 )
 from markbot.agent.memory.daily_log import DailyLogManager
+from markbot.agent.services.interaction_log import InteractionLogger
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.command import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
@@ -251,6 +257,21 @@ class AgentLoop:
         self.tools.register(ThinkTool())
         self.tools.register(MemorySearchTool(memory_manager=self.memory_manager))
         self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
+
+        # Context explorer tools for AI-driven dynamic loading
+        self.tools.register(ExploreContextCatalogTool(
+            workspace=self.workspace,
+            memory_manager=self.memory_manager,
+        ))
+        self.tools.register(SearchContextTool(
+            workspace=self.workspace,
+            memory_manager=self.memory_manager,
+        ))
+        self.tools.register(LoadContextTool(
+            workspace=self.workspace,
+            memory_manager=self.memory_manager,
+        ))
+
         self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
         self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
 
@@ -312,6 +333,7 @@ class AgentLoop:
             QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool)
         )
         self._daily_log = DailyLogManager(workspace=self.workspace)
+        self._interaction_log = InteractionLogger()
         self.pipeline.use(MemoryLifecycleMiddleware(
             memory_manager=self.memory_manager,
             daily_log=self._daily_log,
@@ -504,6 +526,17 @@ class AgentLoop:
                 response.finish_reason,
                 response.has_tool_calls,
                 len(response.content or ""),
+            )
+
+            self._interaction_log.log_interaction(
+                iteration=iteration,
+                messages=messages,
+                tool_defs=tool_defs,
+                response=response,
+                model=self.model,
+                channel=channel,
+                chat_id=chat_id,
+                tokens_before=current_tokens,
             )
 
             usage = response.usage or {}

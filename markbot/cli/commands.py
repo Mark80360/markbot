@@ -70,8 +70,8 @@ def _markbot_banner():
     console.print("  ████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔══██╗██╔═══██╗╚══██╔══╝")
     console.print("  ██╔████╔██║███████║██████╔╝█████╔╝ ██████╔╝██║   ██║   ██║   ")
     console.print("  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══██╗██║   ██║   ██║   ")
-    console.print("  ██║ ╚═╝ ██║██║  ██║██████╔╝██║  ██╗██████╔╝╚██████╔╝   ██║   ")
-    console.print("  ╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═════╝  ╚═════╝    ╚═╝   ")
+    console.print("  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗██████╔╝╚██████╔╝   ██║   ")
+    console.print("  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝    ╚═╝   ")
 
 def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""

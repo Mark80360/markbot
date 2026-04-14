@@ -44,18 +44,27 @@ class ContextBuilder:
         self.skill_registry = skill_registry
         self.memory_manager = memory_manager
         self._context_cache = {}
+        self._guidance_injected = False
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, and skills."""
+        """Build the system prompt from identity, bootstrap files, and skills.
+
+        Uses minimal bootstrap loading for cold-start hybrid approach.
+        Only loads essential identity (SOUL.md) by default.
+        Other context files (AGENTS.md, USER.md, MEMORY.md, etc.) are
+        available via context explorer tools for AI-driven dynamic loading.
+        """
         cache_key = f"system_prompt_{skill_names}"
         if cache_key in self._context_cache:
             return self._context_cache[cache_key]
 
         parts = [self._get_identity()]
 
-        bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
+        # Minimal bootstrap: only load SOUL.md for core identity
+        # Other files available via explore_context_catalog tool
+        minimal_bootstrap = self._load_minimal_bootstrap()
+        if minimal_bootstrap:
+            parts.append(minimal_bootstrap)
 
         # Add always-active skills content
         if self.skill_registry:
@@ -447,8 +456,32 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
+    def _load_minimal_bootstrap(self) -> str:
+        """Load minimal bootstrap files for cold-start.
+
+        Only loads SOUL.md (core identity) by default.
+        Other bootstrap files are available via context explorer tools.
+        This reduces initial token usage and allows AI to decide what to load.
+        """
+        parts = []
+
+        # Only load SOUL.md for core identity
+        soul_path = self.workspace / "SOUL.md"
+        if soul_path.exists():
+            try:
+                content = soul_path.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(f"## SOUL.md\n\n{content}")
+            except Exception as e:
+                logger.warning("Failed to load SOUL.md: {}", e)
+
+        return "\n\n".join(parts) if parts else ""
+
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load all bootstrap files from workspace.
+
+        Kept for backward compatibility and explicit full-load scenarios.
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
@@ -458,6 +491,57 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _build_context_guidance(self) -> str:
+        """Build guidance for AI-driven context exploration.
+
+        Provides instructions on how to use context explorer tools
+        to dynamically load relevant information. This is part of the
+        cold-start hybrid approach.
+        """
+        return """## Context Explorer Tools Available
+
+You have access to three tools for exploring and loading context dynamically:
+
+### 1. explore_context_catalog
+View the catalog of all available context sources (like a book's table of contents).
+- Use this FIRST when you need background information
+- Shows what's available: memory entries, bootstrap files, workspace info
+- Lightweight (~200 tokens)
+
+### 2. search_context
+Search for specific information by keyword or semantic query.
+- Use after exploring the catalog to find relevant entries
+- Returns summarized results with IDs
+- Use when you know what you're looking for
+
+### 3. load_context
+Load the full content of a specific context entry.
+- Use the ID from search_context results
+- Loads complete content (may be large)
+- Use only for entries you've confirmed are relevant
+
+**Workflow Example:**
+1. User asks: "Help me with the markbot project"
+2. You call: `explore_context_catalog(source_type="all")`
+3. You see: "markbot" mentioned in memory and workspace
+4. You call: `search_context(query="markbot architecture")`
+5. You get: result with ID "mem_0"
+6. You call: `load_context(context_id="mem_0")`
+7. You now have full context to help the user
+
+**Important Notes:**
+- Basic memory summary (MEMORY.md) may already be included in the system prompt above
+- Use `load_context` only for **detailed exploration** when you need more than the summary
+- **Avoid reloading MEMORY.md** if you already see memory content in the system prompt - it's wasteful
+- Focus on loading **specific sections** or **other bootstrap files** (AGENTS.md, USER.md, etc.) that aren't auto-loaded
+- The system prompt only contains SOUL.md (identity) + memory summary; everything else is on-demand
+
+**Benefits:**
+- Only load what you actually need (saves tokens)
+- Explore before committing to large loads
+- AI-driven decisions (you choose what's relevant)
+- Minimal cold-start overhead (~1000 tokens vs ~15000 tokens)"""
 
     def build_messages(
         self,
@@ -502,12 +586,27 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
         user_content = self._build_user_content(current_message, media)
 
-        # Merge runtime context and user content into a single user message
+        # Add context explorer guidance for AI-driven dynamic loading (cold-start hybrid)
+        # Only inject on first call to avoid token waste in multi-turn conversations
+        if not self._guidance_injected:
+            context_guidance = self._build_context_guidance()
+            self._guidance_injected = True
+        else:
+            context_guidance = ""
+
+        # Merge runtime context, guidance, and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged = f"{runtime_ctx}\n\n{context_guidance}\n\n{user_content}" if context_guidance else f"{runtime_ctx}\n\n{user_content}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            if context_guidance:
+                merged = [
+                    {"type": "text", "text": f"{runtime_ctx}\n\n{context_guidance}"}
+                ] + user_content
+            else:
+                merged = [
+                    {"type": "text", "text": runtime_ctx}
+                ] + user_content
 
         return [
             {"role": "system", "content": system_content},
