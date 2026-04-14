@@ -17,6 +17,7 @@ MAX_SKILL_NAME_LENGTH = 64
 ALLOWED_FRONTMATTER_KEYS = {
     "name",
     "description",
+    "scripts",
     "metadata",
     "always",
     "license",
@@ -187,17 +188,27 @@ def validate_skill(skill_path):
     if always is not None and not isinstance(always, bool):
         return False, f"'always' must be a boolean, got {type(always).__name__}"
 
+    # Allow standard resource dirs plus skill-creator specific dirs
+    ALLOWED_EXTRA_DIRS = {"agents", "eval-viewer"}
+    ALLOWED_FILES_IN_ROOT = {"LICENSE.txt", "LICENSE", "LICENSE.md"}
+    
     for child in skill_path.iterdir():
         if child.name == "SKILL.md":
             continue
         if child.is_dir() and child.name in ALLOWED_RESOURCE_DIRS:
+            continue
+        # Allow skill-creator specific directories
+        if child.is_dir() and child.name in ALLOWED_EXTRA_DIRS:
+            continue
+        # Allow license files
+        if child.is_file() and child.name in ALLOWED_FILES_IN_ROOT:
             continue
         if child.is_symlink():
             continue
         return (
             False,
             f"Unexpected file or directory in skill root: {child.name}. "
-            "Only SKILL.md, scripts/, references/, and assets/ are allowed.",
+            "Only SKILL.md, scripts/, references/, assets/, and optional license files are allowed.",
         )
 
     return True, "Skill is valid!"

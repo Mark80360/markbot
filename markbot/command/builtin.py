@@ -58,7 +58,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             version=__version__, model=loop.model,
             start_time=loop._start_time,
             context_window_tokens=loop.context_window_tokens,
-            context_tokens=loop._last_context_tokens,
+            context_tokens=last.get("prompt_tokens", 0),
             session_msg_count=len(session.messages),
             session_history_count=len(session.get_history(max_messages=0)),
             tool_count=len(loop.tools.get_definitions()),

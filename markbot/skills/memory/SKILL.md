@@ -1,74 +1,91 @@
 ---
 name: memory
-description: ReMeLight memory system with compaction, summarization, and semantic search.
+description: >
+  ReMeLight memory system with conversation compaction, async summarization,
+  and semantic search. Use memory_search tool to recall past conversations,
+  user preferences, decisions, or project context stored in MEMORY.md and
+  daily notes. Auto-compacts context when conversation grows too long.
+  Trigger when: user asks about prior discussions, preferences, decisions,
+  project history, or needs to recall something mentioned earlier.
 always: true
 ---
 
-# Memory
+# Memory System
 
- memory system using ReMeLight for conversation compaction, summarization, and semantic search.
+Memory system using ReMeLight for conversation compaction, async summarization, and semantic search.
 
 ## Architecture
 
 ### MEMORY.md — Long-Term Curated Memory
-- **Purpose**: Your curated long-term memory, like a human's long-term memory
-- **Lifetime**: Permanent, manually curated
-- **Storage**: `MEMORY.md` (Markdown)
+- **Purpose**: Curated long-term facts, like a human's long-term memory
+- **Lifetime**: Permanent, updated by async summarization
+- **Storage**: `workspace/MEMORY.md`
 - **Use for**: User preferences, key decisions, project context, lessons learned
-- **Auto-loaded**: ✅ In main sessions (direct chats with your human)
+- **Auto-loaded**: Included in system prompt for main sessions
 
-**When to update:**
-- User preferences ("I prefer dark mode", "My name is Mark")
-- Project facts ("API uses OAuth2", "Database is PostgreSQL")
-- Important decisions and their rationale
-- Lessons learned from mistakes
+**Update MEMORY.md when:**
+- User states preferences ("I prefer dark mode", "My name is Mark")
+- Project decisions are made ("API uses OAuth2", "Database is PostgreSQL")
+- Important lessons learned from mistakes
 
 ### memory/YYYY-MM-DD.md — Daily Notes
-- **Purpose**: Auto-generated daily summaries of conversations
-- **Lifetime**: Permanent (Markdown files)
-- **Storage**: `memory/YYYY-MM-DD.md`
+- **Purpose**: Auto-generated daily conversation summaries
+- **Lifetime**: Permanent
+- **Storage**: `workspace/memory/YYYY-MM-DD.md`
 - **Use for**: Reviewing recent activity, finding past conversations
-- **Auto-loaded**: ❌ Search on demand via `memory_search`
+- **Search**: Via `memory_search` tool
 
-### Compressed Summary — Context Window Management
-- **Purpose**: Compressed summary of current conversation for context continuity
+### Compressed Summary — Session Context
+- **Purpose**: Condensed summary of older conversation messages
 - **Lifetime**: Current session only
-- **Storage**: In-memory
-- **Use for**: Maintaining conversation context when history gets too long
-- **Auto-triggered**: When token count exceeds 75% of context window
+- **Storage**: `workspace/memory/.compressed_summary`
+- **Use for**: Maintaining context when history exceeds context window
+- **Auto-triggered**: When messages exceed 75% of context window
+
+## Memory Tools
+
+### memory_search
+Search MEMORY.md and daily notes semantically. Use before answering questions about prior work, decisions, or user preferences.
+
+**Parameters:**
+- `query` (required): Semantic search query
+- `max_results` (default: 5): Maximum results to return
+- `min_score` (default: 0.1): Minimum similarity score
+
+**Example:**
+```
+memory_search(query="user preference for theme", max_results=3)
+```
+
+### force_memory_search (Optional)
+When enabled in config, automatically searches before each LLM call and injects relevant memories. Configured via `tools.memory.force_memory_search`.
 
 ## Memory Operations
 
 ### Automatic Compaction
-When the conversation grows too long (exceeds 75% of context window):
-1. System summarizes older messages into a compressed summary
-2. Recent messages are preserved
-3. System prompt is always preserved
-4. Summary task dispatched to background
+When conversation exceeds 75% of context window:
+1. Older messages summarized via `compact_memory`
+2. Recent messages preserved
+3. System prompt always preserved
+4. Summary stored in `.compressed_summary`
 
 ### Async Summarization
 After each conversation turn:
-1. System dispatches a background summary task
-2. Summary is written to `memory/YYYY-MM-DD.md`
-3. Significant facts may be extracted to `MEMORY.md`
-
-### Memory Search
-Use `memory_search` tool to find information from past conversations:
-- Searches `MEMORY.md` and all daily note files
-- Semantic search (understands meaning, not just keywords)
-- Returns relevant snippets with file paths and content
+1. Background task summarizes via `summary_memory`
+2. Result appended to `.compressed_summary`
+3. Daily summary written to `memory/YYYY-MM-DD.md`
+4. Heartbeat summarization at scheduled times updates MEMORY.md with key facts
 
 ## Slash Commands
 
-- `/compact` — Manually compact the current conversation into a summary
-- `/compact_str` — View the current compressed summary
-- `/new` — Start a new conversation (saves summary first)
-- `/clear` — Clear history and compressed summary
+- `/compact` — Manually trigger conversation compaction
+- `/new` — Start fresh session (saves summary first)
+- `/clear` — Clear history and summary
 
 ## Quick Reference
 
-| Component | Type | Persistence | Search | Auto-Context |
-|-----------|------|-------------|--------|--------------|
-| MEMORY.md | Curated facts | Permanent | Semantic | ✅ Main sessions |
-| memory/YYYY-MM-DD.md | Daily notes | Permanent | Semantic | On demand |
-| Compressed Summary | Session context | Current session | - | Auto-injected |
+| Component | Type | Persistence | Auto-Context |
+|-----------|------|-------------|--------------|
+| MEMORY.md | Curated facts | Permanent | ✅ Main sessions |
+| memory/*.md | Daily notes | Permanent | On demand via search |
+| .compressed_summary | Session context | Current session | Auto-injected |

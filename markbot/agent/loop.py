@@ -976,6 +976,10 @@ class AgentLoop:
         raw = msg.content.strip()
         cmd_ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(cmd_ctx):
+            # Propagate message_id and reaction_id to command responses so channels
+            # (e.g. Feishu) can clean up typing indicators / reactions.
+            result.metadata.setdefault("message_id", msg.metadata.get("message_id"))
+            result.metadata.setdefault("reaction_id", msg.metadata.get("reaction_id"))
             return result
 
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
