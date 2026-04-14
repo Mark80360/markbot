@@ -261,7 +261,12 @@ class MultiLevelCompactor:
         recent_messages = messages[-keep_recent * 2:]
 
         conversation_text = self._format_messages_for_compact(messages_to_compact)
-        summary = await self._generate_summary(conversation_text)
+        try:
+            summary = await self._generate_summary(conversation_text)
+        except Exception as e:
+            logger.error(f"[Compactor] Auto-compaction failed, falling back to history snip: {e}")
+            # Return original messages to trigger fallback to history snip
+            return messages, ""
         formatted = self._format_summary(summary)
 
         compact_msg = {
@@ -364,9 +369,14 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
                     max_tokens=self.config.max_compact_output_tokens,
                     temperature=0.3,
                 )
+                if response.finish_reason == "error":
+                    error_msg = response.content or "Unknown error"
+                    logger.error(f"[Compactor] LLM returned error: {error_msg}")
+                    raise RuntimeError(f"Summary generation failed: {error_msg}")
                 return response.content or "[Empty summary]"
             except Exception as e:
                 logger.error(f"[Compactor] Failed to generate summary with provider: {e}")
+                raise
 
         logger.warning("[Compactor] No LLM available, using simple truncation summary")
         lines = conversation_text.split("\n\n")[:5]

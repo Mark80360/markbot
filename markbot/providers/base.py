@@ -81,6 +81,7 @@ class LLMProvider(ABC):
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
         "429",
+        "529",
         "rate limit",
         "500",
         "502",
