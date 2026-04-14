@@ -108,8 +108,12 @@ class SubagentManager:
                 exec_config=self.exec_config,
                 filesystem_config=self.filesystem_config,
             )
+
+            from markbot.core.skills import SkillRegistry
+            skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
+            skill_registry.load_all()
             
-            system_prompt = self._build_subagent_prompt()
+            system_prompt = self._build_subagent_prompt(skill_registry)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -160,8 +164,16 @@ class SubagentManager:
                             is_read=is_read,
                         )
 
+                    from markbot.core.types import ToolContext as _TC, PermissionMode as _PM, ToolPermissionContext as _TPC
+                    _sub_tool_ctx = _TC(
+                        session_id=f"subagent:{task_id}",
+                        workspace=str(self.workspace),
+                        permission_mode=_PM.AUTO,
+                        tool_permission_context=_TPC(mode=_PM.AUTO),
+                        is_non_interactive=True,
+                    )
                     results = await asyncio.gather(
-                        *(tools.execute(tc.name, tc.arguments) for tc in response.tool_calls),
+                        *(tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx) for tc in response.tool_calls),
                         return_exceptions=True,
                     )
 
@@ -272,10 +284,9 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
     
-    def _build_subagent_prompt(self) -> str:
+    def _build_subagent_prompt(self, skill_registry: "SkillRegistry | None" = None) -> str:
         """Build a focused system prompt for the subagent."""
         from markbot.agent.context import ContextBuilder
-        from markbot.core.skills import SkillRegistry
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [f"""# Subagent
@@ -290,12 +301,10 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 ## Workspace
 {self.workspace}"""]
 
-        # Use SkillRegistry instead of deprecated SkillsLoader
-        registry = SkillRegistry(self.workspace)
-        registry.load_all()
-        skills_summary = registry.build_skills_summary()
-        if skills_summary:
-            parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
+        if skill_registry:
+            skills_summary = skill_registry.build_skills_summary()
+            if skills_summary:
+                parts.append(f"## Skills\n\n{skills_summary}")
 
         return "\n\n".join(parts)
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
+from loguru import logger
+
 from markbot.agent.tools.base import BaseTool
 from markbot.core.types import (
     PermissionDecision,
@@ -34,8 +36,8 @@ class SkillTool(BaseTool):
             name=f"{self._skill_name}.{self._script.name}",
             description=self._script.description,
             parameters=self._script.parameters,
-            is_read_only=False,  # Skills can do anything
-            is_destructive=True,  # Assume destructive for safety
+            is_read_only=False,
+            is_destructive=True,
         )
 
     @property
@@ -49,35 +51,70 @@ class SkillTool(BaseTool):
             return PermissionDecision(behavior="allow", reason="Non-interactive mode")
         return PermissionDecision(behavior="ask")
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        """Execute the skill script."""
-        # Import here to avoid circular dependency
-        from markbot.agent.skill_execution import SkillScriptExecutor
-
-        executor = SkillScriptExecutor()
-
-        # Resolve entry path
+    def _resolve_skill_path(self) -> Path:
         skill_path = self._workspace / "skills" / self._skill_name
-        if not skill_path.exists():
-            # Try builtin
-            import markbot
+        if skill_path.exists():
+            return skill_path
+        from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
+        builtin_path = BUILTIN_SKILLS_DIR / self._skill_name
+        if builtin_path.exists():
+            return builtin_path
+        return skill_path
 
-            skill_path = Path(markbot.__file__).parent / "skills" / self._skill_name
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        """Execute the skill script via Sandbox."""
+        from markbot.agent.skill_execution.sandbox import Sandbox
+        from markbot.agent.skill_execution.scanner import SecurityScanner
 
+        skill_path = self._resolve_skill_path()
         entry_path = skill_path / self._script.entry
         if not entry_path.exists():
             return f"Error: Script entry not found: {entry_path}"
 
-        # Execute
-        result = await executor.execute(
-            script_path=entry_path,
-            language=self._script.language,
-            parameters=params,
-            sandbox_config=self._script.sandbox_config,
-            workspace=context.workspace,
-        )
+        scanner = SecurityScanner()
+        scan_result = scanner.scan(entry_path, self._script.language)
+        if not scan_result.is_safe:
+            findings_str = "\n".join(
+                f"  Line {f.line}: [{f.severity}] {f.message}"
+                for f in scan_result.findings
+                if f.severity in ("high", "critical")
+            )
+            return f"Error: Script failed security check\n{findings_str}"
 
-        return result
+        sandbox_config = self._script.sandbox_config or {}
+        sandbox_config.setdefault("environment", {})
+        sandbox_config["environment"]["SKILL_NAME"] = self._skill_name
+        sandbox_config["environment"]["SCRIPT_NAME"] = self._script.name
+        sandbox_config["environment"]["WORKSPACE_ROOT"] = str(Path(context.workspace).resolve())
+
+        sandbox = Sandbox(sandbox_config)
+
+        if sandbox.config.allowed_paths:
+            allowed, msg = sandbox.validate_script_access(entry_path)
+            if not allowed:
+                return f"Error: {msg}"
+
+        try:
+            logger.info("Executing skill script: {}.{}", self._skill_name, self._script.name)
+            result = await sandbox.run(
+                script=entry_path.resolve(),
+                language=self._script.language,
+                args=params,
+                cwd=skill_path,
+            )
+            if result.success:
+                output = result.stdout
+                if result.stderr:
+                    output += f"\n\n[stderr]:\n{result.stderr}"
+                return output
+            else:
+                error_msg = f"Script execution failed (exit code: {result.exit_code})"
+                if result.stderr:
+                    error_msg += f"\n{result.stderr}"
+                return f"Error: {error_msg}"
+        except Exception as e:
+            logger.exception("Error executing skill script {}.{}", self._skill_name, self._script.name)
+            return f"Error: Failed to execute script: {e}"
 
     def get_activity_description(self, params: dict[str, Any]) -> Optional[str]:
         return f"Running {self._skill_name}.{self._script.name}"

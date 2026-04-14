@@ -590,7 +590,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             except Exception as e:
                 logger.warning(f"Failed to read MEMORY.md for catalog: {e}")
 
-        daily_logs_dir = memory_dir / "daily_logs"
+        daily_logs_dir = memory_dir / "daily"
         if daily_logs_dir.exists():
             try:
                 log_files = sorted(

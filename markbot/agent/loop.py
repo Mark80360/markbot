@@ -620,8 +620,16 @@ class AgentLoop:
                 # return_exceptions=True ensures all results are collected
                 # even if one tool is cancelled or raises BaseException.
                 logger.info("[AgentLoop] Executing {} tool calls...", len(response.tool_calls))
+                from markbot.core.types import ToolContext as _TC, PermissionMode as _PM, ToolPermissionContext as _TPC
+                _tool_ctx = _TC(
+                    session_id=f"{channel}:{chat_id}",
+                    workspace=str(self.workspace),
+                    permission_mode=_PM.AUTO,
+                    tool_permission_context=_TPC(mode=_PM.AUTO),
+                    is_non_interactive=False,
+                )
                 results = await asyncio.gather(
-                    *(self.tools.execute(tc.name, tc.arguments) for tc in response.tool_calls),
+                    *(self.tools.execute(tc.name, tc.arguments, context=_tool_ctx) for tc in response.tool_calls),
                     return_exceptions=True,
                 )
                 logger.info("[AgentLoop] Tool execution completed, {} results", len(results))
