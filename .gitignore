@@ -30,3 +30,5 @@ logs/
 *.log
 .claude/
 .spec-workflow/
+.qwen/
+.ruff_cache/

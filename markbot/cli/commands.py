@@ -274,6 +274,9 @@ def onboard(
     from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
     from markbot.config.schema import Config
 
+    _markbot_banner()
+    console.print()
+
     if config:
         config_path = Path(config).expanduser().resolve()
         set_config_path(config_path)
@@ -391,70 +394,27 @@ def _onboard_plugins(config_path: Path) -> None:
 
 
 def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config.
-
-    Routing is driven by ``ProviderSpec.backend`` in the registry.
     """
-    from markbot.providers.base import GenerationSettings
-    from markbot.providers.registry import find_by_name
+    Create fallback manager from config (V2).
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
+    Returns:
+        FallbackManager instance (replaces old single LLMProvider)
+    """
+    from markbot.providers import FallbackManager
 
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.markbot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.markbot/config.json under providers section")
-            raise typer.Exit(1)
+    if not config.agents.defaults.model_chain:
+        console.print("[red]Error: No models configured in modelChain.[/red]")
+        console.print("Run 'markbot onboard' to configure models.")
+        raise typer.Exit(1)
 
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from markbot.providers.openai_codex_provider import OpenAICodexProvider
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from markbot.providers.azure_openai_provider import AzureOpenAIProvider
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "anthropic":
-        from markbot.providers.anthropic_provider import AnthropicProvider
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from markbot.providers.openai_compat_provider import OpenAICompatProvider
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
+    errors = config.validate_model_chain()
+    if errors:
+        console.print("[red]Configuration errors:[/red]")
+        for error in errors:
+            console.print(f"  • {error}")
+        raise typer.Exit(1)
 
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    return FallbackManager(config)
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -842,9 +802,9 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
 
     agent = AgentLoop(
         bus=bus,
-        provider=provider,
+        fallback_manager=provider,
+        config=config,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
         web_search_config=config.tools.web.search,
@@ -982,7 +942,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
 
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
-        provider=provider,
+        fallback_manager=provider,
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
@@ -1066,9 +1026,9 @@ def agent(
 
     agent_loop = AgentLoop(
         bus=bus,
-        provider=provider,
+        fallback_manager=provider,
+        config=config,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
         web_search_config=config.tools.web.search,
@@ -1542,7 +1502,7 @@ def gateway_status():
 
     # ─ Runtime ───────────────────────────────────────────────────────────────
     section("Runtime", "magenta")
-    kv("Model", config.agents.defaults.model)
+    kv("Model Chain", ", ".join(config.agents.defaults.model_chain) or "[not configured]")
     kv("Context Window", f"{config.agents.defaults.context_window_tokens} tokens")
     hb_on = config.gateway.heartbeat.enabled
     kv("Heartbeat", f"[green]●[/green] Enabled every {config.gateway.heartbeat.interval_s}s" if hb_on else "[yellow]○[/yellow] Disabled")
@@ -1909,7 +1869,7 @@ def status():
     section("Configuration", "blue")
     kv("Config Path", f"{config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
     kv("Workspace", f"{workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
-    kv("Model", config.agents.defaults.model)
+    kv("Model Chain", ", ".join(config.agents.defaults.model_chain) or "[not configured]")
 
     divider()
 
@@ -2116,7 +2076,7 @@ def _parse_value(value_str: str):
 
 @config_app.command("get")
 def config_get(
-    key: str = typer.Argument(..., help="Configuration key (dot notation, e.g., agents.defaults.model)"),
+    key: str = typer.Argument(..., help="Configuration key (dot notation, e.g., agents.defaults.modelChain)"),
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw value without formatting"),
 ):
     """Get a configuration value."""
@@ -2179,7 +2139,7 @@ def config_get(
 
 @config_app.command("set")
 def config_set(
-    key: str = typer.Argument(..., help="Configuration key (dot notation, e.g., agents.defaults.model)"),
+    key: str = typer.Argument(..., help="Configuration key (dot notation, e.g., agents.defaults.modelChain)"),
     value: str = typer.Argument(..., help="Value to set (auto-detected type: string, number, boolean, null)"),
 ):
     """Set a configuration value."""

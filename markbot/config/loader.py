@@ -12,6 +12,14 @@ from markbot.config.schema import Config
 _current_config_path: Path | None = None
 
 
+class ConfigValidationError(Exception):
+    """Raised when configuration fails validation."""
+
+    def __init__(self, message: str, details: list[str] | None = None):
+        super().__init__(message)
+        self.details = details or []
+
+
 def set_config_path(path: Path) -> None:
     """Set the current config path (used to derive data directory)."""
     global _current_config_path
@@ -27,7 +35,10 @@ def get_config_path() -> Path:
 
 def load_config(config_path: Path | None = None) -> Config:
     """
-    Load configuration from file or create default.
+    Load configuration from file with validation.
+
+    Raises:
+        ConfigValidationError: If configuration is invalid
 
     Args:
         config_path: Optional path to config file. Uses default if not provided.
@@ -41,11 +52,23 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            data = _migrate_config(data)
-            return Config.model_validate(data)
-        except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
-            logger.warning(f"Failed to load config from {path}: {e}")
-            logger.warning("Using default configuration.")
+
+            config = Config.model_validate(data)
+
+            # Validate model_chain references
+            errors = config.validate_model_chain()
+            if errors:
+                raise ConfigValidationError(
+                    "Configuration validation failed",
+                    details=errors
+                )
+
+            return config
+
+        except json.JSONDecodeError as e:
+            raise ConfigValidationError(f"Invalid JSON in {path}: {e}")
+        except pydantic.ValidationError as e:
+            raise ConfigValidationError(f"Schema validation failed: {e}")
 
     return Config()
 
@@ -65,13 +88,3 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def _migrate_config(data: dict) -> dict:
-    """Migrate old config formats to current."""
-    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
-    tools = data.get("tools", {})
-    exec_cfg = tools.get("exec", {})
-    if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
-        tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
-    return data

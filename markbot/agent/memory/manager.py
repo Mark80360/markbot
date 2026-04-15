@@ -89,7 +89,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self,
         working_dir: str,
         agent_id: str = "default",
-        provider: Any = None,
+        fallback_manager=None,
         model: str | None = None,
         embedding_config: dict | None = None,
         llm_config: dict | None = None,
@@ -111,7 +111,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         max_input_length: int = 131072,
     ):
         super().__init__(working_dir=working_dir, agent_id=agent_id)
-        self._provider = provider
+        self._fallback_manager = fallback_manager
         self._model = model
         self._embedding_config = embedding_config or {}
         self._llm_config = llm_config or {}
@@ -200,6 +200,10 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 "model_name": llm_model_name,
             }
 
+        # Set environment variables for token counter before initializing ReMeLight
+        os.environ.setdefault("AS_TOKEN_COUNTER_BACKEND", "huggingface")
+        os.environ.setdefault("AS_TOKEN_COUNTER_MODEL_NAME", "gpt2")
+        
         self._reme = ReMeLight(
             working_dir=self.working_dir,
             llm_api_key=llm_api_key or None,

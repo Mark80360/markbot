@@ -14,6 +14,9 @@ __all__ = [
     "OpenAICompatProvider",
     "OpenAICodexProvider",
     "AzureOpenAIProvider",
+    "FallbackManager",
+    "AllModelsFailedError",
+    "FallbackAttempt",
 ]
 
 _LAZY_IMPORTS = {
@@ -21,6 +24,9 @@ _LAZY_IMPORTS = {
     "OpenAICompatProvider": ".openai_compat_provider",
     "OpenAICodexProvider": ".openai_codex_provider",
     "AzureOpenAIProvider": ".azure_openai_provider",
+    "FallbackManager": ".fallback",
+    "AllModelsFailedError": ".fallback",
+    "FallbackAttempt": ".fallback",
 }
 
 if TYPE_CHECKING:
@@ -28,6 +34,7 @@ if TYPE_CHECKING:
     from markbot.providers.azure_openai_provider import AzureOpenAIProvider
     from markbot.providers.openai_compat_provider import OpenAICompatProvider
     from markbot.providers.openai_codex_provider import OpenAICodexProvider
+    from markbot.providers.fallback import FallbackManager, AllModelsFailedError, FallbackAttempt
 
 
 def __getattr__(name: str):

@@ -78,9 +78,9 @@ class AgentLoop:
     def __init__(
         self,
         bus: MessageBus,
-        provider: LLMProvider,
-        workspace: Path,
-        model: str | None = None,
+        fallback_manager,
+        config=None,
+        workspace: Path | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
         web_search_config: WebSearchConfig | None = None,
@@ -101,9 +101,17 @@ class AgentLoop:
     ):
         self.bus = bus
         self.channels_config = channels_config
-        self.provider = provider
+        self.fallback_manager = fallback_manager
+        self.config = config
         self.workspace = workspace
-        self.model = model or provider.get_default_model()
+
+        # 从 config 获取主模型信息
+        if config and config.primary_model_ref:
+            _, primary_model = config.resolve_model(config.primary_model_ref)
+            self.model = primary_model.name
+        else:
+            self.model = "unknown"
+
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
         self.web_search_config = web_search_config or WebSearchConfig()
@@ -122,7 +130,7 @@ class AgentLoop:
         
         self.token_tracker = TokenTracker()
         _compaction_cfg = compaction_config or CompactionConfig()
-        self.compactor = MultiLevelCompactor(provider=provider, config=_compaction_cfg)
+        self.compactor = MultiLevelCompactor(fallback_manager=fallback_manager, config=_compaction_cfg)
         _pricing: PricingTable | None = None
         if budget_config and getattr(budget_config, 'custom_pricing', None):
             from markbot.agent.cost_tracker import ModelPricing as _MP
@@ -145,7 +153,8 @@ class AgentLoop:
 
         self.sessions = session_manager or SessionManager(workspace)
         self.subagents = SubagentManager(
-            provider=provider,
+            fallback_manager=fallback_manager,
+            config=config,
             workspace=workspace,
             bus=bus,
             model=self.model,
@@ -181,15 +190,15 @@ class AgentLoop:
 
         llm_config = {
             "backend": "openai",
-            "api_key": provider.api_key or "",
-            "base_url": provider.api_base or "",
-            "model_name": self.model or provider.get_default_model(),
+            "api_key": "",
+            "base_url": "",
+            "model_name": self.model,
         }
 
         self.memory_manager = ReMeLightMemoryManager(
             working_dir=str(workspace),
             agent_id="markbot",
-            provider=provider,
+            fallback_manager=fallback_manager,
             model=self.model,
             embedding_config=embedding_config,
             llm_config=llm_config,
@@ -507,18 +516,21 @@ class AgentLoop:
 
             if on_stream:
                 logger.info("[AgentLoop] Calling LLM with streaming...")
-                response = await self.provider.chat_stream_with_retry(
+                response, attempts = await self.fallback_manager.chat_with_fallback(
                     messages=messages,
                     tools=tool_defs,
-                    model=self.model,
-                    on_content_delta=_filtered_stream,
                 )
+                if on_stream and response.content:
+                    import asyncio
+                    if asyncio.iscoroutinefunction(on_stream):
+                        await on_stream(response.content)
+                    else:
+                        on_stream(response.content)
             else:
                 logger.info("[AgentLoop] Calling LLM without streaming...")
-                response = await self.provider.chat_with_retry(
+                response, attempts = await self.fallback_manager.chat_with_fallback(
                     messages=messages,
                     tools=tool_defs,
-                    model=self.model,
                 )
 
             logger.info(
@@ -1084,6 +1096,13 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
+        # Ensure memory manager is started
+        if self.memory_manager and not getattr(self.memory_manager, '_started', False):
+            try:
+                await self.memory_manager.start()
+                logger.info("Memory manager started in process_direct")
+            except Exception as e:
+                logger.warning(f"Memory manager start failed in process_direct: {e}")
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg,

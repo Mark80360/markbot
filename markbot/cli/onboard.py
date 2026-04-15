@@ -22,7 +22,7 @@ from markbot.cli.models import (
     get_model_suggestions,
 )
 from markbot.config.loader import get_config_path, load_config
-from markbot.config.schema import Config
+from markbot.config.schema import Config, ProviderConfig
 
 console = Console()
 
@@ -675,7 +675,10 @@ def _get_provider_names() -> dict[str, str]:
 
 
 def _configure_provider(config: Config, provider_name: str) -> None:
-    """Configure a single LLM provider."""
+    """Configure a single LLM provider (V2: with models)."""
+    from markbot.config.schema import ModelConfig
+    from markbot.cli.models import get_provider_models
+
     provider_config = getattr(config.providers, provider_name, None)
     if provider_config is None:
         console.print(f"[red]Unknown provider: {provider_name}[/red]")
@@ -688,24 +691,348 @@ def _configure_provider(config: Config, provider_name: str) -> None:
     if default_api_base and not provider_config.api_base:
         provider_config.api_base = default_api_base
 
+    # Step 1: Configure API key and base URL
     updated_provider = _configure_pydantic_model(
         provider_config,
         display_name,
     )
     if updated_provider is not None:
         setattr(config.providers, provider_name, updated_provider)
+        provider_config = updated_provider
+
+    # Step 2: Configure models for this provider (V2 feature)
+    _configure_models_for_provider(config, provider_name, display_name)
+
+
+def _configure_models_for_provider(config: Config, provider_name: str, display_name: str) -> None:
+    """Configure models for a specific provider."""
+    from markbot.config.schema import ModelConfig
+    from markbot.cli.models import get_provider_models, get_model_info, format_token_count
+
+    provider_config = getattr(config.providers, provider_name, None)
+    if not provider_config or not provider_config.api_key:
+        console.print("[yellow]Please configure API key first before adding models.[/yellow]")
+        return
+
+    available_models = get_provider_models(provider_name)
+    if not available_models:
+        console.print(f"[yellow]No predefined models for {display_name}. You can add custom models.[/yellow]")
+
+    while True:
+        try:
+            console.clear()
+            _show_section_header(
+                f"Models for {display_name}",
+                "Add, remove, or manage models"
+            )
+
+            # Show current models
+            current_models = provider_config.models
+            if current_models:
+                table = Table(title=f"Configured Models ({len(current_models)})")
+                table.add_column("ID", style="cyan")
+                table.add_column("Name", style="green")
+                table.add_column("Context", style="blue")
+                table.add_column("Max Tokens", style="magenta")
+                for m in current_models:
+                    model_info = get_model_info(provider_name, m.id)
+                    ctx = format_token_count(model_info.context_window) if model_info else "?"
+                    table.add_row(m.id, m.name, ctx, str(m.max_tokens))
+                console.print(table)
+            else:
+                console.print("[dim]No models configured yet.[/dim]")
+
+            choices = ["[+] Add Model"]
+            if current_models:
+                choices.append("[-] Remove Model")
+            choices.append("<- Back")
+
+            answer = _select_with_back("Select action:", choices)
+
+            if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+                break
+
+            assert isinstance(answer, str)
+
+            if answer == "[+] Add Model":
+                _add_model_to_provider(config, provider_name, display_name, available_models)
+            elif answer == "[-] Remove Model":
+                _remove_model_from_provider(config, provider_name, display_name)
+
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to provider list...[/dim]")
+            break
+
+
+def _add_model_to_provider(
+    config: Config,
+    provider_name: str,
+    display_name: str,
+    available_models: list,
+) -> None:
+    """Add a model to a provider configuration."""
+    from markbot.config.schema import ModelConfig
+    from markbot.cli.models import get_model_info, format_token_count
+
+    provider_config = getattr(config.providers, provider_name, None)
+    if not provider_config:
+        return
+
+    # Build choices from database + custom option
+    configured_ids = {m.id for m in provider_config.models}
+    model_choices = []
+    for model in available_models:
+        if model.id not in configured_ids:
+            info_str = f"{model.display_name}"
+            if model.context_window:
+                info_str += f" ({format_token_count(model.context_window)} ctx)"
+            model_choices.append(info_str)
+    model_choices.append("[Custom] Enter model ID manually")
+
+    if not model_choices:
+        console.print("[yellow]All available models are already configured.[/yellow]")
+        return
+
+    console.clear()
+    _show_section_header(f"Add Model to {display_name}", "Select a model to add")
+
+    answer = _select_with_back("Select model:", model_choices)
+
+    if answer is _BACK_PRESSED or answer is None:
+        return
+
+    assert isinstance(answer, str)
+
+    if answer == "[Custom] Enter model ID manually":
+        q = _get_questionary()
+        model_id = q.text("Enter model ID:").ask()
+        model_name = q.text("Enter model name (API name):", default=model_id).ask()
+        if not model_id:
+            return
+        new_model = ModelConfig(id=model_id, name=model_name)
+    else:
+        # Find the selected model from available_models
+        selected_display = answer.split(" (")[0]
+        model_info = None
+        for model in available_models:
+            if model.display_name == selected_display:
+                model_info = model
+                break
+        if not model_info:
+            return
+
+        new_model = ModelConfig(
+            id=model_info.id,
+            name=model_info.name,
+            max_tokens=model_info.max_tokens,
+            context_window=model_info.context_window,
+        )
+
+    # Add to provider config
+    provider_config.models.append(new_model)
+    console.print(f"[green]✓ Added model: {new_model.id}[/green]")
+    _wait_for_key()
+
+
+def _remove_model_from_provider(config: Config, provider_name: str, display_name: str) -> None:
+    """Remove a model from a provider configuration."""
+    provider_config = getattr(config.providers, provider_name, None)
+    if not provider_config or not provider_config.models:
+        return
+
+    model_choices = [m.id for m in provider_config.models] + ["<- Back"]
+
+    console.clear()
+    _show_section_header(f"Remove Model from {display_name}", "Select model to remove")
+
+    answer = _select_with_back("Select model to remove:", model_choices)
+
+    if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+        return
+
+    assert isinstance(answer, str)
+
+    provider_config.models = [m for m in provider_config.models if m.id != answer]
+    console.print(f"[green]✓ Removed model: {answer}[/green]")
+    _wait_for_key()
+
+
+def _configure_model_chain(config: Config) -> None:
+    """Configure the model fallback chain (V2 core feature)."""
+    from markbot.cli.models import find_model_info, get_all_models, format_token_count
+
+    while True:
+        try:
+            console.clear()
+            _show_section_header(
+                "Model Chain (Fallback Order)",
+                "Configure priority order for model fallback"
+            )
+
+            current_chain = config.agents.defaults.model_chain
+
+            # Display current chain
+            if current_chain:
+                table = Table(title="Current Model Chain")
+                table.add_column("Priority", style="cyan", width=8)
+                table.add_column("Reference", style="green")
+                table.add_column("Details", style="blue")
+
+                for i, ref in enumerate(current_chain, 1):
+                    info = find_model_info(ref)
+                    if info:
+                        details = f"{info['display_name']} ({format_token_count(info['context_window'])} ctx)"
+                        marker = " [PRIMARY]" if i == 1 else ""
+                        table.add_row(str(i), ref + marker, details)
+                    else:
+                        table.add_row(str(i), f"[red]{ref}[/red]", "[yellow]Not found[/yellow]")
+                console.print(table)
+            else:
+                console.print("[yellow]No models configured. Add providers and models first.[/yellow]")
+
+            # Build available choices
+            all_configured_refs = _get_all_configured_model_refs(config)
+            available = [r for r in all_configured_refs if r not in current_chain]
+
+            choices = []
+            if available:
+                choices.append("[+] Add Model to Chain")
+            if len(current_chain) > 1:
+                choices.append("[↑] Move Up (Increase Priority)")
+                choices.append("[↓] Move Down (Decrease Priority)")
+            if current_chain:
+                choices.append("[-] Remove from Chain")
+            choices.append("<- Back")
+
+            answer = _select_with_back("Select action:", choices)
+
+            if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+                break
+
+            assert isinstance(answer, str)
+
+            if answer == "[+] Add Model to Chain":
+                _add_to_model_chain(config, available)
+            elif answer == "[↑] Move Up (Increase Priority)":
+                _move_in_chain(config, current_chain, direction=-1)
+            elif answer == "[↓] Move Down (Decrease Priority)":
+                _move_in_chain(config, current_chain, direction=1)
+            elif answer == "[-] Remove from Chain":
+                _remove_from_chain(config, current_chain)
+
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to main menu...[/dim]")
+            break
+
+
+def _get_all_configured_model_refs(config: Config) -> list[str]:
+    """Get all configured model references across all providers."""
+    refs = []
+    for provider_name in vars(config.providers).keys():
+        if provider_name.startswith("_"):
+            continue
+        provider = getattr(config.providers, provider_name, None)
+        if not isinstance(provider, ProviderConfig):
+            continue
+        for model in provider.models:
+            refs.append(f"{provider_name}/{model.id}")
+    return refs
+
+
+def _add_to_model_chain(config: Config, available: list[str]) -> None:
+    """Add a model to the fallback chain."""
+    from markbot.cli.models import find_model_info
+
+    if not available:
+        console.print("[yellow]No more models to add. Configure more providers first.[/yellow]")
+        _wait_for_key()
+        return
+
+    # Build display choices
+    choices = []
+    for ref in available:
+        info = find_model_info(ref)
+        if info:
+            choices.append(f"{ref} - {info['display_name']}")
+        else:
+            choices.append(ref)
+    choices.append("<- Back")
+
+    console.clear()
+    _show_section_header("Add Model to Chain", "Select a model to add")
+
+    answer = _select_with_back("Select model:", choices)
+
+    if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+        return
+
+    assert isinstance(answer, str)
+
+    # Extract ref from choice
+    ref = answer.split(" - ")[0]
+    config.agents.defaults.model_chain.append(ref)
+    console.print(f"[green]✓ Added to chain: {ref}[/green]")
+    _wait_for_key()
+
+
+def _move_in_chain(config: Config, current_chain: list[str], direction: int) -> None:
+    """Move a model up or down in the chain."""
+    if len(current_chain) < 2:
+        return
+
+    choices = current_chain + ["<- Back"]
+
+    action = "Move Up" if direction == -1 else "Move Down"
+
+    console.clear()
+    _show_section_header(f"{action} in Chain", "Select model to move")
+
+    answer = _select_with_back(f"Select model to {action.lower()}:", choices)
+
+    if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+        return
+
+    assert isinstance(answer, str)
+
+    idx = current_chain.index(answer)
+    new_idx = idx + direction
+    if 0 <= new_idx < len(current_chain):
+        current_chain[idx], current_chain[new_idx] = current_chain[new_idx], current_chain[idx]
+        console.print(f"[green]✓ Moved: {answer}[/green]")
+    _wait_for_key()
+
+
+def _remove_from_chain(config: Config, current_chain: list[str]) -> None:
+    """Remove a model from the chain."""
+    choices = current_chain + ["<- Back"]
+
+    console.clear()
+    _show_section_header("Remove from Chain", "Select model to remove")
+
+    answer = _select_with_back("Select model to remove:", choices)
+
+    if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+        return
+
+    assert isinstance(answer, str)
+
+    config.agents.defaults.model_chain.remove(answer)
+    console.print(f"[green]✓ Removed from chain: {answer}[/green]")
+    _wait_for_key()
 
 
 def _configure_providers(config: Config) -> None:
-    """Configure LLM providers."""
+    """Configure LLM providers (V2: with model count indicator)."""
 
     def get_provider_choices() -> list[str]:
         """Build provider choices with config status indicators."""
         choices = []
         for name, display in _get_provider_names().items():
             provider = getattr(config.providers, name, None)
-            if provider and provider.api_key:
-                choices.append(f"{display} *")
+            if provider and provider.api_key and provider.models:
+                choices.append(f"{display} * ({len(provider.models)} models)")
+            elif provider and provider.api_key:
+                choices.append(f"{display} * (0 models)")
             else:
                 choices.append(display)
         return choices + ["<- Back"]
@@ -983,6 +1310,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
                 "What would you like to configure?",
                 choices=[
                     "[P] LLM Provider",
+                    "[M] Model Chain (Fallback Order)",
                     "[C] Chat Channel",
                     "[A] Agent Settings",
                     "[G] Gateway",
@@ -1006,6 +1334,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
 
         _MENU_DISPATCH = {
             "[P] LLM Provider": lambda: _configure_providers(config),
+            "[M] Model Chain (Fallback Order)": lambda: _configure_model_chain(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
             "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),

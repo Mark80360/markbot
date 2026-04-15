@@ -29,12 +29,12 @@ class ChannelsConfig(Base):
 
 
 class AgentDefaults(Base):
-    """Default agent configuration."""
+    """Default agent configuration (V2)."""
 
     workspace: str = "~/.markbot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
-    provider: str = (
-        "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
+    model_chain: list[str] = Field(
+        default_factory=list,
+        description="Ordered list of provider/model references for fallback"
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
@@ -50,12 +50,36 @@ class AgentsConfig(Base):
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 
+class ModelConfig(Base):
+    """Single model configuration within a provider."""
+
+    id: str = Field(..., description="Unique model identifier within provider")
+    name: str = Field(..., description="Actual model name passed to API")
+    max_tokens: int = Field(8192, ge=1, description="Max output tokens")
+    context_window: int = Field(65536, ge=1024, description="Context window size")
+    temperature: float | None = Field(None, ge=0.0, le=2.0, description="Override default temperature")
+    reasoning_effort: Literal["low", "medium", "high"] | None = Field(None, description="Reasoning effort level")
+
+
 class ProviderConfig(Base):
-    """LLM provider configuration."""
+    """LLM provider configuration (V2)."""
 
     api_key: str = ""
     api_base: str | None = None
-    extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    extra_headers: dict[str, str] | None = None
+    models: list[ModelConfig] = Field(
+        default_factory=list,
+        description="List of models available under this provider"
+    )
+
+    def get_model(self, model_id: str) -> ModelConfig | None:
+        """Get model config by ID."""
+        return next((m for m in self.models if m.id == model_id), None)
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if provider has at least one model configured."""
+        return bool(self.api_key and self.models)
 
 
 class ProvidersConfig(Base):
@@ -295,99 +319,59 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
 
-    def _match_provider(
-        self, model: str | None = None
-    ) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name)."""
-        from markbot.providers.registry import PROVIDERS, find_by_name
+    def resolve_model(self, model_ref: str) -> tuple[ProviderConfig, ModelConfig]:
+        """
+        Resolve a model reference to (provider_config, model_config).
 
-        forced = self.agents.defaults.provider
-        if forced != "auto":
-            spec = find_by_name(forced)
-            if spec:
-                p = getattr(self.providers, spec.name, None)
-                return (p, spec.name) if p else (None, None)
-            return None, None
+        Args:
+            model_ref: Format "providerId/modelId"
 
-        model_lower = (model or self.agents.defaults.model).lower()
-        model_normalized = model_lower.replace("-", "_")
-        model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
-        normalized_prefix = model_prefix.replace("-", "_")
+        Returns:
+            Tuple of (ProviderConfig, ModelConfig)
 
-        def _kw_matches(kw: str) -> bool:
-            kw = kw.lower()
-            return kw in model_lower or kw.replace("-", "_") in model_normalized
+        Raises:
+            ValueError: If reference format is invalid or not found
+        """
+        if "/" not in model_ref:
+            raise ValueError(f"Invalid model reference format: {model_ref}. Expected 'providerId/modelId'")
 
-        # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or spec.is_local or p.api_key:
-                    return p, spec.name
+        provider_id, model_id = model_ref.split("/", 1)
 
-        # Match by keyword (order follows PROVIDERS registry)
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
-            if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or spec.is_local or p.api_key:
-                    return p, spec.name
+        if not hasattr(self.providers, provider_id):
+            raise ValueError(f"Provider '{provider_id}' not found in config")
 
-        # Fallback: configured local providers can route models without
-        # provider-specific keywords (for example plain "llama3.2" on Ollama).
-        # Prefer providers whose detect_by_base_keyword matches the configured api_base
-        # (e.g. Ollama's "11434" in "http://localhost:11434") over plain registry order.
-        local_fallback: tuple[ProviderConfig, str] | None = None
-        for spec in PROVIDERS:
-            if not spec.is_local:
-                continue
-            p = getattr(self.providers, spec.name, None)
-            if not (p and p.api_base):
-                continue
-            if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
-                return p, spec.name
-            if local_fallback is None:
-                local_fallback = (p, spec.name)
-        if local_fallback:
-            return local_fallback
+        provider = getattr(self.providers, provider_id)
+        if not isinstance(provider, ProviderConfig):
+            raise ValueError(f"Invalid provider config for '{provider_id}'")
 
-        # Fallback: gateways first, then others (follows registry order)
-        # OAuth providers are NOT valid fallbacks — they require explicit model selection
-        for spec in PROVIDERS:
-            if spec.is_oauth:
-                continue
-            p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
-                return p, spec.name
-        return None, None
+        model = provider.get_model(model_id)
+        if model is None:
+            available = [m.id for m in provider.models]
+            raise ValueError(
+                f"Model '{model_id}' not found in provider '{provider_id}'. "
+                f"Available models: {available}"
+            )
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
-        return p
+        return provider, model
 
-    def get_provider_name(self, model: str | None = None) -> str | None:
-        """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
-        return name
+    def validate_model_chain(self) -> list[str]:
+        """
+        Validate all references in model_chain.
 
-    def get_api_key(self, model: str | None = None) -> str | None:
-        """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
-        return p.api_key if p else None
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors = []
+        for i, ref in enumerate(self.agents.defaults.model_chain):
+            try:
+                self.resolve_model(ref)
+            except ValueError as e:
+                errors.append(f"model_chain[{i}] ({ref}): {e}")
+        return errors
 
-    def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for gateway/local providers."""
-        from markbot.providers.registry import find_by_name
-
-        p, name = self._match_provider(model)
-        if p and p.api_base:
-            return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # resolve their base URL from the registry in the provider constructor.
-        if name:
-            spec = find_by_name(name)
-            if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
-                return spec.default_api_base
-        return None
+    @property
+    def primary_model_ref(self) -> str | None:
+        """Get the first (primary) model reference."""
+        return self.agents.defaults.model_chain[0] if self.agents.defaults.model_chain else None
 
     model_config = ConfigDict(env_prefix="MARKBOT_", env_nested_delimiter="__")

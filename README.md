@@ -4,6 +4,7 @@ An advanced AI-powered automation and development assistant designed for develop
 
 ## Core Strengths
 
+- **Multi-Model Support with Auto-Failover**: Configure multiple LLM providers in a priority chain. When the primary model fails or is overloaded, MarkBot automatically falls back to the next model.
 - **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
 - **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
 - **Tiered Memory System**: Multi-layered memory architecture (Hot/Warm/Cold) for context-aware responses
@@ -165,7 +166,22 @@ Edit `~/.markbot/config.json`:
 {
   "providers": {
     "anthropic": {
-      "apiKey": "sk-ant-..."
+      "apiKey": "sk-ant-...",
+      "models": [
+        {
+          "id": "claude-sonnet",
+          "name": "claude-3-5-sonnet-20241022",
+          "maxTokens": 8192,
+          "contextWindow": 128000,
+          "temperature": 0.7
+        }
+      ]
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelChain": ["anthropic/claude-sonnet"],
+      "timezone": "Asia/Shanghai"
     }
   }
 }
@@ -176,6 +192,51 @@ Or use environment variables:
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
+
+#### Multi-Model Chain Configuration
+
+MarkBot supports configuring multiple models with automatic failover:
+
+```json
+{
+  "providers": {
+    "anthropic": {
+      "apiKey": "sk-ant-...",
+      "models": [
+        {
+          "id": "claude-opus",
+          "name": "claude-3-opus-20240229",
+          "maxTokens": 4096,
+          "contextWindow": 200000
+        }
+      ]
+    },
+    "deepseek": {
+      "apiKey": "sk-...",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "deepseek-chat",
+          "maxTokens": 8192,
+          "contextWindow": 65536
+        }
+      ]
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelChain": [
+        "anthropic/claude-opus",
+        "deepseek/deepseek-chat"
+      ],
+      "maxToolIterations": 30,
+      "contextWindowTokens": 120000
+    }
+  }
+}
+```
+
+When the primary model fails or is overloaded, MarkBot automatically falls back to the next model in the chain.
 
 ### Step 3: Start Chatting
 
@@ -213,8 +274,6 @@ markbot gateway restart  # Restart the gateway
 ```bash
 markbot agent                    # Start interactive chat
 markbot agent -m "message"       # Send single message
-markbot agent --provider openai  # Use specific provider
-markbot agent --model gpt-4o     # Use specific model
 ```
 
 ### Skill Management
@@ -239,8 +298,7 @@ markbot session export <id>      # Export session to file
 
 ```bash
 markbot config list                              # List all config
-markbot config get agents.defaults.model          # Get config value
-markbot config set agents.defaults.model claude-3-5-sonnet  # Set value
+markbot config get agents.defaults.modelChain     # Get config value
 markbot config edit                              # Edit config in editor
 ```
 

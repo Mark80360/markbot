@@ -55,8 +55,8 @@ class HeartbeatService:
     def __init__(
         self,
         workspace: Path,
-        provider: LLMProvider,
-        model: str,
+        fallback_manager=None,
+        model: str | None = None,
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
@@ -65,8 +65,8 @@ class HeartbeatService:
         memory_summarizer: "MemorySummarizer | Callable[[], Coroutine[Any, Any, bool]] | None" = None,
     ):
         self.workspace = workspace
-        self.provider = provider
-        self.model = model
+        self.fallback_manager = fallback_manager
+        self.model = model or "unknown"
         self.on_execute = on_execute
         self.on_notify = on_notify
         self.interval_s = interval_s
@@ -98,7 +98,7 @@ class HeartbeatService:
         """
         from markbot.utils.helpers import current_time_str
 
-        response = await self.provider.chat_with_retry(
+        response, _ = await self.fallback_manager.chat_with_fallback(
             messages=[
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
                 {"role": "user", "content": (
@@ -108,7 +108,6 @@ class HeartbeatService:
                 )},
             ],
             tools=_HEARTBEAT_TOOL,
-            model=self.model,
         )
 
         if not response.has_tool_calls:
@@ -250,7 +249,7 @@ class HeartbeatService:
 
                 if response:
                     should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
+                        response, tasks, self.fallback_manager, self.model,
                     )
                     if should_notify and self.on_notify:
                         logger.info("Heartbeat: completed, delivering response")
@@ -273,7 +272,7 @@ class HeartbeatService:
         response = await self.on_execute(tasks)
         if response and self.on_notify:
             should_notify = await evaluate_response(
-                response, tasks, self.provider, self.model,
+                response, tasks, self.fallback_manager, self.model,
             )
             if should_notify:
                 await self.on_notify(response)

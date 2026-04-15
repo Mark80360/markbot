@@ -60,7 +60,7 @@ class MultiLevelCompactor:
     """4-tier progressive conversation compaction.
 
     Usage:
-        compactor = MultiLevelCompactor(provider=provider)
+        compactor = MultiLevelCompactor(fallback_manager=fallback_manager)
         result = await compactor.maybe_compact(messages, current_tokens, max_tokens)
         if result.action != CompactAction.NONE:
             messages = result.messages  # use compressed messages
@@ -68,10 +68,10 @@ class MultiLevelCompactor:
 
     def __init__(
         self,
-        provider: Any = None,
+        fallback_manager=None,
         config: CompactionConfig | None = None,
     ):
-        self.provider = provider
+        self.fallback_manager = fallback_manager
         self.config = config or CompactionConfig()
         self._compaction_count = 0
         self._total_tokens_saved = 0
@@ -357,11 +357,11 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
         return "\n\n".join(lines)
 
     async def _generate_summary(self, conversation_text: str) -> str:
-        if self.provider:
+        if self.fallback_manager:
             try:
                 from markbot.providers.base import LLMResponse
 
-                response: LLMResponse = await self.provider.chat_with_retry(
+                response, _ = await self.fallback_manager.chat_with_fallback(
                     messages=[
                         {"role": "system", "content": self.COMPACT_PROMPT},
                         {"role": "user", "content": conversation_text},
@@ -395,8 +395,8 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
 class ConversationCompactor(MultiLevelCompactor):
     """Backward-compatible alias for existing code that imports ConversationCompactor."""
 
-    def __init__(self, llm_client=None, provider=None, config=None):
-        super().__init__(provider=provider, config=config)
+    def __init__(self, llm_client=None, fallback_manager=None, config=None):
+        super().__init__(fallback_manager=fallback_manager, config=config)
         self.llm_client = llm_client
 
     def should_compact(

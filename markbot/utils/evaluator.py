@@ -53,8 +53,8 @@ _SYSTEM_PROMPT = (
 async def evaluate_response(
     response: str,
     task_context: str,
-    provider: LLMProvider,
-    model: str,
+    fallback_manager=None,
+    model: str | None = None,
 ) -> bool:
     """Decide whether a background-task result should be delivered to the user.
 
@@ -63,7 +63,7 @@ async def evaluate_response(
     that important messages are never silently dropped.
     """
     try:
-        llm_response = await provider.chat_with_retry(
+        llm_response, _ = await fallback_manager.chat_with_fallback(
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": (
@@ -72,7 +72,6 @@ async def evaluate_response(
                 )},
             ],
             tools=_EVALUATE_TOOL,
-            model=model,
             max_tokens=256,
             temperature=0.0,
         )

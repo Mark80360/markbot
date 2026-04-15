@@ -22,9 +22,10 @@ class SubagentManager:
 
     def __init__(
         self,
-        provider: LLMProvider,
-        workspace: Path,
-        bus: MessageBus,
+        fallback_manager=None,
+        config=None,
+        workspace: Path | None = None,
+        bus: MessageBus | None = None,
         model: str | None = None,
         web_search_config: "WebSearchConfig | None" = None,
         web_proxy: str | None = None,
@@ -32,10 +33,18 @@ class SubagentManager:
         filesystem_config: "FilesystemToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
-        self.provider = provider
+        self.fallback_manager = fallback_manager
+        self.config = config
         self.workspace = workspace
         self.bus = bus
-        self.model = model or provider.get_default_model()
+        
+        # Get model name from config if available
+        if config and config.primary_model_ref:
+            _, primary_model = config.resolve_model(config.primary_model_ref)
+            self.model = model or primary_model.name
+        else:
+            self.model = model or "unknown"
+            
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -45,7 +54,10 @@ class SubagentManager:
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
         
         # Initialize progress manager
-        self.progress_manager = SubagentProgressManager(workspace)
+        if workspace:
+            self.progress_manager = SubagentProgressManager(workspace)
+        else:
+            self.progress_manager = None
 
     async def spawn(
         self,
@@ -127,10 +139,9 @@ class SubagentManager:
             while iteration < max_iterations:
                 iteration += 1
 
-                response = await self.provider.chat_with_retry(
+                response, _ = await self.fallback_manager.chat_with_fallback(
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=self.model,
                 )
                 
                 # Record token usage
