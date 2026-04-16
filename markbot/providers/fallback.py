@@ -53,6 +53,11 @@ class FallbackManager:
         err_str = str(error).lower()
         return any(marker in err_str for marker in self.RETRYABLE_ERRORS)
 
+    def _is_retryable_error_from_msg(self, error_msg: str) -> bool:
+        """Check if error message indicates a retryable error."""
+        err_str = error_msg.lower()
+        return any(marker in err_str for marker in self.RETRYABLE_ERRORS)
+
     def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
         """Create or cache LLM provider instance."""
         cache_key = provider_name
@@ -115,6 +120,30 @@ class FallbackManager:
                     reasoning_effort=model_config.reasoning_effort or self.config.agents.defaults.reasoning_effort,
                     tool_choice=tool_choice,
                 )
+
+                # Check if the response indicates an error (provider returned error without raising exception)
+                if response.finish_reason == "error":
+                    error_msg = response.content or "Unknown error"
+                    attempt = FallbackAttempt(
+                        model_ref=model_ref,
+                        provider=provider_config,
+                        model=model_config,
+                        success=False,
+                        error=error_msg,
+                    )
+                    attempts.append(attempt)
+
+                    if self._is_retryable_error_from_msg(error_msg):
+                        logger.warning(f"Model {model_ref} returned error (retryable): {error_msg}. Trying next...")
+                        last_error = Exception(error_msg)
+                        continue
+                    else:
+                        logger.error(f"Model {model_ref} returned error (non-retryable): {error_msg}")
+                        raise AllModelsFailedError(
+                            f"Model {model_ref} failed with non-retryable error",
+                            attempts=attempts,
+                            last_error=Exception(error_msg),
+                        )
 
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
@@ -190,6 +219,30 @@ class FallbackManager:
                     tool_choice=tool_choice,
                     on_content_delta=on_content_delta,
                 )
+
+                # Check if the response indicates an error (provider returned error without raising exception)
+                if response.finish_reason == "error":
+                    error_msg = response.content or "Unknown error"
+                    attempt = FallbackAttempt(
+                        model_ref=model_ref,
+                        provider=provider_config,
+                        model=model_config,
+                        success=False,
+                        error=error_msg,
+                    )
+                    attempts.append(attempt)
+
+                    if self._is_retryable_error_from_msg(error_msg):
+                        logger.warning(f"Model {model_ref} returned error (retryable): {error_msg}. Trying next...")
+                        last_error = Exception(error_msg)
+                        continue
+                    else:
+                        logger.error(f"Model {model_ref} returned error (non-retryable): {error_msg}")
+                        raise AllModelsFailedError(
+                            f"Model {model_ref} failed with non-retryable error",
+                            attempts=attempts,
+                            last_error=Exception(error_msg),
+                        )
 
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
