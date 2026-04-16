@@ -351,7 +351,40 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 if isinstance(m, dict) and "role" in m
             ]
             kwargs["messages"] = wrapped_messages
-        return await self._reme.check_context(**kwargs)
+
+        result = await self._reme.check_context(**kwargs)
+
+        # Handle error case: result might be a string if an exception occurred
+        if isinstance(result, str):
+            logger.warning(f"check_context returned error: {result}")
+            return None
+
+        if result is None or len(result) < 3:
+            return result
+
+        # Convert Msg objects to dicts
+        def msg_to_dict(msg):
+            if hasattr(msg, 'to_dict'):
+                return msg.to_dict()
+            elif isinstance(msg, dict):
+                return msg
+            else:
+                return {
+                    'role': getattr(msg, 'role', ''),
+                    'content': getattr(msg, 'content', ''),
+                    'name': getattr(msg, 'name', ''),
+                    'timestamp': getattr(msg, 'timestamp', ''),
+                    'metadata': getattr(msg, 'metadata', {}),
+                }
+
+        messages_to_compact, messages_to_keep, is_valid = result[0], result[1], result[2]
+
+        if messages_to_compact and isinstance(messages_to_compact, list):
+            messages_to_compact = [msg_to_dict(m) for m in messages_to_compact]
+        if messages_to_keep and isinstance(messages_to_keep, list):
+            messages_to_keep = [msg_to_dict(m) for m in messages_to_keep]
+
+        return messages_to_compact, messages_to_keep, is_valid
 
     async def compact_memory(
         self,

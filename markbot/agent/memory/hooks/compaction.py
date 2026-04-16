@@ -91,6 +91,14 @@ class MemoryCompactionHook:
                 memory_compact_reserve=self.memory_compact_reserve,
             )
 
+            # Handle error case: result might be a string if an exception occurred
+            if isinstance(result, str):
+                logger.warning(
+                    "check_context returned error message: %s",
+                    result,
+                )
+                return None
+
             if result is None or len(result) < 3:
                 return None
 
@@ -106,9 +114,12 @@ class MemoryCompactionHook:
                 )
                 return None
 
+            # Convert Msg objects to dicts if necessary
             messages_to_compact = [
-                m for m in messages_to_compact
-                if isinstance(m, dict) and "role" in m
+                m.to_dict() if hasattr(m, 'to_dict') else m
+                for m in messages_to_compact
+                if (hasattr(m, 'to_dict') and hasattr(m, 'role')) or
+                   (isinstance(m, dict) and "role" in m)
             ]
 
             if not messages_to_compact:
