@@ -284,12 +284,15 @@ class Tool(BaseTool):
             )
             params.append(param)
 
+        _ro = getattr(self, "is_read_only", False)
+        _de = getattr(self, "is_destructive", False)
+
         return ToolDefinition(
             name=self.name,
             description=self.description,
             parameters=params,
-            is_read_only=getattr(self, "is_read_only", False),
-            is_destructive=getattr(self, "is_destructive", False),
+            is_read_only=_ro if isinstance(_ro, bool) else False,
+            is_destructive=_de if isinstance(_de, bool) else False,
         )
 
     @property

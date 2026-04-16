@@ -444,6 +444,10 @@ class AgentLoop:
         # Update question tool context
         if hasattr(self, "question_tool") and self.question_tool:
             self.question_tool.set_context(channel, chat_id)
+        # Update todo tool session
+        if todo_tool := self.tools.get("todo"):
+            if hasattr(todo_tool, "set_session"):
+                todo_tool.set_session(f"{channel}:{chat_id}")
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:

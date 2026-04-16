@@ -8,6 +8,7 @@ as JSON so they can be filtered by status / priority / session.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +31,12 @@ def _now_iso() -> str:
     return datetime.now().isoformat()
 
 
-def _short_id() -> str:
-    return uuid.uuid4().hex[:8]
+def _short_id(existing_ids: set[str] | None = None) -> str:
+    for _ in range(10):
+        sid = uuid.uuid4().hex[:8]
+        if existing_ids is None or sid not in existing_ids:
+            return sid
+    return uuid.uuid4().hex[:12]
 
 
 class _TodoStore:
@@ -41,6 +46,7 @@ class _TodoStore:
         self._dir = workspace / _TODO_DIR_NAME
         self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / _INDEX_FILE
+        self._lock = threading.Lock()
         self._items: list[dict[str, Any]] = self._load()
 
     def _load(self) -> list[dict[str, Any]]:
@@ -59,25 +65,27 @@ class _TodoStore:
         tmp.replace(self._index_path)
 
     def write(self, items: list[dict[str, Any]], session_id: str | None = None) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        for item in items:
-            item_id = item.get("id")
-            if item_id:
-                updated = self._update(item_id, item)
-                if updated:
-                    results.append(updated)
+        with self._lock:
+            results: list[dict[str, Any]] = []
+            for item in items:
+                item_id = item.get("id")
+                if item_id:
+                    updated = self._update(item_id, item)
+                    if updated:
+                        results.append(updated)
+                    else:
+                        results.append({"error": f"Todo item '{item_id}' not found"})
                 else:
-                    results.append({"error": f"Todo item '{item_id}' not found"})
-            else:
-                created = self._create(item, session_id)
-                results.append(created)
-        self._save()
-        return results
+                    created = self._create(item, session_id)
+                    results.append(created)
+            self._save()
+            return results
 
     def _create(self, item: dict[str, Any], session_id: str | None) -> dict[str, Any]:
         now = _now_iso()
+        existing_ids = {i.get("id") for i in self._items}
         new_item: dict[str, Any] = {
-            "id": _short_id(),
+            "id": _short_id(existing_ids),
             "content": item.get("content", ""),
             "status": item.get("status", "pending"),
             "priority": item.get("priority", "medium"),
@@ -86,7 +94,7 @@ class _TodoStore:
             "updated_at": now,
         }
         self._items.append(new_item)
-        return new_item
+        return dict(new_item)
 
     def _update(self, item_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
         for existing in self._items:
@@ -95,35 +103,37 @@ class _TodoStore:
                     if key in patch:
                         existing[key] = patch[key]
                 existing["updated_at"] = _now_iso()
-                return existing
+                return dict(existing)
         return None
 
     def list_items(self, status: str | None = None, priority: str | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
-        filtered = self._items
-        if status:
-            filtered = [i for i in filtered if i.get("status") == status]
-        if priority:
-            filtered = [i for i in filtered if i.get("priority") == priority]
-        if session_id:
-            filtered = [i for i in filtered if i.get("session_id") == session_id]
-        filtered = sorted(
-            filtered,
-            key=lambda i: (
-                _STATUS_ORDER.get(i.get("status", "pending"), 99),
-                _PRIORITY_ORDER.get(i.get("priority", "medium"), 99),
-            ),
-        )
-        return filtered
+        with self._lock:
+            filtered = self._items
+            if status:
+                filtered = [i for i in filtered if i.get("status") == status]
+            if priority:
+                filtered = [i for i in filtered if i.get("priority") == priority]
+            if session_id:
+                filtered = [i for i in filtered if i.get("session_id") == session_id]
+            filtered = sorted(
+                filtered,
+                key=lambda i: (
+                    _STATUS_ORDER.get(i.get("status", "pending"), 99),
+                    _PRIORITY_ORDER.get(i.get("priority", "medium"), 99),
+                ),
+            )
+            return [dict(i) for i in filtered]
 
     def delete(self, ids: list[str]) -> list[dict[str, Any]]:
-        id_set = set(ids)
-        removed: list[dict[str, Any]] = []
-        remaining: list[dict[str, Any]] = []
-        for item in self._items:
-            (removed if item.get("id") in id_set else remaining).append(item)
-        self._items = remaining
-        self._save()
-        return removed
+        with self._lock:
+            id_set = set(ids)
+            removed: list[dict[str, Any]] = []
+            remaining: list[dict[str, Any]] = []
+            for item in self._items:
+                (removed if item.get("id") in id_set else remaining).append(item)
+            self._items = remaining
+            self._save()
+            return [dict(r) for r in removed]
 
 
 class TodoTool(Tool):
@@ -134,8 +144,6 @@ class TodoTool(Tool):
       - list:   query items with optional filters
       - delete: remove items by id
     """
-
-    _is_lightweight_tool = True
 
     def __init__(self, workspace: Path | None = None, **kwargs: Any):
         super().__init__(**kwargs)
@@ -151,6 +159,9 @@ class TodoTool(Tool):
 
     def set_session(self, session_id: str | None) -> None:
         self._session_id = session_id
+
+    def is_read_only(self, params: dict[str, Any]) -> bool:
+        return params.get("action") == "list"
 
     @property
     def name(self) -> str:
@@ -226,6 +237,10 @@ class TodoTool(Tool):
                             "enum": ["high", "medium", "low"],
                             "description": "Filter by priority",
                         },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Filter by session ID (format: channel:chat_id)",
+                        },
                     },
                     "description": "Filters for list action",
                 },
@@ -246,6 +261,9 @@ class TodoTool(Tool):
             items = kwargs.get("items", [])
             if not items:
                 return "Error: items is required for write action"
+            for idx, item in enumerate(items):
+                if not item.get("id") and not item.get("content", "").strip():
+                    return f"Error: item at index {idx} is missing required field 'content'"
             results = store.write(items, session_id=self._session_id)
             return self._format_write_results(results)
 
