@@ -100,38 +100,25 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
-        
-        # Create progress tracker
+
         tracker = await self.progress_manager.create_tracker(task_id, label)
 
         try:
             from markbot.agent.loop import AgentLoop
 
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            AgentLoop._register_base_tools(
-                tools,
-                allowed_dir=allowed_dir,
-                extra_allowed_dirs=extra_read,
-                workspace=self.workspace,
-                web_search_config=self.web_search_config,
-                web_proxy=self.web_proxy,
-                exec_config=self.exec_config,
-                filesystem_config=self.filesystem_config,
-            )
+            self._register_subagent_tools(tools)
 
             from markbot.core.skills import SkillRegistry
             skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
             skill_registry.load_all()
-            
+
             system_prompt = self._build_subagent_prompt(skill_registry)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
 
-            # Run agent loop (limited iterations)
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
@@ -143,8 +130,7 @@ class SubagentManager:
                     messages=messages,
                     tools=tools.get_definitions(),
                 )
-                
-                # Record token usage
+
                 if response.usage:
                     await tracker.record_tokens(
                         input_tokens=response.usage.get("input_tokens", 0),
@@ -207,12 +193,10 @@ class SubagentManager:
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
 
-            # Mark as completed
             await tracker.complete(final_result)
-            
+
             logger.info("Subagent [{}] completed successfully", task_id)
-            
-            # Get progress for announcement
+
             progress = tracker.get_progress()
             await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
 
@@ -223,9 +207,32 @@ class SubagentManager:
             progress = tracker.get_progress()
             await self._announce_result(task_id, label, task, error_msg, origin, "error", progress)
         finally:
-            # Clean up tracker
             await self.progress_manager.remove_tracker(task_id)
     
+    def _register_subagent_tools(self, tools: ToolRegistry) -> None:
+        """Register read-only safe tools for subagent (no exec, no write, no message sending)."""
+        from markbot.agent.tools.filesystem import ListDirTool, ReadFileTool
+        from markbot.agent.tools.search import GlobTool, GrepTool
+        from markbot.agent.tools.web import WebFetchTool, WebSearchTool, WebExtractTool
+
+        allowed_dir = self.workspace if self.restrict_to_workspace else None
+        extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
+
+        tools.register(ReadFileTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+            extra_allowed_dirs=extra_read,
+        ))
+        tools.register(ListDirTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+        ))
+        tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+        tools.register(WebFetchTool(proxy=self.web_proxy))
+        tools.register(WebExtractTool(proxy=self.web_proxy))
+
     def _get_activity_description(self, tool_name: str, args: dict[str, Any]) -> str:
         """Generate a human-readable description for a tool activity."""
         descriptions = {
@@ -306,6 +313,29 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
 You are a subagent spawned by the main agent to complete a specific task.
 Stay focused on the assigned task. Your final response will be reported back to the main agent.
+
+## ⚠️ IMPORTANT RESTRICTIONS - READ CAREFULLY
+
+You are a **READ-ONLY** subagent with limited permissions:
+
+### ✅ ALLOWED:
+- Read files (read_file)
+- List directories (list_dir)
+- Search files (glob, grep)
+- Web search (web_search, web_fetch, web_extract)
+
+### ❌ STRICTLY FORBIDDEN:
+- **NEVER** use `exec` to run shell commands
+- **NEVER** send messages to users (no feishu, lark-cli, email, etc.)
+- **NEVER** write, edit, or delete files
+- **NEVER** spawn other subagents
+- **NEVER** try to communicate directly with external systems or users
+- **NEVER** execute any command that could send notifications or messages
+
+Your ONLY job is to gather information and return it as your final response.
+The main agent will handle all communication with users.
+
+VIOLATING THESE RESTRICTIONS IS A CRITICAL FAILURE.
 
 ## Tool Usage
 - Use `web_search` for current facts, news, versions, or any information you don't know
