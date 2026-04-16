@@ -58,18 +58,28 @@ class _MessageWrapper:
             metadata=msg.get("metadata", {}),
         )
 
-    def get_content_blocks(self) -> list[dict]:
+    def get_content_blocks(self, block_type: str | None = None) -> list[dict]:
         """Return content as a list of content blocks for reme-ai compatibility.
 
         Returns a list of dict blocks. If content is a string, wraps it in a text block.
         If content is already a list, returns it as-is.
+
+        Args:
+            block_type: Optional filter to return only blocks of this type
+                (e.g. "tool_use", "tool_result", "text").  When ``None``,
+                all blocks are returned – this preserves the original behaviour.
         """
         if isinstance(self.content, str):
-            return [{"type": "text", "text": self.content}]
+            blocks = [{"type": "text", "text": self.content}]
         elif isinstance(self.content, list):
-            return self.content
+            blocks = self.content
         else:
-            return [{"type": "text", "text": str(self.content)}]
+            blocks = [{"type": "text", "text": str(self.content)}]
+
+        if block_type is not None:
+            blocks = [b for b in blocks if isinstance(b, dict) and b.get("type") == block_type]
+
+        return blocks
 
 
 class ReMeLightMemoryManager(BaseMemoryManager):

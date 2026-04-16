@@ -10,7 +10,7 @@ import json
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -21,11 +21,17 @@ from markbot.agent.memory.manager import ReMeLightMemoryManager
 from markbot.agent.memory.hooks.bootstrap import BootstrapHook
 from markbot.agent.memory.hooks.compaction import MemoryCompactionHook
 from markbot.agent.subagent import SubagentManager
-from markbot.agent.tokens import TokenTracker
+from markbot.agent.tokens import TokenTracker, token_count_with_estimation
 from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
-from markbot.agent.cost_tracker import CostTracker, BudgetExceededError
+from markbot.agent.cost_tracker import CostTracker, BudgetExceededError, PricingTable
 from markbot.agent.tools.cron import CronTool
-from markbot.agent.tools.filesystem import DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from markbot.agent.tools.filesystem import (
+    DeleteFileTool,
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from markbot.agent.tools.message import MessageTool
 from markbot.agent.tools.question import AskUserQuestionTool
 from markbot.agent.tools.registry import ToolRegistry
@@ -36,6 +42,7 @@ from markbot.agent.tools.subagent_progress import CheckSubagentTool, ListSubagen
 from markbot.agent.tools.web import WebFetchTool, WebSearchTool
 from markbot.agent.tools.think import ThinkTool
 from markbot.agent.tools.memory import MemorySearchTool
+from markbot.agent.tools.todo import TodoTool
 from markbot.agent.tools.explore import ExploreTool
 from markbot.agent.tools.context_explorer import (
     ExploreContextCatalogTool,
@@ -53,13 +60,23 @@ from markbot.agent.services.interaction_log import InteractionLogger
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.command import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
-from markbot.providers.base import LLMProvider
 from markbot.session.manager import Session, SessionManager
 from markbot.core.skills import SkillRegistry
 from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.core.types import (
+    ToolContext,
+    PermissionMode,
+    ToolPermissionContext,
+)
+from markbot.utils.helpers import strip_think
 
 if TYPE_CHECKING:
-    from markbot.config.schema import ChannelsConfig, ExecToolConfig, FilesystemToolConfig, WebSearchConfig
+    from markbot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        FilesystemToolConfig,
+        WebSearchConfig,
+    )
     from markbot.cron.service import CronService
 
 
@@ -106,9 +123,11 @@ class AgentLoop:
         self.workspace = workspace
 
         # 从 config 获取主模型信息
+        self._primary_provider_config = None
         if config and config.primary_model_ref:
-            _, primary_model = config.resolve_model(config.primary_model_ref)
+            primary_provider, primary_model = config.resolve_model(config.primary_model_ref)
             self.model = primary_model.name
+            self._primary_provider_config = primary_provider
         else:
             self.model = "unknown"
 
@@ -118,25 +137,27 @@ class AgentLoop:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
-        
+
         from markbot.config.schema import MemoryToolsConfig
+
         self.memory_config = memory_config or MemoryToolsConfig()
-        
+
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._last_context_tokens: int = 0
-        
+
         self.token_tracker = TokenTracker()
         _compaction_cfg = compaction_config or CompactionConfig()
-        self.compactor = MultiLevelCompactor(fallback_manager=fallback_manager, config=_compaction_cfg)
+        self.compactor = MultiLevelCompactor(
+            fallback_manager=fallback_manager, config=_compaction_cfg
+        )
         _pricing: PricingTable | None = None
-        if budget_config and getattr(budget_config, 'custom_pricing', None):
+        if budget_config and getattr(budget_config, "custom_pricing", None):
             from markbot.agent.cost_tracker import ModelPricing as _MP
-            _custom = {
-                k: _MP(**v) for k, v in budget_config.custom_pricing.items()
-            }
+
+            _custom = {k: _MP(**v) for k, v in budget_config.custom_pricing.items()}
             _pricing = PricingTable(custom=_custom)
         self.cost_tracker = CostTracker(
             max_budget_usd=max_budget_usd,
@@ -190,8 +211,8 @@ class AgentLoop:
 
         llm_config = {
             "backend": "openai",
-            "api_key": "",
-            "base_url": "",
+            "api_key": getattr(self._primary_provider_config, 'api_key', '') or "",
+            "base_url": getattr(self._primary_provider_config, 'api_base', '') or "",
             "model_name": self.model,
         }
 
@@ -260,26 +281,33 @@ class AgentLoop:
             exec_config=self.exec_config,
             filesystem_config=self.filesystem_config,
         )
-        
+
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ThinkTool())
         self.tools.register(MemorySearchTool(memory_manager=self.memory_manager))
+        self.tools.register(TodoTool(workspace=self.workspace))
         self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
 
         # Context explorer tools for AI-driven dynamic loading
-        self.tools.register(ExploreContextCatalogTool(
-            workspace=self.workspace,
-            memory_manager=self.memory_manager,
-        ))
-        self.tools.register(SearchContextTool(
-            workspace=self.workspace,
-            memory_manager=self.memory_manager,
-        ))
-        self.tools.register(LoadContextTool(
-            workspace=self.workspace,
-            memory_manager=self.memory_manager,
-        ))
+        self.tools.register(
+            ExploreContextCatalogTool(
+                workspace=self.workspace,
+                memory_manager=self.memory_manager,
+            )
+        )
+        self.tools.register(
+            SearchContextTool(
+                workspace=self.workspace,
+                memory_manager=self.memory_manager,
+            )
+        )
+        self.tools.register(
+            LoadContextTool(
+                workspace=self.workspace,
+                memory_manager=self.memory_manager,
+            )
+        )
 
         self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
         self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
@@ -304,7 +332,13 @@ class AgentLoop:
         filesystem_config: Any = None,
     ) -> None:
         """Register base filesystem/web/shell tools (shared between AgentLoop and SubagentManager)."""
-        from markbot.agent.tools.filesystem import DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+        from markbot.agent.tools.filesystem import (
+            DeleteFileTool,
+            EditFileTool,
+            ListDirTool,
+            ReadFileTool,
+            WriteFileTool,
+        )
         from markbot.agent.tools.search import GlobTool, GrepTool
         from markbot.agent.tools.shell import ExecTool
         from markbot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -312,42 +346,71 @@ class AgentLoop:
         if workspace is None:
             raise ValueError("workspace must be provided")
 
-        fs_backup_dir = getattr(filesystem_config, 'backup_dir', None) if filesystem_config else None
-        fs_max_backups = getattr(filesystem_config, 'max_backups', None) if filesystem_config else None
-        fs_safe_delete = getattr(filesystem_config, 'safe_delete', True) if filesystem_config else True
+        fs_backup_dir = (
+            getattr(filesystem_config, "backup_dir", None) if filesystem_config else None
+        )
+        fs_max_backups = (
+            getattr(filesystem_config, "max_backups", None) if filesystem_config else None
+        )
+        fs_safe_delete = (
+            getattr(filesystem_config, "safe_delete", True) if filesystem_config else True
+        )
 
-        tools.register(ReadFileTool(workspace=workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_allowed_dirs))
+        tools.register(
+            ReadFileTool(
+                workspace=workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_allowed_dirs
+            )
+        )
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
-            tools.register(cls(workspace=workspace, allowed_dir=allowed_dir, backup_dir=fs_backup_dir, max_backups=fs_max_backups))
-        tools.register(DeleteFileTool(workspace=workspace, allowed_dir=allowed_dir, backup_dir=fs_backup_dir, max_backups=fs_max_backups, safe_delete=fs_safe_delete))
+            tools.register(
+                cls(
+                    workspace=workspace,
+                    allowed_dir=allowed_dir,
+                    backup_dir=fs_backup_dir,
+                    max_backups=fs_max_backups,
+                )
+            )
+        tools.register(
+            DeleteFileTool(
+                workspace=workspace,
+                allowed_dir=allowed_dir,
+                backup_dir=fs_backup_dir,
+                max_backups=fs_max_backups,
+                safe_delete=fs_safe_delete,
+            )
+        )
         if exec_config and exec_config.enable:
             tools.register(
                 ExecTool(
                     working_dir=str(workspace),
                     timeout=exec_config.timeout,
-                    restrict_to_workspace=getattr(exec_config, 'restrict_to_workspace', False),
+                    restrict_to_workspace=getattr(exec_config, "restrict_to_workspace", False),
                     path_append=exec_config.path_append,
                     allowed_internal_ips=exec_config.allowed_internal_ips,
                 )
             )
         tools.register(WebSearchTool(config=web_search_config, proxy=web_proxy))
         tools.register(WebFetchTool(proxy=web_proxy))
+        # Register web_extract as alias for web_fetch with enhanced capabilities
+        from markbot.agent.tools.web import WebExtractTool
+
+        tools.register(WebExtractTool(proxy=web_proxy))
         tools.register(GlobTool(workspace=workspace, allowed_dir=allowed_dir))
         tools.register(GrepTool(workspace=workspace, allowed_dir=allowed_dir))
 
     def _setup_pipeline(self) -> None:
         """Initialize the message processing pipeline with middleware."""
         self.pipeline = MessagePipeline()
-        self.pipeline.use(
-            QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool)
-        )
+        self.pipeline.use(QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool))
         self._daily_log = DailyLogManager(workspace=self.workspace)
         self._interaction_log = InteractionLogger()
-        self.pipeline.use(MemoryLifecycleMiddleware(
-            memory_manager=self.memory_manager,
-            daily_log=self._daily_log,
-            session_manager=self.sessions,
-        ))
+        self.pipeline.use(
+            MemoryLifecycleMiddleware(
+                memory_manager=self.memory_manager,
+                daily_log=self._daily_log,
+                session_manager=self.sessions,
+            )
+        )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -387,8 +450,6 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        from markbot.utils.helpers import strip_think
-
         return strip_think(text) or None
 
     @staticmethod
@@ -439,7 +500,6 @@ class AgentLoop:
 
         async def _filtered_stream(delta: str) -> None:
             nonlocal _stream_buf
-            from markbot.utils.helpers import strip_think
 
             prev_clean = strip_think(_stream_buf)
             _stream_buf += delta
@@ -459,7 +519,6 @@ class AgentLoop:
             )
             logger.info("[AgentLoop] Current message count: {}", len(messages))
 
-            from markbot.agent.tokens import token_count_with_estimation
             current_tokens = token_count_with_estimation(messages)
             logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
 
@@ -475,18 +534,34 @@ class AgentLoop:
                     compact_result.messages_after,
                     compact_result.tokens_before,
                     compact_result.tokens_after,
-                    f", summary={compact_result.summary[:100]}..." if compact_result.summary else "",
+                    f", summary={compact_result.summary[:100]}..."
+                    if compact_result.summary
+                    else "",
                 )
                 current_tokens = compact_result.tokens_after
 
-            # memory compaction: run pre-reasoning hook
-            system_msg = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
-            new_summary = await self.compaction_hook(
-                messages=messages,
-                system_prompt=system_msg,
+            # memory compaction: skip if MultiLevelCompactor already did
+            # aggressive compaction (auto_compact / history_snip) to avoid
+            # double-compressing and redundant LLM summary calls.
+            _skip_memory_compact = compact_result.action in (
+                CompactAction.AUTO_COMPACT,
+                CompactAction.HISTORY_SNIP,
             )
-            if new_summary:
-                logger.info("[AgentLoop] Memory compaction applied, summary updated")
+            if not _skip_memory_compact:
+                system_msg = next(
+                    (m.get("content", "") for m in messages if m.get("role") == "system"), ""
+                )
+                new_summary = await self.compaction_hook(
+                    messages=messages,
+                    system_prompt=system_msg,
+                )
+                if new_summary:
+                    logger.info("[AgentLoop] Memory compaction applied, summary updated")
+            else:
+                logger.debug(
+                    "[AgentLoop] Skipping memory compaction (MultiLevelCompaction already applied: {})",
+                    compact_result.action.value,
+                )
 
             if self.memory_manager.force_memory_search and iteration == 1:
                 try:
@@ -516,16 +591,11 @@ class AgentLoop:
 
             if on_stream:
                 logger.info("[AgentLoop] Calling LLM with streaming...")
-                response, attempts = await self.fallback_manager.chat_with_fallback(
+                response, attempts = await self.fallback_manager.chat_stream_with_fallback(
                     messages=messages,
                     tools=tool_defs,
+                    on_content_delta=_filtered_stream,
                 )
-                if on_stream and response.content:
-                    import asyncio
-                    if asyncio.iscoroutinefunction(on_stream):
-                        await on_stream(response.content)
-                    else:
-                        on_stream(response.content)
             else:
                 logger.info("[AgentLoop] Calling LLM without streaming...")
                 response, attempts = await self.fallback_manager.chat_with_fallback(
@@ -556,7 +626,9 @@ class AgentLoop:
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
                 "total_tokens": int(usage.get("total_tokens", 0) or 0),
-                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+                "cache_creation_input_tokens": int(
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                ),
                 "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
             }
             self._last_context_tokens = current_tokens
@@ -568,9 +640,11 @@ class AgentLoop:
                 if call_cost > 0:
                     logger.debug("[AgentLoop] API cost this call: ${:.6f}", call_cost)
                     ct = self.cost_tracker
-                    if (ct.warn_threshold_usd > 0
-                            and not ct._warn_emitted
-                            and ct.total_cost >= ct.warn_threshold_usd):
+                    if (
+                        ct.warn_threshold_usd > 0
+                        and not ct._warn_emitted
+                        and ct.total_cost >= ct.warn_threshold_usd
+                    ):
                         ct._warn_emitted = True
                         logger.warning(
                             "[AgentLoop] Cost warning: ${:.6f} (threshold=${:.2f})",
@@ -578,9 +652,7 @@ class AgentLoop:
                             ct.warn_threshold_usd,
                         )
             except BudgetExceededError as exc:
-                logger.error(
-                    "[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc
-                )
+                logger.error("[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc)
                 _budget_exceeded = True
                 break
 
@@ -632,16 +704,19 @@ class AgentLoop:
                 # return_exceptions=True ensures all results are collected
                 # even if one tool is cancelled or raises BaseException.
                 logger.info("[AgentLoop] Executing {} tool calls...", len(response.tool_calls))
-                from markbot.core.types import ToolContext as _TC, PermissionMode as _PM, ToolPermissionContext as _TPC
-                _tool_ctx = _TC(
+
+                _tool_ctx = ToolContext(
                     session_id=f"{channel}:{chat_id}",
                     workspace=str(self.workspace),
-                    permission_mode=_PM.AUTO,
-                    tool_permission_context=_TPC(mode=_PM.AUTO),
+                    permission_mode=PermissionMode.AUTO,
+                    tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
                     is_non_interactive=False,
                 )
                 results = await asyncio.gather(
-                    *(self.tools.execute(tc.name, tc.arguments, context=_tool_ctx) for tc in response.tool_calls),
+                    *(
+                        self.tools.execute(tc.name, tc.arguments, context=_tool_ctx)
+                        for tc in response.tool_calls
+                    ),
                     return_exceptions=True,
                 )
                 logger.info("[AgentLoop] Tool execution completed, {} results", len(results))
@@ -657,9 +732,7 @@ class AgentLoop:
                             str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
                         )
                         safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                        logger.info(
-                            "[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview
-                        )
+                        logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -676,9 +749,7 @@ class AgentLoop:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
                     safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
-                    logger.error(
-                        "[AgentLoop] LLM returned error finish_reason: {}", safe_clean
-                    )
+                    logger.error("[AgentLoop] LLM returned error finish_reason: {}", safe_clean)
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
@@ -727,7 +798,9 @@ class AgentLoop:
             "[AgentLoop] Cost - total=${:.6f}, calls={}, budget={}{}",
             cost_summary["total_cost_usd"],
             cost_summary["total_api_calls"],
-            f"${cost_summary['budget_limit_usd']}" if cost_summary["budget_limit_usd"] else "unlimited",
+            f"${cost_summary['budget_limit_usd']}"
+            if cost_summary["budget_limit_usd"]
+            else "unlimited",
             ", OVER BUDGET" if cost_summary["over_budget"] else "",
         )
 
@@ -809,7 +882,16 @@ class AgentLoop:
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content="",
-                                metadata={"_stream_end": True, "_resuming": resuming},
+                                metadata={
+                                    "_stream_end": True,
+                                    "_resuming": resuming,
+                                    "message_id": msg.metadata.get("message_id")
+                                    if msg.metadata
+                                    else None,
+                                    "reaction_id": msg.metadata.get("reaction_id")
+                                    if msg.metadata
+                                    else None,
+                                },
                             )
                         )
 
@@ -899,9 +981,7 @@ class AgentLoop:
         chat_id = msg.chat_id
 
         if channel == "system":
-            channel, chat_id = (
-                chat_id.split(":", 1) if ":" in chat_id else ("cli", chat_id)
-            )
+            channel, chat_id = chat_id.split(":", 1) if ":" in chat_id else ("cli", chat_id)
 
         key = session_key or msg.session_key
         if channel == "system":
@@ -916,7 +996,10 @@ class AgentLoop:
 
         async def _handler(ctx: ProcessContext) -> OutboundMessage | None:
             return await self._handle_message(
-                ctx, on_progress=on_progress, on_stream=on_stream, on_stream_end=on_stream_end,
+                ctx,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
             )
 
         return await self.pipeline.process(pctx, _handler)
@@ -1097,7 +1180,7 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         # Ensure memory manager is started
-        if self.memory_manager and not getattr(self.memory_manager, '_started', False):
+        if self.memory_manager and not getattr(self.memory_manager, "_started", False):
             try:
                 await self.memory_manager.start()
                 logger.info("Memory manager started in process_direct")
