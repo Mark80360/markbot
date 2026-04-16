@@ -2,6 +2,9 @@
 
 This folder (`~/.markbot/workspace/`) is home. Treat it that way.
 
+> **重要**: 遇到困难时，**先搜索再回答** — 详见 [`agents/SEARCH_PROTOCOL.md`](agents/SEARCH_PROTOCOL.md)
+先搜索（历史记忆搜索 memory_search 、代码库搜索 search_codebase / grep / glob 、网络搜索 web_search / web_extract ），再回答用户。
+
 ## First Run
 
 If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
