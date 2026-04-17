@@ -255,5 +255,29 @@ class CostTracker:
             "models": models,
         }
 
+    def get_token_summary(self) -> dict[str, Any]:
+        """Get token usage summary compatible with former TokenTracker.get_summary()."""
+        total = ModelUsage()
+        for mu in self.state.model_usage.values():
+            total.input_tokens += mu.input_tokens
+            total.output_tokens += mu.output_tokens
+            total.cache_creation_input_tokens += mu.cache_creation_input_tokens
+            total.cache_read_input_tokens += mu.cache_read_input_tokens
+            total.api_calls += mu.api_calls
+        return {
+            "total": {
+                "input_tokens": total.input_tokens,
+                "output_tokens": total.output_tokens,
+                "cache_creation_input_tokens": total.cache_creation_input_tokens,
+                "cache_read_input_tokens": total.cache_read_input_tokens,
+                "total_tokens": total.total_tokens,
+            },
+            "api_calls": total.api_calls,
+            "average_per_call": {
+                "input_tokens": total.input_tokens // total.api_calls if total.api_calls else 0,
+                "output_tokens": total.output_tokens // total.api_calls if total.api_calls else 0,
+            },
+        }
+
     def reset(self) -> None:
         self.state = CostState()

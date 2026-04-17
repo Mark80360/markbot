@@ -1,49 +1,8 @@
-# User Profile
-
-Information about the user to help personalize interactions.
-
-## Basic Information
-
-- **Name**: (your name)
-- **Timezone**: (your timezone, e.g., UTC+8)
-- **Language**: (preferred language)
-
-## Preferences
-
-### Communication Style
-
-- [ ] Casual
-- [ ] Professional
-- [ ] Technical
-
-### Response Length
-
-- [ ] Brief and concise
-- [ ] Detailed explanations
-- [ ] Adaptive based on question
-
-### Technical Level
-
-- [ ] Beginner
-- [ ] Intermediate
-- [ ] Expert
-
-## Work Context
-
-- **Primary Role**: (your role, e.g., developer, researcher)
-- **Main Projects**: (what you're working on)
-- **Tools You Use**: (IDEs, languages, frameworks)
-
-## Topics of Interest
-
-- 
-- 
-- 
-
-## Special Instructions
-
-(Any specific instructions for how the assistant should behave)
-
+---
+summary: "用户资料（已合并至 PROFILE.md）"
+read_when:
+  - 手动引导工作区
 ---
 
-*Edit this file to customize markbot's behavior for your needs.*
+> ⚠️ 用户资料已合并到 `PROFILE.md` 的「用户资料」section。
+> 请更新 `PROFILE.md` 而非本文件。本文件仅作兼容保留。

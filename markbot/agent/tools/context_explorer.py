@@ -18,6 +18,8 @@ from typing import Any, TYPE_CHECKING
 from loguru import logger
 
 from markbot.agent.tools.base import Tool
+from markbot.utils.constants import BOOTSTRAP_FILES
+from markbot.utils.helpers import format_time
 
 if TYPE_CHECKING:
     from ..memory.base import BaseMemoryManager
@@ -73,7 +75,7 @@ class ExploreContextCatalogTool(Tool):
         self.workspace = workspace
         self._memory_manager = memory_manager
 
-        self.BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md"]
+        self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
 
     async def _legacy_execute(
         self,
@@ -132,7 +134,7 @@ class ExploreContextCatalogTool(Tool):
 
                 lines.append(f"### {filename}")
                 lines.append(f"- Size: {size_kb:.1f} KB")
-                lines.append(f"- Last modified: {self._format_time(stat.st_mtime)}")
+                lines.append(f"- Last modified: {format_time(stat.st_mtime)}")
 
                 first_line = self._get_first_line(file_path)
                 if first_line:
@@ -230,11 +232,6 @@ class ExploreContextCatalogTool(Tool):
         return "\n".join(lines)
 
     @staticmethod
-    def _format_time(timestamp: float) -> str:
-        from datetime import datetime
-        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
-
-    @staticmethod
     def _get_first_line(file_path: Path) -> str | None:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -305,7 +302,7 @@ class SearchContextTool(Tool):
         super().__init__(**kwargs)
         self.workspace = workspace
         self._memory_manager = memory_manager
-        self.BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md"]
+        self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
 
     async def _legacy_execute(
         self,

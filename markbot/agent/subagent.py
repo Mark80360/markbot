@@ -104,8 +104,6 @@ class SubagentManager:
         tracker = await self.progress_manager.create_tracker(task_id, label)
 
         try:
-            from markbot.agent.loop import AgentLoop
-
             tools = ToolRegistry()
             self._register_subagent_tools(tools)
 

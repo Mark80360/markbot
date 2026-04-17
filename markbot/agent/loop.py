@@ -21,7 +21,7 @@ from markbot.agent.memory.manager import ReMeLightMemoryManager
 from markbot.agent.memory.hooks.bootstrap import BootstrapHook
 from markbot.agent.memory.hooks.compaction import MemoryCompactionHook
 from markbot.agent.subagent import SubagentManager
-from markbot.agent.tokens import TokenTracker, token_count_with_estimation
+from markbot.agent.tokens import token_count_with_estimation
 from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
 from markbot.agent.cost_tracker import CostTracker, BudgetExceededError, PricingTable
 from markbot.agent.tools.cron import CronTool
@@ -38,8 +38,8 @@ from markbot.agent.tools.registry import ToolRegistry
 from markbot.agent.tools.search import GlobTool, GrepTool
 from markbot.agent.tools.shell import ExecTool
 from markbot.agent.tools.spawn import SpawnTool
-from markbot.agent.tools.subagent_progress import CheckSubagentTool, ListSubagentsTool
-from markbot.agent.tools.web import WebFetchTool, WebSearchTool
+from markbot.agent.tools.subagent_tools import CheckSubagentTool, ListSubagentsTool
+from markbot.agent.tools.web import WebFetchTool, WebSearchTool, WebExtractTool
 from markbot.agent.tools.think import ThinkTool
 from markbot.agent.tools.memory import MemorySearchTool
 from markbot.agent.tools.todo import TodoTool
@@ -148,7 +148,6 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._last_context_tokens: int = 0
 
-        self.token_tracker = TokenTracker()
         _compaction_cfg = compaction_config or CompactionConfig()
         self.compactor = MultiLevelCompactor(
             fallback_manager=fallback_manager, config=_compaction_cfg
@@ -332,17 +331,6 @@ class AgentLoop:
         filesystem_config: Any = None,
     ) -> None:
         """Register base filesystem/web/shell tools (shared between AgentLoop and SubagentManager)."""
-        from markbot.agent.tools.filesystem import (
-            DeleteFileTool,
-            EditFileTool,
-            ListDirTool,
-            ReadFileTool,
-            WriteFileTool,
-        )
-        from markbot.agent.tools.search import GlobTool, GrepTool
-        from markbot.agent.tools.shell import ExecTool
-        from markbot.agent.tools.web import WebFetchTool, WebSearchTool
-
         if workspace is None:
             raise ValueError("workspace must be provided")
 
@@ -391,9 +379,6 @@ class AgentLoop:
             )
         tools.register(WebSearchTool(config=web_search_config, proxy=web_proxy))
         tools.register(WebFetchTool(proxy=web_proxy))
-        # Register web_extract as alias for web_fetch with enhanced capabilities
-        from markbot.agent.tools.web import WebExtractTool
-
         tools.register(WebExtractTool(proxy=web_proxy))
         tools.register(GlobTool(workspace=workspace, allowed_dir=allowed_dir))
         tools.register(GrepTool(workspace=workspace, allowed_dir=allowed_dir))
@@ -448,13 +433,6 @@ class AgentLoop:
         if todo_tool := self.tools.get("todo"):
             if hasattr(todo_tool, "set_session"):
                 todo_tool.set_session(f"{channel}:{chat_id}")
-
-    @staticmethod
-    def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
-        if not text:
-            return None
-        return strip_think(text) or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -637,8 +615,6 @@ class AgentLoop:
             }
             self._last_context_tokens = current_tokens
 
-            self.token_tracker.update_from_response(response)
-
             try:
                 call_cost = self.cost_tracker.update_from_response(response, model=self.model)
                 if call_cost > 0:
@@ -673,11 +649,11 @@ class AgentLoop:
 
                 if on_progress:
                     if not on_stream:
-                        thought = self._strip_think(response.content)
+                        thought = strip_think(response.content) or None
                         if thought:
                             await on_progress(thought)
                     tool_hint = self._tool_hint(response.tool_calls)
-                    tool_hint = self._strip_think(tool_hint)
+                    tool_hint = strip_think(tool_hint) or None
                     await on_progress(tool_hint, tool_hint=True)
 
                 tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
@@ -750,7 +726,7 @@ class AgentLoop:
                     await on_stream_end(resuming=False)
                     _stream_buf = ""
 
-                clean = self._strip_think(response.content)
+                clean = strip_think(response.content) or None
                 if response.finish_reason == "error":
                     safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
                     logger.error("[AgentLoop] LLM returned error finish_reason: {}", safe_clean)
@@ -788,7 +764,7 @@ class AgentLoop:
             final_content is not None,
         )
 
-        token_summary = self.token_tracker.get_summary()
+        token_summary = self.cost_tracker.get_token_summary()
         logger.info(
             "[AgentLoop] Token usage - Total: input={}, output={}, cache_creation={}, cache_read={}",
             token_summary["total"]["input_tokens"],

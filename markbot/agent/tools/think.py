@@ -14,8 +14,6 @@ from markbot.agent.tools.base import Tool
 class ThinkTool(Tool):
     """Unified tool for structured thinking, planning, reflection, and code analysis."""
 
-    _is_lightweight_tool = True
-
     @property
     def name(self) -> str:
         return "think"

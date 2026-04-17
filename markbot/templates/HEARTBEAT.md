@@ -1,16 +1,19 @@
-# Heartbeat Tasks
+---
+summary: "心跳定时任务"
+read_when:
+  - 心跳轮询
+---
 
-This file is checked every 30 minutes by your markbot agent.
-Add tasks below that you want the agent to work on periodically.
+本文件每 30 分钟由 markbot 代理检查一次。
+在下方添加你希望代理定期执行的任务。
 
-If this file has no tasks (only headers and comments), the agent will skip the heartbeat.
+如果本文件没有任务（只有标题和注释），代理将跳过本次心跳。
 
-## Active Tasks
+## 活跃任务
 
-<!-- Add your periodic tasks below this line -->
+<!-- 在此行下方添加你的定时任务 -->
 
 
-## Completed
+## 已完成
 
-<!-- Move completed tasks here or delete them -->
-
+<!-- 将已完成任务移至此处或直接删除 -->

@@ -36,7 +36,6 @@ metadata:
 
 from .scanner import SecurityScanner, ScanResult, Finding
 from .sandbox import Sandbox, SandboxConfig
-from .skill_script import SkillScript
 from .guardrail import SkillGuardrail, GuardrailResult, GuardrailViolation, SkillGuardrailManager
 
 __all__ = [
@@ -45,7 +44,6 @@ __all__ = [
     "Finding",
     "Sandbox",
     "SandboxConfig",
-    "SkillScript",
     "SkillGuardrail",
     "GuardrailResult",
     "GuardrailViolation",

@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from markbot.agent.tokens import estimate_messages_tokens as _estimate_messages_tokens
+
 from loguru import logger
 
 
@@ -392,91 +394,7 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
         return re.sub(r'\n\n+', '\n\n', formatted).strip()
 
 
-class ConversationCompactor(MultiLevelCompactor):
-    """Backward-compatible alias for existing code that imports ConversationCompactor."""
-
-    def __init__(self, llm_client=None, fallback_manager=None, config=None):
-        super().__init__(fallback_manager=fallback_manager, config=config)
-        self.llm_client = llm_client
-
-    def should_compact(
-        self,
-        messages: list[dict[str, Any]],
-        current_tokens: int,
-        max_tokens: int,
-        threshold: float = 0.8,
-    ) -> bool:
-        cfg = self.config
-        effective_max = max_tokens - cfg.reserved_output_tokens - cfg.auto_compact_buffer
-        return current_tokens > effective_max * cfg.threshold_ratio
-
-    def compact_conversation(
-        self,
-        messages: list[dict[str, Any]],
-        keep_recent: int = 5,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        import asyncio
-
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, self._legacy_compact(messages, keep_recent)).result()
-
-        return asyncio.run(self._legacy_compact(messages, keep_recent))
-
-    async def _legacy_compact(
-        self, messages: list[dict[str, Any]], keep_recent: int
-    ) -> tuple[str, list[dict[str, Any]]]:
-        if len(messages) <= keep_recent * 2:
-            return "", messages
-        messages_to_compact = messages[:-keep_recent * 2]
-        recent_messages = messages[-keep_recent * 2:]
-        conversation_text = self._format_messages_for_compact(messages_to_compact)
-        summary = await self._generate_summary(conversation_text)
-        formatted = self._format_summary(summary)
-        return formatted, recent_messages
-
-    def create_compact_message(
-        self,
-        summary: str,
-        recent_messages_preserved: bool = True,
-    ) -> dict[str, Any]:
-        content = (
-            "This session is being continued from a previous conversation "
-            "that ran out of context. The summary below covers the earlier portion.\n\n"
-            + summary
-        )
-        if recent_messages_preserved:
-            content += "\n\nRecent messages are preserved verbatim."
-        content += (
-            "\n\nContinue the conversation from where it left off without asking "
-            "the user any further questions. Resume directly."
-        )
-        return {"role": "system", "content": content}
 
 
-def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
-    total = 0
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total += len(content) // 4
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        total += len(block.get("text", "")) // 4
-                    elif block.get("type") == "image":
-                        total += 85
-                    elif block.get("type") == "tool_use":
-                        total += len(str(block.get("input", {}))) // 4
-                    elif block.get("type") == "tool_result":
-                        c = block.get("content", "")
-                        total += (len(c) // 4) if isinstance(c, str) else 0
-    return total
+
+

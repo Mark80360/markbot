@@ -5,7 +5,6 @@ file access control, and timeout management.
 """
 
 import asyncio
-import logging
 import os
 import signal
 import subprocess
@@ -15,13 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+from loguru import logger
+
 # Resource module is Unix-only
 try:
     import resource
 except ImportError:
     resource = None
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass

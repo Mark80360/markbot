@@ -8,15 +8,14 @@ Ported from CoPaw's MemoryCompactionHook — runs as pre_reasoning hook.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from markbot.agent.tokens import estimate_tokens as _estimate_tokens
+
 if TYPE_CHECKING:
     from ..base import BaseMemoryManager
-
-logger = logging.getLogger(__name__)
 
 MEMORY_COMPACT_KEEP_RECENT = 4
 
@@ -61,7 +60,7 @@ class MemoryCompactionHook:
             if not self.memory_manager._reme:
                 return None
 
-            str_token_count = self._estimate_tokens(
+            str_token_count = _estimate_tokens(
                 system_prompt + getattr(self.memory_manager, '_compressed_summary', '')
             )
 
@@ -75,15 +74,6 @@ class MemoryCompactionHook:
                     "combined token length exceeds configured threshold."
                 )
                 return None
-
-            if getattr(self.memory_manager, 'tool_result_compact_enabled', True):
-                await self.memory_manager.compact_tool_result(
-                    messages=messages,
-                    recent_n=getattr(self.memory_manager, 'tool_result_recent_n', 2),
-                    old_max_bytes=getattr(self.memory_manager, 'tool_result_old_max_bytes', 3000),
-                    recent_max_bytes=getattr(self.memory_manager, 'tool_result_recent_max_bytes', 50000),
-                    retention_days=getattr(self.memory_manager, 'tool_result_retention_days', 5),
-                )
 
             result = await self.memory_manager.check_context(
                 messages=messages,
@@ -172,12 +162,6 @@ class MemoryCompactionHook:
         except Exception as e:
             logger.exception(f"Failed to compact memory in pre_reasoning hook: {e}")
             return None
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        if not text:
-            return 0
-        return len(text) // 4
 
     @staticmethod
     def _check_valid_messages(messages: list[dict]) -> bool:

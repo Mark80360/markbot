@@ -13,6 +13,7 @@ from loguru import logger
 from markbot.core.types import SkillDefinition
 from markbot.core.skills.loader import SkillLoader
 from markbot.core.skills.tool import SkillTool
+from markbot.core.skills.utils import load_skill_body, build_constraint_block
 
 if TYPE_CHECKING:
     from markbot.agent.tools.registry import ToolRegistry
@@ -102,21 +103,7 @@ class SkillRegistry:
         skill_path = self._loader.get_skill_path(name)
         if not skill_path:
             return None
-
-        skill_file = skill_path / "SKILL.md"
-        if not skill_file.exists():
-            return None
-
-        content = skill_file.read_text(encoding="utf-8")
-        # Strip frontmatter
-        if content.startswith("---"):
-            import re
-
-            match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
-            if match:
-                content = content[match.end() :].strip()
-
-        return content
+        return load_skill_body(skill_path)
 
     def load_skills_for_context(self, skill_names: list[str]) -> str:
         """Load specific skills for inclusion in agent context."""
@@ -144,25 +131,7 @@ class SkillRegistry:
         body = self.load_skill_content(skill_name)
         if not body:
             return ""
-
-        header = (
-            f'<skill-constraint name="{skill_name}">\n'
-            f'CRITICAL: You are now executing the "{skill_name}" skill.\n'
-            f'The following instructions are MANDATORY constraints, NOT suggestions.\n'
-            f'You MUST:\n'
-            f'1. Follow every step exactly as described, in order\n'
-            f'2. NOT skip, reorder, or improvise steps\n'
-            f'3. NOT add steps or behaviors not described below\n'
-            f'4. Use ONLY the tools and methods specified in the skill\n'
-            f'5. If the skill says "run script X", you MUST run script X — do NOT implement the logic yourself\n'
-            f'6. The SKILL.md document overrides your general knowledge about how to do things\n'
-        )
-        footer = (
-            f'\n</skill-constraint>\n'
-            f'END OF SKILL CONSTRAINT for "{skill_name}".\n'
-            f'Resume normal behavior only after completing all skill steps described above.'
-        )
-        return f"{header}\n{body}{footer}"
+        return build_constraint_block(skill_name, body)
 
     def get_always_active_content(self) -> str:
         """Get content of always-active skills."""

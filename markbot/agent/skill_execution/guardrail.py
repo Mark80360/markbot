@@ -133,8 +133,6 @@ class SkillGuardrail:
         "message": "Subagents cannot send messages to users",
     }
 
-    BASIC_ALLOWED_TOOLS = MAIN_AGENT_ALLOWED_TOOLS
-
     def __init__(self, skill: SkillDefinition, context: str = "main"):
         self.skill = skill
         self._context = context

@@ -48,12 +48,22 @@ class _MessageWrapper:
         self.timestamp = timestamp
         self.metadata = metadata or {}
 
+    # Default username for user messages to ensure consistency across all user messages
+    _DEFAULT_USER_NAME: str = "user"
+
     @classmethod
     def from_dict(cls, msg: dict) -> "_MessageWrapper":
+        role = msg.get("role", "")
+        # MiniMax API requires consistent username for all user messages
+        # Always use the same default name for user messages to avoid "user name must be consistent" error
+        if role == "user":
+            name = cls._DEFAULT_USER_NAME
+        else:
+            name = msg.get("name", "")
         return cls(
-            role=msg.get("role", ""),
+            role=role,
             content=msg.get("content", ""),
-            name=msg.get("name", ""),
+            name=name,
             timestamp=msg.get("timestamp", ""),
             metadata=msg.get("metadata", {}),
         )
@@ -473,7 +483,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         max_results: int = 5,
         min_score: float = 0.1,
     ) -> list[dict]:
-        self._warn_if_version_mismatch()
         results: list[dict] = []
 
         if self._reme is not None and self._started:
@@ -559,7 +568,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         return results
 
     def get_in_memory_memory(self, **kwargs) -> Optional["ReMeInMemoryMemory"]:
-        self._warn_if_version_mismatch()
         if self._reme is None:
             return None
         return self._reme.get_in_memory_memory()

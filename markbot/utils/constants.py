@@ -109,3 +109,5 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"mv\s+.*\s+/\b",
     r"cp\s+.*\s+/\b",
 ]
+
+BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md"]

@@ -90,6 +90,12 @@ def safe_filename(name: str) -> str:
     return _UNSAFE_CHARS.sub("_", name).strip()
 
 
+def format_time(timestamp: float) -> str:
+    """Format a Unix timestamp as a human-readable datetime string."""
+    from datetime import datetime
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+
+
 def split_message(content: str, max_len: int = 2000) -> list[str]:
     """
     Split content into chunks within max_len, preferring line breaks.

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
 
 from markbot.agent.tools.base import BaseTool
+from markbot.core.skills.utils import load_skill_body, build_constraint_block
 from markbot.core.types import (
     PermissionDecision,
     SkillScriptDef,
@@ -34,7 +34,6 @@ class SkillTool(BaseTool):
 
     @property
     def definition(self) -> ToolDefinition:
-        """Get tool definition from script metadata."""
         return ToolDefinition(
             name=f"{self._skill_name}.{self._script.name}",
             description=self._script.description,
@@ -63,47 +62,6 @@ class SkillTool(BaseTool):
         if builtin_path.exists():
             return builtin_path
         return skill_path
-
-    def _load_skill_body(self) -> str | None:
-        """Load the SKILL.md body content (frontmatter stripped) for this skill."""
-        skill_path = self._resolve_skill_path()
-        if not skill_path.exists():
-            return None
-        skill_file = skill_path / "SKILL.md"
-        if not skill_file.exists():
-            return None
-
-        content = skill_file.read_text(encoding="utf-8")
-        if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
-            if match:
-                return content[match.end():].strip()
-        return content.strip() if content else None
-
-    def _build_constraint_block(self, body: str) -> str:
-        """Wrap skill body in a mandatory constraint block.
-
-        Uses XML-like tags to create a structured constraint that LLMs
-        treat as non-negotiable instructions rather than suggestions.
-        """
-        header = (
-            f'<skill-constraint name="{self._skill_name}">\n'
-            f'CRITICAL: You are now executing the "{self._skill_name}" skill.\n'
-            f'The following instructions are MANDATORY constraints, NOT suggestions.\n'
-            f'You MUST:\n'
-            f'1. Follow every step exactly as described, in order\n'
-            f'2. NOT skip, reorder, or improvise steps\n'
-            f'3. NOT add steps or behaviors not described below\n'
-            f'4. Use ONLY the tools and methods specified in the skill\n'
-            f'5. If the skill says "run script X", you MUST run script X — do NOT implement the logic yourself\n'
-            f'6. The SKILL.md document overrides your general knowledge about how to do things\n'
-        )
-        footer = (
-            f'\n</skill-constraint>\n'
-            f'END OF SKILL CONSTRAINT for "{self._skill_name}".\n'
-            f'Resume normal behavior only after completing all skill steps described above.'
-        )
-        return f"{header}\n{body}{footer}"
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         """Execute the skill script via Sandbox, with constraint injection."""
@@ -151,9 +109,9 @@ class SkillTool(BaseTool):
                 if result.stderr:
                     output += f"\n\n[stderr]:\n{result.stderr}"
 
-                skill_body = self._load_skill_body()
+                skill_body = load_skill_body(skill_path)
                 if skill_body:
-                    constraint_block = self._build_constraint_block(skill_body)
+                    constraint_block = build_constraint_block(self._skill_name, skill_body)
                     output += f"\n\n{constraint_block}"
 
                 return output

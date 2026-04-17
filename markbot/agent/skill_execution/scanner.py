@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from loguru import logger
+
 
 @dataclass
 class Finding:
@@ -111,7 +113,7 @@ class SecurityScanner:
                 try:
                     compiled.append((re.compile(pattern, re.IGNORECASE), severity, message))
                 except re.error as e:
-                    print(f"Warning: Invalid regex pattern '{pattern}': {e}")
+                    logger.warning("Invalid regex pattern '{}': {}", pattern, e)
             self._compiled_patterns[language] = compiled
         return self._compiled_patterns[language]
 

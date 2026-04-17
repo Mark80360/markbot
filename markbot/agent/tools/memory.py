@@ -27,8 +27,6 @@ class MemorySearchTool(Tool):
     provides automatic pre-LLM-call search injection via ``get_forced_context()``.
     """
 
-    _is_lightweight_tool = True
-
     def __init__(self, memory_manager: "BaseMemoryManager | None" = None, **kwargs):
         super().__init__(**kwargs)
         self._memory_manager = memory_manager

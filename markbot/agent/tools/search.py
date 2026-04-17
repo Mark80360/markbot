@@ -23,6 +23,7 @@ from markbot.utils.constants import (
     MAX_SEARCH_RESULTS,
     MAX_CONTEXT_LINES,
 )
+from markbot.utils.helpers import format_time
 
 
 def _is_binary_file(file_path: Path) -> bool:
@@ -197,7 +198,7 @@ class GlobTool(Tool):
                 if show_details:
                     stat = fp.stat()
                     size_str = _format_size(stat.st_size)
-                    mtime_str = _format_time(stat.st_mtime)
+                    mtime_str = format_time(stat.st_mtime)
                     rel = fp.relative_to(search_dir)
                     lines.append(f"{size_str:>10}  {mtime_str}  {rel}")
                 else:
@@ -464,9 +465,3 @@ def _format_size(size_bytes: int) -> str:
         size_bytes /= 1024.0
     return f"{size_bytes:.1f}TB"
 
-
-def _format_time(timestamp: float) -> str:
-    """Format modification time."""
-    from datetime import datetime
-    dt = datetime.fromtimestamp(timestamp)
-    return dt.strftime("%Y-%m-%d %H:%M")

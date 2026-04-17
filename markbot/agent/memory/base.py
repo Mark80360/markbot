@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
+from loguru import logger
+
 if TYPE_CHECKING:
     from reme.memory.file_based.reme_in_memory_memory import ReMeInMemoryMemory
-
-logger = logging.getLogger(__name__)
 
 
 class BaseMemoryManager(ABC):
