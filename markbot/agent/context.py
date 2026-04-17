@@ -80,6 +80,15 @@ class ContextBuilder:
 
 Skills extend your capabilities with specialized tools and domain knowledge.
 
+## CRITICAL: Skill Execution Rules (MANDATORY)
+When executing a skill, you MUST treat the skill's SKILL.md instructions as HARD CONSTRAINTS:
+- **Follow the skill's steps EXACTLY** — do not skip, reorder, or modify them
+- **Do NOT improvise or create your own approach** — if the skill says "run script X", run script X; do NOT implement the logic yourself
+- **Do NOT add extra steps** — only perform what the skill's SKILL.md describes
+- **The skill document is LAW** — it overrides your general knowledge about how to do things
+- **When a skill script returns instructions, those instructions are MANDATORY** — follow them precisely
+- Do NOT use "creative interpretation" of skills. Execute them as written, verbatim.
+
 ## How to Use Skills
 - When a skill matches the user's request, **invoke it IMMEDIATELY**
 - This is a **BLOCKING REQUIREMENT**: call the skill tool BEFORE generating any other response

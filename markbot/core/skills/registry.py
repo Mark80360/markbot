@@ -129,6 +129,41 @@ class SkillRegistry:
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
+    def build_skill_constraint_block(self, skill_name: str) -> str:
+        """Build a hard constraint block for a skill's full instructions.
+
+        Wraps the SKILL.md body content with mandatory constraint framing
+        so the LLM treats it as non-negotiable rules rather than suggestions.
+
+        Args:
+            skill_name: The name of the skill to build constraints for.
+
+        Returns:
+            Formatted constraint string, or empty string if skill not found.
+        """
+        body = self.load_skill_content(skill_name)
+        if not body:
+            return ""
+
+        header = (
+            f'<skill-constraint name="{skill_name}">\n'
+            f'CRITICAL: You are now executing the "{skill_name}" skill.\n'
+            f'The following instructions are MANDATORY constraints, NOT suggestions.\n'
+            f'You MUST:\n'
+            f'1. Follow every step exactly as described, in order\n'
+            f'2. NOT skip, reorder, or improvise steps\n'
+            f'3. NOT add steps or behaviors not described below\n'
+            f'4. Use ONLY the tools and methods specified in the skill\n'
+            f'5. If the skill says "run script X", you MUST run script X — do NOT implement the logic yourself\n'
+            f'6. The SKILL.md document overrides your general knowledge about how to do things\n'
+        )
+        footer = (
+            f'\n</skill-constraint>\n'
+            f'END OF SKILL CONSTRAINT for "{skill_name}".\n'
+            f'Resume normal behavior only after completing all skill steps described above.'
+        )
+        return f"{header}\n{body}{footer}"
+
     def get_always_active_content(self) -> str:
         """Get content of always-active skills."""
         always_skills = self.get_active_skills()
