@@ -8,6 +8,7 @@ Provides commands to:
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +106,9 @@ def scan_script(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show all findings"),
 ):
     """Scan a script for security issues."""
+    from loguru import logger
+
+    logger.disable("markbot.core.skills.registry")
     registry = _get_registry()
 
     console.print(f"[cyan]Scanning {skill}.{script}...[/cyan]")
@@ -150,6 +154,8 @@ def scan_script(
     except Exception as e:
         console.print(f"[red]Error scanning script: {e}[/red]")
         raise typer.Exit(1)
+    finally:
+        logger.enable("markbot.core.skills.registry")
 
 
 @app.command("info")

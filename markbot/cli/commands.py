@@ -1775,6 +1775,8 @@ def plugins_list():
         console.print(line)
 
     console.print()
+    console.print("[dim]This command shows channel sources (built-in vs external plugins).[/dim]")
+    console.print("[dim]For runtime status (enable/disable), use: markbot channels status[/dim]\n")
 
     # ─ Plugins ───────────────────────────────────────────────────────────────
     section("Plugins", "cyan")
@@ -1815,6 +1817,12 @@ def plugins_list():
     kv("Enabled", f"[green]{enabled_count}[/green]")
 
     divider()
+
+    if plugin_count == 0:
+        console.print("\n[dim]💡 No external plugins installed.[/dim]")
+        console.print("[dim]   Install via: pip install markbot-<channel>-plugin[/dim]")
+        console.print("[dim]   Or create your own: markbot skills skill-creator[/dim]\n")
+
     console.print()
 
 
