@@ -1070,7 +1070,7 @@ def _get_channel_info() -> dict[str, tuple[str, type[BaseModel]]]:
     """Get channel info (display name + config class) from channel modules."""
     import importlib
 
-    from markbot.channels.registry import discover_all
+    from markbot.channels.discovery import discover_all
 
     result: dict[str, tuple[str, type[BaseModel]]] = {}
     for name, channel_cls in discover_all().items():

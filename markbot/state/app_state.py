@@ -5,7 +5,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Callable, Generator, Optional, TypeVar
 
-from markbot.core.types import AppState, PermissionMode, ToolPermissionContext
+from markbot.state.types import AppState
+from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.state.store import StateStore
 
 T = TypeVar("T")

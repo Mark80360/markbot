@@ -10,7 +10,8 @@ from typing import Any, Callable, Generic, Optional, TypeVar
 
 from loguru import logger
 
-from markbot.core.types import AppState, Event, EventType
+from markbot.state.types import AppState
+from markbot.bus.events import Event, EventType
 
 T = TypeVar("T")
 

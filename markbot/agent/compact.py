@@ -218,9 +218,11 @@ class MultiLevelCompactor:
         keep = self.config.micro_compact_keep_turns
         tool_result_indices = [
             i for i, m in enumerate(messages)
-            if m.get("role") in ("tool", "user")
-            and isinstance(m.get("content"), list)
-            and any(b.get("type") == "tool_result" for b in m["content"])
+            if (
+                m.get("role") in ("tool", "user")
+                and isinstance(m.get("content"), list)
+                and any(b.get("type") == "tool_result" for b in m["content"])
+            )
             or (m.get("role") == "tool" and m.get("content"))
         ]
         to_clear = tool_result_indices[:-keep] if len(tool_result_indices) > keep else []
@@ -305,11 +307,31 @@ class MultiLevelCompactor:
                 f"to fit within the context window.]"
             ),
         }
+        result = [snip_notice] + snipped
+
+        declared: set[str] = set()
+        cleaned: list[dict[str, Any]] = []
+        for msg in result:
+            role = msg.get("role")
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        declared.add(str(tc["id"]))
+            elif role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and str(tid) not in declared:
+                    logger.debug(
+                        "[Compactor] History snip dropped orphan tool_result (id={})",
+                        tid,
+                    )
+                    continue
+            cleaned.append(msg)
+
         logger.warning(
-            "[Compactor] History snip: {} -> {} messages (dropped {})",
-            len(messages), keep, len(messages) - keep,
+            "[Compactor] History snip: {} -> {} messages (dropped {}, cleaned {} orphan tools)",
+            len(messages), len(cleaned), len(messages) - keep, len(result) - len(cleaned),
         )
-        return [snip_notice] + snipped
+        return cleaned
 
     # ------------------------------------------------------------------
     # Summary generation (shared with legacy interface)
@@ -368,8 +390,6 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
                         {"role": "system", "content": self.COMPACT_PROMPT},
                         {"role": "user", "content": conversation_text},
                     ],
-                    max_tokens=self.config.max_compact_output_tokens,
-                    temperature=0.3,
                 )
                 if response.finish_reason == "error":
                     error_msg = response.content or "Unknown error"

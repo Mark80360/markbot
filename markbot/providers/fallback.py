@@ -68,19 +68,19 @@ class FallbackManager:
             backend = spec.backend if spec else "openai_compat"
 
             if backend == "anthropic":
-                from markbot.providers.anthropic_provider import AnthropicProvider
+                from markbot.providers.anthropic import AnthropicProvider
                 self._providers_cache[cache_key] = AnthropicProvider(
                     api_key=provider_config.api_key,
                     api_base=provider_config.api_base,
                 )
             elif backend == "azure_openai":
-                from markbot.providers.azure_openai_provider import AzureOpenAIProvider
+                from markbot.providers.azure_openai import AzureOpenAIProvider
                 self._providers_cache[cache_key] = AzureOpenAIProvider(
                     api_key=provider_config.api_key,
                     api_base=provider_config.api_base,
                 )
             else:
-                from markbot.providers.openai_compat_provider import OpenAICompatProvider
+                from markbot.providers.openai_compat import OpenAICompatProvider
                 self._providers_cache[cache_key] = OpenAICompatProvider(
                     api_key=provider_config.api_key,
                     api_base=provider_config.api_base,

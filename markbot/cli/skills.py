@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from markbot.core.skills import SkillRegistry
+from markbot.skills import SkillRegistry
 from markbot.config.paths import get_workspace_path
 
 app = typer.Typer(

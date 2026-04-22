@@ -20,20 +20,20 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS = {
-    "AnthropicProvider": ".anthropic_provider",
-    "OpenAICompatProvider": ".openai_compat_provider",
-    "OpenAICodexProvider": ".openai_codex_provider",
-    "AzureOpenAIProvider": ".azure_openai_provider",
+    "AnthropicProvider": ".anthropic",
+    "OpenAICompatProvider": ".openai_compat",
+    "OpenAICodexProvider": ".openai_codex",
+    "AzureOpenAIProvider": ".azure_openai",
     "FallbackManager": ".fallback",
     "AllModelsFailedError": ".fallback",
     "FallbackAttempt": ".fallback",
 }
 
 if TYPE_CHECKING:
-    from markbot.providers.anthropic_provider import AnthropicProvider
-    from markbot.providers.azure_openai_provider import AzureOpenAIProvider
-    from markbot.providers.openai_compat_provider import OpenAICompatProvider
-    from markbot.providers.openai_codex_provider import OpenAICodexProvider
+    from markbot.providers.anthropic import AnthropicProvider
+    from markbot.providers.azure_openai import AzureOpenAIProvider
+    from markbot.providers.openai_compat import OpenAICompatProvider
+    from markbot.providers.openai_codex import OpenAICodexProvider
     from markbot.providers.fallback import FallbackManager, AllModelsFailedError, FallbackAttempt
 
 

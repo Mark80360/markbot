@@ -39,7 +39,7 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
-        from markbot.channels.registry import discover_all
+        from markbot.channels.discovery import discover_all
 
         groq_key = self.config.providers.groq.api_key
 

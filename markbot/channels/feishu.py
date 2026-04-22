@@ -318,6 +318,7 @@ class FeishuChannel(BaseChannel):
         self._pending_reactions: dict[
             str, str
         ] = {}  # message_id -> reaction_id (guaranteed cleanup)
+        self._cleaned_reactions: set[str] = set()  # message_ids whose reaction has been removed
         self._clock_offset: int = 0  # Clock offset (ms) = server_time - local_time
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
@@ -761,16 +762,20 @@ class FeishuChannel(BaseChannel):
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             logger.info(
-                "[FEISHU DELTA] _stream_end: message_id={}, reaction_id={}",
+                "[FEISHU DELTA] _stream_end: message_id={}, reaction_id={}, resuming={}",
                 meta.get("message_id"),
                 meta.get("reaction_id"),
+                meta.get("_resuming"),
             )
-            if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
-                await self._remove_reaction(message_id, reaction_id)
-                logger.info("[FEISHU DELTA] removed reaction {}", reaction_id)
-                if self.config.done_emoji and message_id:
-                    await self._add_reaction(message_id, self.config.done_emoji)
-                    logger.info("[FEISHU DELTA] added done_emoji {}", self.config.done_emoji)
+            is_resuming = meta.get("_resuming", False)
+            if not is_resuming:
+                if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
+                    await self._remove_reaction(message_id, reaction_id)
+                    self._cleaned_reactions.add(message_id)
+                    logger.info("[FEISHU DELTA] removed reaction {}", reaction_id)
+                    if self.config.done_emoji and message_id:
+                        await self._add_reaction(message_id, self.config.done_emoji)
+                        logger.info("[FEISHU DELTA] added done_emoji {}", self.config.done_emoji)
 
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
@@ -1600,7 +1605,7 @@ class FeishuChannel(BaseChannel):
             logger.error("[FEISHU SEND] === send() EXIT (error) === {}", e)
             raise
         finally:
-            if should_cleanup_reaction:
+            if should_cleanup_reaction and message_id not in self._cleaned_reactions:
                 pending_rid = self._pending_reactions.pop(message_id, None)
                 rid_to_remove = pending_rid or reaction_id
                 logger.info(
@@ -1611,6 +1616,7 @@ class FeishuChannel(BaseChannel):
                 if rid_to_remove:
                     try:
                         await self._remove_reaction(message_id, rid_to_remove)
+                        self._cleaned_reactions.add(message_id)
                         logger.info("[FEISHU SEND] finally: removed reaction {}", rid_to_remove)
                     except Exception as e:
                         logger.warning("[FEISHU SEND] finally: failed to remove reaction {}", e)
@@ -1624,8 +1630,9 @@ class FeishuChannel(BaseChannel):
                         logger.warning("[FEISHU SEND] finally: failed to add done_emoji {}", e)
             else:
                 logger.info(
-                    "[FEISHU SEND] finally: skipped cleanup (should_cleanup={})",
+                    "[FEISHU SEND] finally: skipped cleanup (should_cleanup={}, already_cleaned={})",
                     should_cleanup_reaction,
+                    message_id in self._cleaned_reactions if message_id else False,
                 )
 
     def _on_message_sync(self, data: Any) -> None:

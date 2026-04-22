@@ -37,7 +37,7 @@ from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.channels.base import BaseChannel
 from markbot.config.schema import Base
-from markbot.security.network import validate_url_target
+from markbot.utils.network import validate_url_target
 
 try:
     from markbot.config.paths import get_media_dir

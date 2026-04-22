@@ -1,26 +1,50 @@
 """Event types for the message bus."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum, auto
 from typing import Any
+
+
+class EventType(Enum):
+    STATE_CHANGED = auto()
+    TOOL_CALLED = auto()
+    TOOL_COMPLETED = auto()
+    PERMISSION_REQUESTED = auto()
+    PERMISSION_GRANTED = auto()
+    PERMISSION_DENIED = auto()
+    MESSAGE_RECEIVED = auto()
+    MESSAGE_SENT = auto()
+    SESSION_CREATED = auto()
+    SESSION_LOADED = auto()
+
+
+@dataclass
+class Event:
+    type: EventType
+    payload: Any
+    timestamp: str = field(
+        default_factory=lambda: __import__("datetime").datetime.now().isoformat()
+    )
 
 
 @dataclass
 class InboundMessage:
     """Message received from a chat channel."""
 
-    channel: str  # Channel type (e.g., dingtalk, feishu, etc.)
-    sender_id: str  # User identifier
-    chat_id: str  # Chat/channel identifier
-    content: str  # Message text
+    channel: str
+    sender_id: str
+    chat_id: str
+    content: str
     timestamp: datetime = field(default_factory=datetime.now)
-    media: list[str] = field(default_factory=list)  # Media URLs
-    metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
-    session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    media: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    session_key_override: str | None = None
 
     @property
     def session_key(self) -> str:
-        """Unique key for session identification."""
         return self.session_key_override or f"{self.channel}:{self.chat_id}"
 
 
@@ -34,5 +58,3 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-

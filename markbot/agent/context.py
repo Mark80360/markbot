@@ -12,11 +12,11 @@ from loguru import logger
 
 from markbot.utils.helpers import build_assistant_message, build_image_content_blocks, current_time_str, detect_image_mime
 from markbot.utils.constants import BOOTSTRAP_FILES
-from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.skills.loader import BUILTIN_SKILLS_DIR
 
 if TYPE_CHECKING:
-    from markbot.agent.memory.base import BaseMemoryManager
-    from markbot.agent.tools.registry import ToolRegistry
+    from markbot.memory.base import BaseMemoryManager
+    from markbot.tools.registry import ToolRegistry
     from markbot.skills import SkillRegistry
 
 
@@ -395,92 +395,58 @@ Your workspace is at: {workspace_path}
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
+    def _build_context_guidance(self) -> str:
+        """Build guidance for AI-driven context exploration.
+
+        Returns instructions for using context explorer tools to dynamically
+        load relevant context on-demand. This enables cold-start hybrid approach
+        where minimal bootstrap is loaded initially, and AI can explore/load
+        additional context as needed.
+        """
+        return """## Context Explorer Guidance
+
+You have access to context explorer tools that allow you to dynamically load relevant background information. Use these when you need additional context to better understand or respond to the user's request.
+
+### Available Tools:
+- **explore_context_catalog**: View available context sources (table of contents). Use this FIRST to see what's available.
+- **search_context**: Search within context sources by keyword. Use after exploring the catalog.
+- **load_context**: Load full content of a specific entry. Use when you've found relevant information.
+
+### When to Use:
+- When you need background information about the project, user preferences, or guidelines
+- When the user references something you don't have context about
+- When you want to provide more informed responses based on project-specific knowledge
+
+### Workflow:
+1. Start with `explore_context_catalog` to see what's available
+2. Use `search_context` to find specific relevant entries
+3. Use `load_context` to read full content of important entries
+
+This helps you provide more accurate, contextual responses without loading unnecessary information upfront."""
+
     def _load_minimal_bootstrap(self) -> str:
         """Load minimal bootstrap files for cold-start.
 
-        Only loads SOUL.md (core identity) by default.
-        Other bootstrap files are available via context explorer tools.
-        This reduces initial token usage and allows AI to decide what to load.
-        """
-        parts = []
-
-        # Only load SOUL.md for core identity
-        soul_path = self.workspace / "SOUL.md"
-        if soul_path.exists():
-            try:
-                content = soul_path.read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(f"## SOUL.md\n\n{content}")
-            except Exception as e:
-                logger.warning("Failed to load SOUL.md: {}", e)
-
-        return "\n\n".join(parts) if parts else ""
-
-    def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace.
-
-        Kept for backward compatibility and explicit full-load scenarios.
+        SOUL.md is NOT loaded here because _get_identity() already
+        handles it (including runtime context injection).  This method
+        only loads supplementary bootstrap files that are not part of
+        the core identity.
         """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
+            if filename == "SOUL.md":
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                try:
+                    content = file_path.read_text(encoding="utf-8").strip()
+                    if content:
+                        parts.append(f"## {filename}\n\n{content}")
+                except Exception as e:
+                    logger.warning("Failed to load {}: {}", filename, e)
 
         return "\n\n".join(parts) if parts else ""
-
-    def _build_context_guidance(self) -> str:
-        """Build guidance for AI-driven context exploration.
-
-        Provides instructions on how to use context explorer tools
-        to dynamically load relevant information. This is part of the
-        cold-start hybrid approach.
-        """
-        return """## Context Explorer Tools Available
-
-You have access to three tools for exploring and loading context dynamically:
-
-### 1. explore_context_catalog
-View the catalog of all available context sources (like a book's table of contents).
-- Use this FIRST when you need background information
-- Shows what's available: memory entries, bootstrap files, workspace info
-- Lightweight (~200 tokens)
-
-### 2. search_context
-Search for specific information by keyword or semantic query.
-- Use after exploring the catalog to find relevant entries
-- Returns summarized results with IDs
-- Use when you know what you're looking for
-
-### 3. load_context
-Load the full content of a specific context entry.
-- Use the ID from search_context results
-- Loads complete content (may be large)
-- Use only for entries you've confirmed are relevant
-
-**Workflow Example:**
-1. User asks: "Help me with the markbot project"
-2. You call: `explore_context_catalog(source_type="all")`
-3. You see: "markbot" mentioned in memory and workspace
-4. You call: `search_context(query="markbot architecture")`
-5. You get: result with ID "mem_0"
-6. You call: `load_context(context_id="mem_0")`
-7. You now have full context to help the user
-
-**Important Notes:**
-- Basic memory summary (MEMORY.md) may already be included in the system prompt above
-- Use `load_context` only for **detailed exploration** when you need more than the summary
-- **Avoid reloading MEMORY.md** if you already see memory content in the system prompt - it's wasteful
-- Focus on loading **specific sections** or **other bootstrap files** (AGENTS.md, USER.md, etc.) that aren't auto-loaded
-- The system prompt only contains SOUL.md (identity) + memory summary; everything else is on-demand
-
-**Benefits:**
-- Only load what you actually need (saves tokens)
-- Explore before committing to large loads
-- AI-driven decisions (you choose what's relevant)
-- Minimal cold-start overhead (~1000 tokens vs ~15000 tokens)"""
 
     def build_messages(
         self,

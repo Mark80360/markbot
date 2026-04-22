@@ -373,7 +373,7 @@ def _onboard_plugins(config_path: Path) -> None:
     """Inject default config for all discovered channels (built-in + plugins)."""
     import json
 
-    from markbot.channels.registry import discover_all
+    from markbot.channels.discovery import discover_all
 
     all_channels = discover_all()
     if not all_channels:
@@ -711,10 +711,10 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
     from markbot.config.loader import load_config
-    from markbot.cron.service import CronService
-    from markbot.cron.types import CronJob
-    from markbot.heartbeat.service import HeartbeatService
-    from markbot.session.manager import SessionManager
+    from markbot.scheduling.cron import CronService
+    from markbot.scheduling.cron import CronJob
+    from markbot.scheduling.heartbeat import HeartbeatService
+    from markbot.state.session import SessionManager
     logging.basicConfig(level=logging.WARNING)
 
     logger.remove()
@@ -825,9 +825,9 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     )
 
     async def on_cron_job(job: CronJob) -> str | None:
-        from markbot.agent.tools.cron import CronTool
-        from markbot.agent.tools.message import MessageTool
-        from markbot.utils.evaluator import evaluate_response
+        from markbot.tools.cron import CronTool
+        from markbot.tools.message import MessageTool
+        from markbot.scheduling.evaluator import evaluate_response
 
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
@@ -1008,7 +1008,7 @@ def agent(
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
-    from markbot.cron.service import CronService
+    from markbot.scheduling.cron import CronService
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
@@ -1418,7 +1418,7 @@ def gateway_status():
     mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
 
     # ─ Skills ──────────────────────────────────────────────────────────────
-    from markbot.core.skills.loader import SkillLoader
+    from markbot.skills.loader import SkillLoader
     skill_loader = SkillLoader(workspace)
     all_skills = skill_loader.load_all()
     skill_count = len(all_skills)
@@ -1548,7 +1548,7 @@ def channels_status():
     """Show channel status."""
     from rich.text import Text
 
-    from markbot.channels.registry import discover_all
+    from markbot.channels.discovery import discover_all
     from markbot.config.loader import load_config
 
     config = load_config()
@@ -1675,7 +1675,7 @@ def channels_login(
     """Authenticate with a channel via QR code or other interactive login."""
     from rich.text import Text
 
-    from markbot.channels.registry import discover_all
+    from markbot.channels.discovery import discover_all
     from markbot.config.loader import load_config
 
     config = load_config()
@@ -1749,7 +1749,7 @@ def plugins_list():
     """List all discovered channels (built-in and plugins)."""
     from rich.text import Text
 
-    from markbot.channels.registry import discover_all, discover_channel_names
+    from markbot.channels.discovery import discover_all, discover_channel_names
     from markbot.config.loader import load_config
 
     config = load_config()

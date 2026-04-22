@@ -194,6 +194,18 @@ class CostTracker:
         self.state.total_cost_usd += cost
         self.state.total_api_calls += 1
 
+        if (
+            self.warn_threshold_usd > 0
+            and not self._warn_emitted
+            and self.state.total_cost_usd >= self.warn_threshold_usd
+        ):
+            self._warn_emitted = True
+            logger.warning(
+                "[CostTracker] Cost warning: ${:.6f} (threshold=${:.2f})",
+                self.state.total_cost_usd,
+                self.warn_threshold_usd,
+            )
+
         if self.max_budget_usd is not None and self.state.total_cost_usd >= self.max_budget_usd:
             logger.warning(
                 "[CostTracker] Budget exceeded: ${:.6f} >= ${:.6f} (model={})",

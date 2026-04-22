@@ -17,57 +17,54 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.agent.context import ContextBuilder
-from markbot.agent.memory.manager import ReMeLightMemoryManager
-from markbot.agent.memory.hooks.bootstrap import BootstrapHook
-from markbot.agent.memory.hooks.compaction import MemoryCompactionHook
-from markbot.agent.subagent import SubagentManager
+from markbot.memory.manager import ReMeLightMemoryManager
+from markbot.memory.hooks.bootstrap import BootstrapHook
+from markbot.memory.hooks.compaction import MemoryCompactionHook
+from markbot.subagent import SubagentManager
 from markbot.agent.tokens import token_count_with_estimation
 from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
 from markbot.agent.cost_tracker import CostTracker, BudgetExceededError, PricingTable
-from markbot.agent.tools.cron import CronTool
-from markbot.agent.tools.filesystem import (
+from markbot.tools.cron import CronTool
+from markbot.tools.filesystem import (
     DeleteFileTool,
     EditFileTool,
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
 )
-from markbot.agent.tools.message import MessageTool
-from markbot.agent.tools.question import AskUserQuestionTool
-from markbot.agent.tools.registry import ToolRegistry
-from markbot.agent.tools.search import GlobTool, GrepTool
-from markbot.agent.tools.shell import ExecTool
-from markbot.agent.tools.spawn import SpawnTool
-from markbot.agent.tools.subagent_tools import CheckSubagentTool, ListSubagentsTool
-from markbot.agent.tools.web import WebFetchTool, WebSearchTool, WebExtractTool
-from markbot.agent.tools.think import ThinkTool
-from markbot.agent.tools.memory import MemorySearchTool
-from markbot.agent.tools.todo import TodoTool
-from markbot.agent.tools.explore import ExploreTool
-from markbot.agent.tools.context_explorer import (
+from markbot.tools.message import MessageTool
+from markbot.tools.question import AskUserQuestionTool
+from markbot.tools.registry import ToolRegistry
+from markbot.tools.search import GlobTool, GrepTool
+from markbot.tools.shell import ExecTool
+from markbot.subagent.spawn import SpawnTool
+from markbot.subagent.tools import CheckSubagentTool, ListSubagentsTool
+from markbot.tools.web import WebFetchTool, WebSearchTool, WebExtractTool
+from markbot.tools.think import ThinkTool
+from markbot.tools.memory import MemorySearchTool
+from markbot.tools.todo import TodoTool
+from markbot.tools.explore import ExploreTool
+from markbot.tools.context_explorer import (
     ExploreContextCatalogTool,
     SearchContextTool,
     LoadContextTool,
 )
-from markbot.agent.services.tool_executor import ToolExecutor
-from markbot.agent.services.message_pipeline import MessagePipeline, ProcessContext
-from markbot.agent.services.middleware import (
+from markbot.services.tool_executor import ToolExecutor
+from markbot.services.message_pipeline import MessagePipeline, ProcessContext
+from markbot.services.middleware import (
     QuestionResponseMiddleware,
     MemoryLifecycleMiddleware,
 )
-from markbot.agent.memory.daily_log import DailyLogManager
-from markbot.agent.services.interaction_log import InteractionLogger
+from markbot.memory.daily_log import DailyLogManager
+from markbot.services.interaction_log import InteractionLogger
 from markbot.bus.events import InboundMessage, OutboundMessage
-from markbot.command import CommandContext, CommandRouter, register_builtin_commands
+from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
 from markbot.bus.queue import MessageBus
-from markbot.session.manager import Session, SessionManager
-from markbot.core.skills import SkillRegistry
-from markbot.core.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.core.types import (
-    ToolContext,
-    PermissionMode,
-    ToolPermissionContext,
-)
+from markbot.state.session import Session, SessionManager
+from markbot.skills import SkillRegistry
+from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.types.permission import PermissionMode, ToolPermissionContext
+from markbot.types.tool import ToolContext
 from markbot.utils.helpers import strip_think
 
 if TYPE_CHECKING:
@@ -77,7 +74,7 @@ if TYPE_CHECKING:
         FilesystemToolConfig,
         WebSearchConfig,
     )
-    from markbot.cron.service import CronService
+    from markbot.scheduling.cron import CronService
 
 
 class AgentLoop:
@@ -402,7 +399,7 @@ class AgentLoop:
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
-        from markbot.agent.tools.mcp import connect_mcp_servers
+        from markbot.tools.mcp import connect_mcp_servers
 
         try:
             self._mcp_stack = AsyncExitStack()
@@ -466,10 +463,12 @@ class AgentLoop:
         ``resuming=False`` means this is the final response.
         """
         messages = initial_messages
+        _initial_count = len(initial_messages)
         iteration = 0
         final_content = None
         tools_used: list[str] = []
         _budget_exceeded = False
+        _new_msg_start = _initial_count
 
         logger.info(
             "[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages)
@@ -521,14 +520,15 @@ class AgentLoop:
                     else "",
                 )
                 current_tokens = compact_result.tokens_after
+                if len(messages) < _new_msg_start:
+                    _new_msg_start = self._recalc_new_msg_start_after_compact(
+                        messages, _initial_count, _new_msg_start,
+                    )
 
             # memory compaction: skip if MultiLevelCompactor already did
             # aggressive compaction (auto_compact / history_snip) to avoid
             # double-compressing and redundant LLM summary calls.
-            _skip_memory_compact = compact_result.action in (
-                CompactAction.AUTO_COMPACT,
-                CompactAction.HISTORY_SNIP,
-            )
+            _skip_memory_compact = compact_result.action != CompactAction.NONE
             if not _skip_memory_compact:
                 system_msg = next(
                     (m.get("content", "") for m in messages if m.get("role") == "system"), ""
@@ -570,6 +570,8 @@ class AgentLoop:
                 "[AgentLoop] Available tools: {}",
                 [t.get("function", {}).get("name") for t in tool_defs[:5]],
             )
+
+            messages = self._strip_orphan_tool_results(messages)
 
             if on_stream:
                 logger.info("[AgentLoop] Calling LLM with streaming...")
@@ -619,18 +621,6 @@ class AgentLoop:
                 call_cost = self.cost_tracker.update_from_response(response, model=self.model)
                 if call_cost > 0:
                     logger.debug("[AgentLoop] API cost this call: ${:.6f}", call_cost)
-                    ct = self.cost_tracker
-                    if (
-                        ct.warn_threshold_usd > 0
-                        and not ct._warn_emitted
-                        and ct.total_cost >= ct.warn_threshold_usd
-                    ):
-                        ct._warn_emitted = True
-                        logger.warning(
-                            "[AgentLoop] Cost warning: ${:.6f} (threshold=${:.2f})",
-                            ct.total_cost,
-                            ct.warn_threshold_usd,
-                        )
             except BudgetExceededError as exc:
                 logger.error("[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc)
                 _budget_exceeded = True
@@ -784,7 +774,82 @@ class AgentLoop:
             ", OVER BUDGET" if cost_summary["over_budget"] else "",
         )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, _new_msg_start
+
+    @staticmethod
+    def _recalc_new_msg_start_after_compact(
+        messages: list[dict],
+        _initial_count: int,
+        _new_msg_start: int,
+    ) -> int:
+        """Recalculate the new-message start index after compaction reshaped messages.
+
+        After history-snip / auto-compaction, ``messages`` is much shorter than
+        before and the original offset-based ``_new_msg_start`` is invalid.
+        We locate the *last user message* that existed *before* the loop started
+        (i.e. the current-turn user input) – everything after it was produced
+        by this loop iteration and must be persisted by ``save_turn``.
+        """
+        orig_new_count = _initial_count - _new_msg_start
+        if orig_new_count <= 0:
+            fallback = max(0, len(messages) - 1)
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    return i + 1
+            return fallback
+
+        target = min(orig_new_count, len(messages))
+        candidate = len(messages) - target
+        candidate = max(0, candidate)
+
+        for i in range(candidate, len(messages)):
+            if messages[i].get("role") == "user":
+                return i + 1
+
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                return i + 1
+
+        return max(0, len(messages) - 1)
+
+    @staticmethod
+    def _strip_orphan_tool_results(messages: list[dict]) -> list[dict]:
+        """Remove orphan tool_result messages before sending to LLM.
+
+        Some providers (e.g. MiniMax) reject requests where a ``tool``
+        message references a ``tool_call_id`` that has no matching
+        ``tool_calls`` entry in any preceding ``assistant`` message.
+        Orphans can appear when:
+          - Previous buggy save_turn persisted partial turns.
+          - Compaction (micro_compact / history_snip) dropped the assistant
+            message but kept its tool results.
+          - Session history was corrupted by earlier bugs.
+
+        This is a defensive cleanup called right before every LLM call.
+        """
+        declared: set[str] = set()
+        cleaned: list[dict] = []
+        dropped = 0
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        declared.add(str(tc["id"]))
+            elif role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid and str(tid) not in declared:
+                    dropped += 1
+                    continue
+            cleaned.append(msg)
+
+        if dropped:
+            logger.warning(
+                "[AgentLoop] Stripped {} orphan tool_result(s) before LLM call",
+                dropped,
+            )
+        return cleaned
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1016,13 +1081,13 @@ class AgentLoop:
                 session=session,
             )
             try:
-                final_content, _, all_msgs = await self._run_agent_loop(
+                final_content, _, all_msgs, _new_start = await self._run_agent_loop(
                     messages,
                     channel=channel,
                     chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
                 )
-                self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
+                self.tool_executor.save_turn(session, all_msgs, _new_start)
             except Exception:
                 raise
 
@@ -1076,10 +1141,13 @@ class AgentLoop:
         # Bootstrap hook: prepend guidance on first interaction
         bootstrap_guidance = self.bootstrap_hook.check_and_inject(initial_messages)
         if bootstrap_guidance:
-            for m in initial_messages:
-                if m.get("role") == "user":
-                    m["content"] = bootstrap_guidance + m.get("content", "")
-                    break
+            first_user = next((i for i, m in enumerate(initial_messages) if m.get("role") == "user"), None)
+            if first_user is not None:
+                original = initial_messages[first_user]
+                initial_messages[first_user] = {
+                    **original,
+                    "content": bootstrap_guidance + original.get("content", ""),
+                }
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -1096,7 +1164,7 @@ class AgentLoop:
 
         logger.info("[AgentLoop] Calling _run_agent_loop...")
         try:
-            final_content, tools_used, all_msgs = await self._run_agent_loop(
+            final_content, tools_used, all_msgs, _new_start = await self._run_agent_loop(
                 initial_messages,
                 on_progress=on_progress or _bus_progress,
                 on_stream=on_stream,
@@ -1115,8 +1183,8 @@ class AgentLoop:
                 final_content = "I've completed processing but have no response to give."
                 logger.warning("[AgentLoop] final_content was None, using default message")
 
-            logger.info("[AgentLoop] Saving session with {} messages", len(all_msgs))
-            self.tool_executor.save_turn(session, all_msgs, 1 + len(history))
+            logger.info("[AgentLoop] Saving session with {} messages (new_msg_start={})", len(all_msgs), _new_start)
+            self.tool_executor.save_turn(session, all_msgs, _new_start)
         except Exception as e:
             logger.error("[AgentLoop] _run_agent_loop failed with exception: {}", e)
             raise
