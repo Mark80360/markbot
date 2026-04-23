@@ -7,7 +7,7 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Multi-Model Support with Auto-Failover**: Configure multiple LLM providers in a priority chain. When the primary model fails or is overloaded, MarkBot automatically falls back to the next model.
 - **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
 - **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
-- **Tiered Memory System**: Multi-layered memory architecture (Hot/Warm/Cold) for context-aware responses
+- **ReMeLight Memory System**: Advanced memory management with compaction, summarization, and semantic search for context-aware responses
 - **Extensible Architecture**: Customize and extend capabilities through a powerful skills system
 
 ## Features
@@ -15,7 +15,7 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (30+ providers supported)
 - **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
 - **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, and more
-- **Tiered Memory Architecture**: Hot (working), Warm (session), Cold (persistent) memory layers
+- **ReMeLight Memory**: Advanced memory management with compaction, summarization, and semantic search
 - **Token Tracking**: Real-time token usage monitoring with cache token support
 - **Conversation Compression**: Automatic summarization of old conversation turns to optimize context
 - **Cost Tracking**: Monitor API usage costs with configurable budgets
@@ -23,7 +23,6 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
 - **MCP Support**: Model Context Protocol for seamless tool integration
 - **Sub-Agent Architecture**: Delegate specialized tasks to focused sub-agents with real-time progress tracking
-- **Subagent Progress Tracking**: Monitor subagent execution with activity logs, token counts, and output files
 - **Web Integration**: Built-in web browsing, content extraction, and API interaction
 - **Command Router**: Built-in commands like `/new`, `/help`, `/stop`
 - **Skill Execution**: Run skill scripts in sandboxed environments
@@ -35,63 +34,86 @@ An advanced AI-powered automation and development assistant designed for develop
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Channels                               │
-│  (DingTalk, Feishu, QQ, WeChat, Email, etc.)              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Channels (Inbound)                          │
+│           (DingTalk, Feishu, QQ, WeChat, Email, etc.)               │
+│                  ↓ publish_inbound(msg)                             │
+└─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Message Bus                            │
-│         (Event Queue, State Management)                    │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Message Bus                                  │
+│  ┌──────────────────────┐      ┌──────────────────────────┐         │
+│  │   Inbound Queue      │      │    Outbound Queue        │         │
+│  │  (Channel→Agent)     │      │   (Agent→ChannelManager) │         │
+│  └──────────────────────┘      └──────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────────┘
+          │ consume_inbound()                        ▲
+          ▼                                          │ publish_outbound()
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Agent Loop                                    │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  Context Builder → Memory Manager → Compactor → LLM         │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐       │
+│  │    Tools        │  │  Tool Executor  │  │   Subagent     │       │
+│  │ (Filesystem,    │  │                 │  │   Manager      │       │
+│  │  Shell, Web,    │  │                 │  │                │       │
+│  │  Spawn, etc.)   │  │                 │  │                │       │
+│  └─────────────────┘  └─────────────────┘  └────────────────┘       │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │           ReMeLight Memory System                           │    │
+│  │  ┌──────────────┐  ┌────────────┐  ┌────────────────┐       │    │
+│  │  │  Compressed  │  │  Summary   │  │    Search      │       │    │
+│  │  │   Summary    │  │   Task     │  │      API       │       │    │
+│  │  └──────────────┘  └────────────┘  └────────────────┘       │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │        Token & Cost Management                              │    │
+│  │  ┌─────────────────┐  ┌────────────────────────────────┐    │    │
+│  │  │  Token Tracker  │  │      Compactor                 │    │    │
+│  │  │  (Usage Monitor)│  │   (Context Compression)        │    │    │
+│  │  │  + Cost Tracker │  │                                │    │    │
+│  │  └─────────────────┘  └────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Agent Loop                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   Context   │  │   Memory    │  │      Tools         │ │
-│  │   Builder   │  │   Manager   │  │   (Filesystem,     │ │
-│  │             │  │             │  │    Shell, Web,     │ │
-│  │             │  │             │  │    Spawn, etc.)    │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Tiered Memory System                    │   │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────────────┐    │   │
-│  │  │   Hot   │→│  Warm   │→│      Cold       │    │   │
-│  │  │(Working) │  │(Session)│  │   (Persistent)  │    │   │
-│  │  └─────────┘  └─────────┘  └─────────────────┘    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │           Token & Cost Management                    │   │
-│  │  ┌─────────────────┐  ┌─────────────────────┐    │   │
-│  │  │  Token Tracker  │  │    Compactor       │    │   │
-│  │  │  (Usage Monitor) │  │ (Context Compress) │    │   │
-│  │  │  + Cost Tracker │  │                    │    │   │
-│  │  └─────────────────┘  └─────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              Subagent System                         │   │
-│  │  ┌─────────────┐  ┌─────────────────────┐       │   │
-│  │  │   Spawn    │  │  Progress Tracker   │       │   │
-│  │  └─────────────┘  └─────────────────────┘       │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Fallback Manager                                 │
+│          (Multi-Model Chain with Auto-Failover)                     │
+└─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Fallback Manager                          │
-│         (Multi-Model Chain with Auto-Failover)           │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Providers                              │
-│        (Anthropic, OpenAI, Azure, DeepSeek, etc.)        │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Providers                                      │
+│            (Anthropic, OpenAI, Azure, DeepSeek, etc.)               │
+└─────────────────────────────────────────────────────────────────────┘
+          │
+          │ consume_outbound()
+          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Channel Manager                                 │
+│              (Route to appropriate channel)                         │
+└─────────────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Channels (Outbound)                          │
+│           (DingTalk, Feishu, QQ, WeChat, Email, etc.)               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Supporting Services (Background)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────┐       │
+│  │ CronService │  │ Heartbeat    │  │    SessionManager     │       │
+│  │ (Scheduled  │  │  Service     │  │    (Session State)    │       │
+│  │    Tasks)   │  │ (Monitoring) │  │                       │       │
+│  └─────────────┘  └──────────────┘  └───────────────────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -625,8 +647,8 @@ pyright
 
 ### Adding a New Tool
 
-1. Create a new file in `markbot/agent/tools/`
-2. Subclass `BaseTool` from `markbot/agent/tools/base.py`
+1. Create a new file in `markbot/tools/`
+2. Subclass `BaseTool` from `markbot/tools/base.py`
 3. Register in the tool registry
 
 ## Contributing
@@ -643,4 +665,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 AGPL-3.0 License
 
-Copyright (c) 2024 MarkBot contributors
+Copyright (c) 2026 MarkBot contributors
