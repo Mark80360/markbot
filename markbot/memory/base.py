@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
@@ -21,6 +22,10 @@ class BaseMemoryManager(ABC):
     Concrete implementations are responsible for managing conversation memory,
     including compaction, summarization, semantic search, and lifecycle management.
 
+    Summary tasks are processed via a **serial FIFO queue** backed by a
+    single background worker.  This eliminates race conditions between
+    concurrent summary tasks without needing version-number guards.
+
     Attributes:
         working_dir: Working directory path for memory storage.
         agent_id: Unique agent identifier.
@@ -37,8 +42,11 @@ class BaseMemoryManager(ABC):
         self.agent_id: str = agent_id
         self.chat_model: Optional[Any] = None
         self.formatter: Optional[Any] = None
-        self.summary_tasks: list[asyncio.Task] = []
-        self._summary_version: int = 0
+
+        self._task_counter: int = 0
+        self._summary_task_info: dict[str, dict[str, Any]] = {}
+        self._task_queue: asyncio.Queue[tuple[str, list, dict]] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
 
     @abstractmethod
     async def start(self) -> None:
@@ -95,80 +103,173 @@ class BaseMemoryManager(ABC):
         """Retrieve the in-memory memory object."""
         return None
 
-    def add_async_summary_task(self, messages: list, **kwargs):
-        """Add an asynchronous summary task for the given messages."""
-        remaining_tasks = []
-        for task in self.summary_tasks:
-            if task.done():
-                if task.cancelled():
-                    logger.warning("Summary task was cancelled.")
-                    continue
-                exc = task.exception()
-                if exc is not None:
-                    logger.error(f"Summary task failed: {exc}")
-                else:
-                    logger.info(f"Summary task completed: {task.result()}")
-            else:
-                remaining_tasks.append(task)
-        self.summary_tasks = remaining_tasks
+    def get_compressed_summary(self) -> str:
+        """Return the current compressed summary string."""
+        return getattr(self, "_compressed_summary", "")
 
-        version = self._summary_version
-        task = asyncio.create_task(
-            self.summary_memory(messages=messages, **kwargs),
-        )
-        task._markbot_summary_version = version
-        task.add_done_callback(self._on_summary_task_done)
-        self.summary_tasks.append(task)
+    def set_compressed_summary(self, summary: str) -> None:
+        """Update the compressed summary string.
 
-    def _on_summary_task_done(self, task: asyncio.Task) -> None:
-        """Callback when a summary task completes — update compressed_summary."""
-        try:
-            result = task.result()
-            if result and hasattr(self, "set_compressed_summary"):
-                task_version = getattr(task, "_markbot_summary_version", -1)
-                if task_version < self._summary_version:
+        Implementations may override to add persistence or truncation.
+        """
+        self._compressed_summary = summary
+
+    async def retrieve(
+        self,
+        messages: list[dict],
+        **kwargs,
+    ) -> str | None:
+        """Retrieve relevant memory based on the given messages.
+
+        Implementations should search for relevant memories and return
+        a formatted string for injection into the system prompt.
+
+        Returns:
+            Formatted memory context string, or None if no relevant
+            memory found.
+        """
+        return None
+
+    async def dream(self, **kwargs) -> None:
+        """Optimize memory files via a background agent pass.
+
+        Runs a lightweight agent with file-editing tools to consolidate
+        redundant or outdated memory entries in MEMORY.md.
+        Default implementation does nothing.
+        """
+        return None
+
+    async def _summarize_worker(self) -> None:
+        """Background worker that processes summary tasks serially (FIFO)."""
+        while True:
+            task_id, messages, kwargs = await self._task_queue.get()
+            info = self._summary_task_info.get(task_id)
+            if info is None:
+                continue
+
+            info["status"] = "running"
+            logger.info(f"[SummaryWorker] Task {task_id} started")
+            try:
+                result = await self.summary_memory(messages=messages, **kwargs)
+                info["status"] = "completed"
+                info["result"] = result
+                logger.info(f"[SummaryWorker] Task {task_id} completed")
+
+                if result:
+                    existing = self.get_compressed_summary()
+                    max_chars = getattr(self, "_MAX_COMPRESSED_SUMMARY_CHARS", 200000)
+                    if existing and len(existing) > max_chars * 0.6:
+                        updated = result
+                        logger.info(
+                            "[SummaryWorker] compressed_summary exceeded 60% threshold, "
+                            "replacing with latest summary to prevent unbounded growth"
+                        )
+                    else:
+                        updated = f"{existing}\n\n{result}" if existing else result
+                    self.set_compressed_summary(updated)
                     logger.info(
-                        "[MemoryManager] Skipping stale summary task result "
-                        f"(task_version={task_version}, current={self._summary_version})"
+                        "[SummaryWorker] Task result appended to compressed_summary"
                     )
-                    return
-                existing = getattr(self, "_compressed_summary", "")
-                updated = f"{existing}\n\n{result}" if existing else result
-                self.set_compressed_summary(updated)
-                logger.info("[MemoryManager] Summary task result appended to compressed_summary")
-        except asyncio.CancelledError:
-            logger.warning("[MemoryManager] Summary task was cancelled.")
-        except Exception as e:
-            logger.error(f"[MemoryManager] Summary task failed: {e}")
+            except asyncio.CancelledError:
+                info["status"] = "cancelled"
+                logger.info(f"[SummaryWorker] Task {task_id} cancelled")
+                raise
+            except BaseException as e:
+                info["status"] = "failed"
+                info["error"] = str(e)
+                logger.error(f"[SummaryWorker] Task {task_id} failed: {e}")
+
+    def add_async_summary_task(self, messages: list, **kwargs):
+        """Schedule a background summarization task without blocking.
+
+        Tasks are executed serially in FIFO order.  If no worker is
+        running, one is started immediately; otherwise the task queues.
+        """
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._summarize_worker())
+
+        self._task_counter += 1
+        task_id = f"summary_{self._task_counter}"
+
+        self._summary_task_info[task_id] = {
+            "task_id": task_id,
+            "start_time": datetime.now(),
+            "status": "pending",
+            "result": None,
+            "error": None,
+        }
+
+        self._task_queue.put_nowait((task_id, messages, kwargs))
+        logger.info(f"[SummaryWorker] Task {task_id} enqueued")
+
+    def _update_task_statuses(self) -> None:
+        """Update status for pending/running tasks if worker was cancelled."""
+        if self._worker_task is None or not self._worker_task.done():
+            return
+
+        for task_id, info in self._summary_task_info.items():
+            if info["status"] == "running":
+                if self._worker_task.cancelled():
+                    info["status"] = "cancelled"
+                    logger.info(f"[SummaryWorker] Task {task_id} cancelled (worker stopped)")
+                else:
+                    exc = self._worker_task.exception()
+                    if exc is not None:
+                        info["status"] = "failed"
+                        info["error"] = str(exc)
+                        logger.error(f"[SummaryWorker] Task {task_id} failed: {exc}")
+
+    def list_summarize_status(self) -> list[dict]:
+        """Return status of all summary tasks as list of dicts.
+
+        Each dict contains:
+            - task_id: Unique identifier
+            - start_time: When the task was enqueued
+            - status: "pending", "running", "completed", "failed", or "cancelled"
+            - result: Summary result (if completed)
+            - error: Error message (if failed)
+        """
+        self._update_task_statuses()
+        result = []
+        for _task_id, info in self._summary_task_info.items():
+            result.append(
+                {
+                    "task_id": info["task_id"],
+                    "start_time": info["start_time"].isoformat(),
+                    "status": info["status"],
+                    "result": info["result"],
+                    "error": info["error"],
+                }
+            )
+        return result
 
     async def await_summary_tasks(self) -> str:
-        """Wait for all background summary tasks to complete."""
-        result = ""
-        for task in self.summary_tasks:
-            if task.done():
-                if task.cancelled():
-                    result += "Summary task was cancelled.\n"
+        """Wait for all queued summary tasks to complete."""
+        lines: list[str] = []
+        self._update_task_statuses()
+
+        for task_id, info in self._summary_task_info.items():
+            status = info["status"]
+            if status in ("completed", "failed", "cancelled"):
+                if status == "completed":
+                    lines.append(f"Summary task {task_id} completed")
+                elif status == "failed":
+                    lines.append(f"Summary task {task_id} failed: {info['error']}")
                 else:
-                    exc = task.exception()
-                    if exc is not None:
-                        logger.error(f"Summary task failed: {exc}")
-                        result += f"Summary task failed: {exc}\n"
-                    else:
-                        task_result = task.result()
-                        logger.info(f"Summary task completed: {task_result}")
-                        result += f"Summary task completed: {task_result}\n"
+                    lines.append(f"Summary task {task_id} cancelled")
             else:
-                try:
-                    task_result = await task
-                    logger.info(f"Summary task completed: {task_result}")
-                    result += f"Summary task completed: {task_result}\n"
-                except asyncio.CancelledError:
-                    result += "Summary task was cancelled.\n"
-                except Exception as e:
-                    logger.exception(f"Summary task failed: {e}")
-                    result += f"Summary task failed: {e}\n"
-        self.summary_tasks.clear()
-        return result
+                lines.append(f"Summary task {task_id} still {status}")
+
+        if self._worker_task and not self._worker_task.done():
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[SummaryWorker] Worker failed: {e}")
+
+        self._summary_task_info.clear()
+        return "\n".join(lines)
 
     @abstractmethod
     async def restart_embedding_model(self) -> None:

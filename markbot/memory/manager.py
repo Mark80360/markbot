@@ -13,11 +13,11 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import json
-import logging
 import os
 import platform
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -48,14 +48,11 @@ class _MessageWrapper:
         self.timestamp = timestamp
         self.metadata = metadata or {}
 
-    # Default username for user messages to ensure consistency across all user messages
     _DEFAULT_USER_NAME: str = "user"
 
     @classmethod
     def from_dict(cls, msg: dict) -> "_MessageWrapper":
         role = msg.get("role", "")
-        # MiniMax API requires consistent username for all user messages
-        # Always use the same default name for user messages to avoid "user name must be consistent" error
         if role == "user":
             name = cls._DEFAULT_USER_NAME
         else:
@@ -223,7 +220,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         # Set environment variables for token counter before initializing ReMeLight
         os.environ.setdefault("AS_TOKEN_COUNTER_BACKEND", "huggingface")
         os.environ.setdefault("AS_TOKEN_COUNTER_MODEL_NAME", "gpt2")
-        
+
         self._reme = ReMeLight(
             working_dir=self.working_dir,
             llm_api_key=llm_api_key or None,
@@ -247,7 +244,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         """Register file tools for use during summarization."""
         try:
             from agentscope.tool import Toolkit
-            from markbot.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool
+
+            from markbot.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 
             self._summary_toolkit = Toolkit()
             workspace = Path(self.working_dir)
@@ -331,7 +329,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             return None
 
     async def close(self) -> bool:
-        self._warn_if_version_mismatch()
         logger.info(f"MemoryManager closing: working_dir={self.working_dir}")
         if self._reme is None:
             return True
@@ -341,7 +338,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         return result
 
     async def compact_tool_result(self, **kwargs):
-        self._warn_if_version_mismatch()
         if self._reme is None:
             return None
         messages = kwargs.get("messages", [])
@@ -355,7 +351,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         return await self._reme.compact_tool_result(**kwargs)
 
     async def check_context(self, **kwargs):
-        self._warn_if_version_mismatch()
         if self._reme is None:
             return None
         messages = kwargs.get("messages", [])
@@ -408,7 +403,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         extra_instruction: str = "",
         **kwargs,
     ) -> str:
-        self._warn_if_version_mismatch()
         if self._reme is None:
             return ""
 
@@ -448,13 +442,12 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                     f"history_compact: {result.get('history_compact', '')[:200]}..."
                 )
             except Exception:
-                logger.error(f"Failed to save invalid compact result")
+                logger.error("Failed to save invalid compact result")
             return ""
 
         return result.get("history_compact", "")
 
     async def summary_memory(self, messages: list, **kwargs) -> str:
-        self._warn_if_version_mismatch()
         if self._reme is None:
             logger.warning("Memory manager not initialized (_reme is None), skipping summary")
             return ""
@@ -515,9 +508,77 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 logger.error(f"Memory search failed: {e}")
 
         if not results:
-            results = self._search_daily_logs(query, max_results=max_results)
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                None, self._search_daily_logs, query, max_results
+            )
 
         return results
+
+    async def retrieve(
+        self,
+        messages: list[dict],
+        **kwargs,
+    ) -> str | None:
+        """Retrieve relevant memory and return formatted context text.
+
+        Builds a query from the latest messages, searches memory, and
+        returns a formatted string that can be injected into the system
+        prompt by the caller.
+        """
+        if not messages:
+            return None
+
+        query_parts: list[str] = []
+        total = 0
+        for msg in reversed(messages):
+            remaining = 100 - total
+            if remaining <= 0:
+                break
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text = ""
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+                content = text
+            content = (content or "").strip()
+            if not content:
+                continue
+            chunk = content[:remaining]
+            query_parts.insert(0, chunk)
+            total += len(chunk)
+
+        query = " ".join(query_parts).strip()
+        if not query:
+            return None
+
+        try:
+            results = await self.memory_search(
+                query=query,
+                max_results=3,
+                min_score=0.15,
+            )
+        except Exception as e:
+            logger.warning(f"[MemoryManager] retrieve() search failed: {e}")
+            return None
+
+        if not results:
+            return None
+
+        text_parts: list[str] = []
+        for idx, r in enumerate(results, 1):
+            content = r.get("content", "")
+            source = r.get("source", "memory")
+            if len(content) > 1500:
+                content = content[:1500] + "\n... [truncated]"
+            text_parts.append(f"### {idx}. [{source}]\n{content}")
+
+        text_content = "\n\n".join(text_parts)
+        if not text_content.strip():
+            return None
+
+        return text_content
 
     @staticmethod
     def _tokenize_for_search(text: str) -> list[str]:
@@ -597,7 +658,6 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
     def set_compressed_summary(self, summary: str) -> None:
         self._compressed_summary = self._truncate_summary(summary)
-        self._summary_version += 1
         self._save_compressed_summary(self._compressed_summary)
 
     _MAX_COMPRESSED_SUMMARY_CHARS = 200000
@@ -712,8 +772,133 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         return entries
 
+    _DREAM_PROMPT_ZH = """\
+现在进入梦境状态，对长期记忆进行优化整理。请读取今日日志与现有长期记忆，在梦境中提炼高价值增量信息并去重合并，最终覆写至 `MEMORY.md`，确保长期记忆文件保持最新、精简、无冗余。
+
+当前日期: {current_date}
+
+【梦境优化原则】
+1. 极简去冗：严禁记录流水账、Bug修复细节或单次任务。仅保留"核心业务决策"、"确认的用户偏好"与"高价值可复用经验"。
+2. 状态覆写：若发现状态变更（如技术栈更改、配置更新），必须用新状态替换旧状态，严禁新旧矛盾信息并存。
+3. 归纳整合：主动将零碎的相似规则提炼、合并为通用性强的独立条目。
+4. 废弃剔除：主动删除已被证伪的假设或不再适用的陈旧条目。
+
+【梦境执行步骤】
+步骤 1 [加载]：调用 `read` 工具，读取根目录下的 `MEMORY.md` 以及当天的日志文件 `memory/daily/YYYY-MM-DD.md`。
+步骤 2 [梦境提纯]：在梦境中对比新旧内容，严格按照【梦境优化原则】进行去重、替换、剔除和合并，生成一份全新的记忆内容。
+步骤 3 [落盘]：调用 `write` 或 `edit` 工具，将整理后全新的 Markdown 内容覆盖写入到 `MEMORY.md` 中（请保持清晰的层级与列表结构）。
+步骤 4 [苏醒汇报]：从梦境中苏醒后，在对话中向我简短汇报：1) 新增/沉淀了哪些核心记忆；2) 修正/删除了哪些过期内容。"""
+
+    _DREAM_PROMPT_EN = """\
+Enter dream state for memory optimization. Read today's logs and existing long-term memory, extract high-value incremental information, deduplicate and merge, and ultimately overwrite `MEMORY.md`. Ensure the long-term memory file remains up-to-date, concise, and non-redundant.
+
+Current date: {current_date}
+
+[Dream Optimization Principles]
+1. Extreme Minimalism: Strictly forbid recording daily routines, specific bug-fix details, or one-off tasks. Retain ONLY 'core business decisions', 'confirmed user preferences', and 'high-value reusable experiences'.
+2. State Overwrite: If a state change is detected (e.g., tech stack changes, config updates), you MUST replace the old state with the new one. Contradictory old and new information must not coexist.
+3. Inductive Consolidation: Proactively distill and merge fragmented, similar rules into highly universal, independent entries.
+4. Deprecation: Proactively delete hypotheses that have been proven false or outdated entries that no longer apply.
+
+[Dream Execution Steps]
+Step 1 [Load]: Invoke the `read` tool to read `MEMORY.md` in the root directory and today's log file `memory/daily/YYYY-MM-DD.md`.
+Step 2 [Dream Purification]: Compare the old and new content. Strictly follow the [Dream Optimization Principles] to deduplicate, replace, remove, and merge, generating entirely new memory content.
+Step 3 [Save]: Invoke the `write` or `edit` tool to overwrite the newly organized Markdown content into `MEMORY.md` (maintain clear hierarchy and list structures).
+Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What core memories were newly added/consolidated; 2) What outdated content was corrected/deleted."""
+
+    async def dream(self, **kwargs) -> None:
+        """Run one dream-based memory optimization pass.
+
+        Creates a ReActAgent with file-editing tools to consolidate
+        redundant or outdated entries in MEMORY.md.
+        """
+        logger.info("[Dream] Starting dream-based memory optimization")
+
+        if self._summary_toolkit is None:
+            logger.warning("[Dream] Summary toolkit not available, skipping dream")
+            return
+
+        try:
+            from agentscope.agent import ReActAgent
+            from agentscope.message import Msg
+        except ImportError:
+            logger.warning("[Dream] agentscope not available, skipping dream")
+            return
+
+        chat_model = None
+        formatter = None
+        if self._llm_config and self.fallback_manager:
+            try:
+                provider_cfg = self._llm_config
+                api_key = provider_cfg.get("api_key", "")
+                base_url = provider_cfg.get("base_url", "")
+                model_name = provider_cfg.get("model_name", "")
+
+                if api_key and base_url and model_name:
+                    from agentscope.model import OpenAIChatWrapper
+
+                    chat_model = OpenAIChatWrapper(
+                        model_name=model_name,
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
+                    from agentscope.formatter import OpenAIFormatter
+
+                    formatter = OpenAIFormatter()
+            except Exception as e:
+                logger.warning(f"[Dream] Failed to create model: {e}")
+                return
+
+        if chat_model is None:
+            logger.warning("[Dream] No model available, skipping dream")
+            return
+
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        template = self._DREAM_PROMPT_ZH if self._language == "zh" else self._DREAM_PROMPT_EN
+        query_text = template.format(current_date=current_date)
+
+        if not query_text.strip():
+            logger.debug("[Dream] Empty query, skipping")
+            return
+
+        memory_file = Path(self.working_dir) / "memory" / "MEMORY.md"
+        if memory_file.exists():
+            backup_dir = Path(self.working_dir) / "memory" / "backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = backup_dir / f"memory_backup_{timestamp}.md"
+            try:
+                import shutil
+
+                shutil.copyfile(memory_file, backup_file)
+                logger.info(f"[Dream] Created MEMORY.md backup: {backup_file}")
+            except Exception as e:
+                logger.error(f"[Dream] Failed to create MEMORY.md backup: {e}")
+        else:
+            logger.debug("[Dream] No existing MEMORY.md file to backup")
+
+        dream_agent = ReActAgent(
+            name="DreamOptimizer",
+            model=chat_model,
+            sys_prompt="You are a Dream Memory Organizer specialized in optimizing long-term memory files.",
+            toolkit=self._summary_toolkit,
+            formatter=formatter,
+        )
+        dream_agent.set_console_output_enabled(False)
+
+        user_msg = Msg(
+            name="dream",
+            role="user",
+            content=query_text,
+        )
+
+        try:
+            response = await dream_agent.reply(user_msg)
+            logger.info(f"[Dream] Optimization completed: {response.get_text_content()[:200]}...")
+        except Exception as e:
+            logger.error(f"[Dream] Memory optimization failed: {e}")
+
     async def restart_embedding_model(self):
-        self._warn_if_version_mismatch()
         if self._reme is None:
             return
         await self._reme.restart(

@@ -12,11 +12,13 @@ An advanced AI-powered automation and development assistant designed for develop
 
 ## Features
 
-- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (20+ providers supported)
+- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (30+ providers supported)
+- **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
 - **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, and more
 - **Tiered Memory Architecture**: Hot (working), Warm (session), Cold (persistent) memory layers
 - **Token Tracking**: Real-time token usage monitoring with cache token support
 - **Conversation Compression**: Automatic summarization of old conversation turns to optimize context
+- **Cost Tracking**: Monitor API usage costs with configurable budgets
 - **Skills System**: Modular skill framework for adding specialized capabilities
 - **Cron Jobs**: Schedule and automate recurring tasks with precision
 - **MCP Support**: Model Context Protocol for seamless tool integration
@@ -25,6 +27,10 @@ An advanced AI-powered automation and development assistant designed for develop
 - **Web Integration**: Built-in web browsing, content extraction, and API interaction
 - **Command Router**: Built-in commands like `/new`, `/help`, `/stop`
 - **Skill Execution**: Run skill scripts in sandboxed environments
+- **Event Bus**: Event-driven architecture for message passing and component communication
+- **Context Explorer**: Explore project context with semantic search and catalog
+- **Todo Management**: Built-in todo tracking tool for task management
+- **Codebase Exploration**: Understand project structure and code context with deep exploration tools
 
 ## Architecture
 
@@ -32,6 +38,12 @@ An advanced AI-powered automation and development assistant designed for develop
 ┌─────────────────────────────────────────────────────────────┐
 │                      Channels                               │
 │  (DingTalk, Feishu, QQ, WeChat, Email, etc.)              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Message Bus                            │
+│         (Event Queue, State Management)                    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -53,18 +65,32 @@ An advanced AI-powered automation and development assistant designed for develop
 │  └─────────────────────────────────────────────────────┘   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │|          Token Management (v2.1.5)                    |│   │
+│  │           Token & Cost Management                    │   │
 │  │  ┌─────────────────┐  ┌─────────────────────┐    │   │
 │  │  │  Token Tracker  │  │    Compactor       │    │   │
 │  │  │  (Usage Monitor) │  │ (Context Compress) │    │   │
+│  │  │  + Cost Tracker │  │                    │    │   │
 │  │  └─────────────────┘  └─────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              Subagent System                         │   │
+│  │  ┌─────────────┐  ┌─────────────────────┐       │   │
+│  │  │   Spawn    │  │  Progress Tracker   │       │   │
+│  │  └─────────────┘  └─────────────────────┘       │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      Providers                               │
-│        (Anthropic, OpenAI, Azure, DeepSeek, etc.)          │
+│                   Fallback Manager                          │
+│         (Multi-Model Chain with Auto-Failover)           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Providers                              │
+│        (Anthropic, OpenAI, Azure, DeepSeek, etc.)        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -91,9 +117,9 @@ pip install -e ".[dev]"
 
 ## Supported LLM Providers
 
-MarkBot supports 20+ LLM providers out of the box:
+MarkBot supports 30+ LLM providers out of the box:
 
-### Cloud Providers
+### Direct Providers
 | Provider | Models | Authentication |
 |----------|--------|----------------|
 | **Anthropic** | Claude 3.5/3.7 Sonnet, Claude 3 Opus/Haiku | API Key |
@@ -115,7 +141,9 @@ MarkBot supports 20+ LLM providers out of the box:
 | **AiHubMix** | OpenAI-compatible gateway |
 | **SiliconFlow (硅基流动)** | Chinese model gateway |
 | **VolcEngine (火山引擎)** | ByteDance cloud models |
+| **VolcEngine Coding Plan** | ByteDance coding-specific models |
 | **BytePlus** | VolcEngine international |
+| **BytePlus Coding Plan** | BytePlus coding-specific models |
 
 ### OAuth-Based Providers
 | Provider | Description |
@@ -129,12 +157,12 @@ MarkBot supports 20+ LLM providers out of the box:
 | **vLLM** | High-throughput local inference |
 | **Ollama** | Local model runner |
 | **OpenVINO Model Server** | Intel-optimized inference |
+| **Custom** | Any OpenAI-compatible endpoint |
 
 ### Auxiliary
 | Provider | Description |
 |----------|-------------|
 | **Groq** | Fast inference + Whisper transcription |
-| **Custom** | Any OpenAI-compatible endpoint |
 
 ## Supported Channels
 
@@ -444,41 +472,42 @@ markbot/
 │   ├── compact.py           # Conversation compression
 │   ├── tokens.py            # Token usage tracking
 │   ├── cost_tracker.py      # Cost tracking for API usage
-│   ├── subagent.py          # Subagent manager
-│   ├── subagent_progress.py # Progress tracking system
 │   ├── memory/              # ReMeLight memory system
 │   │   ├── manager.py       # Memory manager (compaction, search, summary)
-│   │   ├── compaction.py    # Context compaction hook
-│   │   └── bootstrap.py     # First-run bootstrap hook
-│   ├── skill_execution/     # Skill script runner
-│   │   ├── sandbox.py       # Sandboxed execution
-│   │   ├── scanner.py       # Skill scanner
-│   │   └── skill_script.py  # Skill script handling
+│   │   ├── base.py          # Base memory class
+│   │   ├── daily_log.py     # Daily conversation logs
+│   │   ├── hooks/           # Memory operation hooks
+│   │   │   ├── bootstrap.py     # First-run bootstrap hook
+│   │   │   └── compaction.py    # Context compaction hook
+│   ├── subagent/            # Subagent system
+│   │   ├── manager.py       # Subagent manager
+│   │   ├── spawn.py         # Spawn subagent tool
+│   │   ├── progress.py      # Progress tracking
+│   │   └── tools.py         # Subagent tools
 │   ├── services/            # Agent services
 │   │   ├── message_pipeline.py  # Message processing pipeline
 │   │   ├── middleware.py    # Request middleware
 │   │   ├── tool_executor.py # Tool execution service
-│   │   └── turn_lifecycle.py    # Turn lifecycle management
+│   │   └── interaction_log.py   # Interaction logging
 │   └── tools/               # Built-in tools
-│       ├── filesystem.py    # File operations
+│       ├── filesystem.py    # File operations (Read, Write, Edit, List, Delete)
 │       ├── shell.py         # Command execution
 │       ├── spawn.py         # Subagent spawning
-│       ├── subagent_progress.py  # Progress checking tools
-│       ├── web.py           # Web browsing and extraction
-│       ├── search.py        # Web search (DuckDuckGo)
-│       ├── memory.py        # Memory management tools
+│       ├── web.py           # Web browsing, search, extraction
+│       ├── search.py        # Glob and Grep search
+│       ├── memory.py        # Memory search
 │       ├── cron.py          # Cron job management
 │       ├── mcp.py           # MCP (Model Context Protocol) tools
 │       ├── think.py         # Thinking/chain-of-thought tool
 │       ├── explore.py       # Codebase exploration
 │       ├── question.py      # Interactive question tool
-│       └── message.py       # Message handling tools
+│       ├── context_explorer.py  # Context catalog exploration
+│       ├── message.py       # Message handling tools
+│       ├── todo.py          # Todo management
+│       └── registry.py     # Tool registry
 ├── bus/                     # Event bus system
 │   ├── events.py            # Event definitions
-│   └── queue.py             # Event queue
-├── core/
-│   ├── types.py             # Core type definitions
-│   └── skills/              # Skill system (registry, loader, tool)
+│   └── queue.py             # Message queue
 ├── channels/                # Channel integrations
 │   ├── feishu.py           # Feishu/Lark
 │   ├── dingtalk.py         # DingTalk
@@ -487,56 +516,74 @@ markbot/
 │   ├── email.py            # Email
 │   ├── base.py             # Channel base class
 │   ├── manager.py          # Channel manager
+│   ├── discovery.py        # Channel discovery
 │   └── registry.py         # Channel registry
-├── providers/               # LLM providers (20+ supported)
-│   ├── anthropic_provider.py      # Anthropic (Claude)
-│   ├── openai_compat_provider.py  # OpenAI-compatible providers
-│   ├── azure_openai_provider.py   # Azure OpenAI
-│   ├── openai_codex_provider.py   # OpenAI Codex
-│   ├── transcription.py           # Voice transcription
-│   ├── registry.py                # Provider registry
-│   └── base.py                    # Provider base class
-├── security/                # Security utilities
-│   └── network.py           # Network security
-├── state/                   # Application state
-│   ├── app_state.py         # App state management
-│   └── store.py             # State store
-├── session/                 # Session management
-│   └── manager.py           # Session manager
-├── cron/                    # Cron job system
-│   ├── service.py           # Cron service
-│   └── types.py             # Cron type definitions
-├── heartbeat/               # Heartbeat service
-│   └── service.py           # Health monitoring
-├── command/                 # Built-in commands
-│   ├── builtin.py           # Built-in command implementations
-│   └── router.py            # Command router
+├── providers/               # LLM providers (30+ supported)
+│   ├── anthropic.py        # Anthropic (Claude)
+│   ├── openai_compat.py    # OpenAI-compatible providers
+│   ├── azure_openai.py     # Azure OpenAI
+│   ├── openai_codex.py    # OpenAI Codex
+│   ├── fallback.py         # Multi-model fallback chain
+│   ├── transcription.py    # Voice transcription
+│   ├── registry.py         # Provider registry
+│   └── base.py             # Provider base class
+├── config/                  # Configuration
+│   ├── schema.py           # Config schema
+│   ├── loader.py           # Config loader
+│   └── paths.py            # Path utilities
+├── memory/                  # Memory system (legacy alias)
+├── scheduling/              # Scheduling system
+│   ├── cron.py             # Cron job scheduler
+│   ├── evaluator.py        # Cron expression evaluator
+│   └── heartbeat.py        # Heartbeat service
 ├── skills/                  # Built-in skills
-│   ├── skill-creator/       # Skill creation with evaluation
-│   ├── summarize/           # Content summarization
-│   ├── memory/              # Memory management
-│   ├── cron/                # Cron scheduling
-│   ├── github/              # GitHub integration
-│   ├── tmux/                # Tmux control
-│   ├── weather/             # Weather info
-│   ├── clawhub/             # ClawHub registry
-│   └── surprise-me/         # Dynamic skill combination
+│   ├── skill-creator/      # Skill creation with evaluation
+│   ├── summarize/          # Content summarization
+│   ├── memory/             # Memory management
+│   ├── cron/               # Cron scheduling
+│   ├── github/             # GitHub integration
+│   ├── tmux/               # Tmux control
+│   ├── weather/            # Weather info
+│   ├── clawhub/            # ClawHub registry
+│   ├── surprise-me/       # Dynamic skill combination
+│   ├── loader.py           # Skill loader
+│   ├── registry.py         # Skill registry
+│   ├── tool.py             # Skill tool
+│   ├── sandbox.py          # Sandboxed execution
+│   └── scanner.py          # Security scanner
+├── state/                   # Application state
+│   ├── app_state.py        # App state management
+│   ├── session.py          # Session management
+│   ├── store.py            # State store
+│   └── types.py            # State types
+├── subagent/                # Subagent system (legacy alias)
 ├── templates/               # Agent templates
-│   ├── AGENTS.md            # Agent instructions
-│   ├── TOOLS.md             # Tool descriptions
-│   ├── SOUL.md              # Agent personality
-│   ├── USER.md              # User context
-│   └── HEARTBEAT.md         # Heartbeat config
+│   ├── AGENTS.md           # Agent instructions
+│   ├── TOOLS.md            # Tool descriptions
+│   ├── SOUL.md             # Agent personality
+│   ├── USER.md             # User context
+│   ├── MEMORY.md           # Memory guidelines
+│   ├── HEARTBEAT.md        # Heartbeat config
+│   ├── PROFILE.md          # Agent profile
+│   ├── BOOTSTRAP.md        # First-run bootstrap
+│   └── agents/             # Additional agent guides
 ├── cli/                     # CLI commands
-│   ├── commands.py          # Main CLI commands
-│   ├── onboard.py           # Onboarding wizard
-│   ├── skills.py            # Skill management CLI
-│   ├── stream.py            # Stream rendering
-│   └── models.py            # CLI models
-└── config/                  # Configuration
-    ├── schema.py            # Config schema
-    ├── loader.py            # Config loader
-    └── paths.py             # Path utilities
+│   ├── commands.py         # Main CLI commands
+│   ├── onboard.py          # Onboarding wizard
+│   ├── skills.py           # Skill management CLI
+│   ├── slash_commands/     # In-chat slash commands
+│   │   ├── builtin.py      # Built-in commands
+│   │   └── router.py       # Command router
+│   ├── stream.py           # Stream rendering
+│   └── models.py           # CLI models
+├── types/                   # Type definitions
+│   ├── tool.py             # Tool types
+│   ├── skill.py            # Skill types
+│   └── permission.py       # Permission types
+└── utils/                   # Utilities
+    ├── helpers.py          # Helper functions
+    ├── constants.py        # Constants
+    └── network.py          # Network utilities
 ```
 
 ## Development

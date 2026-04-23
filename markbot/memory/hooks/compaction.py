@@ -1,14 +1,25 @@
-"""Memory compaction hook for managing context window.
+"""Memory compaction hook for long-term memory archival.
 
-Monitors token usage and automatically compacts older messages when
-the context window approaches its limit.
+Responsible for archiving older conversation messages into long-term
+memory (compressed_summary + async summary tasks) when the context
+window approaches its limit.
 
-Ported from CoPaw's MemoryCompactionHook — runs as pre_reasoning hook.
+NOTE: This hook handles **long-term memory archival** only. Immediate
+context window pressure (truncating tool results, dropping old messages)
+is handled by MultiLevelCompactor in the agent loop. The two systems
+coordinate via the ``skip_context_compact`` flag: when
+MultiLevelCompactor has already performed aggressive compaction
+(AUTO_COMPACT / HISTORY_SNIP), this hook skips its own context
+compaction step and only triggers async summary archival.
+
+Already-compacted messages are marked with ``_markbot_compacted``
+in their metadata and skipped during subsequent compaction passes
+to avoid double-compressing.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -19,13 +30,24 @@ if TYPE_CHECKING:
 
 MEMORY_COMPACT_KEEP_RECENT = 4
 
+_COMPACTED_MARKER = "_markbot_compacted"
+
 
 class MemoryCompactionHook:
-    """Hook for automatic memory compaction when context is full.
+    """Hook for automatic memory archival when context is full.
 
-    Monitors token count of messages and triggers compaction when it
-    exceeds threshold. Preserves system prompt and recent messages while
-    summarizing older conversation history.
+    Two-phase operation:
+    1. **Async summary archival** (always runs when messages need archiving):
+       Schedules a background summary task via ``add_async_summary_task()``
+       to persist conversation knowledge into MEMORY.md.
+    2. **Context compaction** (skipped when MultiLevelCompactor already handled it):
+       Compresses older messages into ``compressed_summary`` to free up
+       context window space. This is the "session-level" compression that
+       keeps the current conversation flowing.
+
+    The ``skip_context_compact`` parameter allows the agent loop to
+    signal that MultiLevelCompactor already performed aggressive
+    compaction, so only the archival phase should run.
     """
 
     def __init__(
@@ -46,22 +68,27 @@ class MemoryCompactionHook:
         self,
         messages: list[dict],
         system_prompt: str = "",
+        *,
+        skip_context_compact: bool = False,
     ) -> str | None:
         """Pre-reasoning hook to check and compact memory if needed.
 
         Args:
             messages: List of conversation message dicts
             system_prompt: Current system prompt string
+            skip_context_compact: If True, skip context compaction phase
+                (MultiLevelCompactor already handled it). Async summary
+                archival still runs if applicable.
 
         Returns:
-            New compressed summary if compaction occurred, None otherwise
+            New compressed summary if context compaction occurred, None otherwise
         """
         try:
             if not self.memory_manager._reme:
                 return None
 
             str_token_count = _estimate_tokens(
-                system_prompt + getattr(self.memory_manager, '_compressed_summary', '')
+                system_prompt + self.memory_manager.get_compressed_summary()
             )
 
             left_compact_threshold = (
@@ -81,7 +108,6 @@ class MemoryCompactionHook:
                 memory_compact_reserve=self.memory_compact_reserve,
             )
 
-            # Handle error case: result might be a string if an exception occurred
             if isinstance(result, str):
                 logger.warning(
                     "check_context returned error message: %s",
@@ -104,7 +130,6 @@ class MemoryCompactionHook:
                 )
                 return None
 
-            # Convert Msg objects to dicts if necessary
             messages_to_compact = [
                 m.to_dict() if hasattr(m, 'to_dict') else m
                 for m in messages_to_compact
@@ -113,6 +138,11 @@ class MemoryCompactionHook:
             ]
 
             if not messages_to_compact:
+                return None
+
+            messages_to_compact = self._filter_already_compacted(messages_to_compact)
+            if not messages_to_compact:
+                logger.info("All messages already compacted, skipping")
                 return None
 
             if not is_valid:
@@ -132,15 +162,54 @@ class MemoryCompactionHook:
             if not messages_to_compact:
                 return None
 
+            messages_to_compact = self._filter_already_compacted(messages_to_compact)
+            if not messages_to_compact:
+                logger.info("All messages already compacted after adjustment, skipping")
+                return None
+
+            # Phase 1: Always trigger async summary archival for long-term memory
             if self.memory_summary_enabled:
                 self.memory_manager.add_async_summary_task(
                     messages=messages_to_compact,
                 )
 
-            logger.info("Context compaction started...")
+            pre_compact_tokens = _estimate_tokens(
+                "".join(
+                    m.get("content", "") if isinstance(m.get("content", ""), str)
+                    else str(m.get("content", ""))
+                    for m in messages_to_compact
+                )
+            )
+            pre_total_tokens = _estimate_tokens(
+                system_prompt
+                + self.memory_manager.get_compressed_summary()
+                + "".join(
+                    m.get("content", "") if isinstance(m.get("content", ""), str)
+                    else str(m.get("content", ""))
+                    for m in messages
+                )
+            )
+
+            # Phase 2: Context compaction (skip if MultiLevelCompactor already handled it)
+            if skip_context_compact:
+                logger.info(
+                    "[Compaction] Skipping context compaction "
+                    "(MultiLevelCompactor already applied); "
+                    "async summary archival still triggered for {} messages",
+                    len(messages_to_compact),
+                )
+                return None
+
+            logger.info(
+                "[Compaction] Starting — compacting {} messages "
+                "({} tokens), total context ~{} tokens",
+                len(messages_to_compact),
+                pre_compact_tokens,
+                pre_total_tokens,
+            )
 
             if self.context_compact_enabled:
-                compressed_summary = getattr(self.memory_manager, '_compressed_summary', '')
+                compressed_summary = self.memory_manager.get_compressed_summary()
                 compact_content = await self.memory_manager.compact_memory(
                     messages=messages_to_compact,
                     previous_summary=compressed_summary,
@@ -148,11 +217,19 @@ class MemoryCompactionHook:
                 if not compact_content:
                     logger.warning("Context compaction failed.")
                 else:
-                    logger.info("Context compaction completed")
-                    if hasattr(self.memory_manager, 'set_compressed_summary'):
-                        self.memory_manager.set_compressed_summary(compact_content)
-                    else:
-                        self.memory_manager._compressed_summary = compact_content
+                    post_summary_tokens = _estimate_tokens(compact_content)
+                    saved_tokens = pre_compact_tokens - post_summary_tokens
+                    logger.info(
+                        "[Compaction] Completed — summary: {} tokens, "
+                        "saved ~{} tokens ({:.0f}% reduction)",
+                        post_summary_tokens,
+                        max(saved_tokens, 0),
+                        (saved_tokens / pre_compact_tokens * 100)
+                        if pre_compact_tokens > 0
+                        else 0,
+                    )
+                    self._mark_compacted(messages_to_compact)
+                    self.memory_manager.set_compressed_summary(compact_content)
                     return compact_content
             else:
                 logger.info("Context compaction skipped")
@@ -162,6 +239,24 @@ class MemoryCompactionHook:
         except Exception as e:
             logger.exception(f"Failed to compact memory in pre_reasoning hook: {e}")
             return None
+
+    @staticmethod
+    def _filter_already_compacted(messages: list[dict]) -> list[dict]:
+        """Filter out messages that have already been compacted."""
+        return [
+            m for m in messages
+            if not m.get("metadata", {}).get(_COMPACTED_MARKER, False)
+            if isinstance(m, dict)
+        ]
+
+    @staticmethod
+    def _mark_compacted(messages: list[dict]) -> None:
+        """Mark messages as compacted in-place via metadata."""
+        for m in messages:
+            if isinstance(m, dict):
+                metadata = m.setdefault("metadata", {})
+                if isinstance(metadata, dict):
+                    metadata[_COMPACTED_MARKER] = True
 
     @staticmethod
     def _check_valid_messages(messages: list[dict]) -> bool:

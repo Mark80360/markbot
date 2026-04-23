@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from markbot.services.message_pipeline import Middleware, ProcessContext
 from markbot.bus.events import OutboundMessage
+from markbot.services.message_pipeline import Middleware, ProcessContext
 
 if TYPE_CHECKING:
     from markbot.memory.daily_log import DailyLogManager
+
+_AUTO_SUMMARY_INTERVAL = 5
 
 
 class QuestionResponseMiddleware(Middleware):
@@ -64,8 +66,10 @@ class MemoryLifecycleMiddleware(Middleware):
     """Bridges MemoryManager operations into the pipeline.
 
     - Appends raw interaction logs to daily markdown files (no LLM cost).
-    - Summary is only triggered during context compaction (MemoryCompactionHook)
-      or manual commands (/compact, /new), matching CoPaw's strategy.
+    - Periodically triggers background summarization every
+      ``auto_summary_interval`` user messages.
+    - Summary is also triggered during context compaction
+      (MemoryCompactionHook) or manual commands (/compact, /new).
     """
 
     def __init__(
@@ -73,10 +77,13 @@ class MemoryLifecycleMiddleware(Middleware):
         memory_manager: object = None,
         daily_log: "DailyLogManager | None" = None,
         session_manager: object = None,
+        auto_summary_interval: int = _AUTO_SUMMARY_INTERVAL,
     ):
         self._memory = memory_manager
         self._daily_log = daily_log
         self._session_manager = session_manager
+        self._auto_summary_interval = max(auto_summary_interval, 1)
+        self._user_message_count: int = 0
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
         return None
@@ -107,6 +114,30 @@ class MemoryLifecycleMiddleware(Middleware):
                     ctx.session.save()
             except Exception as e:
                 logger.warning(f"[MemoryMW] Session save failed: {e}")
+
+        self._user_message_count += 1
+        if (
+            self._memory
+            and self._user_message_count >= self._auto_summary_interval
+            and self._user_message_count % self._auto_summary_interval == 0
+        ):
+            try:
+                history = []
+                if ctx.session and hasattr(ctx.session, 'get_history'):
+                    history = ctx.session.get_history(max_messages=0)
+                if history:
+                    summary_messages = [
+                        m for m in history
+                        if isinstance(m, dict) and "role" in m
+                    ]
+                    if summary_messages:
+                        self._memory.add_async_summary_task(messages=summary_messages)
+                        logger.info(
+                            f"[MemoryMW] Auto summary triggered "
+                            f"(user_msg_count={self._user_message_count})"
+                        )
+            except Exception as e:
+                logger.warning(f"[MemoryMW] Auto summary trigger failed: {e}")
 
         return response
 

@@ -735,10 +735,23 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             return False
         return True
 
+    _MAX_CONSOLE_MSG_LEN = 4000
+
+    def _console_format(record):
+        msg = record["message"]
+        if len(msg) > _MAX_CONSOLE_MSG_LEN:
+            record["message"] = msg[:_MAX_CONSOLE_MSG_LEN] + "... [truncated]"
+        return (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>\n"
+        )
+
     logger.add(
         sys.stderr,
         level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        format=_console_format,
         colorize=True,
         backtrace=True,
         diagnose=True,
@@ -746,11 +759,15 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         filter=log_filter,
     )
 
-    # Custom formatter that strips ANSI codes from the message
+    _MAX_FILE_MSG_LEN = 10000
+
     def _file_format(record):
         time_str = record["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         level_str = f"{record['level'].name: <8}"
-        return f"{time_str} | {level_str} | {record['name']}:{record['function']}:{record['line']} - {strip_ansi(record['message'])}\n"
+        msg = strip_ansi(record["message"])
+        if len(msg) > _MAX_FILE_MSG_LEN:
+            msg = msg[:_MAX_FILE_MSG_LEN] + "... [truncated]"
+        return f"{time_str} | {level_str} | {record['name']}:{record['function']}:{record['line']} - {msg}\n"
 
     logger.add(
         GATEWAY_LOG_FILE,
@@ -917,27 +934,10 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     # Create memory summarization callback for auto-generating MEMORY.md at 12:00 and 23:59
     async def _summarize_memory_for_heartbeat():
         try:
-            from datetime import datetime as _dt
-            _today = _dt.now().strftime("%Y-%m-%d")
-            _log_path = config.workspace_path / "memory" / f"{_today}.md"
-            if not _log_path.exists():
-                return False
-            _content = _log_path.read_text(encoding="utf-8")
-            if not _content.strip():
-                return False
-            _messages = [{"role": "user", "content": (
-                "请根据以下每日交互日志，生成一份精炼的记忆摘要写入 MEMORY.md。\n"
-                "要求：提取关键信息和重要决策，合并相同主题，保留具体事实，控制在4000字以内。\n\n"
-                f"{_content}"
-            )}]
-            _summary = await agent.memory_manager.summary_memory(messages=_messages)
-            if _summary:
-                _mem_path = config.workspace_path / "memory" / "MEMORY.md"
-                _mem_path.write_text(_summary[:12000], encoding="utf-8")
-                logger.info(f"MEMORY.md updated via heartbeat summarization")
-                return True
+            await agent.memory_manager.dream()
+            return True
         except Exception as e:
-            logger.warning(f"Heartbeat memory summarization failed: {e}")
+            logger.warning(f"Heartbeat dream optimization failed: {e}")
         return False
 
     heartbeat = HeartbeatService(

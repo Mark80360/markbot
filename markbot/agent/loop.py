@@ -281,7 +281,8 @@ class AgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ThinkTool())
-        self.tools.register(MemorySearchTool(memory_manager=self.memory_manager))
+        self._memory_search_tool = MemorySearchTool(memory_manager=self.memory_manager)
+        self.tools.register(self._memory_search_tool)
         self.tools.register(TodoTool(workspace=self.workspace))
         self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
 
@@ -525,48 +526,54 @@ class AgentLoop:
                         messages, _initial_count, _new_msg_start,
                     )
 
-            # memory compaction: skip if MultiLevelCompactor already did
-            # aggressive compaction (auto_compact / history_snip) to avoid
-            # double-compressing and redundant LLM summary calls.
-            _skip_memory_compact = compact_result.action in (
-                CompactAction.AUTO_COMPACT,
-                CompactAction.HISTORY_SNIP,
-            )
-            if not _skip_memory_compact:
-                system_msg = next(
-                    (m.get("content", "") for m in messages if m.get("role") == "system"), ""
-                )
-                new_summary = await self.compaction_hook(
-                    messages=messages,
-                    system_prompt=system_msg,
-                )
-                if new_summary:
-                    logger.info("[AgentLoop] Memory compaction applied, summary updated")
-            else:
-                logger.debug(
-                    "[AgentLoop] Skipping memory compaction (MultiLevelCompaction already applied: {})",
-                    compact_result.action.value,
-                )
-
-            if self.memory_manager.force_memory_search and iteration == 1:
+            if iteration == 1:
+                memory_context_parts: list[str] = []
                 try:
-                    ms_tool = self.tools.get("memory_search")
-                    if ms_tool and hasattr(ms_tool, "get_forced_context"):
-                        user_query = ""
-                        for m in reversed(initial_messages):
-                            if m.get("role") == "user":
-                                c = m.get("content", "")
-                                user_query = c if isinstance(c, str) else str(c)
-                                break
-                        if user_query:
-                            forced_ctx = await ms_tool.get_forced_context(user_query)
-                            if forced_ctx:
-                                for m in messages:
-                                    if m.get("role") == "system":
-                                        m["content"] = m.get("content", "") + "\n\n" + forced_ctx
-                                        break
+                    retrieved = await self.memory_manager.retrieve(messages=messages)
+                    if retrieved:
+                        memory_context_parts.append(
+                            "## Auto-Retrieved Memory Context\n\n" + retrieved
+                        )
+                        logger.info("[AgentLoop] Auto memory retrieval context prepared")
                 except Exception as e:
-                    logger.warning(f"[AgentLoop] force_memory_search failed: {e}")
+                    logger.warning(f"[AgentLoop] Memory retrieve failed: {e}")
+
+                if self._memory_search_tool:
+                    try:
+                        user_text = ""
+                        for m in reversed(messages):
+                            if m.get("role") == "user":
+                                content = m.get("content", "")
+                                if isinstance(content, list):
+                                    for block in content:
+                                        if isinstance(block, dict) and block.get("type") == "text":
+                                            user_text += block.get("text", "")
+                                elif isinstance(content, str):
+                                    user_text = content
+                                if user_text:
+                                    break
+                        if user_text:
+                            forced_ctx = await self._memory_search_tool.get_forced_context(user_text)
+                            if forced_ctx:
+                                memory_context_parts.append(forced_ctx)
+                                logger.info("[AgentLoop] Forced memory search context prepared")
+                    except Exception as e:
+                        logger.warning(f"[AgentLoop] Forced memory search failed: {e}")
+
+                if memory_context_parts:
+                    sys_idx = next(
+                        (i for i, m in enumerate(messages) if m.get("role") == "system"),
+                        None,
+                    )
+                    if sys_idx is not None:
+                        combined = "\n\n".join(memory_context_parts)
+                        messages[sys_idx]["content"] = (
+                            messages[sys_idx]["content"] + "\n\n" + combined
+                        )
+                        logger.info(
+                            "[AgentLoop] Memory context injected into system prompt ({} sections)",
+                            len(memory_context_parts),
+                        )
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -575,6 +582,22 @@ class AgentLoop:
             )
 
             messages = self._strip_orphan_tool_results(messages)
+
+            if current_tokens > self.context_window_tokens * 0.6:
+                _skip_context_compact = compact_result.action in (
+                    CompactAction.AUTO_COMPACT,
+                    CompactAction.HISTORY_SNIP,
+                )
+                system_msg = next(
+                    (m.get("content", "") for m in messages if m.get("role") == "system"), ""
+                )
+                new_summary = await self.compaction_hook(
+                    messages=messages,
+                    system_prompt=system_msg,
+                    skip_context_compact=_skip_context_compact,
+                )
+                if new_summary:
+                    logger.info("[AgentLoop] Memory compaction applied, summary updated")
 
             if on_stream:
                 logger.info("[AgentLoop] Calling LLM with streaming...")
@@ -995,9 +1018,9 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         try:
-            for task in self.memory_manager.summary_tasks:
-                if not task.done():
-                    task.cancel()
+            worker = getattr(self.memory_manager, "_worker_task", None)
+            if worker and not worker.done():
+                worker.cancel()
         except Exception:
             pass
         logger.info("Agent loop stopping")

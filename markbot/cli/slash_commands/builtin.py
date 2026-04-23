@@ -114,10 +114,10 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     )
     summary = await mm.compact_memory(
         messages=history,
-        previous_summary=mm._compressed_summary,
+        previous_summary=mm.get_compressed_summary(),
     )
     if summary:
-        mm._compressed_summary = summary
+        mm.set_compressed_summary(summary)
         session.retain_recent_legal_suffix(max_messages=6)
         loop.sessions.save(session)
         return OutboundMessage(
@@ -139,7 +139,7 @@ async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="Memory manager is not available.",
         )
-    summary = mm._compressed_summary
+    summary = mm.get_compressed_summary()
     if not summary:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
@@ -157,7 +157,7 @@ async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     mm = getattr(loop, "memory_manager", None)
     if mm:
-        mm._compressed_summary = ""
+        mm.set_compressed_summary("")
     session.clear()
     loop.sessions.save(session)
     return OutboundMessage(
