@@ -528,7 +528,10 @@ class AgentLoop:
             # memory compaction: skip if MultiLevelCompactor already did
             # aggressive compaction (auto_compact / history_snip) to avoid
             # double-compressing and redundant LLM summary calls.
-            _skip_memory_compact = compact_result.action != CompactAction.NONE
+            _skip_memory_compact = compact_result.action in (
+                CompactAction.AUTO_COMPACT,
+                CompactAction.HISTORY_SNIP,
+            )
             if not _skip_memory_compact:
                 system_msg = next(
                     (m.get("content", "") for m in messages if m.get("role") == "system"), ""

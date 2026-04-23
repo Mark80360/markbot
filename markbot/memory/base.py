@@ -38,6 +38,7 @@ class BaseMemoryManager(ABC):
         self.chat_model: Optional[Any] = None
         self.formatter: Optional[Any] = None
         self.summary_tasks: list[asyncio.Task] = []
+        self._summary_version: int = 0
 
     @abstractmethod
     async def start(self) -> None:
@@ -111,9 +112,11 @@ class BaseMemoryManager(ABC):
                 remaining_tasks.append(task)
         self.summary_tasks = remaining_tasks
 
+        version = self._summary_version
         task = asyncio.create_task(
             self.summary_memory(messages=messages, **kwargs),
         )
+        task._markbot_summary_version = version
         task.add_done_callback(self._on_summary_task_done)
         self.summary_tasks.append(task)
 
@@ -122,6 +125,13 @@ class BaseMemoryManager(ABC):
         try:
             result = task.result()
             if result and hasattr(self, "set_compressed_summary"):
+                task_version = getattr(task, "_markbot_summary_version", -1)
+                if task_version < self._summary_version:
+                    logger.info(
+                        "[MemoryManager] Skipping stale summary task result "
+                        f"(task_version={task_version}, current={self._summary_version})"
+                    )
+                    return
                 existing = getattr(self, "_compressed_summary", "")
                 updated = f"{existing}\n\n{result}" if existing else result
                 self.set_compressed_summary(updated)

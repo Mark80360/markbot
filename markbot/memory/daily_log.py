@@ -9,12 +9,12 @@ the Tiered Memory Architecture guide.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
-
 
 _DEFAULT_MAX_CONTENT_LENGTH = 2000
 
@@ -83,8 +83,11 @@ class DailyLogManager:
         entry = "\n".join(parts)
 
         try:
-            with open(filepath, "a", encoding="utf-8") as f:
-                f.write(entry)
+            fd = os.open(str(filepath), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                os.write(fd, entry.encode("utf-8"))
+            finally:
+                os.close(fd)
         except Exception as e:
             logger.warning(f"[DailyLog] Failed to append to {filepath}: {e}")
 

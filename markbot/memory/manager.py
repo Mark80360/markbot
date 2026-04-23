@@ -436,7 +436,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         if not result.get("is_valid", True):
             unique_id = uuid.uuid4().hex[:8]
-            filepath = os.path.join(self.working_dir, f"compact_invalid_{unique_id}.json")
+            debug_dir = os.path.join(self.working_dir, "memory")
+            os.makedirs(debug_dir, exist_ok=True)
+            filepath = os.path.join(debug_dir, f"compact_invalid_{unique_id}.json")
             try:
                 with open(filepath, "w", encoding="utf-8") as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
@@ -517,6 +519,15 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         return results
 
+    @staticmethod
+    def _tokenize_for_search(text: str) -> list[str]:
+        tokens = re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", text.lower())
+        bigrams = []
+        for i in range(len(tokens) - 1):
+            if tokens[i][0] >= '\u4e00' or tokens[i + 1][0] >= '\u4e00':
+                bigrams.append(tokens[i] + tokens[i + 1])
+        return tokens + bigrams
+
     def _search_daily_logs(
         self,
         query: str,
@@ -524,15 +535,16 @@ class ReMeLightMemoryManager(BaseMemoryManager):
     ) -> list[dict]:
         """Keyword search over workspace/memory/daily/*.md files.
 
-        Uses simple token matching (split query into words, count hits
-        per file section).  This is a lightweight fallback — ReMeLight
-        does not index the ``memory/daily/`` subdirectory.
+        Uses token matching with CJK bigram support (split query into
+        words/CJK chars + CJK bigrams, count hits per file section).
+        This is a lightweight fallback — ReMeLight does not index the
+        ``memory/daily/`` subdirectory.
         """
         daily_dir = Path(self.working_dir) / "memory" / "daily"
         if not daily_dir.is_dir():
             return []
 
-        query_tokens = set(re.findall(r"\w+", query.lower()))
+        query_tokens = set(self._tokenize_for_search(query))
         if not query_tokens:
             return []
 
@@ -550,10 +562,13 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 if not section.strip():
                     continue
                 section_text = section.lower()
-                hits = sum(1 for t in query_tokens if t in section_text)
+                section_tokens = set(self._tokenize_for_search(section_text))
+                hits = sum(1 for t in query_tokens if t in section_tokens)
                 if hits == 0:
                     continue
                 score = hits / len(query_tokens)
+                section_len = max(len(section_text), 1)
+                score = score * (1.0 / (1.0 + section_len / 10000.0))
                 header = section.split("\n", 1)[0][:80]
                 content = section.strip()
                 if len(content) > 2000:
@@ -581,8 +596,20 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         return self._compressed_summary
 
     def set_compressed_summary(self, summary: str) -> None:
-        self._compressed_summary = summary
-        self._save_compressed_summary(summary)
+        self._compressed_summary = self._truncate_summary(summary)
+        self._summary_version += 1
+        self._save_compressed_summary(self._compressed_summary)
+
+    _MAX_COMPRESSED_SUMMARY_CHARS = 200000
+
+    def _truncate_summary(self, summary: str) -> str:
+        if len(summary) <= self._MAX_COMPRESSED_SUMMARY_CHARS:
+            return summary
+        logger.warning(
+            f"[MemoryManager] compressed_summary truncated: "
+            f"{len(summary)} -> {self._MAX_COMPRESSED_SUMMARY_CHARS} chars"
+        )
+        return summary[:self._MAX_COMPRESSED_SUMMARY_CHARS] + "\n\n... [truncated to fit context window]"
 
     def _load_compressed_summary(self) -> str:
         if self._compressed_summary_path.exists():
@@ -599,6 +626,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         except Exception as e:
             logger.warning(f"[MemoryManager] Failed to persist compressed_summary: {e}")
 
+    _MAX_MEMORY_MD_CHARS = 8_000
+
     def get_memory_context(self, query: str | None = None) -> str:
         parts = []
         memory_md = Path(self.working_dir) / "memory" / "MEMORY.md"
@@ -606,6 +635,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             try:
                 content = memory_md.read_text(encoding="utf-8").strip()
                 if content:
+                    if len(content) > self._MAX_MEMORY_MD_CHARS:
+                        content = content[:self._MAX_MEMORY_MD_CHARS] + "\n\n... [truncated]"
                     parts.append(f"## MEMORY.md\n\n{content}")
             except Exception:
                 pass
