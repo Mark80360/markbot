@@ -817,6 +817,7 @@ class FeishuChannel(BaseChannel):
                     buf.sequence,
                 )
                 if ok:
+                    buf.sequence += 1
                     await loop.run_in_executor(
                         None,
                         self._close_streaming_mode_sync,
