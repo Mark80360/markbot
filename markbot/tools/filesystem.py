@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from markbot.tools.base import Tool, _resolve_path, _is_under
+from markbot.tools.base import Tool, _resolve_path
 from markbot.utils.constants import IGNORE_DIRS as _SHARED_IGNORE_DIRS
 from markbot.utils.helpers import build_image_content_blocks, detect_image_mime
 
@@ -418,7 +418,7 @@ class ListDirTool(_FsTool):
             shutil.copy2(file_path, backup_path)
 
             self._cleanup_old_backups(backup_root)
-        except Exception as e:
+        except Exception:
             pass
 
     @staticmethod
@@ -438,6 +438,8 @@ class ListDirTool(_FsTool):
 
 class DeleteFileTool(_FsTool):
     """Delete a file with safety checks and optional safe-delete (recycle bin) mode."""
+
+    _is_destructive = True
 
     def __init__(self, *args, safe_delete: bool = True, **kwargs):
         super().__init__(*args, **kwargs)

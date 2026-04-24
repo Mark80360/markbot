@@ -86,14 +86,20 @@ class SkillRegistry:
         lines = []
 
         for skill in sorted(self._skills.values(), key=lambda s: s.name):
-            lines.append(f"### {skill.name}")
+            tag = "📦 built-in" if skill.is_builtin else "📁 workspace"
+            lines.append(f"### {skill.name} `[{tag}]`")
             lines.append(f"{skill.description}")
             lines.append(f"**When to use**: {skill.when_to_use}")
 
             if skill.scripts:
                 lines.append("\n**Available scripts**:")
                 for script in skill.scripts:
-                    lines.append(f"- `{script.name}`: {script.description}")
+                    lines.append(f"- `{skill.name}.{script.name}`: {script.description}")
+            else:
+                skill_path = self._loader.get_skill_path(skill.name)
+                if skill_path:
+                    lines.append(f"\n> **Instruction-only skill** (no scripts). Read its guide: `{skill_path / 'SKILL.md'}`")
+
             lines.append("")
 
         return "\n".join(lines)

@@ -116,6 +116,13 @@ class CronTool(Tool):
         job_id: str | None = None,
         **kwargs: Any,
     ) -> str:
+        context = kwargs.get("_tool_context")
+        if context:
+            if context.channel:
+                self._channel = context.channel
+            if context.chat_id:
+                self._chat_id = context.chat_id
+
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"

@@ -83,7 +83,7 @@ class MemoryLifecycleMiddleware(Middleware):
         self._daily_log = daily_log
         self._session_manager = session_manager
         self._auto_summary_interval = max(auto_summary_interval, 1)
-        self._user_message_count: int = 0
+        self._session_message_counts: dict[str, int] = {}
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
         return None
@@ -115,11 +115,13 @@ class MemoryLifecycleMiddleware(Middleware):
             except Exception as e:
                 logger.warning(f"[MemoryMW] Session save failed: {e}")
 
-        self._user_message_count += 1
+        session_key = ctx.session_key or "_default"
+        count = self._session_message_counts.get(session_key, 0) + 1
+        self._session_message_counts[session_key] = count
         if (
             self._memory
-            and self._user_message_count >= self._auto_summary_interval
-            and self._user_message_count % self._auto_summary_interval == 0
+            and count >= self._auto_summary_interval
+            and count % self._auto_summary_interval == 0
         ):
             try:
                 history = []
@@ -134,7 +136,7 @@ class MemoryLifecycleMiddleware(Middleware):
                         self._memory.add_async_summary_task(messages=summary_messages)
                         logger.info(
                             f"[MemoryMW] Auto summary triggered "
-                            f"(user_msg_count={self._user_message_count})"
+                            f"(session={session_key}, msg_count={count})"
                         )
             except Exception as e:
                 logger.warning(f"[MemoryMW] Auto summary trigger failed: {e}")

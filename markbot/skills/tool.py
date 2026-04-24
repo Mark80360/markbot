@@ -115,6 +115,7 @@ class SkillTool(BaseTool):
                 error_msg = f"Script execution failed (exit code: {result.exit_code})"
                 if result.stderr:
                     error_msg += f"\n{result.stderr}"
+
                 return f"Error: {error_msg}"
         except Exception as e:
             logger.exception("Error executing skill script {}.{}", self._skill_name, self._script.name)

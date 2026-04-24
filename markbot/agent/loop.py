@@ -10,21 +10,42 @@ import json
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from markbot.agent.compact import CompactAction, CompactionConfig, MultiLevelCompactor
 from markbot.agent.context import ContextBuilder
-from markbot.memory.manager import ReMeLightMemoryManager
+from markbot.agent.cost_tracker import BudgetExceededError, CostTracker, PricingTable
+from markbot.agent.tokens import token_count_with_estimation
+from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.bus.queue import MessageBus
+from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
+from markbot.memory.daily_log import DailyLogManager
 from markbot.memory.hooks.bootstrap import BootstrapHook
 from markbot.memory.hooks.compaction import MemoryCompactionHook
+from markbot.memory.manager import ReMeLightMemoryManager
+from markbot.services.interaction_log import InteractionLogger
+from markbot.services.message_pipeline import MessagePipeline, ProcessContext
+from markbot.services.middleware import (
+    MemoryLifecycleMiddleware,
+    QuestionResponseMiddleware,
+)
+from markbot.services.tool_executor import ToolExecutor
+from markbot.skills import SkillRegistry
+from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.state.session import SessionManager
 from markbot.subagent import SubagentManager
-from markbot.agent.tokens import token_count_with_estimation
-from markbot.agent.compact import MultiLevelCompactor, CompactionConfig, CompactAction
-from markbot.agent.cost_tracker import CostTracker, BudgetExceededError, PricingTable
+from markbot.subagent.spawn import SpawnTool
+from markbot.subagent.tools import CheckSubagentTool, ListSubagentsTool
+from markbot.tools.context_explorer import (
+    ExploreContextCatalogTool,
+    LoadContextTool,
+    SearchContextTool,
+)
 from markbot.tools.cron import CronTool
+from markbot.tools.explore import ExploreTool
 from markbot.tools.filesystem import (
     DeleteFileTool,
     EditFileTool,
@@ -32,37 +53,15 @@ from markbot.tools.filesystem import (
     ReadFileTool,
     WriteFileTool,
 )
+from markbot.tools.memory import MemorySearchTool
 from markbot.tools.message import MessageTool
 from markbot.tools.question import AskUserQuestionTool
 from markbot.tools.registry import ToolRegistry
 from markbot.tools.search import GlobTool, GrepTool
 from markbot.tools.shell import ExecTool
-from markbot.subagent.spawn import SpawnTool
-from markbot.subagent.tools import CheckSubagentTool, ListSubagentsTool
-from markbot.tools.web import WebFetchTool, WebSearchTool, WebExtractTool
 from markbot.tools.think import ThinkTool
-from markbot.tools.memory import MemorySearchTool
 from markbot.tools.todo import TodoTool
-from markbot.tools.explore import ExploreTool
-from markbot.tools.context_explorer import (
-    ExploreContextCatalogTool,
-    SearchContextTool,
-    LoadContextTool,
-)
-from markbot.services.tool_executor import ToolExecutor
-from markbot.services.message_pipeline import MessagePipeline, ProcessContext
-from markbot.services.middleware import (
-    QuestionResponseMiddleware,
-    MemoryLifecycleMiddleware,
-)
-from markbot.memory.daily_log import DailyLogManager
-from markbot.services.interaction_log import InteractionLogger
-from markbot.bus.events import InboundMessage, OutboundMessage
-from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
-from markbot.bus.queue import MessageBus
-from markbot.state.session import Session, SessionManager
-from markbot.skills import SkillRegistry
-from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.tools.web import WebExtractTool, WebFetchTool, WebSearchTool
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
 from markbot.utils.helpers import strip_think
@@ -180,6 +179,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             filesystem_config=self.filesystem_config,
             restrict_to_workspace=restrict_to_workspace,
+            cost_tracker=self.cost_tracker,
         )
 
         self._running = False
@@ -527,17 +527,6 @@ class AgentLoop:
                     )
 
             if iteration == 1:
-                memory_context_parts: list[str] = []
-                try:
-                    retrieved = await self.memory_manager.retrieve(messages=messages)
-                    if retrieved:
-                        memory_context_parts.append(
-                            "## Auto-Retrieved Memory Context\n\n" + retrieved
-                        )
-                        logger.info("[AgentLoop] Auto memory retrieval context prepared")
-                except Exception as e:
-                    logger.warning(f"[AgentLoop] Memory retrieve failed: {e}")
-
                 if self._memory_search_tool:
                     try:
                         user_text = ""
@@ -555,25 +544,17 @@ class AgentLoop:
                         if user_text:
                             forced_ctx = await self._memory_search_tool.get_forced_context(user_text)
                             if forced_ctx:
-                                memory_context_parts.append(forced_ctx)
-                                logger.info("[AgentLoop] Forced memory search context prepared")
+                                sys_idx = next(
+                                    (i for i, m in enumerate(messages) if m.get("role") == "system"),
+                                    None,
+                                )
+                                if sys_idx is not None:
+                                    messages[sys_idx]["content"] = (
+                                        messages[sys_idx]["content"] + "\n\n" + forced_ctx
+                                    )
+                                    logger.info("[AgentLoop] Forced memory search context injected")
                     except Exception as e:
                         logger.warning(f"[AgentLoop] Forced memory search failed: {e}")
-
-                if memory_context_parts:
-                    sys_idx = next(
-                        (i for i, m in enumerate(messages) if m.get("role") == "system"),
-                        None,
-                    )
-                    if sys_idx is not None:
-                        combined = "\n\n".join(memory_context_parts)
-                        messages[sys_idx]["content"] = (
-                            messages[sys_idx]["content"] + "\n\n" + combined
-                        )
-                        logger.info(
-                            "[AgentLoop] Memory context injected into system prompt ({} sections)",
-                            len(memory_context_parts),
-                        )
 
             tool_defs = self.tools.get_definitions()
             logger.debug(
@@ -707,6 +688,9 @@ class AgentLoop:
                     permission_mode=PermissionMode.AUTO,
                     tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
                     is_non_interactive=False,
+                    channel=channel,
+                    chat_id=chat_id,
+                    message_id=message_id,
                 )
                 results = await asyncio.gather(
                     *(
@@ -1052,10 +1036,11 @@ class AgentLoop:
         chat_id = msg.chat_id
 
         if channel == "system":
-            channel, chat_id = chat_id.split(":", 1) if ":" in chat_id else ("cli", chat_id)
+            channel = msg.origin_channel or ("cli" if ":" not in chat_id else chat_id.split(":", 1)[0])
+            chat_id = msg.origin_chat_id or chat_id
 
         key = session_key or msg.session_key
-        if channel == "system":
+        if msg.channel == "system":
             key = f"{channel}:{chat_id}"
 
         pctx = ProcessContext(
@@ -1097,7 +1082,7 @@ class AgentLoop:
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
-            messages = self.context.build_messages(
+            messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content,
                 channel=channel,
@@ -1154,7 +1139,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
-        initial_messages = self.context.build_messages(
+        initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,

@@ -31,4 +31,6 @@ logs/
 .claude/
 .spec-workflow/
 .qwen/
+.vscode/
 .ruff_cache/
+run_debug.py

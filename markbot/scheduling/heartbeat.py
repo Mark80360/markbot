@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -62,7 +61,6 @@ class HeartbeatService:
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
-        memory_summarizer: "MemorySummarizer | Callable[[], Coroutine[Any, Any, bool]] | None" = None,
     ):
         self.workspace = workspace
         self.fallback_manager = fallback_manager
@@ -72,10 +70,8 @@ class HeartbeatService:
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
-        self.memory_summarizer = memory_summarizer
         self._running = False
         self._task: asyncio.Task | None = None
-        self._last_summarization_date: str | None = None
 
     @property
     def heartbeat_file(self) -> Path:
@@ -116,76 +112,6 @@ class HeartbeatService:
         args = response.tool_calls[0].arguments
         return args.get("action", "skip"), args.get("tasks", "")
 
-    async def _maybe_summarize_memory(self) -> None:
-        """Check if it's time to summarize memory and trigger if so."""
-        if not self.memory_summarizer:
-            return
-
-        # Parse memory_summarize_times from HEARTBEAT.md (e.g., "memory_summarize_times: 12:00, 23:59")
-        summarize_times = self._parse_memory_summarize_times()
-        if not summarize_times:
-            return
-
-        now = datetime.now()
-        current_time = now.time()
-        current_date = now.strftime("%Y-%m-%d")
-
-        # Check if current time matches any configured time (within a 5-minute window)
-        matched_time = None
-        for t in summarize_times:
-            target_hour, target_minute = map(int, t.split(":"))
-            if (current_time.hour == target_hour and
-                abs(current_time.minute - target_minute) <= 5):
-                matched_time = t
-                break
-
-        if not matched_time:
-            return
-
-        # Check if already ran today at this time
-        run_key = f"{current_date}_{matched_time}"
-        last_run_key = getattr(self, '_last_memory_summarize_run', None)
-        if last_run_key == run_key:
-            return
-
-        logger.info(f"Heartbeat: triggering memory summarization (time={matched_time})")
-        try:
-            import inspect
-            _summarizer = self.memory_summarizer
-            if inspect.iscoroutinefunction(_summarizer):
-                success = await _summarizer()
-            elif hasattr(_summarizer, 'summarize_today'):
-                success = await _summarizer.summarize_today()
-            else:
-                success = False
-            if success:
-                self._last_memory_summarize_run = run_key
-                logger.info(f"Heartbeat: memory summarization completed for time={matched_time}")
-        except Exception:
-            logger.exception("Heartbeat: memory summarization failed")
-
-    def _parse_memory_summarize_times(self) -> list[str] | None:
-        """Parse memory_summarize_times from HEARTBEAT.md content.
-
-        Looks for a line like: memory_summarize_times: 12:00, 23:59
-
-        Returns:
-            List of time strings like ["12:00", "23:59"], or None if not found.
-        """
-        content = self._read_heartbeat_file()
-        if not content:
-            return None
-
-        for line in content.split("\n"):
-            line = line.strip()
-            if line.startswith("memory_summarize_times:"):
-                times_str = line.split(":", 1)[1].strip()
-                times = [t.strip() for t in times_str.split(",") if t.strip()]
-                if times:
-                    logger.debug(f"Parsed memory_summarize_times: {times}")
-                    return times
-        return None
-
     async def start(self) -> None:
         """Start the heartbeat service."""
         if not self.enabled:
@@ -225,9 +151,6 @@ class HeartbeatService:
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from markbot.scheduling.evaluator import evaluate_response
-
-        # Check if it's time to summarize memory (12:00 or 23:59)
-        await self._maybe_summarize_memory()
 
         content = self._read_heartbeat_file()
         if not content:

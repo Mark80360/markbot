@@ -97,8 +97,12 @@ class AskUserQuestionTool(Tool):
         if len(options) > 5:
             return "Error: Maximum 5 options allowed"
 
-        channel = self._default_channel
-        chat_id = self._default_chat_id
+        context = kwargs.get("_tool_context")
+        ctx_ch = context.channel if context else ""
+        ctx_cid = context.chat_id if context else ""
+
+        channel = ctx_ch or self._default_channel
+        chat_id = ctx_cid or self._default_chat_id
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"

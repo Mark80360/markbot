@@ -6,6 +6,7 @@ from markbot.tools.base import Tool
 
 if TYPE_CHECKING:
     from markbot.subagent import SubagentManager
+    from markbot.types.tool import ToolContext
 
 
 class SpawnTool(Tool):
@@ -18,7 +19,7 @@ class SpawnTool(Tool):
         self._session_key = "cli:direct"
 
     def set_context(self, channel: str, chat_id: str) -> None:
-        """Set the origin context for subagent announcements."""
+        """Set the origin context for subagent announcements (fallback)."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
         self._session_key = f"{channel}:{chat_id}"
@@ -56,10 +57,15 @@ class SpawnTool(Tool):
 
     async def _legacy_execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
+        context: "ToolContext | None" = kwargs.get("_tool_context")
+        channel = (context.channel if context else "") or self._origin_channel
+        chat_id = (context.chat_id if context else "") or self._origin_chat_id
+        session_key = f"{channel}:{chat_id}" if channel and chat_id else self._session_key
+
         return await self._manager.spawn(
             task=task,
             label=label,
-            origin_channel=self._origin_channel,
-            origin_chat_id=self._origin_chat_id,
-            session_key=self._session_key,
+            origin_channel=channel,
+            origin_chat_id=chat_id,
+            session_key=session_key,
         )

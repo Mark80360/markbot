@@ -7,10 +7,12 @@ import os
 import secrets
 import string
 import uuid
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import json_repair
+import httpx
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -117,6 +119,7 @@ class OpenAICompatProvider(LLMProvider):
         self._client = AsyncOpenAI(
             api_key=api_key or "no-key",
             base_url=effective_base,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
             default_headers={
                 "x-session-affinity": uuid.uuid4().hex,
                 **(extra_headers or {}),
@@ -556,7 +559,10 @@ class OpenAICompatProvider(LLMProvider):
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            stream = await asyncio.wait_for(
+                self._client.chat.completions.create(**kwargs),
+                timeout=30.0,
+            )
             chunks: list[Any] = []
             async for chunk in stream:
                 chunks.append(chunk)

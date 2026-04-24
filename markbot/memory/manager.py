@@ -1,6 +1,6 @@
 """ReMeLight-backed memory manager for markbot.
 
-Ported from CoPaw's ReMeLightMemoryManager with full feature parity:
+Ported from ReMeLightMemoryManager with full feature parity:
 - Conversation compaction via compact_memory()
 - Memory summarization with file tools via summary_memory()
 - Vector and full-text search via memory_search()
@@ -688,23 +688,76 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
     _MAX_MEMORY_MD_CHARS = 8_000
 
-    def get_memory_context(self, query: str | None = None) -> str:
+    async def get_memory_context(self, query: str | None = None) -> str:
         parts = []
-        memory_md = Path(self.working_dir) / "memory" / "MEMORY.md"
-        if memory_md.exists():
-            try:
-                content = memory_md.read_text(encoding="utf-8").strip()
-                if content:
-                    if len(content) > self._MAX_MEMORY_MD_CHARS:
-                        content = content[:self._MAX_MEMORY_MD_CHARS] + "\n\n... [truncated]"
-                    parts.append(f"## MEMORY.md\n\n{content}")
-            except Exception:
-                pass
 
         if self._compressed_summary:
-            parts.append(f"## Compressed Summary\n\n{self._compressed_summary}")
+            parts.append(f"## Session Summary\n\n{self._compressed_summary}")
+
+        memory_md = Path(self.working_dir) / "memory" / "MEMORY.md"
+        if not memory_md.exists():
+            return "\n\n".join(parts) if parts else ""
+
+        try:
+            content = memory_md.read_text(encoding="utf-8").strip()
+            if not content:
+                return "\n\n".join(parts) if parts else ""
+        except Exception:
+            return "\n\n".join(parts) if parts else ""
+
+        if query and self._started and self._reme is not None:
+            try:
+                search_results = await self.memory_search(
+                    query=query, max_results=5, min_score=0.2
+                )
+                if search_results:
+                    relevant_parts = []
+                    for r in search_results:
+                        text = r.get("content", "")
+                        if text:
+                            relevant_parts.append(text)
+                    if relevant_parts:
+                        relevant_text = "\n\n---\n\n".join(relevant_parts)
+                        parts.append(f"## Relevant Memory (query: {query[:50]})\n\n{relevant_text}")
+                        return "\n\n".join(parts) if parts else ""
+            except Exception as e:
+                logger.debug(f"Semantic search in get_memory_context failed, falling back: {e}")
+
+        truncated = self._truncate_by_section(content, self._MAX_MEMORY_MD_CHARS)
+        parts.append(f"## MEMORY.md\n\n{truncated}")
 
         return "\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _truncate_by_section(content: str, max_chars: int) -> str:
+        if len(content) <= max_chars:
+            return content
+
+        sections = []
+        current_section = []
+        current_len = 0
+
+        for line in content.split("\n"):
+            if line.startswith("## ") and current_section:
+                section_text = "\n".join(current_section)
+                if current_len + len(section_text) > max_chars:
+                    break
+                sections.append(section_text)
+                current_len += len(section_text)
+                current_section = [line]
+            else:
+                current_section.append(line)
+
+        if current_section and current_len + len("\n".join(current_section)) <= max_chars:
+            sections.append("\n".join(current_section))
+
+        if not sections:
+            first_section_end = content.find("\n## ")
+            if first_section_end > 0:
+                return content[:min(first_section_end, max_chars)] + "\n\n... [truncated]"
+            return content[:max_chars] + "\n\n... [truncated]"
+
+        return "\n\n".join(sections) + "\n\n... [remaining sections omitted]"
 
     def list_memory_entries(self) -> list[dict]:
         """List all memory entries for context explorer catalog.
@@ -772,24 +825,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         return entries
 
-    _DREAM_PROMPT_ZH = """\
-现在进入梦境状态，对长期记忆进行优化整理。请读取今日日志与现有长期记忆，在梦境中提炼高价值增量信息并去重合并，最终覆写至 `MEMORY.md`，确保长期记忆文件保持最新、精简、无冗余。
-
-当前日期: {current_date}
-
-【梦境优化原则】
-1. 极简去冗：严禁记录流水账、Bug修复细节或单次任务。仅保留"核心业务决策"、"确认的用户偏好"与"高价值可复用经验"。
-2. 状态覆写：若发现状态变更（如技术栈更改、配置更新），必须用新状态替换旧状态，严禁新旧矛盾信息并存。
-3. 归纳整合：主动将零碎的相似规则提炼、合并为通用性强的独立条目。
-4. 废弃剔除：主动删除已被证伪的假设或不再适用的陈旧条目。
-
-【梦境执行步骤】
-步骤 1 [加载]：调用 `read` 工具，读取根目录下的 `MEMORY.md` 以及当天的日志文件 `memory/daily/YYYY-MM-DD.md`。
-步骤 2 [梦境提纯]：在梦境中对比新旧内容，严格按照【梦境优化原则】进行去重、替换、剔除和合并，生成一份全新的记忆内容。
-步骤 3 [落盘]：调用 `write` 或 `edit` 工具，将整理后全新的 Markdown 内容覆盖写入到 `MEMORY.md` 中（请保持清晰的层级与列表结构）。
-步骤 4 [苏醒汇报]：从梦境中苏醒后，在对话中向我简短汇报：1) 新增/沉淀了哪些核心记忆；2) 修正/删除了哪些过期内容。"""
-
-    _DREAM_PROMPT_EN = """\
+    _DREAM_PROMPT = """\
 Enter dream state for memory optimization. Read today's logs and existing long-term memory, extract high-value incremental information, deduplicate and merge, and ultimately overwrite `MEMORY.md`. Ensure the long-term memory file remains up-to-date, concise, and non-redundant.
 
 Current date: {current_date}
@@ -820,14 +856,14 @@ Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What cor
 
         try:
             from agentscope.agent import ReActAgent
-            from agentscope.message import Msg
+            from agentscope.message import Msg, TextBlock
         except ImportError:
             logger.warning("[Dream] agentscope not available, skipping dream")
             return
 
         chat_model = None
         formatter = None
-        if self._llm_config and self.fallback_manager:
+        if self._llm_config:
             try:
                 provider_cfg = self._llm_config
                 api_key = provider_cfg.get("api_key", "")
@@ -854,33 +890,36 @@ Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What cor
             return
 
         current_date = datetime.now().strftime("%Y-%m-%d")
-        template = self._DREAM_PROMPT_ZH if self._language == "zh" else self._DREAM_PROMPT_EN
-        query_text = template.format(current_date=current_date)
+        query_text = self._DREAM_PROMPT.format(current_date=current_date)
 
         if not query_text.strip():
             logger.debug("[Dream] Empty query, skipping")
             return
 
-        memory_file = Path(self.working_dir) / "memory" / "MEMORY.md"
+        backup_path = Path(self.working_dir).absolute() / "backup"
+        backup_path.mkdir(parents=True, exist_ok=True)
+
+        memory_file = Path(self.working_dir) / "MEMORY.md"
         if memory_file.exists():
-            backup_dir = Path(self.working_dir) / "memory" / "backup"
-            backup_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = backup_dir / f"memory_backup_{timestamp}.md"
+            backup_filename = f"memory_backup_{timestamp}.md"
+            backup_file = backup_path / backup_filename
             try:
                 import shutil
 
                 shutil.copyfile(memory_file, backup_file)
                 logger.info(f"[Dream] Created MEMORY.md backup: {backup_file}")
             except Exception as e:
-                logger.error(f"[Dream] Failed to create MEMORY.md backup: {e}")
+                logger.error(f"[Dream] Failed to create MEMORY.md backup: {e}, aborting dream")
+                return
         else:
             logger.debug("[Dream] No existing MEMORY.md file to backup")
 
         dream_agent = ReActAgent(
             name="DreamOptimizer",
             model=chat_model,
-            sys_prompt="You are a Dream Memory Organizer specialized in optimizing long-term memory files.",
+            sys_prompt="You are a Dream Memory Organizer specialized"
+            " in optimizing long-term memory files.",
             toolkit=self._summary_toolkit,
             formatter=formatter,
         )
@@ -889,7 +928,7 @@ Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What cor
         user_msg = Msg(
             name="dream",
             role="user",
-            content=query_text,
+            content=[TextBlock(type="text", text=query_text)],
         )
 
         try:
@@ -897,6 +936,7 @@ Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What cor
             logger.info(f"[Dream] Optimization completed: {response.get_text_content()[:200]}...")
         except Exception as e:
             logger.error(f"[Dream] Memory optimization failed: {e}")
+            raise
 
     async def restart_embedding_model(self):
         if self._reme is None:

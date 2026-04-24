@@ -2,7 +2,7 @@
 
 Supports both manual agent-initiated searches (via tool call) and
 automatic forced injection (force_memory_search) before each LLM call.
-Ported from CoPaw's MemorySearchTool.
+Ported from MemorySearchTool.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 Checks for BOOTSTRAP.md on first user interaction and prepends
 guidance to help set up agent identity and preferences.
-Ported from CoPaw's bootstrap hook.
+Ported from bootstrap hook.
 """
 
 from __future__ import annotations

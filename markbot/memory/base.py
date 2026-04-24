@@ -140,7 +140,14 @@ class BaseMemoryManager(ABC):
         return None
 
     async def _summarize_worker(self) -> None:
-        """Background worker that processes summary tasks serially (FIFO)."""
+        """Background worker that processes summary tasks serially (FIFO).
+
+        summary_memory() writes to MEMORY.md via its internal ReActAgent
+        with file-editing tools.  It does NOT update compressed_summary —
+        that is the sole responsibility of compact_memory(), called by
+        MemoryCompactionHook.  Keeping the two stores separate avoids
+        semantic overlap and duplicate token consumption.
+        """
         while True:
             task_id, messages, kwargs = await self._task_queue.get()
             info = self._summary_task_info.get(task_id)
@@ -154,22 +161,6 @@ class BaseMemoryManager(ABC):
                 info["status"] = "completed"
                 info["result"] = result
                 logger.info(f"[SummaryWorker] Task {task_id} completed")
-
-                if result:
-                    existing = self.get_compressed_summary()
-                    max_chars = getattr(self, "_MAX_COMPRESSED_SUMMARY_CHARS", 200000)
-                    if existing and len(existing) > max_chars * 0.6:
-                        updated = result
-                        logger.info(
-                            "[SummaryWorker] compressed_summary exceeded 60% threshold, "
-                            "replacing with latest summary to prevent unbounded growth"
-                        )
-                    else:
-                        updated = f"{existing}\n\n{result}" if existing else result
-                    self.set_compressed_summary(updated)
-                    logger.info(
-                        "[SummaryWorker] Task result appended to compressed_summary"
-                    )
             except asyncio.CancelledError:
                 info["status"] = "cancelled"
                 logger.info(f"[SummaryWorker] Task {task_id} cancelled")

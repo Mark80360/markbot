@@ -17,6 +17,8 @@ from markbot.utils.helpers import strip_ansi
 class ExecTool(Tool):
     """Tool to execute shell commands."""
 
+    _is_destructive = True
+
     def __init__(
         self,
         timeout: int = 60,

@@ -100,6 +100,10 @@ class BaseTool(ABC):
         if tool_name in ctx.always_ask:
             return PermissionDecision(behavior="ask")
 
+        # AUTO mode: allow all tools but log destructive ones
+        if context.permission_mode == PermissionMode.AUTO:
+            return PermissionDecision(behavior="allow", reason="AUTO mode")
+
         # Check permission mode
         if context.permission_mode == PermissionMode.ACCEPT_EDITS:
             # In accept_edits mode, allow file operations
@@ -279,15 +283,15 @@ class Tool(BaseTool):
             )
             params.append(param)
 
-        _ro = getattr(self, "is_read_only", False)
-        _de = getattr(self, "is_destructive", False)
+        _ro = getattr(self.__class__, "_is_read_only", False)
+        _de = getattr(self.__class__, "_is_destructive", False)
 
         return ToolDefinition(
             name=self.name,
             description=self.description,
             parameters=params,
-            is_read_only=_ro if isinstance(_ro, bool) else False,
-            is_destructive=_de if isinstance(_de, bool) else False,
+            is_read_only=bool(_ro),
+            is_destructive=bool(_de),
         )
 
     @property
@@ -316,8 +320,8 @@ class Tool(BaseTool):
         if errors:
             return f"Error: {'; '.join(errors)}"
 
-        # Call legacy execute method
-        return await self._legacy_execute(**casted)
+        # Call legacy execute method with context available
+        return await self._legacy_execute(**casted, _tool_context=context)
 
     @abstractmethod
     async def _legacy_execute(self, **kwargs: Any) -> Any:

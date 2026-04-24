@@ -3,7 +3,7 @@
 Appends raw user/assistant interaction logs to workspace/memory/daily/YYYY-MM-DD.md
 files. This is a lightweight, no-LLM audit trail — just file I/O.
 
-Inspired by CoPaw's daily memory logs and the Warm Memory concept from
+Inspired by daily memory logs and the Warm Memory concept from
 the Tiered Memory Architecture guide.
 """
 

@@ -6,6 +6,7 @@ import select
 import signal
 import sys
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -931,15 +932,6 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
 
     hb_cfg = config.gateway.heartbeat
 
-    # Create memory summarization callback for auto-generating MEMORY.md at 12:00 and 23:59
-    async def _summarize_memory_for_heartbeat():
-        try:
-            await agent.memory_manager.dream()
-            return True
-        except Exception as e:
-            logger.warning(f"Heartbeat dream optimization failed: {e}")
-        return False
-
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         fallback_manager=provider,
@@ -949,7 +941,6 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
-        memory_summarizer=_summarize_memory_for_heartbeat,
     )
 
     if channels.enabled_channels:
@@ -966,6 +957,37 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     async def run():
         try:
             await cron.start()
+
+            dream_cron = config.tools.memory.dream_cron
+            dream_task: asyncio.Task | None = None
+            if dream_cron:
+                from croniter import croniter
+                from zoneinfo import ZoneInfo
+
+                async def _dream_loop():
+                    tz = ZoneInfo(config.agents.defaults.timezone)
+                    while True:
+                        try:
+                            now = datetime.now(tz=tz)
+                            cron_iter = croniter(dream_cron, now)
+                            next_ts = cron_iter.get_next(float)
+                            delay = next_ts - now.timestamp()
+                            if delay < 0:
+                                delay = 0
+                            next_dt = datetime.fromtimestamp(next_ts, tz=tz)
+                            logger.info(f"[Dream] Next dream at {next_dt} (in {delay:.0f}s)")
+                            await asyncio.sleep(delay)
+                            logger.info("[Dream] Triggering dream-based memory optimization")
+                            await agent.memory_manager.dream()
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            logger.error(f"[Dream] Dream optimization failed: {e}")
+                            await asyncio.sleep(60)
+
+                dream_task = asyncio.create_task(_dream_loop())
+                console.print(f"[green]✓[/green] Dream: cron={dream_cron}")
+
             await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
@@ -978,6 +1000,8 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            if dream_task:
+                dream_task.cancel()
             await agent.close_mcp()
             await heartbeat.stop()
             cron.stop()

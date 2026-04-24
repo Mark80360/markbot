@@ -90,6 +90,9 @@ class ToolContext:
     permission_mode: PermissionMode
     tool_permission_context: ToolPermissionContext
     is_non_interactive: bool = False
+    channel: str = ""
+    chat_id: str = ""
+    message_id: str | None = None
 
     report_progress: Optional[Callable[[str, Optional[float]], None]] = None
     add_notification: Optional[Callable[[str, str], None]] = None

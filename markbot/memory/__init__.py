@@ -2,12 +2,12 @@
 
 Provides ReMeLight-backed memory management with:
 - Abstract BaseMemoryManager interface
-- ReMeLightMemoryManager concrete implementation (ported from CoPaw)
+- ReMeLightMemoryManager concrete implementation
 - Bootstrap hook for first-time user guidance
 - Memory compaction hook for context window management
 - DailyLogManager for lightweight interaction logging
 
-Architecture ported from CoPaw's tiered memory system.
+Architecture ported from tiered memory system.
 """
 
 from .base import BaseMemoryManager

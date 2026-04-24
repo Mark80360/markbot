@@ -205,6 +205,10 @@ class MemoryToolsConfig(Base):
         default=True,
         description="Enable automatic context compaction when threshold exceeded"
     )
+    dream_cron: str = Field(
+        default="0 23 * * *",
+        description="Cron expression for dream-based memory optimization job (empty string to disable)"
+    )
 
 
 class MCPServerConfig(Base):

@@ -88,7 +88,9 @@ class MemoryCompactionHook:
                 return None
 
             str_token_count = _estimate_tokens(
-                system_prompt + self.memory_manager.get_compressed_summary()
+                system_prompt
+            ) + _estimate_tokens(
+                self.memory_manager.get_compressed_summary()
             )
 
             left_compact_threshold = (

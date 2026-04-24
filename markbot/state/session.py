@@ -1,7 +1,9 @@
 """Session management for conversation history."""
 
 import json
+import os
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -132,11 +134,12 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, max_cache_size: int = 50):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
-        self._cache: dict[str, Session] = {}
+        self._cache: OrderedDict[str, Session] = OrderedDict()
+        self._max_cache_size = max_cache_size
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -159,6 +162,7 @@ class SessionManager:
             The session.
         """
         if key in self._cache:
+            self._cache.move_to_end(key)
             return self._cache[key]
 
         session = self._load(key)
@@ -166,6 +170,7 @@ class SessionManager:
             session = Session(key=key)
 
         self._cache[key] = session
+        self._evict_if_needed()
         return session
 
     def _load(self, key: str) -> Session | None:
@@ -216,23 +221,48 @@ class SessionManager:
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
-        path = self._get_session_path(session.key)
-
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
+        """Save a session to disk using atomic write."""
+        self._save_to_disk(session)
         self._cache[session.key] = session
+        self._cache.move_to_end(session.key)
+
+    def _evict_if_needed(self) -> None:
+        """Evict oldest cached sessions when cache exceeds max size."""
+        while len(self._cache) > self._max_cache_size:
+            evicted_key, evicted_session = self._cache.popitem(last=False)
+            try:
+                self._save_to_disk(evicted_session)
+            except Exception as e:
+                logger.warning(f"Failed to save evicted session {evicted_key}: {e}")
+
+    def _save_to_disk(self, session: Session) -> None:
+        """Save a session to disk (extracted from save() for reuse)."""
+        path = self._get_session_path(session.key)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        temp_path = path.with_suffix(".tmp")
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+            os.replace(temp_path, path)
+        except BaseException:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            raise
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
