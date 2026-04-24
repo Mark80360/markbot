@@ -871,16 +871,16 @@ Step 4 [Awake Report]: After waking from your dream, briefly report: 1) What cor
                 model_name = provider_cfg.get("model_name", "")
 
                 if api_key and base_url and model_name:
-                    from agentscope.model import OpenAIChatWrapper
+                    from agentscope.model import OpenAIChatModel
 
-                    chat_model = OpenAIChatWrapper(
+                    chat_model = OpenAIChatModel(
                         model_name=model_name,
                         api_key=api_key,
-                        base_url=base_url,
+                        client_kwargs={"base_url": base_url},
                     )
-                    from agentscope.formatter import OpenAIFormatter
+                    from agentscope.formatter import OpenAIChatFormatter
 
-                    formatter = OpenAIFormatter()
+                    formatter = OpenAIChatFormatter()
             except Exception as e:
                 logger.warning(f"[Dream] Failed to create model: {e}")
                 return
