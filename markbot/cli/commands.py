@@ -712,10 +712,10 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
     from markbot.config.loader import load_config
-    from markbot.scheduling.cron import CronService
-    from markbot.scheduling.cron import CronJob
-    from markbot.scheduling.heartbeat import HeartbeatService
-    from markbot.state.session import SessionManager
+    from markbot.schedule.cron import CronService
+    from markbot.schedule.cron import CronJob
+    from markbot.schedule.heartbeat import HeartbeatService
+    from markbot.session.session import SessionManager
     logging.basicConfig(level=logging.WARNING)
 
     logger.remove()
@@ -845,7 +845,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     async def on_cron_job(job: CronJob) -> str | None:
         from markbot.tools.cron import CronTool
         from markbot.tools.message import MessageTool
-        from markbot.scheduling.evaluator import evaluate_response
+        from markbot.schedule.evaluator import evaluate_response
 
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
@@ -1032,7 +1032,7 @@ def agent(
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
-    from markbot.scheduling.cron import CronService
+    from markbot.schedule.cron import CronService
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)

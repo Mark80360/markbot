@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from markbot.bus.events import InboundMessage, OutboundMessage
-    from markbot.state.session import Session
+    from markbot.session.session import Session
 
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
 

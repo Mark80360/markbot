@@ -69,9 +69,13 @@ class Session:
         return start
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
+        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary.
+
+        Args:
+            max_messages: Max messages to return.  ``<= 0`` means no limit.
+        """
         unconsolidated = self.messages[self.last_consolidated:]
-        sliced = unconsolidated[-max_messages:]
+        sliced = unconsolidated[-max_messages:] if max_messages > 0 else unconsolidated[:]
 
         # Drop leading non-user messages to avoid starting mid-turn when possible.
         for i, message in enumerate(sliced):
@@ -134,12 +138,36 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
-    def __init__(self, workspace: Path, max_cache_size: int = 50):
+    _FORMAT_VERSION = 1
+    """Schema version for JSONL session files. Incremented on breaking changes."""
+    _DEFAULT_TTL_DAYS = 30
+    """Default session TTL. Sessions older than this are cleaned up on init."""
+
+    def __init__(self, workspace: Path, max_cache_size: int = 50, ttl_days: int | None = None):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._max_cache_size = max_cache_size
+        self._ttl_days = ttl_days if ttl_days is not None else self._DEFAULT_TTL_DAYS
+        self._cleanup_expired()
+
+    def _cleanup_expired(self) -> None:
+        """Remove session files older than TTL."""
+        if self._ttl_days <= 0:
+            return
+        cutoff = datetime.now().timestamp() - self._ttl_days * 86400
+        removed = 0
+        for path in self.sessions_dir.glob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+                if mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except Exception:
+                continue
+        if removed:
+            logger.info("Cleaned up {} expired session(s) (TTL={}d)", removed, self._ttl_days)
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -200,7 +228,11 @@ class SessionManager:
                     if not line:
                         continue
 
-                    data = json.loads(line)
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning("Skipping corrupted line in session {}: {}", key, line[:80])
+                        continue
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
@@ -245,6 +277,7 @@ class SessionManager:
             with open(temp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
                     "_type": "metadata",
+                    "format_version": self._FORMAT_VERSION,
                     "key": session.key,
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat(),

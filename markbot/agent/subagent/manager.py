@@ -11,7 +11,7 @@ from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
 from markbot.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.subagent.progress import SubagentProgressManager
+from markbot.agent.subagent.progress import SubagentProgressManager
 from markbot.tools.registry import ToolRegistry
 from markbot.utils.helpers import build_assistant_message
 
@@ -125,7 +125,7 @@ class SubagentManager:
             while iteration < max_iterations:
                 iteration += 1
 
-                response, _ = await self.fallback_manager.chat_with_fallback(
+                response, attempts = await self.fallback_manager.chat_with_fallback(
                     messages=messages,
                     tools=tools.get_definitions(),
                 )
@@ -138,7 +138,12 @@ class SubagentManager:
 
                 if self.cost_tracker and response.usage:
                     try:
-                        self.cost_tracker.update_from_response(response, model=self.model)
+                        _actual_model = self.model
+                        for _a in reversed(attempts):
+                            if _a.success and _a.model:
+                                _actual_model = _a.model.name
+                                break
+                        self.cost_tracker.update_from_response(response, model=_actual_model)
                     except Exception:
                         pass
 
@@ -273,7 +278,7 @@ class SubagentManager:
         progress: Any = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        from markbot.subagent.progress import SubagentProgress
+        from markbot.agent.subagent.progress import SubagentProgress
 
         status_text = "completed successfully" if status == "ok" else "failed"
 

@@ -150,7 +150,7 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
-        from markbot.scheduling.evaluator import evaluate_response
+        from markbot.schedule.evaluator import evaluate_response
 
         content = self._read_heartbeat_file()
         if not content:
@@ -184,7 +184,7 @@ class HeartbeatService:
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat (full pipeline including evaluate & notify)."""
-        from markbot.scheduling.evaluator import evaluate_response
+        from markbot.schedule.evaluator import evaluate_response
 
         content = self._read_heartbeat_file()
         if not content:

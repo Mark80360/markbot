@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 import time
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -17,28 +17,30 @@ from loguru import logger
 
 from markbot.agent.compact import CompactAction, CompactionConfig, MultiLevelCompactor
 from markbot.agent.context import ContextBuilder
-from markbot.agent.cost_tracker import BudgetExceededError, CostTracker, PricingTable
+from markbot.agent.cost import BudgetExceededError, CostTracker, PricingTable
+from markbot.agent.mcp.manager import McpManager
+from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
 from markbot.memory.daily_log import DailyLogManager
-from markbot.memory.hooks.bootstrap import BootstrapHook
-from markbot.memory.hooks.compaction import MemoryCompactionHook
+from markbot.agent.hooks.bootstrap import BootstrapHook
+from markbot.agent.hooks.compaction import MemoryCompactionHook
 from markbot.memory.manager import ReMeLightMemoryManager
-from markbot.services.interaction_log import InteractionLogger
-from markbot.services.message_pipeline import MessagePipeline, ProcessContext
-from markbot.services.middleware import (
+from markbot.agent.services.interaction import InteractionLogger
+from markbot.agent.pipeline.engine import MessagePipeline, ProcessContext
+from markbot.agent.pipeline.middleware import (
     MemoryLifecycleMiddleware,
     QuestionResponseMiddleware,
 )
-from markbot.services.tool_executor import ToolExecutor
+from markbot.agent.services.executor import ToolExecutor
 from markbot.skills import SkillRegistry
 from markbot.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.state.session import SessionManager
-from markbot.subagent import SubagentManager
-from markbot.subagent.spawn import SpawnTool
-from markbot.subagent.tools import CheckSubagentTool, ListSubagentsTool
+from markbot.session.session import SessionManager
+from markbot.agent.subagent import SubagentManager
+from markbot.agent.subagent.spawn import SpawnTool
+from markbot.agent.subagent.tools import CheckSubagentTool, ListSubagentsTool
 from markbot.tools.context_explorer import (
     ExploreContextCatalogTool,
     LoadContextTool,
@@ -54,6 +56,7 @@ from markbot.tools.filesystem import (
     WriteFileTool,
 )
 from markbot.tools.memory import MemorySearchTool
+from markbot.tools.memory_tools import DreamTool, MemoryForgetTool, MemoryListTool, MemorySaveTool
 from markbot.tools.message import MessageTool
 from markbot.tools.question import AskUserQuestionTool
 from markbot.tools.registry import ToolRegistry
@@ -73,7 +76,7 @@ if TYPE_CHECKING:
         FilesystemToolConfig,
         WebSearchConfig,
     )
-    from markbot.scheduling.cron import CronService
+    from markbot.schedule.cron import CronService
 
 
 class AgentLoop:
@@ -150,7 +153,7 @@ class AgentLoop:
         )
         _pricing: PricingTable | None = None
         if budget_config and getattr(budget_config, "custom_pricing", None):
-            from markbot.agent.cost_tracker import ModelPricing as _MP
+            from markbot.agent.cost import ModelPricing as _MP
 
             _custom = {k: _MP(**v) for k, v in budget_config.custom_pricing.items()}
             _pricing = PricingTable(custom=_custom)
@@ -183,12 +186,8 @@ class AgentLoop:
         )
 
         self._running = False
-        self._mcp_servers = mcp_servers or {}
-        self._mcp_stack: AsyncExitStack | None = None
-        self._mcp_connected = False
-        self._mcp_connecting = False
+        self.mcp = McpManager(mcp_servers)
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -309,6 +308,12 @@ class AgentLoop:
         self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
         self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
 
+        # Memory self-management tools
+        self.tools.register(MemorySaveTool(memory_manager=self.memory_manager))
+        self.tools.register(MemoryForgetTool(memory_manager=self.memory_manager))
+        self.tools.register(MemoryListTool(memory_manager=self.memory_manager))
+        self.tools.register(DreamTool(memory_manager=self.memory_manager))
+
         self.question_tool = AskUserQuestionTool(send_callback=self.bus.publish_outbound)
         self.question_tool.set_context("", "")
         self.tools.register(self.question_tool)
@@ -397,26 +402,7 @@ class AgentLoop:
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
-        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
-            return
-        self._mcp_connecting = True
-        from markbot.tools.mcp import connect_mcp_servers
-
-        try:
-            self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
-        except BaseException as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            if self._mcp_stack:
-                try:
-                    await self._mcp_stack.aclose()
-                except Exception:
-                    pass
-                self._mcp_stack = None
-        finally:
-            self._mcp_connecting = False
+        await self.mcp.connect(self.tools)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -477,18 +463,7 @@ class AgentLoop:
 
         # Wrap on_stream with stateful think-tag filter so downstream
         # consumers (CLI, channels) never see  <think>  blocks.
-        _raw_stream = on_stream
-        _stream_buf = ""
-
-        async def _filtered_stream(delta: str) -> None:
-            nonlocal _stream_buf
-
-            prev_clean = strip_think(_stream_buf)
-            _stream_buf += delta
-            new_clean = strip_think(_stream_buf)
-            incremental = new_clean[len(prev_clean) :]
-            if incremental and _raw_stream:
-                await _raw_stream(incremental)
+        _stream_filter = StreamFilter(on_stream)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -585,7 +560,7 @@ class AgentLoop:
                 response, attempts = await self.fallback_manager.chat_stream_with_fallback(
                     messages=messages,
                     tools=tool_defs,
-                    on_content_delta=_filtered_stream,
+                    on_content_delta=_stream_filter,
                 )
             else:
                 logger.info("[AgentLoop] Calling LLM without streaming...")
@@ -601,12 +576,19 @@ class AgentLoop:
                 len(response.content or ""),
             )
 
+            # Use the actual model from the successful fallback attempt for correct billing
+            _actual_model = self.model
+            for _a in reversed(attempts):
+                if _a.success and _a.model:
+                    _actual_model = _a.model.name
+                    break
+
             self._interaction_log.log_interaction(
                 iteration=iteration,
                 messages=messages,
                 tool_defs=tool_defs,
                 response=response,
-                model=self.model,
+                model=_actual_model,
                 channel=channel,
                 chat_id=chat_id,
                 tokens_before=current_tokens,
@@ -625,7 +607,7 @@ class AgentLoop:
             self._last_context_tokens = current_tokens
 
             try:
-                call_cost = self.cost_tracker.update_from_response(response, model=self.model)
+                call_cost = self.cost_tracker.update_from_response(response, model=_actual_model)
                 if call_cost > 0:
                     logger.debug("[AgentLoop] API cost this call: ${:.6f}", call_cost)
             except BudgetExceededError as exc:
@@ -642,7 +624,7 @@ class AgentLoop:
 
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=True)
-                    _stream_buf = ""
+                    _stream_filter.reset()
 
                 if on_progress:
                     if not on_stream:
@@ -724,7 +706,7 @@ class AgentLoop:
                 logger.info("[AgentLoop] LLM returned final response (no tool calls)")
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=False)
-                    _stream_buf = ""
+                    _stream_filter.reset()
 
                 clean = strip_think(response.content) or None
                 if response.finish_reason == "error":
@@ -981,22 +963,8 @@ class AgentLoop:
                 )
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-        if self._mcp_stack:
-            try:
-                await self._mcp_stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                pass  # MCP SDK cancel scope cleanup is noisy but harmless
-            self._mcp_stack = None
-
-    def _schedule_background(self, coro) -> None:
-        """Schedule a coroutine as a tracked background task (drained on shutdown)."""
-        task = asyncio.create_task(coro)
-        self._background_tasks.append(task)
-        task.add_done_callback(self._background_tasks.remove)
+        """Drain pending background tasks, then close MCP connections."""
+        await self.mcp.close()
 
     def stop(self) -> None:
         """Stop the agent loop."""

@@ -13,7 +13,7 @@ Architecture ported from tiered memory system.
 from .base import BaseMemoryManager
 from .daily_log import DailyLogManager
 from .manager import ReMeLightMemoryManager, _MessageWrapper
-from .hooks import BootstrapHook, MemoryCompactionHook
+from markbot.agent.hooks import BootstrapHook, MemoryCompactionHook
 
 __all__ = [
     "BaseMemoryManager",

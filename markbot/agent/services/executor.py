@@ -10,7 +10,7 @@ from loguru import logger
 
 from markbot.agent.context import ContextBuilder
 from markbot.tools.registry import ToolRegistry
-from markbot.state.session import Session
+from markbot.session.session import Session
 from markbot.utils.helpers import strip_ansi
 
 
@@ -87,7 +87,11 @@ class ToolExecutor:
             messages: Full message list from agent loop
             skip: Number of initial messages to skip (history)
         """
-        for m in messages[skip:]:
+        # Include the current user message at ``skip - 1`` so that
+        # ``get_history()`` on the *next* turn returns what the user
+        # actually asked, not only assistant replies and tool results.
+        _start = max(0, skip - 1)
+        for m in messages[_start:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
 

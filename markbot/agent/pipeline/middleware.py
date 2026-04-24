@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from markbot.bus.events import OutboundMessage
-from markbot.services.message_pipeline import Middleware, ProcessContext
+from markbot.agent.pipeline.engine import Middleware, ProcessContext
 
 if TYPE_CHECKING:
     from markbot.memory.daily_log import DailyLogManager

@@ -5,8 +5,8 @@ from datetime import datetime
 from typing import Any
 
 from markbot.tools.base import Tool
-from markbot.scheduling.cron import CronService
-from markbot.scheduling.cron import CronJobState, CronSchedule
+from markbot.schedule.cron import CronService
+from markbot.schedule.cron import CronJobState, CronSchedule
 
 
 class CronTool(Tool):
