@@ -496,7 +496,7 @@ class OpenAICompatProvider(LLMProvider):
                 _accum_tc(tc, getattr(tc, "index", 0))
 
         return LLMResponse(
-            content="".join(content_parts) or None,
+            content="".join(content_parts) or "",
             tool_calls=[
                 ToolCallRequest(
                     id=b["id"] or _short_tool_id(),

@@ -185,7 +185,14 @@ def build_assistant_message(
     reasoning_content: str | None = None,
     thinking_blocks: list[dict] | None = None,
 ) -> dict[str, Any]:
-    """Build a provider-safe assistant message with optional reasoning fields."""
+    """Build a provider-safe assistant message with optional reasoning fields.
+
+    Ensures ``content`` is never ``None`` — normalises to empty string.
+    This prevents downstream crashes in serialisation / compaction / context-checking
+    paths that assume content is always iterable or string-castable.
+    """
+    if content is None:
+        content = ""
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls

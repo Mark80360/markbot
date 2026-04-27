@@ -299,7 +299,7 @@ class AzureOpenAIProvider(LLMProvider):
         ]
 
         return LLMResponse(
-            content="".join(content_parts) or None,
+            content="".join(content_parts) or "",
             tool_calls=tool_calls,
             finish_reason=finish_reason,
         )

@@ -590,7 +590,13 @@ This helps you provide more accurate, contextual responses without loading unnec
         tool_name: str,
         result: Any,
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
+        """Add a tool result to the message list.
+
+        Normalises ``result`` to string so that downstream consumers never see
+        a ``None`` content field.
+        """
+        if result is None:
+            result = ""
         messages.append(
             {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
         )
