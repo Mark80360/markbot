@@ -21,6 +21,7 @@ from markbot.agent.cost import BudgetExceededError, CostTracker, PricingTable
 from markbot.agent.mcp.manager import McpManager
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
+from markbot.agent.tool_binder import ToolBinder
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
@@ -36,35 +37,12 @@ from markbot.agent.pipeline.middleware import (
 )
 from markbot.agent.services.executor import ToolExecutor
 from markbot.skills import SkillRegistry
-from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.skills.guardrail import SkillGuardrailManager
 from markbot.session.session import SessionManager
 from markbot.agent.subagent import SubagentManager
-from markbot.agent.subagent.spawn import SpawnTool
-from markbot.agent.subagent.tools import CheckSubagentTool, ListSubagentsTool
-from markbot.tools.context_explorer import (
-    ExploreContextCatalogTool,
-    LoadContextTool,
-    SearchContextTool,
-)
-from markbot.tools.cron import CronTool
-from markbot.tools.explore import ExploreTool
-from markbot.tools.filesystem import (
-    DeleteFileTool,
-    EditFileTool,
-    ListDirTool,
-    ReadFileTool,
-    WriteFileTool,
-)
-from markbot.tools.memory import MemorySearchTool
-from markbot.tools.memory_tools import DreamTool, MemoryForgetTool, MemoryListTool, MemorySaveTool
 from markbot.tools.message import MessageTool
 from markbot.tools.question import AskUserQuestionTool
 from markbot.tools.registry import ToolRegistry
-from markbot.tools.search import GlobTool, GrepTool
-from markbot.tools.shell import ExecTool
-from markbot.tools.think import ThinkTool
-from markbot.tools.todo import TodoTool
-from markbot.tools.web import WebExtractTool, WebFetchTool, WebSearchTool
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
 from markbot.utils.helpers import strip_think
@@ -170,6 +148,11 @@ class AgentLoop:
         self.skill_registry = SkillRegistry(workspace, tool_registry=self.tools)
         self.skill_registry.load_all()
 
+        # Skill execution guardrail manager — validates tool calls against
+        # active skill constraints. SkillTool auto-activates its guardrail
+        # on execution.
+        self.guardrail_manager = SkillGuardrailManager(context="main")
+
         self.sessions = session_manager or SessionManager(workspace)
         self.subagents = SubagentManager(
             fallback_manager=fallback_manager,
@@ -252,8 +235,26 @@ class AgentLoop:
             skill_registry=self.skill_registry,
             memory_manager=self.memory_manager,
         )
-        self._register_default_tools()
-        # Skills are now registered via SkillRegistry
+        _allowed_dir = workspace if restrict_to_workspace else None
+        binder = ToolBinder(
+            self.tools,
+            workspace=workspace,
+            allowed_dir=_allowed_dir,
+            web_search_config=self.web_search_config,
+            web_proxy=web_proxy,
+            exec_config=self.exec_config,
+            filesystem_config=self.filesystem_config,
+            cron_service=cron_service,
+            subagent_manager=self.subagents,
+            memory_manager=self.memory_manager,
+            skill_registry=self.skill_registry,
+            timezone=timezone,
+            publish_outbound=self.bus.publish_outbound,
+        )
+        binder.register_all()
+        self._memory_search_tool = binder.memory_search_tool
+        self.question_tool = binder.question_tool
+
         logger.info(f"Agent has {len(self.tools)} tools available")
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
@@ -261,130 +262,6 @@ class AgentLoop:
         # Initialize decoupled services (extracted from monolithic loop)
         self.tool_executor = ToolExecutor(self.tools)
         self._setup_pipeline()
-
-    def _register_default_tools(self) -> None:
-        """Register the default set of tools."""
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-        self._register_base_tools(
-            self.tools,
-            allowed_dir=allowed_dir,
-            extra_allowed_dirs=extra_read,
-            workspace=self.workspace,
-            web_search_config=self.web_search_config,
-            web_proxy=self.web_proxy,
-            exec_config=self.exec_config,
-            filesystem_config=self.filesystem_config,
-        )
-
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        self.tools.register(SpawnTool(manager=self.subagents))
-        self.tools.register(ThinkTool())
-        self._memory_search_tool = MemorySearchTool(memory_manager=self.memory_manager)
-        self.tools.register(self._memory_search_tool)
-        self.tools.register(TodoTool(workspace=self.workspace))
-        self.tools.register(ExploreTool(workspace=self.workspace, allowed_dir=allowed_dir))
-
-        # Context explorer tools for AI-driven dynamic loading
-        self.tools.register(
-            ExploreContextCatalogTool(
-                workspace=self.workspace,
-                memory_manager=self.memory_manager,
-            )
-        )
-        self.tools.register(
-            SearchContextTool(
-                workspace=self.workspace,
-                memory_manager=self.memory_manager,
-            )
-        )
-        self.tools.register(
-            LoadContextTool(
-                workspace=self.workspace,
-                memory_manager=self.memory_manager,
-            )
-        )
-
-        self.tools.register(CheckSubagentTool(subagent_manager=self.subagents))
-        self.tools.register(ListSubagentsTool(subagent_manager=self.subagents))
-
-        # Memory self-management tools
-        self.tools.register(MemorySaveTool(memory_manager=self.memory_manager))
-        self.tools.register(MemoryForgetTool(memory_manager=self.memory_manager))
-        self.tools.register(MemoryListTool(memory_manager=self.memory_manager))
-        self.tools.register(DreamTool(memory_manager=self.memory_manager))
-
-        self.question_tool = AskUserQuestionTool(send_callback=self.bus.publish_outbound)
-        self.question_tool.set_context("", "")
-        self.tools.register(self.question_tool)
-        if self.cron_service:
-            self.tools.register(
-                CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
-            )
-
-    @staticmethod
-    def _register_base_tools(
-        tools: "ToolRegistry",
-        allowed_dir: Path | None = None,
-        extra_allowed_dirs: list[Path] | None = None,
-        workspace: Path | None = None,
-        web_search_config: Any = None,
-        web_proxy: str | None = None,
-        exec_config: Any = None,
-        filesystem_config: Any = None,
-    ) -> None:
-        """Register base filesystem/web/shell tools (shared between AgentLoop and SubagentManager)."""
-        if workspace is None:
-            raise ValueError("workspace must be provided")
-
-        fs_backup_dir = (
-            getattr(filesystem_config, "backup_dir", None) if filesystem_config else None
-        )
-        fs_max_backups = (
-            getattr(filesystem_config, "max_backups", None) if filesystem_config else None
-        )
-        fs_safe_delete = (
-            getattr(filesystem_config, "safe_delete", True) if filesystem_config else True
-        )
-
-        tools.register(
-            ReadFileTool(
-                workspace=workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_allowed_dirs
-            )
-        )
-        for cls in (WriteFileTool, EditFileTool, ListDirTool):
-            tools.register(
-                cls(
-                    workspace=workspace,
-                    allowed_dir=allowed_dir,
-                    backup_dir=fs_backup_dir,
-                    max_backups=fs_max_backups,
-                )
-            )
-        tools.register(
-            DeleteFileTool(
-                workspace=workspace,
-                allowed_dir=allowed_dir,
-                backup_dir=fs_backup_dir,
-                max_backups=fs_max_backups,
-                safe_delete=fs_safe_delete,
-            )
-        )
-        if exec_config and exec_config.enable:
-            tools.register(
-                ExecTool(
-                    working_dir=str(workspace),
-                    timeout=exec_config.timeout,
-                    restrict_to_workspace=getattr(exec_config, "restrict_to_workspace", False),
-                    path_append=exec_config.path_append,
-                    allowed_internal_ips=exec_config.allowed_internal_ips,
-                )
-            )
-        tools.register(WebSearchTool(config=web_search_config, proxy=web_proxy))
-        tools.register(WebFetchTool(proxy=web_proxy))
-        tools.register(WebExtractTool(proxy=web_proxy))
-        tools.register(GlobTool(workspace=workspace, allowed_dir=allowed_dir))
-        tools.register(GrepTool(workspace=workspace, allowed_dir=allowed_dir))
 
     def _setup_pipeline(self) -> None:
         """Initialize the message processing pipeline with middleware."""
@@ -508,10 +385,15 @@ class AgentLoop:
                         for m in reversed(messages):
                             if m.get("role") == "user":
                                 content = m.get("content", "")
+                                if content is None:
+                                    content = ""
                                 if isinstance(content, list):
                                     for block in content:
                                         if isinstance(block, dict) and block.get("type") == "text":
-                                            user_text += block.get("text", "")
+                                            block_text = block.get("text", "")
+                                            if block_text is None:
+                                                block_text = ""
+                                            user_text += block_text
                                 elif isinstance(content, str):
                                     user_text = content
                                 if user_text:
@@ -658,6 +540,27 @@ class AgentLoop:
                 # concurrent sessions don't clobber each other's routing.
                 self._set_tool_context(channel, chat_id, message_id)
 
+                # Guardrail check: validate tool calls against active skill constraints.
+                # Also auto-activate guardrails when a skill tool is called.
+                for tc in response.tool_calls:
+                    # Auto-activate guardrail for skill script calls
+                    if "." in tc.name:
+                        skill_name = tc.name.split(".", 1)[0]
+                        skill_def = self.skill_registry.get(skill_name)
+                        if skill_def and skill_name not in self.guardrail_manager.active_skills:
+                            self.guardrail_manager.start_guarding(skill_def)
+                            logger.info("Guardrail activated for skill: {}", skill_name)
+
+                    violations = self.guardrail_manager.check_all(tc.name, tc.arguments)
+                    for v in violations:
+                        logger.warning(
+                            "Guardrail violation [{}] {} (tool: {}, skill: {})",
+                            v.severity.upper(),
+                            v.message,
+                            tc.name,
+                            getattr(v, 'tool_name', 'unknown'),
+                        )
+
                 # Execute all tool calls concurrently — the LLM batches
                 # independent calls in a single response on purpose.
                 # return_exceptions=True ensures all results are collected
@@ -776,23 +679,27 @@ class AgentLoop:
     ) -> int:
         """Recalculate the new-message start index after compaction reshaped messages.
 
-        After history-snip / auto-compaction, ``messages`` is much shorter than
-        before and the original offset-based ``_new_msg_start`` is invalid.
-        We locate the *last user message* that existed *before* the loop started
-        (i.e. the current-turn user input) – everything after it was produced
-        by this loop iteration and must be persisted by ``save_turn``.
+        Uses the count of messages added since the last save boundary
+        (``len(messages) - _new_msg_start``) to derive the new boundary.
+        This is more correct than the original ``_initial_count - _new_msg_start``
+        which becomes stale after repeated compactions within one turn.
         """
-        orig_new_count = _initial_count - _new_msg_start
-        if orig_new_count <= 0:
-            fallback = max(0, len(messages) - 1)
+        new_msgs = len(messages) - _new_msg_start
+
+        if new_msgs <= 0:
+            # No new messages were produced by the loop before compaction.
+            # Find the current-turn user message to use as the save boundary.
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i].get("role") == "user":
                     return i + 1
-            return fallback
+            # User message was consumed by compaction (extremely long turn).
+            # Default to 1 so save_turn skips the system prompt and preserves
+            # whatever remains, avoiding total data loss.
+            return 1
 
-        target = min(orig_new_count, len(messages))
-        candidate = len(messages) - target
-        candidate = max(0, candidate)
+        # Adjust the boundary by the same number of new-message slots.
+        target = min(new_msgs, len(messages))
+        candidate = max(0, len(messages) - target)
 
         for i in range(candidate, len(messages)):
             if messages[i].get("role") == "user":
@@ -802,7 +709,7 @@ class AgentLoop:
             if messages[i].get("role") == "user":
                 return i + 1
 
-        return max(0, len(messages) - 1)
+        return 1
 
     @staticmethod
     def _strip_orphan_tool_results(messages: list[dict]) -> list[dict]:
@@ -951,13 +858,15 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
+            except Exception as e:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                error_detail = str(e).strip()
+                safe_detail = error_detail[:300].replace("{", "{{").replace("}", "}}")
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
+                        content=f"Sorry, I encountered an error: {safe_detail}",
                         metadata=dict(msg.metadata or {}),
                     )
                 )

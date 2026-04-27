@@ -118,7 +118,13 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     )
     if summary:
         mm.set_compressed_summary(summary)
-        session.retain_recent_legal_suffix(max_messages=6)
+        # Advance last_consolidated to mark old messages as archived
+        # without deleting them, so get_history() still has access.
+        keep_recent = 6
+        session.last_consolidated = max(
+            session.last_consolidated,
+            max(0, len(session.messages) - keep_recent),
+        )
         loop.sessions.save(session)
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,

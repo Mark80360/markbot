@@ -2,7 +2,7 @@
 
 from markbot.types.permission import PermissionMode, PermissionDecision, ToolPermissionContext
 from markbot.types.tool import ToolParameter, ToolDefinition, ToolContext
-from markbot.types.skill import SkillScriptDef, SkillDefinition
+from markbot.types.skill import SkillScriptDef, SkillDefinition, SkillConfigVar, SkillConditions
 
 __all__ = [
     "PermissionMode",
@@ -13,4 +13,6 @@ __all__ = [
     "ToolContext",
     "SkillScriptDef",
     "SkillDefinition",
+    "SkillConfigVar",
+    "SkillConditions",
 ]

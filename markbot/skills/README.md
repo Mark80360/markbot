@@ -1,6 +1,6 @@
-# markbot Skills
+# Markbot Skills
 
-This directory contains built-in skills that extend markbot's capabilities.
+This directory contains built-in skills that extend Markbot's capabilities.
 
 ## Skill Format
 

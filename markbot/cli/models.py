@@ -435,3 +435,33 @@ def get_model_context_limit(ref: str) -> int | None:
 def format_token_count(tokens: int) -> str:
     """Format token count for display (e.g., 200000 -> '200,000')."""
     return f"{tokens:,}"
+
+
+def get_model_suggestions(text: str, *, provider: str = "", limit: int = 50) -> list[str]:
+    """Return model name suggestions matching *text* for autocomplete.
+
+    Args:
+        text: Partial model name typed so far.
+        provider: Optional provider ID to filter by.
+        limit: Maximum number of suggestions to return.
+
+    Returns:
+        List of matching model name strings.
+    """
+    text_lower = text.lower()
+    results: list[str] = []
+
+    providers_to_search = (
+        {provider: MODEL_DATABASE[provider]}
+        if provider and provider in MODEL_DATABASE
+        else MODEL_DATABASE
+    )
+
+    for prov in providers_to_search.values():
+        for model in prov.models:
+            if text_lower in model.name.lower() or text_lower in model.id.lower():
+                results.append(model.name)
+            if len(results) >= limit:
+                return results
+
+    return results

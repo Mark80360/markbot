@@ -125,6 +125,13 @@ class Session:
         if start:
             retained = retained[start:]
 
+        # Mirror get_history(): drop leading non-user messages so the retained
+        # suffix aligns with what get_history() will actually return.
+        for i, msg in enumerate(retained):
+            if msg.get("role") == "user":
+                retained = retained[i:]
+                break
+
         dropped = len(self.messages) - len(retained)
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)

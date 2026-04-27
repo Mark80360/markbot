@@ -1,22 +1,16 @@
-"""Skill loader for markbot.
-
-Refactored to use new core types inspired by MarkBot.
-"""
+"""Skill loader for markbot."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 
-from markbot.types.skill import SkillDefinition, SkillScriptDef
+from markbot.types.skill import SkillConditions, SkillConfigVar, SkillDefinition, SkillScriptDef
 from markbot.types.tool import ToolParameter
 
-# Import PyYAML for proper YAML parsing
 try:
     import yaml
 
@@ -33,8 +27,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Default builtin skills directory - points to the skills/ folder with actual skill definitions
 BUILTIN_SKILLS_DIR = Path(__file__).parent
+
+VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+MAX_NAME_LENGTH = 64
+MAX_DESCRIPTION_LENGTH = 1024
+MAX_SKILL_CONTENT_CHARS = 100_000
+ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
 
 class SkillLoader:
@@ -54,7 +53,6 @@ class SkillLoader:
         skills = []
         loaded_names = set()
 
-        # Load workspace skills first (can override builtin)
         if self.workspace_skills.exists():
             for skill_dir in sorted(self.workspace_skills.iterdir()):
                 if skill_dir.is_dir() and not skill_dir.name.startswith("."):
@@ -66,7 +64,6 @@ class SkillLoader:
                     except Exception as e:
                         logger.warning(f"Failed to load skill from {skill_dir}: {e}")
 
-        # Load builtin skills
         if self.builtin_skills.exists():
             for skill_dir in sorted(self.builtin_skills.iterdir()):
                 if skill_dir.is_dir() and not skill_dir.name.startswith("."):
@@ -97,8 +94,9 @@ class SkillLoader:
         if not meta:
             raise ValueError(f"No frontmatter found in {skill_file}")
 
-        # Parse scripts
         scripts = self._parse_scripts(meta, skill_file.parent)
+        config_vars = self._parse_config_vars(meta)
+        conditions = self._parse_conditions(meta)
 
         return SkillDefinition(
             name=meta.get("name", skill_file.parent.name),
@@ -107,6 +105,8 @@ class SkillLoader:
             scripts=scripts,
             is_builtin=is_builtin,
             is_always_active=self._parse_markbot_metadata(meta).get("always", False),
+            config_vars=config_vars,
+            conditions=conditions,
         )
 
     def _parse_frontmatter(self, content: str) -> dict[str, Any] | None:
@@ -114,19 +114,16 @@ class SkillLoader:
         if not content.startswith("---"):
             return None
 
-        # Find the end of frontmatter
         end_match = re.search(r"\n---\s*\n", content[3:])
         if not end_match:
             return None
 
         yaml_content = content[3 : 3 + end_match.start()]
 
-        # Try PyYAML first
         result = _parse_yaml(yaml_content)
         if result is not None:
             return result
 
-        # Fallback to manual parsing
         return self._manual_parse_yaml(yaml_content)
 
     def _manual_parse_yaml(self, yaml_content: str) -> dict[str, Any]:
@@ -134,15 +131,12 @@ class SkillLoader:
         result = {}
         current_key = None
         current_list = None
-        current_dict = None
-        dict_key = None
 
         for line in yaml_content.split("\n"):
             stripped = line.rstrip()
             if not stripped:
                 continue
 
-            # Check for list item
             list_match = re.match(r"^\s*-\s+(.+)$", stripped)
             if list_match and current_key:
                 if current_list is None:
@@ -151,24 +145,18 @@ class SkillLoader:
                 current_list.append(list_match.group(1).strip('"\''))
                 continue
 
-            # Check for key-value pair
             kv_match = re.match(r"^(\w+):\s*(.*)$", stripped)
             if kv_match:
                 key, value = kv_match.groups()
                 current_key = key
                 current_list = None
-                current_dict = None
-                dict_key = None
 
-                # Check if this starts a nested structure
                 if stripped.rstrip().endswith(":") and not value.strip():
                     result[key] = {}
-                    current_dict = result[key]
                     continue
 
                 value = value.strip()
                 if value:
-                    # Remove quotes
                     if (value.startswith('"') and value.endswith('"')) or (
                         value.startswith("'") and value.endswith("'")
                     ):
@@ -179,11 +167,86 @@ class SkillLoader:
 
         return result
 
+    def _parse_config_vars(self, meta: dict[str, Any]) -> list[SkillConfigVar]:
+        """Parse config variable declarations from skill frontmatter.
+
+        Skills declare config settings via::
+
+            markbot:
+              config:
+                - key: wiki.path
+                  description: Path to the knowledge base directory
+                  default: "~/wiki"
+                  prompt: Wiki directory path
+        """
+        markbot_meta = meta.get("markbot", {})
+        if not isinstance(markbot_meta, dict):
+            return []
+
+        raw = markbot_meta.get("config", [])
+        if not raw:
+            return []
+        if isinstance(raw, dict):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+
+        result: list[SkillConfigVar] = []
+        seen: set[str] = set()
+
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "")).strip()
+            if not key or key in seen:
+                continue
+            desc = str(item.get("description", "")).strip()
+            if not desc:
+                continue
+            prompt_text = str(item.get("prompt", "")).strip() or desc
+            default = item.get("default")
+            if default is not None:
+                default = str(default)
+            seen.add(key)
+            result.append(SkillConfigVar(
+                key=key,
+                description=desc,
+                default=default,
+                prompt=prompt_text,
+            ))
+
+        return result
+
+    def _parse_conditions(self, meta: dict[str, Any]) -> SkillConditions:
+        """Parse conditional activation fields from skill frontmatter.
+
+        Skills declare conditions via::
+
+            markbot:
+              requires_tools: [exec, web_search]
+              fallback_for_tools: [web_search]
+        """
+        markbot_meta = meta.get("markbot", {})
+        if not isinstance(markbot_meta, dict):
+            return SkillConditions()
+
+        requires = markbot_meta.get("requires_tools", [])
+        fallback = markbot_meta.get("fallback_for_tools", [])
+
+        if isinstance(requires, str):
+            requires = [requires]
+        if isinstance(fallback, str):
+            fallback = [fallback]
+
+        return SkillConditions(
+            requires_tools=[str(t).strip() for t in (requires or []) if str(t).strip()],
+            fallback_for_tools=[str(t).strip() for t in (fallback or []) if str(t).strip()],
+        )
+
     def _parse_scripts(self, meta: dict[str, Any], skill_dir: Path) -> list[SkillScriptDef]:
         """Parse executable scripts from skill metadata."""
         scripts = []
 
-        # Get scripts section
         scripts_meta = meta.get("scripts", {})
         if isinstance(scripts_meta, dict):
             for name, script_def in scripts_meta.items():
@@ -202,7 +265,6 @@ class SkillLoader:
         if not entry:
             return None
 
-        # Parse parameters
         params = []
         params_meta = script_def.get("parameters", {})
         if isinstance(params_meta, dict):
@@ -218,7 +280,6 @@ class SkillLoader:
                     )
                     params.append(param)
 
-        # Parse sandbox config
         sandbox_config = script_def.get("sandbox", {})
 
         return SkillScriptDef(
@@ -239,12 +300,10 @@ class SkillLoader:
 
     def get_skill_path(self, name: str) -> Path | None:
         """Get the path to a skill directory by name."""
-        # Check workspace first
         workspace_skill = self.workspace_skills / name
         if workspace_skill.exists():
             return workspace_skill
 
-        # Check builtin
         builtin_skill = self.builtin_skills / name
         if builtin_skill.exists():
             return builtin_skill
@@ -253,6 +312,84 @@ class SkillLoader:
 
     def check_requirements(self, skill: SkillDefinition) -> bool:
         """Check if skill requirements are met."""
-        # This would check for required binaries, env vars, etc.
-        # For now, assume all requirements are met
         return True
+
+    @staticmethod
+    def validate_name(name: str) -> str | None:
+        """Validate a skill name. Returns error message or None if valid."""
+        if not name:
+            return "Skill name is required."
+        if len(name) > MAX_NAME_LENGTH:
+            return f"Skill name exceeds {MAX_NAME_LENGTH} characters."
+        if not VALID_NAME_RE.match(name):
+            return (
+                f"Invalid skill name '{name}'. Use lowercase letters, numbers, "
+                f"hyphens, dots, and underscores. Must start with a letter or digit."
+            )
+        return None
+
+    @staticmethod
+    def validate_frontmatter(content: str) -> str | None:
+        """Validate that SKILL.md content has proper frontmatter with required fields."""
+        if not content.strip():
+            return "Content cannot be empty."
+
+        if not content.startswith("---"):
+            return "SKILL.md must start with YAML frontmatter (---)."
+
+        end_match = re.search(r'\n---\s*\n', content[3:])
+        if not end_match:
+            return "SKILL.md frontmatter is not closed. Ensure you have a closing '---' line."
+
+        yaml_content = content[3:end_match.start() + 3]
+
+        try:
+            parsed = _parse_yaml(yaml_content)
+        except Exception as e:
+            return f"YAML frontmatter parse error: {e}"
+
+        if not isinstance(parsed, dict):
+            return "Frontmatter must be a YAML mapping (key: value pairs)."
+
+        if "name" not in parsed:
+            return "Frontmatter must include 'name' field."
+        if "description" not in parsed:
+            return "Frontmatter must include 'description' field."
+        if len(str(parsed.get("description", ""))) > MAX_DESCRIPTION_LENGTH:
+            return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
+
+        body = content[end_match.end() + 3:].strip()
+        if not body:
+            return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
+
+        return None
+
+    @staticmethod
+    def validate_content_size(content: str, label: str = "SKILL.md") -> str | None:
+        """Check that content doesn't exceed the character limit."""
+        if len(content) > MAX_SKILL_CONTENT_CHARS:
+            return (
+                f"{label} content is {len(content):,} characters "
+                f"(limit: {MAX_SKILL_CONTENT_CHARS:,}). "
+                f"Consider splitting into a smaller SKILL.md with supporting files."
+            )
+        return None
+
+    @staticmethod
+    def validate_file_path(file_path: str) -> str | None:
+        """Validate a file path for write_file/remove_file."""
+        if not file_path:
+            return "file_path is required."
+
+        if ".." in Path(file_path).parts:
+            return "Path traversal ('..') is not allowed."
+
+        normalized = Path(file_path)
+        if not normalized.parts or normalized.parts[0] not in ALLOWED_SUBDIRS:
+            allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
+            return f"File must be under one of: {allowed}. Got: '{file_path}'"
+
+        if len(normalized.parts) < 2:
+            return f"Provide a file path, not just a directory. Example: '{normalized.parts[0]}/myfile.md'"
+
+        return None

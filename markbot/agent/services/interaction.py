@@ -220,6 +220,8 @@ class InteractionLogger:
             ptype = part.get("type", "?")
             if ptype == "text":
                 text = part.get("text", "")
+                if text is None:
+                    text = ""
                 lines.append(text)
             elif ptype == "image_url":
                 url = part.get("image_url", {}).get("url", "")[:100]

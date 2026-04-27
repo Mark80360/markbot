@@ -26,6 +26,41 @@ from markbot.config.schema import Config, ProviderConfig
 
 console = Console()
 
+_SECURITY_WARNING = (
+    "MarkBot is a personal AI assistant that runs in your own environment. "
+    "It can execute shell commands, read/write files, and call external APIs. "
+    "By default it operates within a single-operator boundary: one trusted user.\n\n"
+    "A malicious or confused prompt can lead the agent to do unsafe things if tools are enabled.\n\n"
+    "Recommended baseline:\n"
+    "• Restrict which channels and users can trigger the agent; use allowlists where possible.\n"
+    "• Run skills with least privilege; sandbox where you can.\n"
+    "• Keep secrets out of the agent's working directory and skill-accessible paths.\n"
+    "• Use a capable model when the agent has tools or handles untrusted input."
+)
+
+
+def _show_security_warning() -> bool:
+    """Display security warning and require user acceptance.
+
+    Returns:
+        True if user accepts, False otherwise.
+    """
+    console.print()
+    console.print(
+        Panel(
+            _SECURITY_WARNING,
+            title="[bold]⚠️  Security Warning — Please Read[/bold]",
+            border_style="yellow",
+        )
+    )
+    console.print()
+    return bool(
+        _get_questionary().confirm(
+            "I have read and understand the security notice",
+            default=True,
+        ).ask()
+    )
+
 
 @dataclass
 class OnboardResult:
@@ -297,29 +332,24 @@ def _show_config_panel(display_name: str, model: BaseModel, fields: list) -> Non
     console.print(Panel(table, title=f"[bold]{display_name}[/bold]", border_style="blue"))
 
 
+def _wait_for_key() -> None:
+    """Pause and wait for user to press Enter."""
+    _get_questionary().confirm("Press Enter to continue...", default=True).ask()
+
+
 def _show_main_menu_header() -> None:
-    """Display the main menu header."""
+    """Display the main menu header (compact, avoids Window too small)."""
     from markbot import __logo__, __version__
 
-    console.print()
-    # Use Align.CENTER for the single line of text
-    from rich.align import Align
-
-    console.print(
-        Align.center(f"{__logo__} [bold cyan]markbot[{__version__}][/bold cyan]")
-    )
-    console.print()
+    console.print(f"[bold cyan]{__logo__} Markbot[{__version__}][/bold cyan]")
 
 
 def _show_section_header(title: str, subtitle: str = "") -> None:
-    """Display a section header."""
-    console.print()
+    """Display a section header (compact, avoids Window too small)."""
     if subtitle:
-        console.print(
-            Panel(f"[dim]{subtitle}[/dim]", title=f"[bold]{title}[/bold]", border_style="blue")
-        )
+        console.print(f"[bold blue]── {title} ──[/bold blue] [dim]{subtitle}[/dim]")
     else:
-        console.print(Panel("", title=f"[bold]{title}[/bold]", border_style="blue"))
+        console.print(f"[bold blue]── {title} ──[/bold blue]")
 
 
 # --- Input Handlers ---
@@ -695,6 +725,7 @@ def _configure_provider(config: Config, provider_name: str) -> None:
     updated_provider = _configure_pydantic_model(
         provider_config,
         display_name,
+        skip_fields={"models"},
     )
     if updated_provider is not None:
         setattr(config.providers, provider_name, updated_provider)
@@ -703,6 +734,66 @@ def _configure_provider(config: Config, provider_name: str) -> None:
     # Step 2: Configure models for this provider (V2 feature)
     _configure_models_for_provider(config, provider_name, display_name)
 
+    # Step 3: If no models were added, prompt to add one
+    if not provider_config.models:
+        add_now = _get_questionary().confirm(
+            f"No models configured for {display_name}. Add one now?",
+            default=True,
+        ).ask()
+        if add_now:
+            _configure_models_for_provider(config, provider_name, display_name)
+
+    # Step 4: Offer to update model chain if provider has models
+    if provider_config.models:
+        _prompt_update_model_chain(config, provider_name, display_name)
+
+
+def _prompt_update_model_chain(config: Config, provider_name: str, display_name: str) -> None:
+    """After configuring a provider's models, offer to update the model chain."""
+    provider_config = getattr(config.providers, provider_name, None)
+    if not provider_config or not provider_config.models:
+        return
+
+    current_chain = config.agents.defaults.model_chain
+    provider_refs = [f"{provider_name}/{m.id}" for m in provider_config.models]
+    already_in_chain = any(ref in current_chain for ref in provider_refs)
+
+    if already_in_chain and current_chain:
+        return
+
+    if not current_chain:
+        new_chain = provider_refs
+        config.agents.defaults.model_chain = new_chain
+        console.print(f"[green]✓ Model chain set to: {', '.join(new_chain)}[/green]")
+        _wait_for_key()
+        return
+
+    console.print(f"\n[dim]Current model chain: {', '.join(current_chain)}[/dim]")
+    console.print(f"[dim]Available from {display_name}: {', '.join(provider_refs)}[/dim]")
+
+    choices = [
+        "Prepend (use as primary, existing models as fallback)",
+        "Append (use as fallback after existing models)",
+        "Replace (use only these models)",
+        "Skip (keep current chain)",
+    ]
+
+    answer = _select_with_back("Update model chain?", choices)
+    if answer is _BACK_PRESSED or answer is None or answer == "Skip (keep current chain)":
+        return
+
+    assert isinstance(answer, str)
+
+    if answer.startswith("Prepend"):
+        config.agents.defaults.model_chain = provider_refs + current_chain
+    elif answer.startswith("Append"):
+        config.agents.defaults.model_chain = current_chain + provider_refs
+    elif answer.startswith("Replace"):
+        config.agents.defaults.model_chain = provider_refs
+
+    console.print(f"[green]✓ Model chain updated: {', '.join(config.agents.defaults.model_chain)}[/green]")
+    _wait_for_key()
+
 
 def _configure_models_for_provider(config: Config, provider_name: str, display_name: str) -> None:
     """Configure models for a specific provider."""
@@ -710,7 +801,11 @@ def _configure_models_for_provider(config: Config, provider_name: str, display_n
     from markbot.cli.models import get_provider_models, get_model_info, format_token_count
 
     provider_config = getattr(config.providers, provider_name, None)
-    if not provider_config or not provider_config.api_key:
+    if not provider_config:
+        return
+
+    is_local = provider_name in ("ollama", "vllm", "ovms")
+    if not is_local and not provider_config.api_key:
         console.print("[yellow]Please configure API key first before adding models.[/yellow]")
         return
 
@@ -744,6 +839,7 @@ def _configure_models_for_provider(config: Config, provider_name: str, display_n
 
             choices = ["[+] Add Model"]
             if current_models:
+                choices.append("[E] Edit Model")
                 choices.append("[-] Remove Model")
             choices.append("<- Back")
 
@@ -756,6 +852,8 @@ def _configure_models_for_provider(config: Config, provider_name: str, display_n
 
             if answer == "[+] Add Model":
                 _add_model_to_provider(config, provider_name, display_name, available_models)
+            elif answer == "[E] Edit Model":
+                _edit_model_in_provider(config, provider_name, display_name)
             elif answer == "[-] Remove Model":
                 _remove_model_from_provider(config, provider_name, display_name)
 
@@ -832,6 +930,38 @@ def _add_model_to_provider(
     provider_config.models.append(new_model)
     console.print(f"[green]✓ Added model: {new_model.id}[/green]")
     _wait_for_key()
+
+
+def _edit_model_in_provider(config: Config, provider_name: str, display_name: str) -> None:
+    """Edit an existing model's fields individually."""
+    provider_config = getattr(config.providers, provider_name, None)
+    if not provider_config or not provider_config.models:
+        return
+
+    model_choices = [f"{m.id} ({m.name})" for m in provider_config.models] + ["<- Back"]
+
+    console.clear()
+    _show_section_header(f"Edit Model in {display_name}", "Select a model to edit")
+
+    answer = _select_with_back("Select model:", model_choices)
+
+    if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+        return
+
+    assert isinstance(answer, str)
+
+    selected_id = answer.split(" (")[0]
+    model_obj = next((m for m in provider_config.models if m.id == selected_id), None)
+    if not model_obj:
+        return
+
+    updated = _configure_pydantic_model(model_obj, f"Model: {model_obj.id}")
+    if updated is not None:
+        idx = next(i for i, m in enumerate(provider_config.models) if m.id == selected_id)
+        provider_config.models[idx] = updated
+        console.print(f"[green]✓ Updated model: {updated.id}[/green]")
+    else:
+        console.print("[dim]No changes made.[/dim]")
 
 
 def _remove_model_from_provider(config: Config, provider_name: str, display_name: str) -> None:
@@ -1049,9 +1179,7 @@ def _configure_providers(config: Config) -> None:
 
             # Type guard: answer is now guaranteed to be a string
             assert isinstance(answer, str)
-            # Extract provider name from choice (remove " *" suffix if present)
-            provider_name = answer.replace(" *", "")
-            # Find the actual provider key from display names
+            provider_name = answer.split(" *")[0].split(" (")[0]
             for name, display in _get_provider_names().items():
                 if display == provider_name:
                     _configure_provider(config, name)
@@ -1147,7 +1275,7 @@ def _configure_channels(config: Config) -> None:
 # --- General Settings ---
 
 _SETTINGS_SECTIONS: dict[str, tuple[str, str, set[str] | None]] = {
-    "Agent Settings": ("Agent Defaults", "Configure default model, temperature, and behavior", None),
+    "Agent Settings": ("Agent Defaults", "Configure default model, temperature, and behavior", {"model_chain"}),
     "Gateway": ("Gateway Settings", "Configure server host, port, and heartbeat", None),
     "Tools": ("Tools Settings", "Configure web search, shell exec, and other tools", {"mcp_servers"}),
 }
@@ -1175,6 +1303,17 @@ def _configure_general_settings(config: Config, section: str) -> None:
     updated = _configure_pydantic_model(model, display_name, skip_fields=skip)
     if updated is not None:
         _SETTINGS_SETTER[section](config, updated)
+
+    if section == "Agent Settings":
+        chain = config.agents.defaults.model_chain
+        if chain:
+            console.print(f"[dim]Current model chain: {', '.join(chain)}[/dim]")
+        edit_chain = _get_questionary().confirm(
+            "Configure model chain (fallback order)?",
+            default=not bool(chain),
+        ).ask()
+        if edit_chain:
+            _configure_model_chain(config)
 
 
 # --- Summary ---
@@ -1350,3 +1489,102 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
         action_fn = _MENU_DISPATCH.get(answer)
         if action_fn:
             action_fn()
+
+
+# --- Guided (Linear) Onboarding ---
+
+
+_GUIDED_STEPS: list[tuple[str, str, bool]] = [
+    ("LLM Provider", "Configure API key and endpoint for your LLM provider", True),
+    ("Model Chain", "Set up the model fallback order (at least one model required)", True),
+    ("Chat Channel", "Connect to DingTalk, Feishu, WeChat, QQ, Email, etc.", False),
+    ("Agent Settings", "Default model parameters, timezone, workspace", False),
+    ("Tools", "Web search, shell exec, filesystem, memory, MCP servers", False),
+    ("Gateway", "Server host, port, heartbeat interval", False),
+]
+
+_GUIDED_DISPATCH = {
+    "LLM Provider": lambda c: _configure_providers(c),
+    "Model Chain": lambda c: _configure_model_chain(c),
+    "Chat Channel": lambda c: _configure_channels(c),
+    "Agent Settings": lambda c: _configure_general_settings(c, "Agent Settings"),
+    "Tools": lambda c: _configure_general_settings(c, "Tools"),
+    "Gateway": lambda c: _configure_general_settings(c, "Gateway"),
+}
+
+
+def run_guided_onboard(initial_config: Config | None = None) -> OnboardResult:
+    """Run a linear, step-by-step guided onboarding.
+
+    Unlike the menu-driven ``run_onboard``, this walks the user through
+    each configuration section in order, making it ideal for first-time
+    users who don't know what to configure.
+
+    Args:
+        initial_config: Optional pre-loaded config to use as starting point.
+
+    Returns:
+        OnboardResult with the final config and save decision.
+    """
+    _get_questionary()
+
+    if initial_config is not None:
+        base_config = initial_config.model_copy(deep=True)
+    else:
+        config_path = get_config_path()
+        if config_path.exists():
+            base_config = load_config()
+        else:
+            base_config = Config()
+
+    original_config = base_config.model_copy(deep=True)
+    config = base_config.model_copy(deep=True)
+
+    console.clear()
+    _show_main_menu_header()
+
+    if not _show_security_warning():
+        console.print("[yellow]Onboarding aborted. Run 'markbot onboard --guided' when ready.[/yellow]")
+        return OnboardResult(config=original_config, should_save=False)
+
+    total = len(_GUIDED_STEPS)
+
+    for i, (step_name, step_desc, required) in enumerate(_GUIDED_STEPS, 1):
+        console.clear()
+        _show_section_header(
+            f"Step {i}/{total}: {step_name}",
+            step_desc,
+        )
+
+        if required:
+            _GUIDED_DISPATCH[step_name](config)
+        else:
+            proceed = _get_questionary().confirm(
+                f"Configure {step_name}?",
+                default=False,
+            ).ask()
+            if proceed:
+                _GUIDED_DISPATCH[step_name](config)
+            else:
+                console.print(f"[dim]Skipped {step_name}[/dim]")
+
+    console.clear()
+    _show_main_menu_header()
+    _show_summary(config)
+
+    save = _get_questionary().confirm(
+        "\nSave this configuration?",
+        default=True,
+    ).ask()
+
+    if save:
+        return OnboardResult(config=config, should_save=True)
+
+    discard = _get_questionary().confirm(
+        "Discard all changes?",
+        default=False,
+    ).ask()
+    if discard:
+        return OnboardResult(config=original_config, should_save=False)
+
+    return OnboardResult(config=config, should_save=True)

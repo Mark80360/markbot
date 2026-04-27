@@ -1,4 +1,4 @@
-"""CLI commands for markbot."""
+"""CLI commands for Markbot."""
 
 import asyncio
 import os
@@ -47,6 +47,10 @@ app = typer.Typer(
 
 # Add skill management subcommands
 app.add_typer(skills_app, name="skills")
+
+# Add doctor diagnostic subcommand
+from markbot.cli.doctor import doctor_app
+app.add_typer(doctor_app, name="doctor")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -269,7 +273,9 @@ def main(
 def onboard(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-    wizard: bool = typer.Option(False, "--wizard", help="Use interactive wizard"),
+    wizard: bool = typer.Option(False, "--wizard", help="Use interactive menu-driven wizard"),
+    guided: bool = typer.Option(False, "--guided", help="Use linear step-by-step guided setup (recommended for first-time users)"),
+    defaults: bool = typer.Option(False, "--defaults", help="Use all default values (non-interactive, for scripts/Docker)"),
 ):
     """Initialize MarkBot configuration and workspace."""
     from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
@@ -290,27 +296,45 @@ def onboard(
             loaded.agents.defaults.workspace = workspace
         return loaded
 
+    # --defaults mode: create config with all defaults, no interaction
+    if defaults:
+        config_obj = _apply_workspace_override(Config())
+        save_config(config_obj, config_path)
+        console.print(f"[green]✓[/green] Created default config at {config_path}")
+        _onboard_plugins(config_path)
+
+        workspace_path = get_workspace_path(config_obj.workspace_path)
+        if not workspace_path.exists():
+            workspace_path.mkdir(parents=True, exist_ok=True)
+            console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
+        sync_workspace_templates(workspace_path)
+
+        console.print(f"\n{__logo__} Default configuration created!")
+        console.print(f"  Edit config: [cyan]{config_path}[/cyan]")
+        console.print(f"  Run guided setup: [cyan]markbot onboard --guided[/cyan]")
+        return
+
     # Create or update config
+    is_interactive = wizard or guided
     if config_path.exists():
-        if wizard:
-            config = _apply_workspace_override(load_config(config_path))
+        if is_interactive:
+            config_obj = _apply_workspace_override(load_config(config_path))
         else:
             console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
             console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
             console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
             if typer.confirm("Overwrite?"):
-                config = _apply_workspace_override(Config())
-                save_config(config, config_path)
+                config_obj = _apply_workspace_override(Config())
+                save_config(config_obj, config_path)
                 console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
             else:
-                config = _apply_workspace_override(load_config(config_path))
-                save_config(config, config_path)
+                config_obj = _apply_workspace_override(load_config(config_path))
+                save_config(config_obj, config_path)
                 console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        config = _apply_workspace_override(Config())
-        # In wizard mode, don't save yet - the wizard will handle saving if should_save=True
-        if not wizard:
-            save_config(config, config_path)
+        config_obj = _apply_workspace_override(Config())
+        if not is_interactive:
+            save_config(config_obj, config_path)
             console.print(f"[green]✓[/green] Created config at {config_path}")
 
     # Run interactive wizard if enabled
@@ -318,22 +342,41 @@ def onboard(
         from markbot.cli.onboard import run_onboard
 
         try:
-            result = run_onboard(initial_config=config)
+            result = run_onboard(initial_config=config_obj)
             if not result.should_save:
                 console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
                 return
 
-            config = result.config
-            save_config(config, config_path)
+            config_obj = result.config
+            save_config(config_obj, config_path)
             console.print(f"[green]✓[/green] Config saved at {config_path}")
         except Exception as e:
             console.print(f"[red]✗[/red] Error during configuration: {e}")
             console.print("[yellow]Please run 'markbot onboard' again to complete setup.[/yellow]")
             raise typer.Exit(1)
+
+    # Run guided onboarding if enabled
+    if guided:
+        from markbot.cli.onboard import run_guided_onboard
+
+        try:
+            result = run_guided_onboard(initial_config=config_obj)
+            if not result.should_save:
+                console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
+                return
+
+            config_obj = result.config
+            save_config(config_obj, config_path)
+            console.print(f"[green]✓[/green] Config saved at {config_path}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Error during configuration: {e}")
+            console.print("[yellow]Please run 'markbot onboard --guided' again to complete setup.[/yellow]")
+            raise typer.Exit(1)
+
     _onboard_plugins(config_path)
 
     # Create workspace, preferring the configured workspace path.
-    workspace_path = get_workspace_path(config.workspace_path)
+    workspace_path = get_workspace_path(config_obj.workspace_path)
     if not workspace_path.exists():
         workspace_path.mkdir(parents=True, exist_ok=True)
         console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
@@ -348,7 +391,7 @@ def onboard(
 
     console.print(f"\n{__logo__} I'm ready!")
     console.print("\nNext steps:")
-    if wizard:
+    if is_interactive:
         console.print(f"  1. Chat: [cyan]{agent_cmd}[/cyan]")
         console.print(f"  2. Start gateway: [cyan]{gateway_cmd}[/cyan]")
     else:
@@ -588,7 +631,7 @@ def gateway_start(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     daemon: bool = typer.Option(True, "--daemon/--foreground", "-d", help="Run as daemon (background)"),
 ):
-    """Start the markbot gateway service."""
+    """Start the Markbot gateway service."""
     _markbot_banner()
 
     existing_pid = _read_pid()
@@ -1491,7 +1534,7 @@ def gateway_status():
             cpu_pct_val = proc.cpu_percent(interval=0.1)
             threads = proc.num_threads()
             # line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%  |  {threads} threads[/dim]")
-            line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%[/dim]")
+            line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}[/dim]")
         except Exception:
             line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  (psutil error)[/dim]")
     elif running:
@@ -1519,7 +1562,7 @@ def gateway_status():
     section("Workspace", "blue")
     kv("Path", ws_str)
     kv("Memory", dir_info(workspace / "memory"))
-    kv("Sessions", dir_info(workspace / "sessions", "*.json"))
+    kv("Sessions", dir_info(workspace / "sessions", "*.jsonl"))
     kv("Cron", dir_info(get_cron_dir(workspace), "*.json"))
 
     divider()
@@ -2326,6 +2369,71 @@ def config_list(
 
 
 app.add_typer(config_app, name="config")
+
+
+@config_app.command("provider")
+def config_provider(
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Interactively configure an LLM provider and its models."""
+    from markbot.cli.onboard import run_onboard
+    from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
+
+    if config_path:
+        path = Path(config_path).expanduser().resolve()
+        set_config_path(path)
+    else:
+        path = get_config_path()
+
+    cfg = load_config(path) if path.exists() else Config()
+    result = run_onboard(initial_config=cfg)
+    if result.should_save:
+        save_config(result.config, path)
+        console.print(f"[green]✓[/green] Config saved at {path}")
+    else:
+        console.print("[yellow]No changes saved.[/yellow]")
+
+
+@config_app.command("channel")
+def config_channel(
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Interactively configure chat channels."""
+    from markbot.cli.onboard import _configure_channels, run_onboard
+    from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
+
+    if config_path:
+        path = Path(config_path).expanduser().resolve()
+        set_config_path(path)
+    else:
+        path = get_config_path()
+
+    cfg = load_config(path) if path.exists() else Config()
+    original = cfg.model_copy(deep=True)
+    _configure_channels(cfg)
+    if cfg.model_dump(by_alias=True) != original.model_dump(by_alias=True):
+        save_config(cfg, path)
+        console.print(f"[green]✓[/green] Config saved at {path}")
+    else:
+        console.print("[dim]No changes made.[/dim]")
+
+
+@config_app.command("show")
+def config_show(
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Display a rich summary of the current configuration."""
+    from markbot.cli.onboard import _show_summary
+    from markbot.config.loader import get_config_path, load_config, set_config_path
+
+    if config_path:
+        path = Path(config_path).expanduser().resolve()
+        set_config_path(path)
+    else:
+        path = get_config_path()
+
+    cfg = load_config(path) if path.exists() else Config()
+    _show_summary(cfg)
 
 
 if __name__ == "__main__":

@@ -203,10 +203,23 @@ MarkBot can integrate with multiple messaging platforms:
 ### Step 1: Initialize Configuration
 
 ```bash
-markbot onboard
+# Recommended for first-time users: linear guided setup
+markbot onboard --guided
+
+# Or use the menu-driven wizard
+markbot onboard --wizard
+
+# Non-interactive (for Docker/CI/scripts)
+markbot onboard --defaults
 ```
 
-This interactive wizard will guide you through setting up your workspace and configuring your preferred LLM provider.
+The guided wizard will walk you through:
+1. **Security Notice** — understand the risks of AI with file/command access
+2. **Provider Setup** — choose and configure your LLM provider (API key, base URL, etc.)
+3. **Model Configuration** — add models for your provider
+4. **Model Chain** — set up priority chain with auto-failover
+5. **Channel Setup** — configure messaging platforms (optional)
+6. **Agent & Tools** — fine-tune agent behavior and tool permissions
 
 ### Step 2: Configure Your Provider
 
@@ -349,15 +362,39 @@ markbot session export <id>      # Export session to file
 ```bash
 markbot config list                              # List all config
 markbot config get agents.defaults.modelChain     # Get config value
-markbot config edit                              # Edit config in editor
+markbot config set agents.defaults.timezone Asia/Shanghai  # Set config value
+markbot config provider                          # Interactively configure LLM provider
+markbot config channel                           # Interactively configure channels
+markbot config show                              # Display rich config summary
 ```
+
+### Diagnostics
+
+```bash
+markbot doctor                    # Run diagnostic checks on installation
+markbot doctor --deep             # Extra: test provider connectivity & channel reachability
+markbot doctor fix                # Apply automated safe fixes
+markbot doctor fix --dry-run      # Preview fixes without writing files
+markbot doctor fix --list         # List available fix ids
+markbot doctor fix --only clean-stale-pid -y  # Run specific fix with confirmation
+```
+
+`doctor` checks: environment, config validity, model chain, provider credentials, workspace, channels, MCP servers, skills, memory/embedding, cron jobs, sessions, gateway status, disk space, and optional dependencies.
+
+`doctor fix` supports:
+- **Safe fixes** (default): ensure data/workspace dirs, clean stale PID files
+- **Risky fixes** (require `-y`): seed empty jobs.json, trim oversized gateway logs
+
+All file modifications are backed up under `~/.markbot/doctor-fix-backups/` before applying.
 
 ### Other Commands
 
 ```bash
-markbot onboard                  # Run setup wizard
-markbot status                   # Show system status
-markbot version                  # Show version info
+markbot onboard --guided          # Linear step-by-step guided setup (recommended)
+markbot onboard --wizard          # Menu-driven interactive wizard
+markbot onboard --defaults        # Non-interactive, use all defaults
+markbot status                    # Show system status
+markbot version                   # Show version info
 ```
 
 ### In-Chat Commands

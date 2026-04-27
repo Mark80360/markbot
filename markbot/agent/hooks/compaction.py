@@ -178,7 +178,7 @@ class MemoryCompactionHook:
             pre_compact_tokens = _estimate_tokens(
                 "".join(
                     m.get("content", "") if isinstance(m.get("content", ""), str)
-                    else str(m.get("content", ""))
+                    else str(m.get("content") or "")
                     for m in messages_to_compact
                 )
             )
@@ -187,7 +187,7 @@ class MemoryCompactionHook:
                 + self.memory_manager.get_compressed_summary()
                 + "".join(
                     m.get("content", "") if isinstance(m.get("content", ""), str)
-                    else str(m.get("content", ""))
+                    else str(m.get("content") or "")
                     for m in messages
                 )
             )

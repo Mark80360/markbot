@@ -81,7 +81,10 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 continue
             btype = block.get("type")
             if btype == "text":
-                parts.append(block.get("text", ""))
+                text = block.get("text", "")
+                if text is None:
+                    text = ""
+                parts.append(text)
             elif btype == "image":
                 parts.append("[image]")
             elif btype == "tool_use":
@@ -93,7 +96,10 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 elif isinstance(bc, list):
                     for item in bc:
                         if isinstance(item, dict) and item.get("type") == "text":
-                            parts.append(item.get("text", ""))
+                            item_text = item.get("text", "")
+                            if item_text is None:
+                                item_text = ""
+                            parts.append(item_text)
 
     for key in ("name", "tool_call_id"):
         value = message.get(key)

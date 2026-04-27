@@ -108,6 +108,43 @@ DANGEROUS_COMMAND_PATTERNS = [
     r">\s+/etc/",
     r"mv\s+.*\s+/\b",
     r"cp\s+.*\s+/\b",
+    # Argument injection / option splitting
+    r"\$\{IFS\}",
+    r"\$@\s",
+    r"\bxargs\s+.*\b(sh|bash|python|perl)\b",
+    r"\b(base64|xxd)\s+.*-d.*\|\s*(sh|bash)\b",
+    r"\bopenssl\s+enc\s+.*-d.*\|\s*(sh|bash)\b",
+    # Dangerous privilege escalation
+    r"\bsudo\s+.*\brm\s+-[rf]{1,2}\b",
+    r"\bsudo\s+su\b",
+    r"\bchmod\s+[0-7]*7[0-7]*7[0-7]*\s+/",
+    # Network exfiltration patterns
+    r"\bnc\s+.*-e\s+/bin/",
+    r"\b/dev/tcp/",
 ]
 
 BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md"]
+
+# Context builder cache TTL (seconds)
+CONTEXT_CACHE_TTL: float = 300.0
+
+# Guidance injection TTL per session (seconds)
+GUIDANCE_INJECTION_TTL: float = 3600.0
+
+# Maximum characters for git status in system context
+MAX_GIT_STATUS_CHARS: int = 2000
+
+# Maximum characters for compressed summary before truncation
+MAX_COMPRESSED_SUMMARY_CHARS: int = 200_000
+
+# Maximum characters for MEMORY.md before section-based truncation
+MAX_MEMORY_MD_CHARS: int = 8_000
+
+# Maximum characters for daily log search results
+MAX_DAILY_LOG_RESULT_CHARS: int = 2000
+
+# Default context window tokens
+DEFAULT_CONTEXT_WINDOW_TOKENS: int = 65_536
+
+# Default compaction threshold ratio
+DEFAULT_COMPACTION_THRESHOLD: float = 0.75

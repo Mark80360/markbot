@@ -4,6 +4,8 @@ import asyncio
 import os
 import re
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,10 @@ class ExecTool(Tool):
     """Tool to execute shell commands."""
 
     _is_destructive = True
+
+    # Rate limiting: max commands per session in a sliding window
+    _RATE_WINDOW_S = 60
+    _MAX_COMMANDS_PER_WINDOW = 30
 
     def __init__(
         self,
@@ -36,6 +42,7 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
+        self._cmd_timestamps: defaultdict[str, list[float]] = defaultdict(list)
 
     @property
     def name(self) -> str:
@@ -82,6 +89,10 @@ class ExecTool(Tool):
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+
+        rate_error = self._check_rate_limit()
+        if rate_error:
+            return rate_error
 
         effective_timeout = min(timeout or self.timeout, self._MAX_TIMEOUT)
 
@@ -164,9 +175,9 @@ class ExecTool(Tool):
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
-        from markbot.utils.network import contains_internal_url
-        if contains_internal_url(cmd, self.allowed_internal_ips):
-            return "Error: Command blocked by safety guard (internal/private URL detected)"
+        curl_wget_error = self._validate_curl_wget_urls(cmd)
+        if curl_wget_error:
+            return curl_wget_error
 
         if self.restrict_to_workspace:
             if "..\\" in cmd or "../" in cmd:
@@ -182,6 +193,39 @@ class ExecTool(Tool):
                     continue
                 if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
                     return "Error: Command blocked by safety guard (path outside working dir)"
+
+        return None
+
+    def _check_rate_limit(self) -> str | None:
+        """Rate-limit shell commands to prevent abuse."""
+        now = time.time()
+        session_key = getattr(self, "_session_key", "default")
+        timestamps = self._cmd_timestamps[session_key]
+
+        # Prune expired entries
+        cutoff = now - self._RATE_WINDOW_S
+        self._cmd_timestamps[session_key] = [t for t in timestamps if t > cutoff]
+        timestamps = self._cmd_timestamps[session_key]
+
+        if len(timestamps) >= self._MAX_COMMANDS_PER_WINDOW:
+            return (
+                f"Error: Rate limit exceeded ({self._MAX_COMMANDS_PER_WINDOW} commands "
+                f"per {self._RATE_WINDOW_S}s). Please wait and retry."
+            )
+
+        timestamps.append(now)
+        return None
+
+    def _validate_curl_wget_urls(self, command: str) -> str | None:
+        """Validate URLs in curl/wget commands target only external hosts."""
+        from markbot.utils.network import contains_internal_url
+
+        lower = command.lower()
+        if not (lower.startswith("curl") or lower.startswith("wget")):
+            return None
+
+        if contains_internal_url(command, self.allowed_internal_ips):
+            return "Error: Command blocked by safety guard (internal/private URL in curl/wget)"
 
         return None
 

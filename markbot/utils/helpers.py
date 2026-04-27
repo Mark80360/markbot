@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 
-def strip_think(text: str) -> str:
-    """Remove  blocks and any unclosed trailing <think> tag."""
+def strip_think(text: str | None) -> str | None:
+    """Remove  blocks and any unclosed trailing  tag."""
+    if not text:
+        return text
     text = re.sub(r"<think>[\s\S]*?</think>", "", text)
     text = re.sub(r"<think>[\s\S]*$", "", text)
     return text.strip()
@@ -58,6 +60,58 @@ def ensure_dir(path: Path) -> Path:
 def timestamp() -> str:
     """Current ISO timestamp."""
     return datetime.now().isoformat()
+
+
+def normalize_timezone(tz: str | None) -> str:
+    """Convert offset-style timezone strings (e.g. ``"UTC+8"``) to IANA names.
+
+    Returns *tz* unchanged when it is already a valid IANA name or ``None``.
+    Falls back to ``"UTC"`` for unrecognised offsets.
+    """
+    if not tz:
+        return "UTC"
+
+    from zoneinfo import ZoneInfo
+
+    try:
+        ZoneInfo(tz)
+        return tz
+    except (KeyError, Exception):
+        pass
+
+    _OFFSET_MAP: dict[str, str] = {
+        "UTC-12": "Etc/GMT+12", "UTC-11": "Pacific/Pago_Pago",
+        "UTC-10": "Pacific/Honolulu", "UTC-9:30": "Pacific/Marquesas",
+        "UTC-9": "America/Anchorage", "UTC-8": "America/Los_Angeles",
+        "UTC-7": "America/Denver", "UTC-6": "America/Chicago",
+        "UTC-5": "America/New_York", "UTC-4:30": "America/Caracas",
+        "UTC-4": "America/Santiago", "UTC-3:30": "America/St_Johns",
+        "UTC-3": "America/Sao_Paulo", "UTC-2": "America/Noronha",
+        "UTC-1": "Atlantic/Azores", "UTC+0": "UTC", "UTC+1": "Europe/Berlin",
+        "UTC+2": "Africa/Cairo", "UTC+3": "Europe/Moscow",
+        "UTC+3:30": "Asia/Tehran", "UTC+4": "Asia/Dubai",
+        "UTC+4:30": "Asia/Kabul", "UTC+5": "Asia/Karachi",
+        "UTC+5:30": "Asia/Kolkata", "UTC+5:45": "Asia/Kathmandu",
+        "UTC+6": "Asia/Dhaka", "UTC+6:30": "Asia/Yangon",
+        "UTC+7": "Asia/Bangkok", "UTC+8": "Asia/Shanghai",
+        "UTC+8:45": "Australia/Eucla", "UTC+9": "Asia/Tokyo",
+        "UTC+9:30": "Australia/Darwin", "UTC+10": "Australia/Sydney",
+        "UTC+10:30": "Australia/Lord_Howe", "UTC+11": "Pacific/Noumea",
+        "UTC+12": "Pacific/Auckland", "UTC+12:45": "Pacific/Chatham",
+        "UTC+13": "Pacific/Tongatapu", "UTC+14": "Pacific/Kiritimati",
+    }
+
+    normalized = _OFFSET_MAP.get(tz)
+    if normalized:
+        try:
+            ZoneInfo(normalized)
+            return normalized
+        except (KeyError, Exception):
+            pass
+
+    logger = __import__("loguru").logger
+    logger.warning("Unrecognised timezone '{}', falling back to UTC", tz)
+    return "UTC"
 
 
 def current_time_str(timezone: str | None = None) -> str:

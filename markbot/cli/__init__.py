@@ -1,1 +1,1 @@
-"""CLI module for markbot."""
+"""CLI module for Markbot."""

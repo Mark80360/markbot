@@ -9,6 +9,20 @@ from markbot.types.tool import ToolParameter
 
 
 @dataclass
+class SkillConfigVar:
+    key: str
+    description: str
+    default: Optional[str] = None
+    prompt: str = ""
+
+
+@dataclass
+class SkillConditions:
+    requires_tools: list[str] = field(default_factory=list)
+    fallback_for_tools: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SkillScriptDef:
     name: str
     description: str
@@ -26,3 +40,5 @@ class SkillDefinition:
     scripts: list[SkillScriptDef] = field(default_factory=list)
     is_builtin: bool = False
     is_always_active: bool = False
+    config_vars: list[SkillConfigVar] = field(default_factory=list)
+    conditions: SkillConditions = field(default_factory=SkillConditions)

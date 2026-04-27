@@ -23,6 +23,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
+from markbot.utils.constants import (
+    MAX_COMPRESSED_SUMMARY_CHARS,
+    MAX_DAILY_LOG_RESULT_CHARS,
+    MAX_MEMORY_MD_CHARS,
+)
+
 from .base import BaseMemoryManager
 
 if TYPE_CHECKING:
@@ -57,9 +63,12 @@ class _MessageWrapper:
             name = cls._DEFAULT_USER_NAME
         else:
             name = msg.get("name", "")
+        content = msg.get("content")
+        if content is None:
+            content = ""
         return cls(
             role=role,
-            content=msg.get("content", ""),
+            content=content,
             name=name,
             timestamp=msg.get("timestamp", ""),
             metadata=msg.get("metadata", {}),
@@ -536,11 +545,16 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             if remaining <= 0:
                 break
             content = msg.get("content", "")
+            if content is None:
+                content = ""
             if isinstance(content, list):
                 text = ""
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        text += block.get("text", "")
+                        block_text = block.get("text", "")
+                        if block_text is None:
+                            block_text = ""
+                        text += block_text
                 content = text
             content = (content or "").strip()
             if not content:
@@ -569,6 +583,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         text_parts: list[str] = []
         for idx, r in enumerate(results, 1):
             content = r.get("content", "")
+            if content is None:
+                content = ""
             source = r.get("source", "memory")
             if len(content) > 1500:
                 content = content[:1500] + "\n... [truncated]"
@@ -632,8 +648,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 score = score * (1.0 / (1.0 + section_len / 10000.0))
                 header = section.split("\n", 1)[0][:80]
                 content = section.strip()
-                if len(content) > 2000:
-                    content = content[:2000] + "\n... [truncated]"
+                if len(content) > MAX_DAILY_LOG_RESULT_CHARS:
+                    content = content[:MAX_DAILY_LOG_RESULT_CHARS] + "\n... [truncated]"
                 candidates.append((score, header, content))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -660,7 +676,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self._compressed_summary = self._truncate_summary(summary)
         self._save_compressed_summary(self._compressed_summary)
 
-    _MAX_COMPRESSED_SUMMARY_CHARS = 200000
+    _MAX_COMPRESSED_SUMMARY_CHARS = MAX_COMPRESSED_SUMMARY_CHARS
 
     def _truncate_summary(self, summary: str) -> str:
         if len(summary) <= self._MAX_COMPRESSED_SUMMARY_CHARS:
@@ -686,7 +702,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         except Exception as e:
             logger.warning(f"[MemoryManager] Failed to persist compressed_summary: {e}")
 
-    _MAX_MEMORY_MD_CHARS = 8_000
+    _MAX_MEMORY_MD_CHARS = MAX_MEMORY_MD_CHARS
 
     async def get_memory_context(self, query: str | None = None) -> str:
         parts = []
@@ -714,6 +730,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                     relevant_parts = []
                     for r in search_results:
                         text = r.get("content", "")
+                        if text is None:
+                            text = ""
                         if text:
                             relevant_parts.append(text)
                     if relevant_parts:

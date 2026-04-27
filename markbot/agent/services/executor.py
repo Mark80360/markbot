@@ -95,6 +95,10 @@ class ToolExecutor:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
 
+            # Never persist system-prompt messages (incl. compaction summaries).
+            if role == "system":
+                continue
+
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue
 

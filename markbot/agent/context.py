@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 from markbot.skills.loader import BUILTIN_SKILLS_DIR
-from markbot.utils.constants import BOOTSTRAP_FILES
+from markbot.utils.constants import (
+    BOOTSTRAP_FILES,
+    CONTEXT_CACHE_TTL,
+    GUIDANCE_INJECTION_TTL,
+    MAX_GIT_STATUS_CHARS,
+)
 from markbot.utils.helpers import (
     build_assistant_message,
     build_image_content_blocks,
@@ -35,7 +40,6 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = BOOTSTRAP_FILES
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    MAX_GIT_STATUS_CHARS = 2000
 
     def __init__(
         self,
@@ -51,9 +55,9 @@ class ContextBuilder:
         self.skill_registry = skill_registry
         self.memory_manager = memory_manager
         self._context_cache: dict[str, tuple[float, Any]] = {}
-        self._cache_ttl: float = 300.0  # 5 minutes
+        self._cache_ttl: float = CONTEXT_CACHE_TTL
         self._guidance_injected_sessions: dict[str, float] = {}
-        self._guidance_ttl: float = 3600.0  # 1 hour
+        self._guidance_ttl: float = GUIDANCE_INJECTION_TTL
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, and skills.
@@ -76,45 +80,71 @@ class ContextBuilder:
         if minimal_bootstrap:
             parts.append(minimal_bootstrap)
 
-        # Add always-active skills content
+        # Add always-active skills content (kept as-is for skills that need permanent presence)
         if self.skill_registry:
             always_content = self.skill_registry.get_always_active_content()
             if always_content:
                 parts.append(always_content)
 
-            # Add skills summary
-            skills_summary = self.skill_registry.build_skills_summary()
-            if skills_summary:
-                parts.append(f"""# Skills
+            # Add compact skill index using progressive disclosure.
+            # Only name + one-line description is injected.
+            # Full SKILL.md content is loaded on demand via skill_view().
+            skills_index = self.skill_registry.build_skills_index()
+            if skills_index:
+                # Build conditional activation info
+                conditional_info = ""
+                if self.skill_registry:
+                    cond = self.skill_registry.get_conditional_skills()
+                    if cond.get("suppressed"):
+                        suppressed_names = ", ".join(s.name for s in cond["suppressed"])
+                        conditional_info += f"\n- Suppressed (missing tools): {suppressed_names}"
+                    if cond.get("fallback"):
+                        fallback_names = ", ".join(f"{s.name} (fallback for: {', '.join(s.conditions.fallback_for_tools)})" for s in cond["fallback"])
+                        conditional_info += f"\n- Fallback-activated: {fallback_names}"
 
-Skills extend your capabilities with specialized tools and domain knowledge.
+                # Build config-required info
+                config_info = ""
+                if self.skill_registry:
+                    for skill in self.skill_registry.list_all():
+                        missing = self.skill_registry._config_resolver.get_missing_vars(skill)
+                        if missing:
+                            vars_list = ", ".join(f"`{v.key}`" for v in missing)
+                            config_info += f"\n- **{skill.name}** needs config: {vars_list}"
 
-## CRITICAL: Skill Execution Rules (MANDATORY)
-When executing a skill, you MUST treat the skill's SKILL.md instructions as HARD CONSTRAINTS:
-- **Follow the skill's steps EXACTLY** — do not skip, reorder, or modify them
-- **Do NOT improvise or create your own approach** — if the skill says "run script X", run script X; do NOT implement the logic yourself
-- **Do NOT add extra steps** — only perform what the skill's SKILL.md describes
-- **The skill document is LAW** — it overrides your general knowledge about how to do things
-- **When a skill script returns instructions, those instructions are MANDATORY** — follow them precisely
-- Do NOT use "creative interpretation" of skills. Execute them as written, verbatim.
+                parts.append(f"""# Skills — MANDATORY KNOWLEDGE SYSTEM
+
+Skills are your **procedural memory**: battle-tested workflows that capture how to do specific tasks correctly. They are NOT optional suggestions — they are **mandatory constraints** that you MUST follow when applicable.
+
+## ⚠️ CRITICAL RULES (non-negotiable)
+1. **ALWAYS check skills FIRST** before responding. If a skill matches the user's request, you MUST use it.
+2. **BLOCKING REQUIREMENT**: Load the matching skill with `skill_view(name)` BEFORE generating any other response about that topic.
+3. **NEVER improvise** when a skill exists — follow its instructions exactly. Skills encode hard-won experience from real usage.
+4. **NEVER mention a skill without loading it** — call `skill_view(name)` first, then follow its guidance.
+5. **After loading a skill, its SKILL.md content becomes mandatory constraints** — treat every instruction as a hard rule, not a suggestion.
+6. If no skill matches, proceed with normal tools and your own judgment.
 
 ## How to Use Skills
-- When a skill matches the user's request, **invoke it IMMEDIATELY**
-- This is a **BLOCKING REQUIREMENT**: call the skill tool BEFORE generating any other response
-- **NEVER mention a skill without actually calling it**
-- Use the skill's scripts as tools with the format: skill_name.script_name
+- Scan the available skills below for matches with the user's request
+- Load matching skills with `skill_view(name)` to see full instructions
+- Execute skill scripts with the format: `skill_name.script_name()`
+- Skill content may contain `{{config.key}}` placeholders — these are auto-resolved from environment variables or config files
 
-## Skill Invocation Examples
-- skill_name.script_name(path="/path/to/file") - invoke with arguments
-- skill.github.commit(message="fix bug") - invoke github skill script
+## Available Skills (compact index)
+{skills_index}
+{conditional_info}
+{config_info}
 
-## Available Skills
-{skills_summary}
+## Skill Management — Create & Maintain
+- **After completing a complex task** (5+ tool calls, iterative debugging, multi-step workflow), offer to save it as a skill using `skill_manage(action='create', ...)`.
+- **When a skill is wrong or incomplete**, fix it immediately with `skill_manage(action='patch', ...)` — don't wait to be asked.
+- **Skills that aren't maintained become liabilities** — outdated skills are worse than no skills.
+- **Add supporting files** (references, templates, scripts) with `skill_manage(action='write_file', ...)`.
+- **All skill changes are security-scanned** — dangerous patterns (exfiltration, injection, destructive ops) are blocked automatically.
 
-## Important
-- If the user asks you to do something that matches a skill's when_to_use description, invoke that skill immediately
-- Do not describe what you would do - actually call the skill's script tool
-- If no skill matches, proceed with normal tools""")
+## Conditional Activation
+- Skills with `[requires: tool1,tool2]` are only active when those tools are available.
+- Skills with `[fallback-for: tool1]` activate as alternatives when those tools are missing.
+- Always-active skills are loaded into your context automatically.""")
 
         result = "\n\n---\n\n".join(parts)
         self._context_cache[cache_key] = (time.monotonic(), result)
@@ -174,8 +204,8 @@ When executing a skill, you MUST treat the skill's SKILL.md instructions as HARD
             )
             status = status_result.stdout.strip()
 
-            if len(status) > self.MAX_GIT_STATUS_CHARS:
-                status = status[: self.MAX_GIT_STATUS_CHARS] + "\n... (truncated)"
+            if len(status) > MAX_GIT_STATUS_CHARS:
+                status = status[:MAX_GIT_STATUS_CHARS] + "\n... (truncated)"
 
             log_result = subprocess.run(
                 ["git", "log", "--oneline", "-n", "5"],

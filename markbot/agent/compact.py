@@ -268,9 +268,10 @@ class MultiLevelCompactor:
         try:
             summary = await self._generate_summary(conversation_text)
         except Exception as e:
-            logger.error(f"[Compactor] Auto-compaction failed, falling back to history snip: {e}")
-            # Return original messages to trigger fallback to history snip
-            return messages, ""
+            logger.error(f"[Compactor] Auto-compaction LLM failed: {e}")
+            summary = self._simple_truncation_summary(messages_to_compact)
+            if not summary:
+                return messages, ""
         formatted = self._format_summary(summary)
 
         compact_msg = {
@@ -364,12 +365,17 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
+            if content is None:
+                content = ""
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block.get("text", ""))
+                            text = block.get("text", "")
+                            if text is None:
+                                text = ""
+                            text_parts.append(text)
                         elif block.get("type") == "image":
                             text_parts.append("[image]")
                         elif block.get("type") == "tool_use":
@@ -403,6 +409,51 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
         logger.warning("[Compactor] No LLM available, using simple truncation summary")
         lines = conversation_text.split("\n\n")[:5]
         return f"[Simple summary - first 5 message pairs]\n" + "\n\n".join(lines)
+
+    def _simple_truncation_summary(self, messages: list[dict[str, Any]]) -> str:
+        """Generate a simple summary without LLM when auto-compaction LLM fails.
+
+        Extracts key information: user messages, tool calls, and errors.
+        Much better than history snip which drops everything.
+        """
+        user_msgs = []
+        tool_calls = []
+        errors = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                text = content if isinstance(content, str) else str(content)[:200]
+                if text.strip():
+                    user_msgs.append(text.strip()[:300])
+            elif role == "assistant":
+                tcs = msg.get("tool_calls") or []
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        name = tc.get("function", {}).get("name", "unknown")
+                        tool_calls.append(name)
+            elif role == "tool":
+                if isinstance(content, str) and ("error" in content.lower() or "failed" in content.lower()):
+                    errors.append(content[:200])
+
+        parts = ["[Auto-generated summary (LLM unavailable)]"]
+
+        if user_msgs:
+            parts.append("\nUser requests:")
+            for i, m in enumerate(user_msgs[-10:], 1):
+                parts.append(f"  {i}. {m}")
+
+        if tool_calls:
+            parts.append(f"\nTools used: {', '.join(tool_calls[-30:])}")
+
+        if errors:
+            parts.append("\nErrors encountered:")
+            for e in errors[-5:]:
+                parts.append(f"  - {e}")
+
+        return "\n".join(parts)
 
     @staticmethod
     def _format_summary(summary: str) -> str:

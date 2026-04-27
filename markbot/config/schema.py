@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -42,6 +42,12 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _normalize_timezone(cls, v: str | None) -> str:
+        from markbot.utils.helpers import normalize_timezone
+        return normalize_timezone(v)
 
 
 class AgentsConfig(Base):

@@ -11,7 +11,7 @@ from markbot.tools.base import BaseTool
 from markbot.skills.helpers import load_skill_body, build_constraint_block
 from markbot.types.permission import PermissionDecision
 from markbot.types.skill import SkillScriptDef
-from markbot.types.tool import ToolContext, ToolDefinition
+from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
 
 
 class SkillTool(BaseTool):
@@ -123,3 +123,103 @@ class SkillTool(BaseTool):
 
     def get_activity_description(self, params: dict[str, Any]) -> Optional[str]:
         return f"Running {self._skill_name}.{self._script.name}"
+
+
+class SkillViewTool(BaseTool):
+    """Tool that loads a skill's full SKILL.md content on demand.
+
+    Supports progressive disclosure: the system prompt only shows a compact
+    skill index; the AI calls this tool to load the full instructions when
+    a skill is relevant.
+    """
+
+    def __init__(self, registry: "SkillRegistry"):  # noqa: F821
+        from markbot.skills.registry import SkillRegistry as _SR
+        self._registry: _SR = registry
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="skill_view",
+            description="Load a skill's full SKILL.md content (instructions, when_to_use, available scripts). Use when a skill matches the user's request to get complete execution guidance.",
+            parameters=[
+                ToolParameter(
+                    name="name",
+                    description="Skill name to load (e.g. 'github', 'tmux'). Use skills_list to see available skills.",
+                    type="string",
+                    required=True,
+                ),
+            ],
+            is_read_only=True,
+            is_destructive=False,
+        )
+
+    @property
+    def is_enabled(self) -> bool:
+        return True
+
+    async def check_permission(self, params: dict[str, Any], context: ToolContext) -> PermissionDecision:
+        return PermissionDecision(behavior="allow")
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        name = params.get("name", "")
+        if not name:
+            return "Error: 'name' parameter is required."
+
+        content = self._registry.load_skill_content(name)
+        if content is None:
+            available = ", ".join(s.name for s in self._registry.list_all())
+            return f"Error: Skill '{name}' not found. Available skills: {available}"
+
+        skill = self._registry.get(name)
+        header = f"# Skill: {name}\n\n"
+        if skill:
+            header += f"**Description**: {skill.description}\n"
+            header += f"**When to use**: {skill.when_to_use}\n"
+            if skill.scripts:
+                header += "**Scripts**:\n"
+                for script in skill.scripts:
+                    header += f"- {skill.name}.{script.name}: {script.description}\n"
+            header += "\n---\n\n"
+
+        return header + content
+
+
+class SkillsListTool(BaseTool):
+    """Tool that lists available skills with optional category filtering."""
+
+    def __init__(self, registry: "SkillRegistry"):  # noqa: F821
+        from markbot.skills.registry import SkillRegistry as _SR
+        self._registry: _SR = registry
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="skills_list",
+            description="List all available skills (name + description). Use before skill_view to discover relevant skills.",
+            parameters=[],
+            is_read_only=True,
+            is_destructive=False,
+        )
+
+    @property
+    def is_enabled(self) -> bool:
+        return True
+
+    async def check_permission(self, params: dict[str, Any], context: ToolContext) -> PermissionDecision:
+        return PermissionDecision(behavior="allow")
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        skills = self._registry.list_all()
+        if not skills:
+            return "No skills available."
+
+        lines = [f"**{len(skills)} skills available:**\n"]
+        for skill in sorted(skills, key=lambda s: s.name):
+            tag = "📦 builtin" if skill.is_builtin else "📁 workspace"
+            desc = skill.description[:100] + "..." if len(skill.description) > 100 else skill.description
+            has_scripts = " (has scripts)" if skill.scripts else ""
+            lines.append(f"- **{skill.name}** `[{tag}]`: {desc}{has_scripts}")
+
+        lines.append("\nUse `skill_view(name)` to load a skill's full instructions.")
+        return "\n".join(lines)
