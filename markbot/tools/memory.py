@@ -7,7 +7,7 @@ Ported from MemorySearchTool.
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -25,11 +25,21 @@ class MemorySearchTool(Tool):
 
     When ``force_memory_search`` is enabled on the manager, this tool also
     provides automatic pre-LLM-call search injection via ``get_forced_context()``.
+
+    Session context (``channel`` / ``chat_id``) is injected by the agent
+    loop before each turn so that searches are scoped to the current
+    conversation.
     """
 
     def __init__(self, memory_manager: "BaseMemoryManager | None" = None, **kwargs):
         super().__init__(**kwargs)
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     @property
     def name(self) -> str:
@@ -87,6 +97,8 @@ class MemorySearchTool(Tool):
                 query=query,
                 max_results=max_results,
                 min_score=min_score,
+                channel=self._channel,
+                chat_id=self._chat_id,
             )
             if not results:
                 return f"No memories found for query: '{query}'"
@@ -120,6 +132,8 @@ class MemorySearchTool(Tool):
                 query=user_message,
                 max_results=max_r,
                 min_score=min_s,
+                channel=self._channel,
+                chat_id=self._chat_id,
             )
 
             if not results:

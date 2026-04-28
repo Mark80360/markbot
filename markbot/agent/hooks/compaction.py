@@ -70,6 +70,8 @@ class MemoryCompactionHook:
         system_prompt: str = "",
         *,
         skip_context_compact: bool = False,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> str | None:
         """Pre-reasoning hook to check and compact memory if needed.
 
@@ -79,6 +81,8 @@ class MemoryCompactionHook:
             skip_context_compact: If True, skip context compaction phase
                 (MultiLevelCompactor already handled it). Async summary
                 archival still runs if applicable.
+            channel: Message channel for session-scoped compaction.
+            chat_id: Chat ID for session-scoped compaction.
 
         Returns:
             New compressed summary if context compaction occurred, None otherwise
@@ -87,10 +91,12 @@ class MemoryCompactionHook:
             if not self.memory_manager._reme:
                 return None
 
+            session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+
             str_token_count = _estimate_tokens(
                 system_prompt
             ) + _estimate_tokens(
-                self.memory_manager.get_compressed_summary()
+                self.memory_manager.get_compressed_summary(session_key=session_key)
             )
 
             left_compact_threshold = (
@@ -184,7 +190,7 @@ class MemoryCompactionHook:
             )
             pre_total_tokens = _estimate_tokens(
                 system_prompt
-                + self.memory_manager.get_compressed_summary()
+                + self.memory_manager.get_compressed_summary(session_key=session_key)
                 + "".join(
                     m.get("content", "") if isinstance(m.get("content", ""), str)
                     else str(m.get("content") or "")
@@ -211,7 +217,7 @@ class MemoryCompactionHook:
             )
 
             if self.context_compact_enabled:
-                compressed_summary = self.memory_manager.get_compressed_summary()
+                compressed_summary = self.memory_manager.get_compressed_summary(session_key=session_key)
                 compact_content = await self.memory_manager.compact_memory(
                     messages=messages_to_compact,
                     previous_summary=compressed_summary,
@@ -231,7 +237,9 @@ class MemoryCompactionHook:
                         else 0,
                     )
                     self._mark_compacted(messages_to_compact)
-                    self.memory_manager.set_compressed_summary(compact_content)
+                    self.memory_manager.set_compressed_summary(
+                        compact_content, session_key=session_key,
+                    )
                     return compact_content
             else:
                 logger.info("Context compaction skipped")

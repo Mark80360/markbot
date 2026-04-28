@@ -45,7 +45,7 @@ class FallbackManager:
     )
 
     MODEL_UNAVAILABLE_ERRORS = (
-        "402", "insufficient balance", "quota exceeded",
+        "402", "insufficient balance", "insufficient_quota", "quota exceeded",
         "401", "unauthorized", "invalid api key", "authentication",
         "403", "forbidden", "access denied",
         "model not found", "model_not_found",

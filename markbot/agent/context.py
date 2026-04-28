@@ -516,11 +516,6 @@ This helps you provide more accurate, contextual responses without loading unnec
         """
         system_content = self.build_system_prompt(skill_names)
 
-        if self.memory_manager:
-            memory_context = await self.memory_manager.get_memory_context(query=current_message)
-            if memory_context:
-                system_content = f"{system_content}\n\n# Memory Context\n\n{memory_context}"
-
         if extra_system_context:
             system_content = f"{system_content}\n\n{extra_system_context}"
 

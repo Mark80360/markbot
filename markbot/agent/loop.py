@@ -269,6 +269,8 @@ class AgentLoop:
         self.pipeline.use(QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool))
         self._daily_log = DailyLogManager(workspace=self.workspace)
         self._interaction_log = InteractionLogger()
+        if hasattr(self.memory_manager, "_daily_log_manager"):
+            self.memory_manager._daily_log_manager = self._daily_log
         self.pipeline.use(
             MemoryLifecycleMiddleware(
                 memory_manager=self.memory_manager,
@@ -287,13 +289,13 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
-        # Update question tool context
         if hasattr(self, "question_tool") and self.question_tool:
             self.question_tool.set_context(channel, chat_id)
-        # Update todo tool session
         if todo_tool := self.tools.get("todo"):
             if hasattr(todo_tool, "set_session"):
                 todo_tool.set_session(f"{channel}:{chat_id}")
+        if self._memory_search_tool:
+            self._memory_search_tool.set_session_context(channel, chat_id)
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -433,6 +435,8 @@ class AgentLoop:
                     messages=messages,
                     system_prompt=system_msg,
                     skip_context_compact=_skip_context_compact,
+                    channel=channel,
+                    chat_id=chat_id,
                 )
                 if new_summary:
                     logger.info("[AgentLoop] Memory compaction applied, summary updated")
@@ -957,7 +961,7 @@ class AgentLoop:
             ctx.session = session
 
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=0)
+            history = session.get_history(max_messages=200)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = await self.context.build_messages(
                 history=history,
@@ -1015,7 +1019,7 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=0)
+        history = session.get_history(max_messages=200)
         initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,

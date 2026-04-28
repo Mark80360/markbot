@@ -338,26 +338,26 @@ class MultiLevelCompactor:
     # Summary generation (shared with legacy interface)
     # ------------------------------------------------------------------
 
-    COMPACT_PROMPT = """CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+    COMPACT_PROMPT = """CRITICAL: You are a summarization engine. Your ONLY output is an <analysis> block followed by a <summary> block. You have NO tools. You CANNOT call tools. Do NOT pretend to call tools. Do NOT write "TOOL:" or "<tool_call>" or any tool-like text. If you write tool calls, you have FAILED.
 
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
 Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts.
 
-Your summary should include these sections:
+Your summary MUST include these sections:
 
-1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+1. Primary Request and Intent: Capture all of the user's explicit requests in detail
 2. Key Technical Concepts: List important concepts, technologies, frameworks discussed
-3. Files and Code Sections: Enumerate specific files examined/modified/created with code snippets
+3. Files and Code Sections: Enumerate specific files examined/modified/created
 4. Errors and fixes: List errors encountered and how they were fixed
 5. Problem Solving: Document problems solved and ongoing troubleshooting
-6. All user messages: List ALL user messages that are not tool results
+6. All user messages: List ALL user messages verbatim (not tool results)
 7. Pending Tasks: Outline pending tasks explicitly requested
 8. Current Work: Describe precisely what was being worked on immediately before this summary
 9. Optional Next Step: Next step directly related to the most recent work
 
-REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block.
+FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</summary>. Nothing else. No tools, no TOOL:, no function calls, no JSON.
 """
 
     def _format_messages_for_compact(self, messages: list[dict[str, Any]]) -> str:
@@ -457,12 +457,44 @@ REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> 
 
     @staticmethod
     def _format_summary(summary: str) -> str:
+        # Strip hallucinated tool-call patterns that weak models sometimes emit
+        summary = re.sub(
+            r'(?:TOOL:\s*)?<tool_calls?>[\s\S]*?</tool_calls?>', '', summary,
+        )
+        summary = re.sub(
+            r'(?:TOOL:\s*)?\{[\s\S]*?"(?:name|function)"[\s\S]*?\}', '', summary,
+        )
+        summary = re.sub(
+            r'^TOOL:\s*#\s*Search\s*Results.*?(?=\n\n|\n\*|\Z)', '',
+            summary, flags=re.MULTILINE | re.IGNORECASE,
+        )
+        # Strip <function_call> patterns
+        summary = re.sub(
+            r'<function_calls?>[\s\S]*?</function_calls?>', '', summary,
+        )
+        # Strip JSON tool_call blocks
+        summary = re.sub(
+            r'\{\s*"tool_calls?"\s*:[\s\S]*?\}', '', summary,
+        )
+        # Strip stray TOOL: lines
+        summary = re.sub(r'^TOOL:.*$', '', summary, flags=re.MULTILINE)
+
         formatted = re.sub(r'<analysis>[\s\S]*?</analysis>', '', summary)
         summary_match = re.search(r'<summary>([\s\S]*?)</summary>', formatted)
         if summary_match:
             content = summary_match.group(1) or ''
-            formatted = re.sub(r'<summary>[\s\S]*?</summary>', f'Summary:\n{content.strip()}', formatted)
-        return re.sub(r'\n\n+', '\n\n', formatted).strip()
+            formatted = re.sub(
+                r'<summary>[\s\S]*?</summary>',
+                f'Summary:\n{content.strip()}',
+                formatted,
+            )
+        else:
+            # If no <summary> block found (weak model), treat everything after
+            # <analysis> (or the whole text) as the summary
+            formatted = re.sub(r'<analysis>[\s\S]*?</analysis>', '', summary)
+
+        formatted = re.sub(r'\n{3,}', '\n\n', formatted).strip()
+        return formatted
 
 
 

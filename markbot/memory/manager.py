@@ -163,8 +163,12 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self._reme_version_ok: bool = self._check_reme_version()
         self._reme = None
         self._started = False
-        self._compressed_summary_path = Path(working_dir) / "memory" / ".compressed_summary"
+        self._compressed_summary_dir = Path(working_dir) / "memory"
+        self._compressed_summary_dir.mkdir(parents=True, exist_ok=True)
+        self._session_summaries: dict[str, str] = {}
+        self._compressed_summary_path = self._compressed_summary_dir / ".compressed_summary"
         self._compressed_summary: str = self._load_compressed_summary()
+        self._daily_log_manager: Any = None
         self._summary_toolkit: Any = None
 
         logger.info(
@@ -491,6 +495,9 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         query: str,
         max_results: int = 5,
         min_score: float = 0.1,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> list[dict]:
         results: list[dict] = []
 
@@ -504,29 +511,58 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 if hasattr(result, "content"):
                     for block in result.content:
                         if hasattr(block, "text"):
-                            results.append({"content": block.text})
+                            results.append({"content": block.text, "source": "reme"})
                         elif isinstance(block, dict) and "text" in block:
-                            results.append({"content": block["text"]})
+                            results.append({"content": block["text"], "source": "reme"})
                 elif isinstance(result, str):
-                    results.append({"content": result})
+                    results.append({"content": result, "source": "reme"})
                 elif isinstance(result, list):
-                    results.extend({"content": str(r)} for r in result)
+                    results.extend({"content": str(r), "source": "reme"} for r in result)
                 else:
-                    results.append({"content": str(result)})
+                    results.append({"content": str(result), "source": "reme"})
             except Exception as e:
                 logger.error(f"Memory search failed: {e}")
 
-        if not results:
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None, self._search_daily_logs, query, max_results
+        # Also try daily log keyword search for complementary results
+        loop = asyncio.get_running_loop()
+        daily_results = await loop.run_in_executor(
+            None, self._search_daily_logs, query, max_results, channel, chat_id
+        )
+        for r in daily_results:
+            r.setdefault("source", "daily_log")
+
+        # Merge: ReMe results first, then deduplicated daily log results
+        existing_contents = {r.get("content", "")[:200] for r in results}
+        for r in daily_results:
+            key = r.get("content", "")[:200]
+            if key not in existing_contents and len(results) < max_results * 2:
+                results.append(r)
+                existing_contents.add(key)
+
+        # If still no results, try chronological retrieval from daily logs
+        if not results and self._daily_log_manager is not None:
+            recent_msgs = self._daily_log_manager.get_recent_user_messages(
+                limit=max_results * 2,
+                channel=channel,
+                chat_id=chat_id,
             )
+            if recent_msgs:
+                lines = ["## Recent User Messages (chronological)\n"]
+                for i, m in enumerate(recent_msgs, 1):
+                    lines.append(f"{i}. [{m['timestamp']}] {m['content'][:500]}")
+                results.append({
+                    "content": "\n".join(lines),
+                    "source": "daily_log/recent",
+                })
 
         return results
 
     async def retrieve(
         self,
         messages: list[dict],
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
         **kwargs,
     ) -> str | None:
         """Retrieve relevant memory and return formatted context text.
@@ -572,6 +608,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 query=query,
                 max_results=3,
                 min_score=0.15,
+                channel=channel,
+                chat_id=chat_id,
             )
         except Exception as e:
             logger.warning(f"[MemoryManager] retrieve() search failed: {e}")
@@ -609,6 +647,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self,
         query: str,
         max_results: int = 5,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> list[dict]:
         """Keyword search over workspace/memory/daily/*.md files.
 
@@ -616,7 +656,18 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         words/CJK chars + CJK bigrams, count hits per file section).
         This is a lightweight fallback — ReMeLight does not index the
         ``memory/daily/`` subdirectory.
+
+        When *channel* and/or *chat_id* are provided, only log sections
+        belonging to that session are considered.
         """
+        if self._daily_log_manager is not None:
+            return self._daily_log_manager.search(
+                query,
+                max_results,
+                channel=channel,
+                chat_id=chat_id,
+            )
+
         daily_dir = Path(self.working_dir) / "memory" / "daily"
         if not daily_dir.is_dir():
             return []
@@ -638,6 +689,19 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             for section in sections:
                 if not section.strip():
                     continue
+
+                header_line = section.split("\n", 1)[0]
+                if channel or chat_id:
+                    from .daily_log import _SECTION_HEADER_RE
+                    match = _SECTION_HEADER_RE.match("## [" + header_line)
+                    if match:
+                        sec_channel = match.group("channel") or ""
+                        sec_chat_id = match.group("chat_id") or ""
+                        if channel and sec_channel != channel:
+                            continue
+                        if chat_id and sec_chat_id != chat_id:
+                            continue
+
                 section_text = section.lower()
                 section_tokens = set(self._tokenize_for_search(section_text))
                 hits = sum(1 for t in query_tokens if t in section_tokens)
@@ -646,7 +710,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 score = hits / len(query_tokens)
                 section_len = max(len(section_text), 1)
                 score = score * (1.0 / (1.0 + section_len / 10000.0))
-                header = section.split("\n", 1)[0][:80]
+                header = header_line[:80]
                 content = section.strip()
                 if len(content) > MAX_DAILY_LOG_RESULT_CHARS:
                     content = content[:MAX_DAILY_LOG_RESULT_CHARS] + "\n... [truncated]"
@@ -669,12 +733,18 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             return None
         return self._reme.get_in_memory_memory()
 
-    def get_compressed_summary(self) -> str:
+    def get_compressed_summary(self, *, session_key: str | None = None) -> str:
+        if session_key:
+            return self._session_summaries.get(session_key, "")
         return self._compressed_summary
 
-    def set_compressed_summary(self, summary: str) -> None:
-        self._compressed_summary = self._truncate_summary(summary)
-        self._save_compressed_summary(self._compressed_summary)
+    def set_compressed_summary(self, summary: str, *, session_key: str | None = None) -> None:
+        if session_key:
+            self._session_summaries[session_key] = self._truncate_summary(summary)
+            self._save_session_summary(session_key, self._session_summaries[session_key])
+        else:
+            self._compressed_summary = self._truncate_summary(summary)
+            self._save_compressed_summary(self._compressed_summary)
 
     _MAX_COMPRESSED_SUMMARY_CHARS = MAX_COMPRESSED_SUMMARY_CHARS
 
@@ -702,49 +772,83 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         except Exception as e:
             logger.warning(f"[MemoryManager] Failed to persist compressed_summary: {e}")
 
+    def _session_summary_path(self, session_key: str) -> Path:
+        safe_key = re.sub(r'[^\w\-.]', '_', session_key)
+        return self._compressed_summary_dir / f".compressed_summary_{safe_key}"
+
+    def _load_session_summary(self, session_key: str) -> str:
+        path = self._session_summary_path(session_key)
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        return ""
+
+    def _save_session_summary(self, session_key: str, summary: str) -> None:
+        try:
+            path = self._session_summary_path(session_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(summary, encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"[MemoryManager] Failed to persist session summary for {session_key}: {e}")
+
     _MAX_MEMORY_MD_CHARS = MAX_MEMORY_MD_CHARS
 
-    async def get_memory_context(self, query: str | None = None) -> str:
-        parts = []
+    async def get_memory_context(
+        self,
+        query: str | None = None,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> str:
+        """Retrieve relevant memory for a query via semantic search.
 
-        if self._compressed_summary:
-            parts.append(f"## Session Summary\n\n{self._compressed_summary}")
+        Only performs on-demand semantic search — does NOT inject session
+        summaries or MEMORY.md content.  Session summaries are an internal
+        compaction detail (used by MemoryCompactionHook for incremental
+        compaction) and should not be re-exposed as context.  MEMORY.md is
+        loaded during bootstrap by ContextBuilder and does not need to be
+        duplicated here.
 
-        memory_md = Path(self.working_dir) / "memory" / "MEMORY.md"
-        if not memory_md.exists():
-            return "\n\n".join(parts) if parts else ""
+        Returns empty string when no query is provided or no results are found.
+        """
+        if not query:
+            return ""
+
+        if not self._started or self._reme is None:
+            return ""
 
         try:
-            content = memory_md.read_text(encoding="utf-8").strip()
-            if not content:
-                return "\n\n".join(parts) if parts else ""
-        except Exception:
-            return "\n\n".join(parts) if parts else ""
+            search_results = await self.memory_search(
+                query=query,
+                max_results=5,
+                min_score=0.2,
+                channel=channel,
+                chat_id=chat_id,
+            )
+        except Exception as e:
+            logger.debug(f"memory_search in get_memory_context failed: {e}")
+            return ""
 
-        if query and self._started and self._reme is not None:
-            try:
-                search_results = await self.memory_search(
-                    query=query, max_results=5, min_score=0.2
-                )
-                if search_results:
-                    relevant_parts = []
-                    for r in search_results:
-                        text = r.get("content", "")
-                        if text is None:
-                            text = ""
-                        if text:
-                            relevant_parts.append(text)
-                    if relevant_parts:
-                        relevant_text = "\n\n---\n\n".join(relevant_parts)
-                        parts.append(f"## Relevant Memory (query: {query[:50]})\n\n{relevant_text}")
-                        return "\n\n".join(parts) if parts else ""
-            except Exception as e:
-                logger.debug(f"Semantic search in get_memory_context failed, falling back: {e}")
+        if not search_results:
+            return ""
 
-        truncated = self._truncate_by_section(content, self._MAX_MEMORY_MD_CHARS)
-        parts.append(f"## MEMORY.md\n\n{truncated}")
+        relevant_parts: list[str] = []
+        for r in search_results:
+            text = r.get("content", "")
+            if text is None:
+                text = ""
+            if text:
+                if len(text) > 1500:
+                    text = text[:1500] + "\n... [truncated]"
+                relevant_parts.append(text)
 
-        return "\n\n".join(parts) if parts else ""
+        if not relevant_parts:
+            return ""
+
+        relevant_text = "\n\n---\n\n".join(relevant_parts)
+        return f"## Relevant Memory (query: {query[:80]})\n\n{relevant_text}"
 
     @staticmethod
     def _truncate_by_section(content: str, max_chars: int) -> str:

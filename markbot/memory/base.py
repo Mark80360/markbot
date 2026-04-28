@@ -96,33 +96,68 @@ class BaseMemoryManager(ABC):
         query: str,
         max_results: int = 5,
         min_score: float = 0.1,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> Any:
-        """Search stored memories for relevant content."""
+        """Search stored memories for relevant content.
+
+        Args:
+            query: Search query string.
+            max_results: Maximum number of results.
+            min_score: Minimum relevance score.
+            channel: Optional channel filter for session-scoped search.
+            chat_id: Optional chat ID filter for session-scoped search.
+        """
 
     def get_in_memory_memory(self, **kwargs) -> Optional["ReMeInMemoryMemory"]:
         """Retrieve the in-memory memory object."""
         return None
 
-    def get_compressed_summary(self) -> str:
-        """Return the current compressed summary string."""
+    def get_compressed_summary(self, *, session_key: str | None = None) -> str:
+        """Return the current compressed summary string.
+
+        Args:
+            session_key: Optional session key for per-session summary.
+                When provided, implementations should return the summary
+                specific to that session.  When None, returns the global
+                or default summary.
+        """
         return getattr(self, "_compressed_summary", "")
 
-    def set_compressed_summary(self, summary: str) -> None:
+    def set_compressed_summary(
+        self,
+        summary: str,
+        *,
+        session_key: str | None = None,
+    ) -> None:
         """Update the compressed summary string.
 
         Implementations may override to add persistence or truncation.
+
+        Args:
+            summary: The new compressed summary text.
+            session_key: Optional session key for per-session summary.
         """
         self._compressed_summary = summary
 
     async def retrieve(
         self,
         messages: list[dict],
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
         **kwargs,
     ) -> str | None:
         """Retrieve relevant memory based on the given messages.
 
         Implementations should search for relevant memories and return
         a formatted string for injection into the system prompt.
+
+        Args:
+            messages: Recent conversation messages to build query from.
+            channel: Optional channel filter for session-scoped retrieval.
+            chat_id: Optional chat ID filter for session-scoped retrieval.
 
         Returns:
             Formatted memory context string, or None if no relevant

@@ -126,7 +126,7 @@ class MemoryLifecycleMiddleware(Middleware):
             try:
                 history = []
                 if ctx.session and hasattr(ctx.session, 'get_history'):
-                    history = ctx.session.get_history(max_messages=0)
+                    history = ctx.session.get_history(max_messages=200)
                 if history:
                     summary_messages = [
                         m for m in history
