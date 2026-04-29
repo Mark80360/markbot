@@ -23,8 +23,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from markbot.skills.loader import SkillLoader
-from markbot.skills.scanner import SecurityScanner
+from markbot.skills.core.loader import SkillLoader
+from markbot.skills.core.scanner import SecurityScanner
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
@@ -161,7 +161,7 @@ class SkillManageTool(BaseTool):
         if ws.exists() and (ws / "SKILL.md").exists():
             return ws
 
-        from markbot.skills.loader import BUILTIN_SKILLS_DIR
+        from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
         builtin = BUILTIN_SKILLS_DIR / name
         if builtin.exists() and (builtin / "SKILL.md").exists():
             return builtin

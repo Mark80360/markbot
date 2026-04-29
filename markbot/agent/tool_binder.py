@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 
 if TYPE_CHECKING:
     from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
@@ -208,7 +208,7 @@ class ToolBinder:
     def _register_skill_tools(self) -> None:
         """Register skill progressive disclosure tools."""
         from markbot.skills import SkillViewTool, SkillsListTool
-        from markbot.skills.manage import SkillManageTool
+        from markbot.skills.core.manage import SkillManageTool
 
         if self._skill_registry:
             self._tools.register(SkillViewTool(registry=self._skill_registry))

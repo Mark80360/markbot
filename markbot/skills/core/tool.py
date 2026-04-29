@@ -8,7 +8,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from markbot.tools.base import BaseTool
-from markbot.skills.helpers import load_skill_body, build_constraint_block
+from markbot.skills.core.helpers import load_skill_body, build_constraint_block
 from markbot.types.permission import PermissionDecision
 from markbot.types.skill import SkillScriptDef
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
@@ -53,7 +53,7 @@ class SkillTool(BaseTool):
         skill_path = self._workspace / "skills" / self._skill_name
         if skill_path.exists():
             return skill_path
-        from markbot.skills.loader import BUILTIN_SKILLS_DIR
+        from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
         builtin_path = BUILTIN_SKILLS_DIR / self._skill_name
         if builtin_path.exists():
             return builtin_path
@@ -61,8 +61,8 @@ class SkillTool(BaseTool):
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         """Execute the skill script via Sandbox, with constraint injection."""
-        from markbot.skills.sandbox import Sandbox
-        from markbot.skills.scanner import SecurityScanner
+        from markbot.skills.core.sandbox import Sandbox
+        from markbot.skills.core.scanner import SecurityScanner
 
         skill_path = self._resolve_skill_path()
         entry_path = skill_path / self._script.entry
@@ -134,7 +134,7 @@ class SkillViewTool(BaseTool):
     """
 
     def __init__(self, registry: "SkillRegistry"):  # noqa: F821
-        from markbot.skills.registry import SkillRegistry as _SR
+        from markbot.skills.core.registry import SkillRegistry as _SR
         self._registry: _SR = registry
 
     @property
@@ -189,7 +189,7 @@ class SkillsListTool(BaseTool):
     """Tool that lists available skills with optional category filtering."""
 
     def __init__(self, registry: "SkillRegistry"):  # noqa: F821
-        from markbot.skills.registry import SkillRegistry as _SR
+        from markbot.skills.core.registry import SkillRegistry as _SR
         self._registry: _SR = registry
 
     @property

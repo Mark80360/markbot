@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 from markbot.types.skill import SkillDefinition
-from markbot.skills.loader import SkillLoader
-from markbot.skills.tool import SkillTool
-from markbot.skills.helpers import load_skill_body, build_constraint_block
-from markbot.skills.config import SkillConfigResolver
-from markbot.skills.scanner import SecurityScanner, ScanResult, Finding, should_allow
+from markbot.skills.core.loader import SkillLoader
+from markbot.skills.core.tool import SkillTool
+from markbot.skills.core.helpers import load_skill_body, build_constraint_block
+from markbot.skills.core.config import SkillConfigResolver
+from markbot.skills.core.scanner import SecurityScanner, ScanResult, Finding, should_allow
 
 if TYPE_CHECKING:
     from markbot.tools.registry import ToolRegistry

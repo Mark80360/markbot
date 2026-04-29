@@ -10,7 +10,7 @@ from loguru import logger
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
-from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 from markbot.agent.subagent.progress import SubagentProgressManager
 from markbot.tools.registry import ToolRegistry
 from markbot.utils.helpers import build_assistant_message

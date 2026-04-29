@@ -27,7 +27,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-BUILTIN_SKILLS_DIR = Path(__file__).parent
+BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "builtin"
 
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 MAX_NAME_LENGTH = 64

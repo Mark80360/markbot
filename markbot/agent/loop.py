@@ -37,7 +37,7 @@ from markbot.agent.pipeline.middleware import (
 )
 from markbot.agent.services.executor import ToolExecutor
 from markbot.skills import SkillRegistry
-from markbot.skills.guardrail import SkillGuardrailManager
+from markbot.skills.core.guardrail import SkillGuardrailManager
 from markbot.session.session import SessionManager
 from markbot.agent.subagent import SubagentManager
 from markbot.tools.message import MessageTool

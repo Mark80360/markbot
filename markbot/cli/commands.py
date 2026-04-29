@@ -1487,7 +1487,7 @@ def gateway_status():
     mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
 
     # ─ Skills ──────────────────────────────────────────────────────────────
-    from markbot.skills.loader import SkillLoader
+    from markbot.skills.core.loader import SkillLoader
     skill_loader = SkillLoader(workspace)
     all_skills = skill_loader.load_all()
     skill_count = len(all_skills)

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
-from markbot.skills.loader import BUILTIN_SKILLS_DIR
+from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 from markbot.utils.constants import (
     BOOTSTRAP_FILES,
     CONTEXT_CACHE_TTL,

@@ -333,7 +333,7 @@ def check_mcp_servers(cfg: Config) -> list[str]:
 
 
 def check_skills(cfg: Config) -> tuple[bool, str]:
-    from markbot.skills.loader import SkillLoader
+    from markbot.skills.core.loader import SkillLoader
 
     try:
         loader = SkillLoader(cfg.workspace_path)

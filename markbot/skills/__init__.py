@@ -1,13 +1,13 @@
 """Unified skills module: loading, registry, execution, security, config, and management."""
 
-from markbot.skills.loader import SkillLoader, BUILTIN_SKILLS_DIR
-from markbot.skills.registry import SkillRegistry
-from markbot.skills.tool import SkillTool, SkillViewTool, SkillsListTool
-from markbot.skills.scanner import SecurityScanner, ScanResult, Finding, should_allow
-from markbot.skills.sandbox import Sandbox, SandboxConfig
-from markbot.skills.guardrail import SkillGuardrail, GuardrailResult, GuardrailViolation, SkillGuardrailManager
-from markbot.skills.config import SkillConfigResolver
-from markbot.skills.manage import SkillManageTool
+from markbot.skills.core.loader import SkillLoader, BUILTIN_SKILLS_DIR
+from markbot.skills.core.registry import SkillRegistry
+from markbot.skills.core.tool import SkillTool, SkillViewTool, SkillsListTool
+from markbot.skills.core.scanner import SecurityScanner, ScanResult, Finding, should_allow
+from markbot.skills.core.sandbox import Sandbox, SandboxConfig
+from markbot.skills.core.guardrail import SkillGuardrail, GuardrailResult, GuardrailViolation, SkillGuardrailManager
+from markbot.skills.core.config import SkillConfigResolver
+from markbot.skills.core.manage import SkillManageTool
 
 __all__ = [
     "SkillLoader",
