@@ -46,11 +46,16 @@ class Session:
         self.updated_at = datetime.now()
 
     @staticmethod
-    def _find_legal_start(messages: list[dict[str, Any]]) -> int:
-        """Find first index where every tool result has a matching assistant tool_call."""
+    def _strip_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove orphan tool results whose matching assistant tool_call is missing.
+
+        Unlike the old ``_find_legal_start`` which dropped all messages before
+        the last orphan, this only removes the orphan tool results themselves,
+        preserving valid history.
+        """
         declared: set[str] = set()
-        start = 0
-        for i, msg in enumerate(messages):
+        cleaned: list[dict[str, Any]] = []
+        for msg in messages:
             role = msg.get("role")
             if role == "assistant":
                 for tc in msg.get("tool_calls") or []:
@@ -59,17 +64,12 @@ class Session:
             elif role == "tool":
                 tid = msg.get("tool_call_id")
                 if tid and str(tid) not in declared:
-                    start = i + 1
-                    declared.clear()
-                    for prev in messages[start:i + 1]:
-                        if prev.get("role") == "assistant":
-                            for tc in prev.get("tool_calls") or []:
-                                if isinstance(tc, dict) and tc.get("id"):
-                                    declared.add(str(tc["id"]))
-        return start
+                    continue
+            cleaned.append(msg)
+        return cleaned
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary.
+        """Return unconsolidated messages for LLM input.
 
         Args:
             max_messages: Max messages to return.  ``<= 0`` means no limit.
@@ -83,11 +83,10 @@ class Session:
                 sliced = sliced[i:]
                 break
 
-        # Some providers reject orphan tool results if the matching assistant
-        # tool_calls message fell outside the fixed-size history window.
-        start = self._find_legal_start(sliced)
-        if start:
-            sliced = sliced[start:]
+        # Remove orphan tool results (missing assistant tool_calls) that some
+        # providers reject. We remove them individually rather than dropping
+        # all messages before the last orphan.
+        sliced = self._strip_orphan_tool_results(sliced)
 
         out: list[dict[str, Any]] = []
         for message in sliced:
@@ -120,10 +119,8 @@ class Session:
 
         retained = self.messages[start_idx:]
 
-        # Mirror get_history(): avoid persisting orphan tool results at the front.
-        start = self._find_legal_start(retained)
-        if start:
-            retained = retained[start:]
+        # Strip orphan tool results (matching get_history() behavior).
+        retained = self._strip_orphan_tool_results(retained)
 
         # Mirror get_history(): drop leading non-user messages so the retained
         # suffix aligns with what get_history() will actually return.

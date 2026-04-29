@@ -1088,8 +1088,10 @@ def agent(
 
     if logs:
         logger.enable("markbot")
+        logger.enable("reme")
     else:
         logger.disable("markbot")
+        logger.disable("reme")
 
     agent_loop = AgentLoop(
         bus=bus,

@@ -63,7 +63,12 @@ class ToolExecutor:
                 continue
 
             if btype == "text" and isinstance(block.get("text"), str):
-                text = strip_ansi(block["text"])
+                text = block["text"]
+                if drop_runtime and text.lstrip().startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
+                    continue
+                text = strip_ansi(text)
                 max_chars = self.get_truncation_limit(tool_name)
                 if truncate_text and len(text) > max_chars:
                     text = text[:max_chars] + "\n... (truncated)"
@@ -122,9 +127,15 @@ class ToolExecutor:
                 if isinstance(content, str) and content.startswith(
                     ContextBuilder._RUNTIME_CONTEXT_TAG
                 ):
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = strip_ansi(parts[1])
+                    boundary = ContextBuilder._CONTENT_BOUNDARY
+                    idx = content.find(boundary)
+                    if idx >= 0:
+                        remaining = content[idx + len(boundary) :].strip()
+                    else:
+                        parts = content.split("\n\n", 1)
+                        remaining = parts[1].strip() if len(parts) > 1 else ""
+                    if remaining:
+                        entry["content"] = strip_ansi(remaining)
                     else:
                         continue
                 if isinstance(content, list):

@@ -140,22 +140,6 @@ class SkillRegistry:
 
         return {"active": active, "suppressed": suppressed, "fallback": fallback}
 
-    def get_skills_for_tools(self, available_tools: set[str]) -> list[SkillDefinition]:
-        """Get skills that should be active given the current set of available tools.
-
-        Combines always-active, conditionally-active, and fallback skills.
-        """
-        result = self.get_conditional_skills(available_tools)
-        seen: set[str] = set()
-        skills: list[SkillDefinition] = []
-
-        for skill in result["active"] + result["fallback"]:
-            if skill.name not in seen:
-                seen.add(skill.name)
-                skills.append(skill)
-
-        return skills
-
     def build_skills_summary(self) -> str:
         """Build markdown summary of available skills."""
         lines = []

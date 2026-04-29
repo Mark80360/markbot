@@ -40,6 +40,7 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = BOOTSTRAP_FILES
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    _CONTENT_BOUNDARY = "<!-- /injected -->"
 
     def __init__(
         self,
@@ -540,16 +541,13 @@ This helps you provide more accurate, contextual responses without loading unnec
         # Merge runtime context, guidance, and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{context_guidance}\n\n{user_content}" if context_guidance else f"{runtime_ctx}\n\n{user_content}"
+            injected = f"{runtime_ctx}\n\n{context_guidance}" if context_guidance else runtime_ctx
+            merged = f"{injected}\n\n{ContextBuilder._CONTENT_BOUNDARY}\n\n{user_content}"
         else:
-            if context_guidance:
-                merged = [
-                    {"type": "text", "text": f"{runtime_ctx}\n\n{context_guidance}"}
-                ] + user_content
-            else:
-                merged = [
-                    {"type": "text", "text": runtime_ctx}
-                ] + user_content
+            injected_text = f"{runtime_ctx}\n\n{context_guidance}\n\n{ContextBuilder._CONTENT_BOUNDARY}" if context_guidance else f"{runtime_ctx}\n\n{ContextBuilder._CONTENT_BOUNDARY}"
+            merged = [
+                {"type": "text", "text": injected_text}
+            ] + user_content
 
         return [
             {"role": "system", "content": system_content},

@@ -38,12 +38,6 @@ class FallbackManager:
         response = await manager.chat_with_fallback(messages, tools)
     """
 
-    RETRYABLE_ERRORS = (
-        "429", "529", "rate limit", "500", "502", "503", "504",
-        "overloaded", "timeout", "timed out", "connection",
-        "server error", "temporarily unavailable",
-    )
-
     MODEL_UNAVAILABLE_ERRORS = (
         "402", "insufficient balance", "insufficient_quota", "quota exceeded",
         "401", "unauthorized", "invalid api key", "authentication",
@@ -56,13 +50,10 @@ class FallbackManager:
         self.config = config
         self._providers_cache: dict[str, LLMProvider] = {}
 
-    def _is_retryable_error(self, error: Exception) -> bool:
+    @staticmethod
+    def _is_retryable_error(error: Exception | str) -> bool:
         err_str = str(error).lower()
-        return any(marker in err_str for marker in self.RETRYABLE_ERRORS)
-
-    def _is_retryable_error_from_msg(self, error_msg: str) -> bool:
-        err_str = error_msg.lower()
-        return any(marker in err_str for marker in self.RETRYABLE_ERRORS)
+        return any(marker in err_str for marker in LLMProvider._TRANSIENT_ERROR_MARKERS)
 
     def _is_model_unavailable_error(self, error: Exception | str) -> bool:
         err_str = str(error).lower()
@@ -153,7 +144,7 @@ class FallbackManager:
                     )
                     attempts.append(attempt)
 
-                    if self._is_retryable_error_from_msg(error_msg):
+                    if self._is_retryable_error(error_msg):
                         logger.warning(
                             f"Model {model_ref} returned error (retryable): {error_msg}. Trying next..."
                         )

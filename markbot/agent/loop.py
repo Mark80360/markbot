@@ -719,40 +719,11 @@ class AgentLoop:
     def _strip_orphan_tool_results(messages: list[dict]) -> list[dict]:
         """Remove orphan tool_result messages before sending to LLM.
 
-        Some providers (e.g. MiniMax) reject requests where a ``tool``
-        message references a ``tool_call_id`` that has no matching
-        ``tool_calls`` entry in any preceding ``assistant`` message.
-        Orphans can appear when:
-          - Previous buggy save_turn persisted partial turns.
-          - Compaction (micro_compact / history_snip) dropped the assistant
-            message but kept its tool results.
-          - Session history was corrupted by earlier bugs.
-
-        This is a defensive cleanup called right before every LLM call.
+        Delegates to Session._strip_orphan_tool_results to avoid duplication.
         """
-        declared: set[str] = set()
-        cleaned: list[dict] = []
-        dropped = 0
+        from markbot.session.session import Session
 
-        for msg in messages:
-            role = msg.get("role")
-            if role == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict) and tc.get("id"):
-                        declared.add(str(tc["id"]))
-            elif role == "tool":
-                tid = msg.get("tool_call_id")
-                if tid and str(tid) not in declared:
-                    dropped += 1
-                    continue
-            cleaned.append(msg)
-
-        if dropped:
-            logger.warning(
-                "[AgentLoop] Stripped {} orphan tool_result(s) before LLM call",
-                dropped,
-            )
-        return cleaned
+        return Session._strip_orphan_tool_results(messages)
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1100,12 +1071,6 @@ class AgentLoop:
             content=final_content,
             metadata=meta,
         )
-
-    @staticmethod
-    def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
-        """Convert an inline image block into a compact text placeholder."""
-        path = (block.get("_meta") or {}).get("path", "")
-        return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
 
     async def process_direct(
         self,

@@ -261,8 +261,55 @@ class MultiLevelCompactor:
         if len(messages) <= keep_recent * 2:
             return messages, ""
 
-        messages_to_compact = messages[:-keep_recent * 2]
-        recent_messages = messages[-keep_recent * 2:]
+        # Split messages at the recent boundary, then adjust backward so that
+        # no tool result in the "recent" part is orphaned from its matching
+        # assistant tool_calls message.  Without this, compaction creates
+        # orphan tool results that corrupt session history on the next turn.
+        split = max(0, len(messages) - keep_recent * 2)
+        recent_messages = messages[split:]
+        # Collect tool_call_ids that are referenced in recent tool messages.
+        needed_ids: set[str] = set()
+        for m in recent_messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                needed_ids.add(str(m["tool_call_id"]))
+        if needed_ids:
+            # Check which of those ids are declared by assistant messages
+            # already inside recent_messages.
+            declared_in_recent: set[str] = set()
+            for m in recent_messages:
+                if m.get("role") == "assistant":
+                    for tc in m.get("tool_calls") or []:
+                        if isinstance(tc, dict) and tc.get("id"):
+                            declared_in_recent.add(str(tc["id"]))
+            missing = needed_ids - declared_in_recent
+            if missing:
+                # Walk backward from the split point to find the assistant
+                # messages that declare the missing ids, then continue back
+                # to the preceding user message to keep the turn intact.
+                earliest: int | None = None
+                for i in range(split - 1, max(0, split - 40), -1):
+                    m = messages[i]
+                    if m.get("role") == "assistant":
+                        for tc in m.get("tool_calls") or []:
+                            if isinstance(tc, dict) and tc.get("id"):
+                                tid = str(tc["id"])
+                                if tid in missing:
+                                    missing.discard(tid)
+                                    if earliest is None or i < earliest:
+                                        earliest = i
+                    if not missing:
+                        break
+                if earliest is not None:
+                    # Extend split back to the user message that started the
+                    # turn containing the earliest matching assistant message.
+                    for i in range(earliest, max(0, earliest - 10), -1):
+                        if messages[i].get("role") == "user":
+                            split = i
+                            break
+                    else:
+                        split = max(0, earliest)
+        messages_to_compact = messages[:split]
+        recent_messages = messages[split:]
 
         conversation_text = self._format_messages_for_compact(messages_to_compact)
         try:

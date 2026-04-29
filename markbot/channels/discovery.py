@@ -11,7 +11,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from markbot.channels.base import BaseChannel
 
-_INTERNAL = frozenset({"base", "manager", "registry"})
+_INTERNAL = frozenset({"base", "manager"})
 
 
 def discover_channel_names() -> list[str]:
