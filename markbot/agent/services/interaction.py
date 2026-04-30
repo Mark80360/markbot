@@ -26,7 +26,8 @@ class InteractionLogger:
     Each LLM call (each iteration of the agent loop) produces one log entry
     containing:
     - Timestamp and session metadata
-    - Full messages sent to the LLM (truncated for size)
+    - **Incremental** messages sent to the LLM (only new messages since
+      the last logged interaction for this session, avoiding duplicates)
     - Tool definitions summary
     - Complete LLM response (content, tool calls, usage, reasoning)
     """
@@ -36,6 +37,7 @@ class InteractionLogger:
             log_dir = Path.home() / ".markbot" / "logs"
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._logged_msg_counts: dict[str, int] = {}
 
     def log_interaction(
         self,
@@ -51,6 +53,11 @@ class InteractionLogger:
     ) -> None:
         """Log one LLM interaction (request + response).
 
+        Only new messages (those not yet logged for this session) are
+        written to the request section.  The response section is always
+        written in full.  This prevents duplicate content when the same
+        conversation history is sent across multiple agent-loop iterations.
+
         Args:
             iteration: Agent loop iteration number.
             messages: Full message list sent to the LLM.
@@ -61,6 +68,15 @@ class InteractionLogger:
             chat_id: Chat/session identifier.
             tokens_before: Estimated token count before this call.
         """
+        session_key = f"{channel}:{chat_id}"
+        prev_count = self._logged_msg_counts.get(session_key, 0)
+
+        if len(messages) < prev_count:
+            prev_count = 0
+
+        new_messages = messages[prev_count:]
+        self._logged_msg_counts[session_key] = len(messages)
+
         now = datetime.now()
         filename = f"{now.strftime('%Y-%m-%d')}.log"
         filepath = self._log_dir / filename
@@ -68,7 +84,11 @@ class InteractionLogger:
         parts: list[str] = []
 
         parts.append(self._build_header(now, iteration, channel, chat_id, model))
-        parts.append(self._build_request_section(messages, tool_defs, tokens_before))
+        parts.append(
+            self._build_request_section(
+                new_messages, tool_defs, tokens_before, total_msg_count=len(messages),
+            )
+        )
         parts.append(self._build_response_section(response))
 
         entry = "\n".join(parts)
@@ -102,10 +122,13 @@ class InteractionLogger:
         messages: list[dict[str, Any]],
         tool_defs: list[dict[str, Any]],
         tokens_before: int,
+        *,
+        total_msg_count: int | None = None,
     ) -> str:
+        display_total = total_msg_count if total_msg_count is not None else len(messages)
         lines = [
             "--- REQUEST ---",
-            f"Messages ({len(messages)}), estimated tokens: ~{tokens_before}",
+            f"Messages ({len(messages)} new / {display_total} total), estimated tokens: ~{tokens_before}",
             "",
         ]
 
