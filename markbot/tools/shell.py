@@ -180,18 +180,18 @@ class ExecTool(Tool):
             return curl_wget_error
 
         if self.restrict_to_workspace:
-            if "..\\" in cmd or "../" in cmd:
-                return "Error: Command blocked by safety guard (path traversal detected)"
-
             cwd_path = Path(cwd).resolve()
 
-            for raw in self._extract_absolute_paths(cmd):
+            for raw in self._extract_all_paths(cmd):
                 try:
                     expanded = os.path.expandvars(raw.strip())
-                    p = Path(expanded).expanduser().resolve()
+                    p = Path(expanded).expanduser()
+                    if not p.is_absolute():
+                        p = cwd_path / p
+                    p = p.resolve()
                 except Exception:
                     continue
-                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
+                if cwd_path not in p.parents and p != cwd_path:
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None
@@ -230,8 +230,39 @@ class ExecTool(Tool):
         return None
 
     @staticmethod
-    def _extract_absolute_paths(command: str) -> list[str]:
-        win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]+", command)   # Windows: C:\...
-        posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
-        home_paths = re.findall(r"(?:^|[\s|>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
-        return win_paths + posix_paths + home_paths
+    def _looks_like_path(s: str) -> bool:
+        s = s.strip()
+        if not s:
+            return False
+        if re.match(r'[A-Za-z]:[\\/]', s):
+            return True
+        if s.startswith('/'):
+            return True
+        if s.startswith('~'):
+            return True
+        if re.search(r'(?:^|[/\\])\.\.(?:$|[/\\])', s):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_all_paths(command: str) -> list[str]:
+        paths = []
+        quoted_re = re.compile(r'''["']([^"']+)["']''')
+
+        for m in quoted_re.finditer(command):
+            content = m.group(1).strip()
+            if ExecTool._looks_like_path(content):
+                paths.append(content)
+
+        remaining = quoted_re.sub(' ', command)
+
+        win_paths = re.findall(r'[A-Za-z]:[\\/][^\s\"\'|><;]+', remaining)
+        posix_paths = re.findall(r'(?:^|[\s|>])(/[^\s\"\'|><;]+)', remaining)
+        home_paths = re.findall(r'(?:^|[\s|>])(~/[^\s\"\'|><;]*)', remaining)
+        rel_traversal = re.findall(
+            r'(?:^|[\s|>])([^\s\"\'|><;]*[/\\]\.\.(?:[/\\][^\s\"\'|><;]*)*)',
+            remaining,
+        )
+
+        paths.extend(win_paths + posix_paths + home_paths + rel_traversal)
+        return paths

@@ -75,12 +75,13 @@ _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
 def _markbot_banner():
-    console.print("\n  ███╗   ███╗ █████╗ ██████╗ ██╗  ██╗██████╗  ██████╗ ████████╗")
-    console.print("  ████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔══██╗██╔═══██╗╚══██╔══╝")
-    console.print("  ██╔████╔██║███████║██████╔╝█████╔╝ ██████╔╝██║   ██║   ██║   ")
-    console.print("  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══██╗██║   ██║   ██║   ")
-    console.print("  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗██████╔╝╚██████╔╝   ██║   ")
-    console.print("  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝    ╚═╝   ")
+    console.print()
+    console.print("  ███╗░░░███╗░█████╗░██████╗░██╗░░██╗██████╗░░█████╗░████████╗")
+    console.print("  ████╗░████║██╔══██╗██╔══██╗██║░██╔╝██╔══██╗██╔══██╗╚══██╔══╝")
+    console.print("  ██╔████╔██║███████║██████╔╝█████═╝░██████╦╝██║░░██║░░░██║░░░")
+    console.print("  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗░██╔══██╗██║░░██║░░░██║░░░")
+    console.print("  ██║░╚═╝░██║██║░░██║██║░░██║██║░╚██╗██████╦╝╚█████╔╝░░░██║░░░")
+    console.print("  ╚═╝░░░░░╚═╝╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░░╚════╝░░░░╚═╝░░░")
 
 def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""
