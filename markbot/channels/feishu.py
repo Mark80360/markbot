@@ -1403,7 +1403,11 @@ class FeishuChannel(BaseChannel):
                 ReplyMessageRequest.builder()
                 .message_id(parent_message_id)
                 .request_body(
-                    ReplyMessageRequestBody.builder().msg_type(msg_type).content(content).build()
+                    ReplyMessageRequestBody.builder()
+                    .msg_type(msg_type)
+                    .content(content)
+                    .reply_in_thread(True)
+                    .build()
                 )
                 .build()
             )
@@ -1511,17 +1515,13 @@ class FeishuChannel(BaseChannel):
                     msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
                 )
 
-            first_send = True
-
             def _do_send(m_type: str, content: str) -> None:
-                nonlocal first_send
                 logger.info(
                     "[FEISHU SEND] _do_send() type={}, content_preview='{}...'",
                     m_type,
                     content[:100] if len(content) > 100 else content,
                 )
-                if reply_message_id and first_send:
-                    first_send = False
+                if reply_message_id:
                     ok = self._reply_message_sync(reply_message_id, m_type, content)
                     if ok:
                         logger.info("[FEISHU SEND] _do_send() replied successfully")
@@ -1786,6 +1786,7 @@ class FeishuChannel(BaseChannel):
                 return
 
             reply_to = chat_id if chat_type == "group" else sender_id
+            session_key = f"feishu:{chat_id}:{thread_id}" if thread_id else None
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -1800,6 +1801,7 @@ class FeishuChannel(BaseChannel):
                     "thread_id": thread_id,
                     "reaction_id": reaction_id,
                 },
+                session_key=session_key,
             )
 
         except Exception as e:

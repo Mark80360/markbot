@@ -1076,17 +1076,31 @@ def agent(
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show MarkBot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
+    import time
     from loguru import logger
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.schedule.cron import CronService
 
-    config = _load_runtime_config(config, workspace)
-    sync_workspace_templates(config.workspace_path)
+    _cmd_start = time.time()
+    logger.info("[CLI] agent command starting...")
 
+    _t0 = time.time()
+    config = _load_runtime_config(config, workspace)
+    logger.debug("[CLI] Config loaded, took {:.3f}s", time.time() - _t0)
+
+    _t0 = time.time()
+    sync_workspace_templates(config.workspace_path)
+    logger.debug("[CLI] Workspace templates synced, took {:.3f}s", time.time() - _t0)
+
+    _t0 = time.time()
     bus = MessageBus()
+    logger.debug("[CLI] MessageBus created, took {:.3f}s", time.time() - _t0)
+
+    _t0 = time.time()
     provider = _make_provider(config)
+    logger.debug("[CLI] Provider created, took {:.3f}s", time.time() - _t0)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
     cron = CronService(cron_store_path)
@@ -1098,6 +1112,8 @@ def agent(
         logger.disable("markbot")
         logger.disable("reme")
 
+    _t0 = time.time()
+    logger.info("[CLI] Creating AgentLoop...")
     agent_loop = AgentLoop(
         bus=bus,
         fallback_manager=provider,
@@ -1120,6 +1136,7 @@ def agent(
         warn_threshold_usd=config.budget.warn_threshold_usd,
         budget_config=config.budget if config.budget.enabled else None,
     )
+    logger.info("[CLI] AgentLoop created, took {:.3f}s", time.time() - _t0)
 
     # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None

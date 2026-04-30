@@ -93,13 +93,16 @@ class AgentLoop:
         warn_threshold_usd: float = 0.5,
         budget_config=None,
     ):
+        _init_start = time.time()
+        logger.info("[AgentLoop] Starting initialization...")
+
         self.bus = bus
         self.channels_config = channels_config
         self.fallback_manager = fallback_manager
         self.config = config
         self.workspace = workspace
 
-        # 从 config 获取主模型信息
+        _t0 = time.time()
         self._primary_provider_config = None
         if config and config.primary_model_ref:
             primary_provider, primary_model = config.resolve_model(config.primary_model_ref)
@@ -107,6 +110,7 @@ class AgentLoop:
             self._primary_provider_config = primary_provider
         else:
             self.model = "unknown"
+        logger.debug("[AgentLoop] Model resolution took {:.3f}s", time.time() - _t0)
 
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
@@ -141,18 +145,21 @@ class AgentLoop:
             pricing=_pricing,
         )
 
-        # Initialize tool registry
+        _t0 = time.time()
         self.tools = ToolRegistry()
+        logger.debug("[AgentLoop] ToolRegistry init took {:.3f}s", time.time() - _t0)
 
-        # Initialize skill registry (new system)
+        _t0 = time.time()
         self.skill_registry = SkillRegistry(workspace, tool_registry=self.tools)
         self.skill_registry.load_all()
+        logger.debug("[AgentLoop] SkillRegistry load_all took {:.3f}s", time.time() - _t0)
 
         # Skill execution guardrail manager — validates tool calls against
         # active skill constraints. SkillTool auto-activates its guardrail
         # on execution.
         self.guardrail_manager = SkillGuardrailManager(context="main")
 
+        _t0 = time.time()
         self.sessions = session_manager or SessionManager(workspace)
         self.subagents = SubagentManager(
             fallback_manager=fallback_manager,
@@ -167,6 +174,7 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
             cost_tracker=self.cost_tracker,
         )
+        logger.debug("[AgentLoop] SubagentManager init took {:.3f}s", time.time() - _t0)
 
         self._running = False
         self.mcp = McpManager(mcp_servers)
@@ -194,6 +202,7 @@ class AgentLoop:
             "model_name": self.model,
         }
 
+        _t0 = time.time()
         self.memory_manager = ReMeLightMemoryManager(
             working_dir=str(workspace),
             agent_id="markbot",
@@ -212,7 +221,7 @@ class AgentLoop:
             force_max_results=getattr(memory_cfg, "force_max_results", 1),
             force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
         )
-        logger.info("Memory manager initialized (ReMeLight)")
+        logger.info("[AgentLoop] Memory manager initialized (ReMeLight) took {:.3f}s", time.time() - _t0)
 
         self.bootstrap_hook = BootstrapHook(
             working_dir=workspace,
@@ -236,6 +245,7 @@ class AgentLoop:
             memory_manager=self.memory_manager,
         )
         _allowed_dir = workspace if restrict_to_workspace else None
+        _t0 = time.time()
         binder = ToolBinder(
             self.tools,
             workspace=workspace,
@@ -252,16 +262,18 @@ class AgentLoop:
             publish_outbound=self.bus.publish_outbound,
         )
         binder.register_all()
+        logger.debug("[AgentLoop] ToolBinder register_all took {:.3f}s", time.time() - _t0)
         self._memory_search_tool = binder.memory_search_tool
         self.question_tool = binder.question_tool
 
-        logger.info(f"Agent has {len(self.tools)} tools available")
+        logger.info("[AgentLoop] Agent has {} tools available", len(self.tools))
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
-        # Initialize decoupled services (extracted from monolithic loop)
         self.tool_executor = ToolExecutor(self.tools)
         self._setup_pipeline()
+
+        logger.info("[AgentLoop] Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     def _setup_pipeline(self) -> None:
         """Initialize the message processing pipeline with middleware."""
@@ -281,7 +293,13 @@ class AgentLoop:
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
+        if not self.mcp._mcp_servers:
+            logger.debug("[AgentLoop] No MCP servers configured, skipping connection")
+            return
+        _t0 = time.time()
+        logger.info("[AgentLoop] Connecting to MCP servers...")
         await self.mcp.connect(self.tools)
+        logger.info("[AgentLoop] MCP connection took {:.3f}s", time.time() - _t0)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -757,14 +775,18 @@ class AgentLoop:
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
+        _run_start = time.time()
+        logger.info("[AgentLoop] Starting run()...")
         self._running = True
         await self._connect_mcp()
         try:
+            _t0 = time.time()
+            logger.info("[AgentLoop] Starting memory manager...")
             await self.memory_manager.start()
-            logger.info("Memory manager started")
+            logger.info("[AgentLoop] Memory manager started, took {:.3f}s", time.time() - _t0)
         except Exception as e:
-            logger.warning(f"Memory manager start failed: {e}")
-        logger.info("Agent loop started")
+            logger.warning("[AgentLoop] Memory manager start failed: {}", e)
+        logger.info("[AgentLoop] Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
         while self._running:
             try:
@@ -1113,14 +1135,18 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
+        _direct_start = time.time()
+        logger.info("[AgentLoop] process_direct starting...")
         await self._connect_mcp()
-        # Ensure memory manager is started
         if self.memory_manager and not getattr(self.memory_manager, "_started", False):
             try:
+                _t0 = time.time()
+                logger.info("[AgentLoop] Starting memory manager in process_direct...")
                 await self.memory_manager.start()
-                logger.info("Memory manager started in process_direct")
+                logger.info("[AgentLoop] Memory manager started in process_direct, took {:.3f}s", time.time() - _t0)
             except Exception as e:
-                logger.warning(f"Memory manager start failed in process_direct: {e}")
+                logger.warning("[AgentLoop] Memory manager start failed in process_direct: {}", e)
+        logger.info("[AgentLoop] process_direct startup took {:.3f}s", time.time() - _direct_start)
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg,

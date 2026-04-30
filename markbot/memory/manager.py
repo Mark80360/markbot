@@ -136,6 +136,10 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         tool_result_retention_days: int = 5,
         max_input_length: int = 131072,
     ):
+        import time
+        _init_start = time.time()
+        logger.info("[ReMeLightMemoryManager] Starting initialization...")
+
         super().__init__(working_dir=working_dir, agent_id=agent_id)
         self._fallback_manager = fallback_manager
         self._model = model
@@ -172,13 +176,18 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         self._summary_toolkit: Any = None
 
         logger.info(
-            f"ReMeLightMemoryManager init: agent_id={agent_id}, "
-            f"working_dir={working_dir}, language={language}"
+            "[ReMeLightMemoryManager] Config: agent_id={}, working_dir={}, language={}",
+            agent_id, working_dir, language
         )
 
         self._init_reme()
+        logger.info("[ReMeLightMemoryManager] Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     def _init_reme(self) -> None:
+        import time
+        _init_reme_start = time.time()
+        logger.info("[ReMeLightMemoryManager] _init_reme starting...")
+
         backend_env = os.environ.get("MEMORY_STORE_BACKEND", "auto")
         if backend_env == "auto":
             if platform.system() == "Windows":
@@ -189,21 +198,25 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                     memory_backend = "chroma"
                 except Exception as e:
                     logger.warning(
-                        f"chromadb import failed, falling back to `local` backend. Error: {e}"
+                        "[ReMeLightMemoryManager] chromadb import failed, falling back to `local` backend. Error: {}",
+                        e
                     )
                     memory_backend = "local"
         else:
             memory_backend = backend_env
+        logger.info("[ReMeLightMemoryManager] Memory backend: {}", memory_backend)
 
+        _t0 = time.time()
         try:
             from reme.reme_light import ReMeLight
         except ImportError:
             logger.error(
-                "reme-ai is not installed. Memory system requires reme-ai. "
+                "[ReMeLightMemoryManager] reme-ai is not installed. Memory system requires reme-ai. "
                 "Install with: pip install reme-ai"
             )
             self._reme = None
             return
+        logger.debug("[ReMeLightMemoryManager] Import ReMeLight took {:.3f}s", time.time() - _t0)
 
         emb_config = self._build_embedding_config()
         vector_enabled = bool(emb_config.get("base_url")) and bool(
@@ -212,7 +225,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         log_cfg = {**emb_config, "api_key": self._mask_key(emb_config.get("api_key", ""))}
         logger.info(
-            "Embedding config: %s, vector_enabled=%s, memory_backend=%s",
+            "[ReMeLightMemoryManager] Embedding config: {}, vector_enabled={}, memory_backend={}",
             json.dumps(log_cfg, ensure_ascii=False), vector_enabled, memory_backend,
         )
 
@@ -230,10 +243,11 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 "model_name": llm_model_name,
             }
 
-        # Set environment variables for token counter before initializing ReMeLight
         os.environ.setdefault("AS_TOKEN_COUNTER_BACKEND", "huggingface")
         os.environ.setdefault("AS_TOKEN_COUNTER_MODEL_NAME", "gpt2")
 
+        _t0 = time.time()
+        logger.info("[ReMeLightMemoryManager] Creating ReMeLight instance...")
         self._reme = ReMeLight(
             working_dir=self.working_dir,
             llm_api_key=llm_api_key or None,
@@ -250,8 +264,10 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 "rebuild_index_on_start": False,
             },
         )
+        logger.info("[ReMeLightMemoryManager] ReMeLight instance created, took {:.3f}s", time.time() - _t0)
 
         self._setup_summary_toolkit()
+        logger.info("[ReMeLightMemoryManager] _init_reme complete, total took {:.3f}s", time.time() - _init_reme_start)
 
     def _setup_summary_toolkit(self) -> None:
         """Register file tools for use during summarization."""
@@ -313,32 +329,41 @@ class ReMeLightMemoryManager(BaseMemoryManager):
     def _warn_if_version_mismatch(self) -> None:
         if not self._reme_version_ok:
             logger.warning(
-                f"reme-ai version mismatch, expected={_EXPECTED_REME_VERSION}. "
-                f"Run `pip install reme-ai=={_EXPECTED_REME_VERSION}` to align."
+                "[ReMeLightMemoryManager] reme-ai version mismatch, expected={}. "
+                "Run `pip install reme-ai=={}` to align.",
+                _EXPECTED_REME_VERSION, _EXPECTED_REME_VERSION
             )
 
     def _prepare_model_formatter(self) -> None:
         pass
 
     async def start(self):
+        import time
+        _start_begin = time.time()
+        logger.info("[ReMeLightMemoryManager] start() beginning...")
+
         self._warn_if_version_mismatch()
         if self._reme is None:
-            logger.warning("Cannot start memory manager: _reme is None")
+            logger.warning("[ReMeLightMemoryManager] Cannot start memory manager: _reme is None")
             return None
         if self._summary_toolkit is None:
             logger.warning(
-                "Summary toolkit not available (agentscope not installed). "
+                "[ReMeLightMemoryManager] Summary toolkit not available (agentscope not installed). "
                 "summary_memory() will run without file tool support."
             )
         try:
+            logger.info("[ReMeLightMemoryManager] Calling _reme.start()...")
+            _t0 = time.time()
             result = await self._reme.start()
+            logger.info("[ReMeLightMemoryManager] _reme.start() took {:.3f}s", time.time() - _t0)
             self._started = True
-            logger.info(f"Memory manager started successfully, working_dir={self.working_dir}")
+            logger.info("[ReMeLightMemoryManager] Started successfully, working_dir={}", self.working_dir)
             memory_dir = Path(self.working_dir) / "memory"
-            logger.info(f"Memory directory: {memory_dir}, exists={memory_dir.exists()}")
+            logger.info("[ReMeLightMemoryManager] Memory directory: {}, exists={}", memory_dir, memory_dir.exists())
+            logger.info("[ReMeLightMemoryManager] start() complete, total took {:.3f}s", time.time() - _start_begin)
             return result
         except Exception as e:
-            logger.error(f"Failed to start memory manager: {e}")
+            logger.error("[ReMeLightMemoryManager] Failed to start: {}", e)
             return None
 
     async def close(self) -> bool:
