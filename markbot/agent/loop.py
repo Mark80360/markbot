@@ -358,8 +358,11 @@ class AgentLoop:
             current_tokens = token_count_with_estimation(messages)
             logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
 
+            task_context = self._gather_task_context()
+
             messages, compact_result = await self.compactor.maybe_compact(
-                messages, current_tokens, self.context_window_tokens
+                messages, current_tokens, self.context_window_tokens,
+                task_context=task_context,
             )
             if compact_result.action != CompactAction.NONE:
                 logger.info(
@@ -674,6 +677,33 @@ class AgentLoop:
         )
 
         return final_content, tools_used, messages, _new_msg_start
+
+    def _gather_task_context(self) -> str:
+        max_task_context_chars = 2000
+        parts: list[str] = []
+
+        todo_tool = self.tools.get("todo")
+        if todo_tool is not None and hasattr(todo_tool, "_get_store"):
+            try:
+                store = todo_tool._get_store()
+                items = store.list_items()
+                active_items = [i for i in items if i.get("status") in ("pending", "in_progress")]
+                if active_items:
+                    lines = ["[CURRENT TASK STATE — preserve verbatim in summary]"]
+                    for item in active_items:
+                        status = item.get("status", "pending")
+                        priority = item.get("priority", "medium")
+                        content = item.get("content", "")
+                        item_id = item.get("id", "?")
+                        lines.append(f"  - [{item_id}] {content} (status={status}, priority={priority})")
+                    text = "\n".join(lines)
+                    if len(text) > max_task_context_chars:
+                        text = text[:max_task_context_chars] + "\n  ... (truncated)"
+                    parts.append(text)
+            except Exception as e:
+                logger.debug("Failed to gather todo context for compaction: {}", e)
+
+        return "\n\n".join(parts) if parts else ""
 
     @staticmethod
     def _recalc_new_msg_start_after_compact(

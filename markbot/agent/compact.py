@@ -22,6 +22,11 @@ from markbot.agent.tokens import estimate_messages_tokens as _estimate_messages_
 
 from loguru import logger
 
+_PROTECTED_TOOL_NAMES = frozenset({
+    "todo", "autopilot_list", "autopilot_intake",
+    "autopilot_pick_next", "autopilot_verify",
+})
+
 
 class CompactAction(str, Enum):
     COLLAPSE = "collapse"
@@ -89,13 +94,32 @@ class MultiLevelCompactor:
         self._compaction_count = 0
         self._total_tokens_saved = 0
 
+    @staticmethod
+    def _get_protected_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+        protected_ids: set[str] = set()
+        for m in messages:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        if isinstance(func, dict) and func.get("name") in _PROTECTED_TOOL_NAMES:
+                            tc_id = tc.get("id")
+                            if tc_id:
+                                protected_ids.add(str(tc_id))
+        return protected_ids
+
     async def maybe_compact(
         self,
         messages: list[dict[str, Any]],
         current_tokens: int,
         max_tokens: int,
+        task_context: str = "",
     ) -> tuple[list[dict[str, Any]], CompactResult]:
         """Run compaction if needed, trying cheapest strategy first.
+
+        Args:
+            task_context: Current task state string to preserve through compaction.
+                Gathered from todo/autopilot stores before compaction runs.
 
         Returns:
             (messages, CompactResult) — messages may be modified in-place or replaced.
@@ -149,7 +173,7 @@ class MultiLevelCompactor:
                 tokens_after=tokens_after_micro,
             )
 
-        messages, summary = await self._apply_auto_compaction(messages)
+        messages, summary = await self._apply_auto_compaction(messages, task_context=task_context)
         tokens_after_auto = _estimate_messages_tokens(messages)
         logger.debug("[Compactor] After auto-compaction: {} tokens (saved {})", tokens_after_auto, tokens_before - tokens_after_auto)
 
@@ -164,7 +188,7 @@ class MultiLevelCompactor:
                 summary=summary,
             )
 
-        messages = self._apply_history_snip(messages)
+        messages = self._apply_history_snip(messages, task_context=task_context)
         tokens_after_snip = _estimate_messages_tokens(messages)
         self._record_savings(tokens_before, tokens_after_snip)
         logger.warning(
@@ -216,6 +240,7 @@ class MultiLevelCompactor:
 
     def _apply_micro_compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         keep = self.config.micro_compact_keep_turns
+        protected_ids = self._get_protected_tool_call_ids(messages)
         tool_result_indices = [
             i for i, m in enumerate(messages)
             if (
@@ -227,16 +252,24 @@ class MultiLevelCompactor:
         ]
         to_clear = tool_result_indices[:-keep] if len(tool_result_indices) > keep else []
         cleared = 0
+        protected_count = 0
         for idx in to_clear:
             msg = messages[idx]
             role = msg.get("role")
             if role == "tool":
+                if msg.get("name") in _PROTECTED_TOOL_NAMES or str(msg.get("tool_call_id", "")) in protected_ids:
+                    protected_count += 1
+                    continue
                 msg["content"] = "[tool result removed by micro-compact]"
                 cleared += 1
             elif role == "user" and isinstance(msg.get("content"), list):
                 new_content = []
                 for block in msg["content"]:
                     if block.get("type") == "tool_result":
+                        if str(block.get("tool_call_id", "")) in protected_ids:
+                            new_content.append(block)
+                            protected_count += 1
+                            continue
                         new_content.append({
                             "type": "tool_result",
                             "tool_call_id": block.get("tool_call_id", ""),
@@ -248,6 +281,8 @@ class MultiLevelCompactor:
                 cleared += 1
         if cleared:
             logger.info("[Compactor] Micro-compacted {} old tool results", cleared)
+        if protected_count:
+            logger.info("[Compactor] Protected {} task-related tool results from micro-compact", protected_count)
         return messages
 
     # ------------------------------------------------------------------
@@ -255,7 +290,7 @@ class MultiLevelCompactor:
     # ------------------------------------------------------------------
 
     async def _apply_auto_compaction(
-        self, messages: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], *, task_context: str = ""
     ) -> tuple[list[dict[str, Any]], str]:
         keep_recent = self.config.auto_compact_keep_recent
         if len(messages) <= keep_recent * 2:
@@ -312,6 +347,8 @@ class MultiLevelCompactor:
         recent_messages = messages[split:]
 
         conversation_text = self._format_messages_for_compact(messages_to_compact)
+        if task_context:
+            conversation_text += f"\n\n{task_context}"
         try:
             summary = await self._generate_summary(conversation_text)
         except Exception as e:
@@ -321,6 +358,10 @@ class MultiLevelCompactor:
                 return messages, ""
         formatted = self._format_summary(summary)
 
+        task_section = ""
+        if task_context:
+            task_section = f"\n\n{task_context}\n\n"
+
         compact_msg = {
             "role": "system",
             "content": (
@@ -328,7 +369,8 @@ class MultiLevelCompactor:
                 "that ran out of context. The summary below covers the earlier portion.\n\n"
                 + formatted
                 + "\n\nRecent messages are preserved verbatim.\n\n"
-                "Continue the conversation from where it left off without asking further questions. "
+                + task_section
+                + "Continue the conversation from where it left off without asking further questions. "
                 "Resume directly — do not acknowledge the summary, do not recap. "
                 "Pick up the last task as if the break never happened."
             ),
@@ -343,16 +385,19 @@ class MultiLevelCompactor:
     # Level 4: History Snip — force drop oldest messages (last resort)
     # ------------------------------------------------------------------
 
-    def _apply_history_snip(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _apply_history_snip(self, messages: list[dict[str, Any]], *, task_context: str = "") -> list[dict[str, Any]]:
         keep = self.config.snip_keep_messages
         if len(messages) <= keep:
             return messages
         snipped = messages[-keep:]
+        task_section = ""
+        if task_context:
+            task_section = f"\n\n{task_context}"
         snip_notice = {
             "role": "system",
             "content": (
                 f"[{len(messages) - keep} earlier messages were removed by context snip "
-                f"to fit within the context window.]"
+                f"to fit within the context window.]{task_section}"
             ),
         }
         result = [snip_notice] + snipped
@@ -400,8 +445,8 @@ Your summary MUST include these sections:
 4. Errors and fixes: List errors encountered and how they were fixed
 5. Problem Solving: Document problems solved and ongoing troubleshooting
 6. All user messages: List ALL user messages verbatim (not tool results)
-7. Pending Tasks: Outline pending tasks explicitly requested
-8. Current Work: Describe precisely what was being worked on immediately before this summary
+7. Pending Tasks: List ALL pending and in-progress tasks with full details. If a [CURRENT TASK STATE] section appears in the input, you MUST include ALL items from it verbatim — do not omit, merge, or summarize any task item. Preserve each task's ID, description, status, and priority exactly as given.
+8. Current Work: Describe precisely what was being worked on immediately before this summary. Include the specific step, sub-task, or tool call that was in progress, so work can resume seamlessly.
 9. Optional Next Step: Next step directly related to the most recent work
 
 FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</summary>. Nothing else. No tools, no TOOL:, no function calls, no JSON.

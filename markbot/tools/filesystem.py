@@ -41,6 +41,32 @@ class _FsTool(Tool):
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
 
+    def _create_backup(self, file_path: Path) -> None:
+        try:
+            backup_root = self._backup_dir
+
+            backup_root.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rel_path = file_path.name
+            backup_name = f"{timestamp}_{rel_path}.bak"
+            backup_path = backup_root / backup_name
+
+            import shutil
+            shutil.copy2(file_path, backup_path)
+
+            self._cleanup_old_backups(backup_root)
+        except Exception:
+            pass
+
+    def _cleanup_old_backups(self, backup_dir: Path) -> None:
+        try:
+            backups = sorted(backup_dir.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old_backup in backups[self._max_backups:]:
+                old_backup.unlink()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # read_file
@@ -401,35 +427,6 @@ class ListDirTool(_FsTool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error listing directory: {e}"
-
-    def _create_backup(self, file_path: Path) -> None:
-        """Create a backup of file before modification."""
-        try:
-            backup_root = self._backup_dir
-
-            backup_root.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            rel_path = file_path.name
-            backup_name = f"{timestamp}_{rel_path}.bak"
-            backup_path = backup_root / backup_name
-
-            import shutil
-            shutil.copy2(file_path, backup_path)
-
-            self._cleanup_old_backups(backup_root)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _cleanup_old_backups(backup_dir: Path) -> None:
-        """Keep only the most recent backups."""
-        try:
-            backups = sorted(backup_dir.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old_backup in backups[self._max_backups:]:
-                old_backup.unlink()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
