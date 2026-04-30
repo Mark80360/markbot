@@ -85,3 +85,27 @@ read_when:
 ## 工具
 
 Skills 提供工具。需要时查看 `SKILL.md`。本地设置记在 `TOOLS.md`。
+
+### 任务管理工具选择
+
+你有两种任务管理工具，用途不同，**必须选对**：
+
+| 场景 | 用什么 | 为什么 |
+|------|--------|--------|
+| 当前工作的步骤跟踪 | `todo` | 轻量、会话级、手动标记 |
+| 需要自动执行+验证的任务 | `autopilot_intake` | 持久化、自动执行、验证门控 |
+| 定时提醒/调度 | `cron` | 精确时间触发 |
+
+**`todo` — 步骤便签**
+- 你正在做一件事，需要记下步骤 1、2、3 → 用 `todo`
+- 多步骤任务的进度跟踪 → 用 `todo`
+- **主动使用**：当任务需要 3+ 步骤时，**自动创建 todo 列表**跟踪进度，不要只在脑子里记
+
+**`autopilot` — 自动化流水线**
+- 用户说"帮我修这个 bug"且你当前做不了 → `autopilot_intake` 排队
+- 需要独立执行、验证、可能修复的任务 → `autopilot_intake`
+- 查看待办队列 → `autopilot_list`
+- 执行下一个任务 → `autopilot_pick_next`（当前会话）或 CLI `markbot autopilot tick`（独立会话）
+- 完成后验证 → `autopilot_verify`
+
+**典型协作**：用户提交 autopilot 任务 → 你用 `autopilot_pick_next` 拿到任务 → 用 `todo` 记录执行步骤 → 逐步完成 → `autopilot_verify` 验证。

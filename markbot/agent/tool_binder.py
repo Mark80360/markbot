@@ -11,10 +11,9 @@ from typing import TYPE_CHECKING, Any
 from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 
 if TYPE_CHECKING:
-    from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
-    from markbot.schedule.cron import CronService
     from markbot.agent.subagent import SubagentManager
     from markbot.memory.manager import ReMeLightMemoryManager
+    from markbot.schedule.cron import CronService
     from markbot.skills import SkillRegistry
     from markbot.tools.registry import ToolRegistry
 
@@ -74,6 +73,7 @@ class ToolBinder:
         self._register_subagent_tools()
         self._register_memory_tools()
         self._register_skill_tools()
+        self._register_autopilot_tools()
 
         if self._cron_service:
             from markbot.tools.cron import CronTool
@@ -148,11 +148,11 @@ class ToolBinder:
 
     def _register_agent_tools(self) -> None:
         """Register tools specific to agent operation."""
-        from markbot.tools.message import MessageTool
+        from markbot.agent.subagent.spawn import SpawnTool
         from markbot.tools.explore import ExploreTool
+        from markbot.tools.message import MessageTool
         from markbot.tools.think import ThinkTool
         from markbot.tools.todo import TodoTool
-        from markbot.agent.subagent.spawn import SpawnTool
 
         self._tools.register(MessageTool(send_callback=self._publish_outbound))
         if self._subagent_manager:
@@ -190,7 +190,12 @@ class ToolBinder:
     def _register_memory_tools(self) -> None:
         """Register memory search and self-management tools."""
         from markbot.tools.memory import MemorySearchTool
-        from markbot.tools.memory_tools import DreamTool, MemoryForgetTool, MemoryListTool, MemorySaveTool
+        from markbot.tools.memory_tools import (
+            DreamTool,
+            MemoryForgetTool,
+            MemoryListTool,
+            MemorySaveTool,
+        )
         from markbot.tools.question import AskUserQuestionTool
 
         if self._memory_manager:
@@ -207,10 +212,17 @@ class ToolBinder:
 
     def _register_skill_tools(self) -> None:
         """Register skill progressive disclosure tools."""
-        from markbot.skills import SkillViewTool, SkillsListTool
+        from markbot.skills import SkillsListTool, SkillViewTool
         from markbot.skills.core.manage import SkillManageTool
 
         if self._skill_registry:
             self._tools.register(SkillViewTool(registry=self._skill_registry))
             self._tools.register(SkillsListTool(registry=self._skill_registry))
         self._tools.register(SkillManageTool(workspace=self._workspace))
+
+    def _register_autopilot_tools(self) -> None:
+        """Register autopilot pipeline tools."""
+        from markbot.autopilot.tools import ALL_AUTOPILOT_TOOLS
+
+        for tool_cls in ALL_AUTOPILOT_TOOLS:
+            self._tools.register(tool_cls())

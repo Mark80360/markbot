@@ -48,6 +48,10 @@ app = typer.Typer(
 # Add skill management subcommands
 app.add_typer(skills_app, name="skills")
 
+# Add autopilot pipeline subcommands
+from markbot.cli.autopilot import app as autopilot_app
+app.add_typer(autopilot_app, name="autopilot")
+
 # Add doctor diagnostic subcommand
 from markbot.cli.doctor import doctor_app
 app.add_typer(doctor_app, name="doctor")

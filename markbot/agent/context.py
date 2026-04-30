@@ -366,8 +366,17 @@ Path: {workspace_path}
 
 ## Task Management
 
-- `plan` for complex tasks; `todo` for 3+ steps with dependencies (not for single steps or cron)
-- Mark `in_progress` on start, `completed` immediately on finish
+Choose the right tool for the job:
+- `todo` — step tracking for current work (3+ steps, in-session). **Use proactively**, don't keep steps in your head.
+- `autopilot_intake` — queue tasks for autonomous execution with verification. For bugs, features, or any task that should run independently.
+- `autopilot_pick_next` — pick the next queued task to work on now.
+- `autopilot_verify` — run verification after completing an autopilot task.
+- `autopilot_list` — view the autopilot task queue.
+- `cron` — scheduled/future reminders, not for task tracking.
+
+Typical flow: `autopilot_pick_next` → `todo` (track steps) → do work → `autopilot_verify`.
+
+For `todo`: mark `in_progress` on start, `completed` immediately on finish.
 
 ## Reminders
 

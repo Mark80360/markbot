@@ -16,9 +16,8 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.tools.base import Tool
 from markbot.config.paths import get_workspace_path
-
+from markbot.tools.base import Tool
 
 _TODO_DIR_NAME = "todos"
 _INDEX_FILE = "index.json"
@@ -175,10 +174,13 @@ class TodoTool(Tool):
             "- User explicitly asks to record, track, or list tasks/todos\n"
             "- A task requires 3+ steps with dependencies between them\n"
             "- You need to persist progress across multiple tool-call turns\n"
+            "- Tracking steps within the current work session\n"
             "WHEN NOT to use:\n"
             "- Single-step operations or simple Q&A\n"
             "- One-off commands with no follow-up\n"
             "- Scheduled/future reminders (use `cron` instead)\n"
+            "- Autonomous task execution with verification "
+            "(use `autopilot_intake` instead)\n"
             "Actions:\n"
             "- write: create new items or update existing ones (provide id to update)\n"
             "- list: query items with optional filters (status, priority)\n"
