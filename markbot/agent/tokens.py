@@ -2,11 +2,17 @@
 
 Provides tiktoken-based estimation for messages, with a simple
 char/4 fallback when tiktoken is unavailable.
+
+Includes:
+- Image token budget estimation (configurable via env var)
+- Conservative padding factor (4/3) for estimation safety margin
+- Mixed estimation: uses last API-reported token count + estimates for new messages
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -18,6 +24,19 @@ try:
     _ENC = tiktoken.get_encoding("cl100k_base")
 except Exception:
     _ENC = None
+
+TOKEN_ESTIMATION_PADDING = 4 / 3
+_DEFAULT_VISION_IMAGE_TOKEN_ESTIMATE = 3_072
+
+
+def _vision_token_budget_per_image() -> int:
+    raw = os.environ.get("MARKBOT_IMAGE_TOKEN_ESTIMATE", "").strip()
+    if raw:
+        try:
+            return max(64, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid MARKBOT_IMAGE_TOKEN_ESTIMATE={}", raw)
+    return _DEFAULT_VISION_IMAGE_TOKEN_ESTIMATE
 
 
 @dataclass
@@ -69,9 +88,14 @@ def estimate_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
-    """Estimate token count for a single message using tiktoken."""
+    """Estimate token count for a single message using tiktoken.
+
+    Includes proper image token budget estimation and a 4/3 padding
+    factor for conservative safety margin.
+    """
     content = message.get("content", "")
     parts: list[str] = []
+    image_count = 0
 
     if isinstance(content, str):
         parts.append(content)
@@ -86,7 +110,7 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                     text = ""
                 parts.append(text)
             elif btype == "image":
-                parts.append("[image]")
+                image_count += 1
             elif btype == "tool_use":
                 parts.append(json.dumps(block.get("input", {}), ensure_ascii=False))
             elif btype == "tool_result":
@@ -114,14 +138,18 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
         parts.append(rc)
 
     payload = "\n".join(parts)
-    if not payload:
+    if not payload and image_count == 0:
         return 4
     if _ENC is not None:
         try:
-            return max(4, len(_ENC.encode(payload)) + 4)
+            text_tokens = max(4, len(_ENC.encode(payload)) + 4) if payload else 4
         except Exception:
-            pass
-    return max(4, len(payload) // 4 + 4)
+            text_tokens = max(4, len(payload) // 4 + 4) if payload else 4
+    else:
+        text_tokens = max(4, len(payload) // 4 + 4) if payload else 4
+
+    image_tokens = image_count * _vision_token_budget_per_image()
+    return int((text_tokens + image_tokens) * TOKEN_ESTIMATION_PADDING)
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:

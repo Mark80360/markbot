@@ -15,33 +15,38 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
-from markbot.agent.compact import CompactAction, CompactionConfig, MultiLevelCompactor
+from markbot.agent.compact import (
+    CompactAction,
+    CompactionConfig,
+    MultiLevelCompactor,
+    is_prompt_too_long_error,
+    offload_tool_output,
+)
 from markbot.agent.context import ContextBuilder
 from markbot.agent.cost import BudgetExceededError, CostTracker, PricingTable
-from markbot.agent.mcp.manager import McpManager
-from markbot.agent.stream import StreamFilter
-from markbot.agent.tokens import token_count_with_estimation
-from markbot.agent.tool_binder import ToolBinder
-from markbot.bus.events import InboundMessage, OutboundMessage
-from markbot.bus.queue import MessageBus
-from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
-from markbot.memory.daily_log import DailyLogManager
 from markbot.agent.hooks.bootstrap import BootstrapHook
 from markbot.agent.hooks.compaction import MemoryCompactionHook
-from markbot.memory.manager import ReMeLightMemoryManager
-from markbot.agent.services.interaction import InteractionLogger
+from markbot.agent.mcp.manager import McpManager
 from markbot.agent.pipeline.engine import MessagePipeline, ProcessContext
 from markbot.agent.pipeline.middleware import (
     MemoryLifecycleMiddleware,
     QuestionResponseMiddleware,
 )
 from markbot.agent.services.executor import ToolExecutor
+from markbot.agent.services.interaction import InteractionLogger
+from markbot.agent.stream import StreamFilter
+from markbot.agent.subagent import SubagentManager
+from markbot.agent.tokens import token_count_with_estimation
+from markbot.agent.tool_binder import ToolBinder
+from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.bus.queue import MessageBus
+from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
+from markbot.memory.daily_log import DailyLogManager
+from markbot.memory.manager import ReMeLightMemoryManager
+from markbot.session.session import SessionManager
 from markbot.skills import SkillRegistry
 from markbot.skills.core.guardrail import SkillGuardrailManager
-from markbot.session.session import SessionManager
-from markbot.agent.subagent import SubagentManager
 from markbot.tools.message import MessageTool
-from markbot.tools.question import AskUserQuestionTool
 from markbot.tools.registry import ToolRegistry
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
@@ -237,12 +242,17 @@ class AgentLoop:
             memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
         )
 
+        _system_prompt_token_budget = 16_000
+        if compaction_config and hasattr(compaction_config, "system_prompt_token_budget"):
+            _system_prompt_token_budget = compaction_config.system_prompt_token_budget
+
         self.context = ContextBuilder(
             workspace,
             timezone=timezone,
             tool_registry=self.tools,
             skill_registry=self.skill_registry,
             memory_manager=self.memory_manager,
+            system_prompt_token_budget=_system_prompt_token_budget,
         )
         _allowed_dir = workspace if restrict_to_workspace else None
         _t0 = time.time()
@@ -462,19 +472,63 @@ class AgentLoop:
                 if new_summary:
                     logger.info("[AgentLoop] Memory compaction applied, summary updated")
 
-            if on_stream:
-                logger.info("[AgentLoop] Calling LLM with streaming...")
-                response, attempts = await self.fallback_manager.chat_stream_with_fallback(
-                    messages=messages,
-                    tools=tool_defs,
-                    on_content_delta=_stream_filter,
-                )
-            else:
-                logger.info("[AgentLoop] Calling LLM without streaming...")
-                response, attempts = await self.fallback_manager.chat_with_fallback(
-                    messages=messages,
-                    tools=tool_defs,
-                )
+            try:
+                if on_stream:
+                    logger.info("[AgentLoop] Calling LLM with streaming...")
+                    response, attempts = await self.fallback_manager.chat_stream_with_fallback(
+                        messages=messages,
+                        tools=tool_defs,
+                        on_content_delta=_stream_filter,
+                    )
+                else:
+                    logger.info("[AgentLoop] Calling LLM without streaming...")
+                    response, attempts = await self.fallback_manager.chat_with_fallback(
+                        messages=messages,
+                        tools=tool_defs,
+                    )
+            except Exception as llm_exc:
+                if is_prompt_too_long_error(llm_exc):
+                    logger.warning("[AgentLoop] Prompt-too-long error, attempting reactive compaction")
+                    reactive_result = await self.compactor.reactive_compact(
+                        messages, self.context_window_tokens, llm_exc,
+                        task_context=task_context,
+                    )
+                    if reactive_result is not None:
+                        messages, compact_result_ptl = reactive_result
+                        current_tokens = compact_result_ptl.tokens_after
+                        if len(messages) < _new_msg_start:
+                            _new_msg_start = self._recalc_new_msg_start_after_compact(
+                                messages, _initial_count, _new_msg_start,
+                            )
+                        logger.info(
+                            "[AgentLoop] Reactive compaction applied: {} -> {} tokens",
+                            compact_result_ptl.tokens_before,
+                            compact_result_ptl.tokens_after,
+                        )
+                        try:
+                            if on_stream:
+                                response, attempts = await self.fallback_manager.chat_stream_with_fallback(
+                                    messages=messages,
+                                    tools=tool_defs,
+                                    on_content_delta=_stream_filter,
+                                )
+                            else:
+                                response, attempts = await self.fallback_manager.chat_with_fallback(
+                                    messages=messages,
+                                    tools=tool_defs,
+                                )
+                        except Exception as retry_exc:
+                            logger.error("[AgentLoop] LLM call failed after reactive compaction: {}", retry_exc)
+                            final_content = "Sorry, the conversation context became too large and compaction was unable to reduce it enough. Please start a new session or simplify your request."
+                            break
+                    else:
+                        logger.error("[AgentLoop] LLM call failed (not a PTL error): {}", llm_exc)
+                        final_content = f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
+                        break
+                else:
+                    logger.error("[AgentLoop] LLM call failed: {}", llm_exc)
+                    final_content = f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
+                    break
 
             logger.info(
                 "[AgentLoop] LLM response received: finish_reason={}, has_tool_calls={}, content_length={}",
@@ -618,11 +672,33 @@ class AgentLoop:
                         )
                         result = f"Error: {type(result).__name__}: {result}"
                     else:
-                        result_preview = (
-                            str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
-                        )
-                        safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                        logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
+                        result_str = str(result)
+                        if len(result_str) > self.compactor.config.tool_output_inline_chars:
+                            inline, artifact_path = offload_tool_output(
+                                result_str,
+                                tool_call.name,
+                                tool_call.id,
+                                inline_limit=self.compactor.config.tool_output_inline_chars,
+                                preview_chars=self.compactor.config.tool_output_preview_chars,
+                            )
+                            if artifact_path:
+                                logger.info(
+                                    "[AgentLoop] Tool {} output offloaded to {} ({} chars)",
+                                    tool_call.name, artifact_path, len(result_str),
+                                )
+                                result = inline
+                            else:
+                                result_preview = (
+                                    result_str[:100] + "..." if len(result_str) > 100 else result_str
+                                )
+                                safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
+                                logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
+                        else:
+                            result_preview = (
+                                result_str[:100] + "..." if len(result_str) > 100 else result_str
+                            )
+                            safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
+                            logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )

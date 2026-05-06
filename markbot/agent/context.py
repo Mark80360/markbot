@@ -1,6 +1,10 @@
 """Context builder for assembling agent prompts.
 
 Refactored to use new skill system inspired.
+
+Enhanced with token budget management: when the system prompt exceeds
+a configured token budget, lower-priority sections are automatically
+truncated to preserve space for conversation history.
 """
 
 import mimetypes
@@ -11,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
+from markbot.agent.tokens import estimate_tokens
 from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 from markbot.utils.constants import (
     BOOTSTRAP_FILES,
@@ -29,6 +34,8 @@ if TYPE_CHECKING:
     from markbot.memory.base import BaseMemoryManager
     from markbot.skills import SkillRegistry
     from markbot.tools.registry import ToolRegistry
+
+DEFAULT_SYSTEM_PROMPT_TOKEN_BUDGET = 16_000
 
 
 class ContextBuilder:
@@ -49,12 +56,14 @@ class ContextBuilder:
         tool_registry: Optional["ToolRegistry"] = None,
         skill_registry: Optional["SkillRegistry"] = None,
         memory_manager: Optional["BaseMemoryManager"] = None,
+        system_prompt_token_budget: int = DEFAULT_SYSTEM_PROMPT_TOKEN_BUDGET,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.tool_registry = tool_registry
         self.skill_registry = skill_registry
         self.memory_manager = memory_manager
+        self.system_prompt_token_budget = system_prompt_token_budget
         self._context_cache: dict[str, tuple[float, Any]] = {}
         self._cache_ttl: float = CONTEXT_CACHE_TTL
         self._guidance_injected_sessions: dict[str, float] = {}
@@ -142,8 +151,65 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
 - Always-active skills are auto-loaded into context""")
 
         result = "\n\n---\n\n".join(parts)
+
+        token_count = estimate_tokens(result)
+        if token_count > self.system_prompt_token_budget:
+            logger.warning(
+                "[ContextBuilder] System prompt {} tokens exceeds budget {}, truncating",
+                token_count, self.system_prompt_token_budget,
+            )
+            result = self._enforce_token_budget(result, parts)
+
         self._context_cache[cache_key] = (time.monotonic(), result)
         return result
+
+    def _enforce_token_budget(self, result: str, parts: list[str]) -> str:
+        """Truncate system prompt sections to fit within the token budget.
+
+        Priority order (highest to lowest):
+        1. Identity (SOUL.md) — always preserved
+        2. Bootstrap files — preserved
+        3. Skills index — truncated if needed
+        4. Always-active skills content — truncated if needed
+        Lower priority sections are truncated from the end first.
+        """
+        budget = self.system_prompt_token_budget
+
+        if not parts:
+            return result
+
+        identity = parts[0] if parts else ""
+        identity_tokens = estimate_tokens(identity)
+        remaining_budget = budget - identity_tokens
+
+        if remaining_budget <= 0:
+            logger.warning("[ContextBuilder] Identity alone exceeds token budget")
+            return identity[:budget * 4]
+
+        kept_parts = [identity]
+        used_tokens = identity_tokens
+
+        for part in parts[1:]:
+            part_tokens = estimate_tokens(part)
+            if used_tokens + part_tokens <= budget:
+                kept_parts.append(part)
+                used_tokens += part_tokens
+            else:
+                available = budget - used_tokens
+                if available > 200:
+                    char_budget = available * 4
+                    truncated = part[:char_budget]
+                    if len(truncated) < len(part):
+                        truncated += "\n\n[... section truncated to fit token budget ...]"
+                    kept_parts.append(truncated)
+                    used_tokens += estimate_tokens(truncated)
+                logger.info(
+                    "[ContextBuilder] Truncated section ({} tokens -> budget remaining: {})",
+                    part_tokens, available,
+                )
+                break
+
+        return "\n\n---\n\n".join(kept_parts)
 
     def get_system_context(self) -> dict[str, str]:
         """

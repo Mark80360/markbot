@@ -249,6 +249,18 @@ class CompactionConfig(Base):
         le=50_000,
         description="Max chars per tool_result block before collapse truncation",
     )
+    collapse_head_chars: int = Field(
+        default=900,
+        ge=100,
+        le=10_000,
+        description="Head chars to preserve during context collapse (head+tail strategy)",
+    )
+    collapse_tail_chars: int = Field(
+        default=500,
+        ge=100,
+        le=10_000,
+        description="Tail chars to preserve during context collapse (head+tail strategy)",
+    )
     micro_compact_keep_turns: int = Field(
         default=6,
         ge=2,
@@ -290,6 +302,24 @@ class CompactionConfig(Base):
         ge=1_000,
         le=50_000,
         description="Extra buffer tokens subtracted from window before auto-compaction trigger",
+    )
+    tool_output_inline_chars: int = Field(
+        default=16_000,
+        ge=1_000,
+        le=100_000,
+        description="Max chars of tool output to keep inline before offloading to file",
+    )
+    tool_output_preview_chars: int = Field(
+        default=3_000,
+        ge=256,
+        le=16_000,
+        description="Preview chars to keep when tool output is offloaded to file",
+    )
+    system_prompt_token_budget: int = Field(
+        default=16_000,
+        ge=2_000,
+        le=100_000,
+        description="Max tokens for system prompt; lower-priority sections truncated if exceeded",
     )
 
 

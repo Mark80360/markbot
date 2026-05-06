@@ -6,12 +6,15 @@ import imaplib
 import re
 import smtplib
 import ssl
+from contextlib import suppress
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
+from fnmatch import fnmatch
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -20,7 +23,9 @@ from pydantic import Field
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.channels.base import BaseChannel
+from markbot.config.paths import get_media_dir
 from markbot.config.schema import Base
+from markbot.utils.helpers import safe_filename
 
 
 class EmailConfig(Base):
@@ -50,6 +55,15 @@ class EmailConfig(Base):
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
     allow_from: list[str] = Field(default_factory=list)
+
+    # Email authentication verification (anti-spoofing)
+    verify_dkim: bool = True   # Require Authentication-Results with dkim=pass
+    verify_spf: bool = True    # Require Authentication-Results with spf=pass
+
+    # Attachment handling — set allowed types to enable (e.g. ["application/pdf", "image/*"], or ["*"] for all)
+    allowed_attachment_types: list[str] = Field(default_factory=list)
+    max_attachment_size: int = 2_000_000  # 2MB per attachment
+    max_attachments_per_email: int = 5
 
 
 class EmailChannel(BaseChannel):
@@ -105,6 +119,7 @@ class EmailChannel(BaseChannel):
             config = EmailConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: EmailConfig = config
+        self._self_addresses = self._collect_self_addresses()
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
@@ -123,6 +138,12 @@ class EmailChannel(BaseChannel):
             return
 
         self._running = True
+        if not self.config.verify_dkim and not self.config.verify_spf:
+            logger.warning(
+                "Email channel: DKIM and SPF verification are both DISABLED. "
+                "Emails with spoofed From headers will be accepted. "
+                "Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
+            )
         logger.info("Starting Email channel (IMAP polling mode)...")
 
         poll_seconds = max(5, int(self.config.poll_interval_seconds))
@@ -360,6 +381,39 @@ class EmailChannel(BaseChannel):
                 if not sender:
                     continue
 
+                # --- Self-address filtering (prevent infinite loops) ---
+                if self._is_self_address(sender):
+                    logger.info("Email from {} ignored: matches bot-owned address", sender)
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if mark_seen:
+                        client.store(imap_id, "+FLAGS", "\\Seen")
+                    continue
+
+                # --- Anti-spoofing: verify Authentication-Results ---
+                spf_pass, dkim_pass = self._check_authentication_results(parsed)
+                if self.config.verify_spf and not spf_pass:
+                    logger.warning(
+                        "Email from {} rejected: SPF verification failed "
+                        "(no 'spf=pass' in Authentication-Results header)",
+                        sender,
+                    )
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    continue
+                if self.config.verify_dkim and not dkim_pass:
+                    logger.warning(
+                        "Email from {} rejected: DKIM verification failed "
+                        "(no 'dkim=pass' in Authentication-Results header)",
+                        sender,
+                    )
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    continue
+
+                if not self.is_allowed(sender):
+                    self._remember_processed_uid(uid, dedupe, cycle_uids)
+                    if mark_seen:
+                        client.store(imap_id, "+FLAGS", "\\Seen")
+                    continue
+
                 subject = self._decode_header_value(parsed.get("Subject", ""))
                 date_value = parsed.get("Date", "")
                 message_id = parsed.get("Message-ID", "").strip()
@@ -370,12 +424,26 @@ class EmailChannel(BaseChannel):
 
                 body = body[: self.config.max_body_chars]
                 content = (
-                    f"Email received.\n"
+                    f"[EMAIL-CONTEXT] Email received.\n"
                     f"From: {sender}\n"
                     f"Subject: {subject}\n"
                     f"Date: {date_value}\n\n"
                     f"{body}"
                 )
+
+                # --- Attachment extraction ---
+                attachment_paths: list[str] = []
+                if self.config.allowed_attachment_types:
+                    saved = self._extract_attachments(
+                        parsed,
+                        uid or "noid",
+                        allowed_types=self.config.allowed_attachment_types,
+                        max_size=self.config.max_attachment_size,
+                        max_count=self.config.max_attachments_per_email,
+                    )
+                    for p in saved:
+                        attachment_paths.append(str(p))
+                        content += f"\n[attachment: {p.name} — saved to {p}]"
 
                 metadata = {
                     "message_id": message_id,
@@ -391,25 +459,17 @@ class EmailChannel(BaseChannel):
                         "message_id": message_id,
                         "content": content,
                         "metadata": metadata,
+                        "media": attachment_paths,
                     }
                 )
 
-                if uid:
-                    cycle_uids.add(uid)
-                if dedupe and uid:
-                    self._processed_uids.add(uid)
-                    # mark_seen is the primary dedup; this set is a safety net
-                    if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
-                        # Evict a random half to cap memory; mark_seen is the primary dedup
-                        self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+                self._remember_processed_uid(uid, dedupe, cycle_uids)
 
                 if mark_seen:
                     client.store(imap_id, "+FLAGS", "\\Seen")
         finally:
-            try:
+            with suppress(Exception):
                 client.logout()
-            except Exception:
-                pass
 
     @classmethod
     def _is_stale_imap_error(cls, exc: Exception) -> bool:
@@ -499,6 +559,122 @@ class EmailChannel(BaseChannel):
         text = re.sub(r"<\s*/\s*p\s*>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text)
+
+    def _collect_self_addresses(self) -> set[str]:
+        """Return normalized email addresses owned by this channel instance."""
+        candidates = (
+            self.config.from_address,
+            self.config.smtp_username,
+            self.config.imap_username,
+        )
+        normalized = {
+            addr
+            for candidate in candidates
+            if (addr := self._normalize_address(candidate))
+        }
+        return normalized
+
+    @staticmethod
+    def _normalize_address(value: str) -> str:
+        """Normalize an address or mailbox-like identifier for comparisons."""
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        parsed = parseaddr(raw)[1].strip().lower()
+        if parsed:
+            return parsed
+        if "@" in raw:
+            return raw.lower()
+        return ""
+
+    def _is_self_address(self, sender: str) -> bool:
+        """Return True when an inbound sender belongs to the bot itself."""
+        normalized_sender = self._normalize_address(sender)
+        return bool(normalized_sender) and normalized_sender in self._self_addresses
+
+    def _remember_processed_uid(self, uid: str, dedupe: bool, cycle_uids: set[str]) -> None:
+        """Track a fetched UID so skipped messages are not reprocessed forever."""
+        if not uid:
+            return
+        cycle_uids.add(uid)
+        if dedupe:
+            self._processed_uids.add(uid)
+            # mark_seen is the primary dedup; this set is a safety net
+            if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
+                # Evict a random half to cap memory; mark_seen is the primary dedup
+                self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+
+    @staticmethod
+    def _check_authentication_results(parsed_msg: Any) -> tuple[bool, bool]:
+        """Parse Authentication-Results headers for SPF and DKIM verdicts.
+
+        Returns:
+            A tuple of (spf_pass, dkim_pass) booleans.
+        """
+        spf_pass = False
+        dkim_pass = False
+        for ar_header in parsed_msg.get_all("Authentication-Results") or []:
+            ar_lower = ar_header.lower()
+            if re.search(r"\bspf\s*=\s*pass\b", ar_lower):
+                spf_pass = True
+            if re.search(r"\bdkim\s*=\s*pass\b", ar_lower):
+                dkim_pass = True
+        return spf_pass, dkim_pass
+
+    @classmethod
+    def _extract_attachments(
+        cls,
+        msg: Any,
+        uid: str,
+        *,
+        allowed_types: list[str],
+        max_size: int,
+        max_count: int,
+    ) -> list[Path]:
+        """Extract and save email attachments to the media directory.
+
+        Returns list of saved file paths.
+        """
+        if not msg.is_multipart():
+            return []
+
+        saved: list[Path] = []
+        media_dir = get_media_dir("email")
+
+        for part in msg.walk():
+            if len(saved) >= max_count:
+                break
+            if part.get_content_disposition() != "attachment":
+                continue
+
+            content_type = part.get_content_type()
+            if not any(fnmatch(content_type, pat) for pat in allowed_types):
+                logger.debug("Email attachment skipped (type {}): not in allowed list", content_type)
+                continue
+
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            if len(payload) > max_size:
+                logger.warning(
+                    "Email attachment skipped: size {} exceeds limit {}",
+                    len(payload),
+                    max_size,
+                )
+                continue
+
+            raw_name = part.get_filename() or "attachment"
+            sanitized = safe_filename(raw_name) or "attachment"
+            dest = media_dir / f"{uid}_{sanitized}"
+
+            try:
+                dest.write_bytes(payload)
+                saved.append(dest)
+                logger.info("Email attachment saved: {}", dest)
+            except Exception as exc:
+                logger.warning("Failed to save email attachment {}: {}", dest, exc)
+
+        return saved
 
     def _reply_subject(self, base_subject: str) -> str:
         subject = (base_subject or "").strip() or "markbot reply"

@@ -1,31 +1,65 @@
 """Multi-level conversation context compression service.
 
 4-tier progressive compression strategy (inspired by Claude's context management):
-  Level 1: Context Collapse  — Truncate individual tool_result blocks that exceed char limit
+  Level 1: Context Collapse  — Truncate individual tool_result blocks that exceed char limit (head+tail)
   Level 2: Micro-Compact      — Remove old tool_result content, keep recent N turns
   Level 3: Auto-Compaction    — LLM generates summary to replace old history
   Level 4: History Snip       — Force-drop oldest messages (last resort)
 
 Each level is progressively more aggressive and expensive.
 The system tries the cheapest level first and escalates only when needed.
+
+Enhanced features (inspired by OpenHarness):
+- Head+tail context collapse preserving both ends of content
+- CompactAttachment system for preserving key context across compaction
+- Tool output offloading for oversized tool results
+- PTL (Prompt-Too-Long) retry with head truncation
+- Consecutive compaction failure protection
+- Compaction progress callback for UI notification
+- Image placeholder replacement during compaction summarization
 """
 
 from __future__ import annotations
 
-import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
-
-from markbot.agent.tokens import estimate_messages_tokens as _estimate_messages_tokens
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from loguru import logger
+
+from markbot.agent.tokens import estimate_messages_tokens as _estimate_messages_tokens
 
 _PROTECTED_TOOL_NAMES = frozenset({
     "todo", "autopilot_list", "autopilot_intake",
     "autopilot_pick_next", "autopilot_verify",
 })
+
+CONTEXT_COLLAPSE_HEAD_CHARS = 900
+CONTEXT_COLLAPSE_TAIL_CHARS = 500
+MAX_COMPACT_ATTACHMENTS = 6
+MAX_COMPACT_ATTACHMENT_CHARS = 4_000
+MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+DEFAULT_TOOL_OUTPUT_INLINE_CHARS = 16_000
+DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS = 3_000
+PTL_RETRY_MARKER = "[earlier conversation truncated for compaction retry]"
+
+_PTL_ERROR_PATTERNS = (
+    "prompt too long",
+    "context length",
+    "maximum context",
+    "context window",
+    "too many tokens",
+    "too large for the model",
+    "maximum context length",
+    "exceed_context",
+    "exceeds the available context size",
+    "available context size",
+)
 
 
 class CompactAction(str, Enum):
@@ -45,6 +79,7 @@ class CompactResult:
     tokens_before: int
     tokens_after: int
     summary: str = ""
+    attachments: list[CompactAttachment] = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +87,8 @@ class CompactionConfig:
     """Tunable parameters for multi-level compaction."""
 
     collapse_tool_result_chars: int = 4_000
+    collapse_head_chars: int = CONTEXT_COLLAPSE_HEAD_CHARS
+    collapse_tail_chars: int = CONTEXT_COLLAPSE_TAIL_CHARS
     micro_compact_keep_turns: int = 6
     auto_compact_keep_recent: int = 5
     snip_keep_messages: int = 10
@@ -61,6 +98,279 @@ class CompactionConfig:
 
     reserved_output_tokens: int = 8_000
     auto_compact_buffer: int = 13_000
+
+    tool_output_inline_chars: int = DEFAULT_TOOL_OUTPUT_INLINE_CHARS
+    tool_output_preview_chars: int = DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS
+
+
+CompactProgressCallback = Callable[[str, str, dict[str, Any]], Awaitable[None]]
+
+
+@dataclass
+class CompactAttachment:
+    """Structured compact asset carried across a compaction boundary.
+
+    Preserves key context (file paths, tool names, user goals, artifacts)
+    that would otherwise be lost when messages are compressed.
+    """
+
+    kind: str
+    title: str
+    body: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_message(self) -> dict[str, Any]:
+        header = f"[Compact attachment: {self.kind}] {self.title}".strip()
+        text = f"{header}\n{self.body}".strip()
+        return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+
+def is_prompt_too_long_error(exc: Exception) -> bool:
+    """Check if an exception indicates the prompt exceeded the context window."""
+    text = str(exc).lower()
+    return any(needle in text for needle in _PTL_ERROR_PATTERNS)
+
+
+def collapse_text_head_tail(
+    text: str,
+    limit: int,
+    head_chars: int = CONTEXT_COLLAPSE_HEAD_CHARS,
+    tail_chars: int = CONTEXT_COLLAPSE_TAIL_CHARS,
+) -> str:
+    """Collapse text preserving both head and tail portions.
+
+    For code snippets and tool output, the beginning (imports, setup)
+    and end (results, errors) are typically most valuable.
+    """
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - head_chars - tail_chars
+    head = text[:head_chars].rstrip()
+    tail = text[-tail_chars:].lstrip()
+    return f"{head}\n...[collapsed {omitted} chars]...\n{tail}"
+
+
+def offload_tool_output(
+    output: str,
+    tool_name: str,
+    tool_use_id: str,
+    inline_limit: int = DEFAULT_TOOL_OUTPUT_INLINE_CHARS,
+    preview_chars: int = DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS,
+    artifact_dir: Path | None = None,
+) -> tuple[str, Path | None]:
+    """Offload oversized tool output to a file, returning inline preview.
+
+    When tool output exceeds inline_limit, saves the full output to a file
+    and returns a truncated preview with a reference to the saved file.
+
+    Returns:
+        (inline_content, artifact_path) — artifact_path is None if no offload needed.
+    """
+    if len(output) <= inline_limit:
+        return output, None
+
+    if artifact_dir is None:
+        artifact_dir = Path(os.environ.get("MARKBOT_ARTIFACT_DIR", ".markbot_artifacts"))
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name.strip())[:80] or "tool"
+    artifact_path = artifact_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe_name}-{uuid4().hex[:12]}.txt"
+    artifact_path.write_text(output, encoding="utf-8", errors="replace")
+
+    preview = output[:preview_chars]
+    omitted = max(0, len(output) - len(preview))
+    inline = (
+        "[Tool output truncated]\n"
+        f"Tool: {tool_name}\n"
+        f"Tool use id: {tool_use_id}\n"
+        f"Original size: {len(output)} chars\n"
+        f"Full output saved to: {artifact_path}\n"
+        f"Inline preview: first {len(preview)} chars"
+    )
+    if omitted:
+        inline += f" ({omitted} chars omitted)"
+    if preview:
+        inline += f"\n\nPreview:\n{preview}"
+    return inline, artifact_path
+
+
+def extract_attachments_from_messages(
+    messages: list[dict[str, Any]],
+) -> list[CompactAttachment]:
+    """Extract structured attachments from messages before compaction.
+
+    Captures:
+    - File paths referenced in tool calls and results
+    - Tool names discovered in the conversation
+    - Image references with source paths
+    """
+    attachments: list[CompactAttachment] = []
+    file_paths: list[str] = []
+    discovered_tools: list[str] = []
+    seen_paths: set[str] = set()
+    seen_tools: set[str] = set()
+    path_pattern = re.compile(r"(?:path|file):\s*([^\s\)\"]+)")
+    image_sources: list[str] = []
+
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image":
+                    source = block.get("source_path", "")
+                    if source and source not in seen_paths:
+                        seen_paths.add(source)
+                        image_sources.append(source)
+                elif block.get("type") == "text":
+                    text = block.get("text", "")
+                    for match in path_pattern.findall(text):
+                        p = match.strip()
+                        if p and p not in seen_paths:
+                            seen_paths.add(p)
+                            file_paths.append(p)
+                elif block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    if name and name not in seen_tools:
+                        seen_tools.add(name)
+                        discovered_tools.append(name)
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        for key in ("path", "file_path", "filename"):
+                            val = str(inp.get(key, "")).strip()
+                            if val and val not in seen_paths:
+                                seen_paths.add(val)
+                                file_paths.append(val)
+        elif isinstance(content, str):
+            for match in path_pattern.findall(content):
+                p = match.strip()
+                if p and p not in seen_paths:
+                    seen_paths.add(p)
+                    file_paths.append(p)
+
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    name = tc.get("function", {}).get("name", "")
+                    if name and name not in seen_tools:
+                        seen_tools.add(name)
+                        discovered_tools.append(name)
+
+    if file_paths and len(attachments) < MAX_COMPACT_ATTACHMENTS:
+        lines = ["Referenced file paths (may still be relevant):"]
+        for p in file_paths[:8]:
+            lines.append(f"  - {p}")
+        body = "\n".join(lines)
+        if len(body) > MAX_COMPACT_ATTACHMENT_CHARS:
+            body = body[:MAX_COMPACT_ATTACHMENT_CHARS] + "\n  ..."
+        attachments.append(CompactAttachment(
+            kind="referenced_files",
+            title="Referenced file paths",
+            body=body,
+            metadata={"paths": file_paths[:8]},
+        ))
+
+    if image_sources and len(attachments) < MAX_COMPACT_ATTACHMENTS:
+        lines = ["Image sources referenced (payloads omitted from compaction):"]
+        for s in image_sources[:4]:
+            lines.append(f"  - {s}")
+        attachments.append(CompactAttachment(
+            kind="image_sources",
+            title="Image source references",
+            body="\n".join(lines),
+            metadata={"sources": image_sources[:4]},
+        ))
+
+    if discovered_tools and len(attachments) < MAX_COMPACT_ATTACHMENTS:
+        tool_list = ", ".join(discovered_tools[:12])
+        attachments.append(CompactAttachment(
+            kind="discovered_tools",
+            title="Tools used in conversation",
+            body=f"Tools invoked: {tool_list}",
+            metadata={"tools": discovered_tools[:12]},
+        ))
+
+    return attachments
+
+
+def replace_images_with_placeholders(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace image blocks with text placeholders for compaction summarization.
+
+    Images consume large numbers of tokens but provide little value
+    when sent to the summarization LLM. Replace them with compact
+    text references.
+    """
+    changed = False
+    result: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        new_blocks: list[dict[str, Any]] = []
+        msg_changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                msg_changed = True
+                source = block.get("source_path", "").strip() or "inline"
+                new_blocks.append({
+                    "type": "text",
+                    "text": f"[Image omitted from compaction summarization; source: {source}.]\n",
+                })
+            else:
+                new_blocks.append(block)
+        if msg_changed:
+            changed = True
+            result.append({**msg, "content": new_blocks})
+        else:
+            result.append(msg)
+    return result if changed else messages
+
+
+def truncate_head_for_ptl_retry(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Drop the oldest prompt rounds when the compact request itself is too large.
+
+    Groups messages by user-prompt rounds and drops the oldest 1/5
+    to make the prompt fit within the context window.
+    """
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for message in messages:
+        starts_new_round = (
+            message.get("role") == "user"
+            and not (
+                isinstance(message.get("content"), list)
+                and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in message["content"]
+                )
+            )
+            and isinstance(message.get("content"), str)
+            and message["content"].strip()
+        )
+        if starts_new_round and current:
+            groups.append(current)
+            current = []
+        current.append(message)
+    if current:
+        groups.append(current)
+
+    if len(groups) < 2:
+        return None
+
+    drop_count = max(1, len(groups) // 5)
+    drop_count = min(drop_count, len(groups) - 1)
+    retained = [message for group in groups[drop_count:] for message in group]
+    if not retained:
+        return None
+    if retained[0].get("role") == "assistant":
+        return [{"role": "user", "content": PTL_RETRY_MARKER}, *retained]
+    return retained
 
 
 class MultiLevelCompactor:
@@ -77,22 +387,39 @@ class MultiLevelCompactor:
         self,
         fallback_manager=None,
         config: CompactionConfig | None = None,
+        on_progress: CompactProgressCallback | None = None,
     ):
         self.fallback_manager = fallback_manager
         self.config = config or CompactionConfig()
         self._compaction_count = 0
         self._total_tokens_saved = 0
+        self._consecutive_failures = 0
+        self._on_progress = on_progress
 
     @property
     def stats(self) -> dict[str, Any]:
         return {
             "compaction_count": self._compaction_count,
             "total_tokens_saved": self._total_tokens_saved,
+            "consecutive_failures": self._consecutive_failures,
         }
 
     def reset_stats(self) -> None:
         self._compaction_count = 0
         self._total_tokens_saved = 0
+        self._consecutive_failures = 0
+
+    async def _emit_progress(
+        self,
+        phase: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self._on_progress:
+            try:
+                await self._on_progress(phase, message, details or {})
+            except Exception as e:
+                logger.debug("[Compactor] Progress callback error: {}", e)
 
     @staticmethod
     def _get_protected_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
@@ -137,26 +464,52 @@ class MultiLevelCompactor:
                 tokens_after=current_tokens,
             )
 
+        if self._consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
+            logger.warning(
+                "[Compactor] Skipping compaction: {} consecutive failures reached",
+                self._consecutive_failures,
+            )
+            return messages, CompactResult(
+                action=CompactAction.NONE,
+                messages_before=len(messages),
+                messages_after=len(messages),
+                tokens_before=current_tokens,
+                tokens_after=current_tokens,
+            )
+
         logger.info(
             "[Compactor] Tokens {} / {} (threshold {}), starting multi-level compaction",
             current_tokens, effective_max, int(threshold),
         )
 
+        await self._emit_progress("compaction_start", "Starting context compaction", {
+            "current_tokens": current_tokens,
+            "threshold": int(threshold),
+        })
+
         tokens_before = current_tokens
         msgs_before = len(messages)
+
+        attachments = extract_attachments_from_messages(messages)
 
         messages = self._apply_collapse(messages)
         tokens_after_collapse = _estimate_messages_tokens(messages)
         logger.debug("[Compactor] After collapse: {} tokens (saved {})", tokens_after_collapse, tokens_before - tokens_after_collapse)
 
         if tokens_after_collapse < threshold:
+            self._consecutive_failures = 0
             self._record_savings(tokens_before, tokens_after_collapse)
+            await self._emit_progress("compaction_end", "Context collapse completed", {
+                "action": "collapse",
+                "tokens_saved": tokens_before - tokens_after_collapse,
+            })
             return messages, CompactResult(
                 action=CompactAction.COLLAPSE,
                 messages_before=msgs_before,
                 messages_after=len(messages),
                 tokens_before=tokens_before,
                 tokens_after=tokens_after_collapse,
+                attachments=attachments,
             )
 
         messages = self._apply_micro_compact(messages)
@@ -164,21 +517,37 @@ class MultiLevelCompactor:
         logger.debug("[Compactor] After micro-compact: {} tokens (saved {})", tokens_after_micro, tokens_before - tokens_after_micro)
 
         if tokens_after_micro < threshold:
+            self._consecutive_failures = 0
             self._record_savings(tokens_before, tokens_after_micro)
+            await self._emit_progress("compaction_end", "Micro-compact completed", {
+                "action": "micro_compact",
+                "tokens_saved": tokens_before - tokens_after_micro,
+            })
             return messages, CompactResult(
                 action=CompactAction.MICRO_COMPACT,
                 messages_before=msgs_before,
                 messages_after=len(messages),
                 tokens_before=tokens_before,
                 tokens_after=tokens_after_micro,
+                attachments=attachments,
             )
+
+        await self._emit_progress("auto_compact_start", "Generating conversation summary", {
+            "messages_to_compact": msgs_before,
+        })
 
         messages, summary = await self._apply_auto_compaction(messages, task_context=task_context)
         tokens_after_auto = _estimate_messages_tokens(messages)
         logger.debug("[Compactor] After auto-compaction: {} tokens (saved {})", tokens_after_auto, tokens_before - tokens_after_auto)
 
         if tokens_after_auto < threshold:
+            self._consecutive_failures = 0
             self._record_savings(tokens_before, tokens_after_auto)
+            messages = self._inject_attachments(messages, attachments)
+            await self._emit_progress("compaction_end", "Auto-compaction completed", {
+                "action": "auto_compact",
+                "tokens_saved": tokens_before - tokens_after_auto,
+            })
             return messages, CompactResult(
                 action=CompactAction.AUTO_COMPACT,
                 messages_before=msgs_before,
@@ -186,52 +555,135 @@ class MultiLevelCompactor:
                 tokens_before=tokens_before,
                 tokens_after=tokens_after_auto,
                 summary=summary,
+                attachments=attachments,
             )
 
+        self._consecutive_failures += 1
         messages = self._apply_history_snip(messages, task_context=task_context)
         tokens_after_snip = _estimate_messages_tokens(messages)
         self._record_savings(tokens_before, tokens_after_snip)
+        messages = self._inject_attachments(messages, attachments)
         logger.warning(
             "[Compactor] Had to use history snip (last resort): {} -> {} tokens",
             tokens_before, tokens_after_snip,
         )
+        await self._emit_progress("compaction_end", "History snip applied (last resort)", {
+            "action": "history_snip",
+            "tokens_saved": tokens_before - tokens_after_snip,
+        })
         return messages, CompactResult(
             action=CompactAction.HISTORY_SNIP,
             messages_before=msgs_before,
             messages_after=len(messages),
             tokens_before=tokens_before,
             tokens_after=tokens_after_snip,
+            attachments=attachments,
         )
+
+    async def reactive_compact(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        error: Exception,
+        task_context: str = "",
+    ) -> tuple[list[dict[str, Any]], CompactResult] | None:
+        """Attempt reactive compaction when the API returns a PTL error.
+
+        Called when the LLM API rejects the prompt for being too long.
+        Tries aggressive compaction to recover and allow a retry.
+
+        Returns None if compaction cannot help (e.g., not a PTL error).
+        """
+        if not is_prompt_too_long_error(error):
+            return None
+
+        logger.warning(
+            "[Compactor] Prompt-too-long error detected, attempting reactive compaction"
+        )
+        await self._emit_progress("reactive_compact", "Prompt too long; compacting and retrying", {
+            "error": str(error)[:200],
+        })
+
+        current_tokens = _estimate_messages_tokens(messages)
+        result = await self.maybe_compact(
+            messages, current_tokens, max_tokens,
+            task_context=task_context,
+        )
+
+        if result[1].action == CompactAction.NONE:
+            truncated = truncate_head_for_ptl_retry(messages)
+            if truncated is not None:
+                tokens_after = _estimate_messages_tokens(truncated)
+                logger.info(
+                    "[Compactor] PTL retry: truncated head, {} -> {} tokens",
+                    current_tokens, tokens_after,
+                )
+                return truncated, CompactResult(
+                    action=CompactAction.HISTORY_SNIP,
+                    messages_before=len(messages),
+                    messages_after=len(truncated),
+                    tokens_before=current_tokens,
+                    tokens_after=tokens_after,
+                )
+
+        return result
 
     def _record_savings(self, before: int, after: int) -> None:
         self._compaction_count += 1
         self._total_tokens_saved += max(0, before - after)
 
+    @staticmethod
+    def _inject_attachments(
+        messages: list[dict[str, Any]],
+        attachments: list[CompactAttachment],
+    ) -> list[dict[str, Any]]:
+        """Inject compact attachments into the message list after compaction."""
+        if not attachments:
+            return messages
+        attachment_messages = [att.to_message() for att in attachments]
+        sys_idx = next(
+            (i for i, m in enumerate(messages) if m.get("role") == "system"),
+            None,
+        )
+        if sys_idx is not None:
+            return messages[:sys_idx + 1] + attachment_messages + messages[sys_idx + 1:]
+        return attachment_messages + messages
+
     # ------------------------------------------------------------------
-    # Level 1: Context Collapse — truncate oversized tool_result blocks
+    # Level 1: Context Collapse — truncate oversized blocks (head+tail)
     # ------------------------------------------------------------------
 
     def _apply_collapse(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        limit = self.config.collapse_tool_result_chars
+        cfg = self.config
+        limit = cfg.collapse_tool_result_chars
+        head = cfg.collapse_head_chars
+        tail = cfg.collapse_tail_chars
         collapsed = 0
         for m in messages:
             content = m.get("content")
+
+            if isinstance(content, str) and len(content) > limit:
+                m["content"] = collapse_text_head_tail(
+                    content, limit, head_chars=head, tail_chars=tail,
+                )
+                collapsed += 1
+                continue
+
             if not isinstance(content, list):
                 continue
             for block in content:
-                if block.get("type") not in ("tool_result",):
+                if not isinstance(block, dict):
                     continue
-                text = str(block.get("content", ""))
+                if block.get("type") not in ("tool_result", "text"):
+                    continue
+                key = "content" if block.get("type") == "tool_result" else "text"
+                text = str(block.get(key, ""))
                 if len(text) <= limit:
                     continue
-                kept = text[:limit]
-                omitted = len(text) - limit
-                block["content"] = (
-                    kept + f"\n\n[... {omitted} chars omitted by context collapse ...]"
-                )
+                block[key] = collapse_text_head_tail(text, limit, head_chars=head, tail_chars=tail)
                 collapsed += 1
         if collapsed:
-            logger.info("[Compactor] Collapsed {} oversized tool_result blocks", collapsed)
+            logger.info("[Compactor] Collapsed {} oversized blocks (head+tail)", collapsed)
         return messages
 
     # ------------------------------------------------------------------
@@ -296,20 +748,13 @@ class MultiLevelCompactor:
         if len(messages) <= keep_recent * 2:
             return messages, ""
 
-        # Split messages at the recent boundary, then adjust backward so that
-        # no tool result in the "recent" part is orphaned from its matching
-        # assistant tool_calls message.  Without this, compaction creates
-        # orphan tool results that corrupt session history on the next turn.
         split = max(0, len(messages) - keep_recent * 2)
         recent_messages = messages[split:]
-        # Collect tool_call_ids that are referenced in recent tool messages.
         needed_ids: set[str] = set()
         for m in recent_messages:
             if m.get("role") == "tool" and m.get("tool_call_id"):
                 needed_ids.add(str(m["tool_call_id"]))
         if needed_ids:
-            # Check which of those ids are declared by assistant messages
-            # already inside recent_messages.
             declared_in_recent: set[str] = set()
             for m in recent_messages:
                 if m.get("role") == "assistant":
@@ -318,9 +763,6 @@ class MultiLevelCompactor:
                             declared_in_recent.add(str(tc["id"]))
             missing = needed_ids - declared_in_recent
             if missing:
-                # Walk backward from the split point to find the assistant
-                # messages that declare the missing ids, then continue back
-                # to the preceding user message to keep the turn intact.
                 earliest: int | None = None
                 for i in range(split - 1, max(0, split - 40), -1):
                     m = messages[i]
@@ -335,8 +777,6 @@ class MultiLevelCompactor:
                     if not missing:
                         break
                 if earliest is not None:
-                    # Extend split back to the user message that started the
-                    # turn containing the earliest matching assistant message.
                     for i in range(earliest, max(0, earliest - 10), -1):
                         if messages[i].get("role") == "user":
                             split = i
@@ -346,6 +786,8 @@ class MultiLevelCompactor:
         messages_to_compact = messages[:split]
         recent_messages = messages[split:]
 
+        messages_to_compact = replace_images_with_placeholders(messages_to_compact)
+
         conversation_text = self._format_messages_for_compact(messages_to_compact)
         if task_context:
             conversation_text += f"\n\n{task_context}"
@@ -353,6 +795,7 @@ class MultiLevelCompactor:
             summary = await self._generate_summary(conversation_text)
         except Exception as e:
             logger.error(f"[Compactor] Auto-compaction LLM failed: {e}")
+            self._consecutive_failures += 1
             summary = self._simple_truncation_summary(messages_to_compact)
             if not summary:
                 return messages, ""
@@ -430,27 +873,37 @@ class MultiLevelCompactor:
     # Summary generation (shared with legacy interface)
     # ------------------------------------------------------------------
 
-    COMPACT_PROMPT = """CRITICAL: You are a summarization engine. Your ONLY output is an <analysis> block followed by a <summary> block. You have NO tools. You CANNOT call tools. Do NOT pretend to call tools. Do NOT write "TOOL:" or "<tool_call>" or any tool-like text. If you write tool calls, you have FAILED.
-
-Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
-This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
-
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts.
-
-Your summary MUST include these sections:
-
-1. Primary Request and Intent: Capture all of the user's explicit requests in detail
-2. Key Technical Concepts: List important concepts, technologies, frameworks discussed
-3. Files and Code Sections: Enumerate specific files examined/modified/created
-4. Errors and fixes: List errors encountered and how they were fixed
-5. Problem Solving: Document problems solved and ongoing troubleshooting
-6. All user messages: List ALL user messages verbatim (not tool results)
-7. Pending Tasks: List ALL pending and in-progress tasks with full details. If a [CURRENT TASK STATE] section appears in the input, you MUST include ALL items from it verbatim — do not omit, merge, or summarize any task item. Preserve each task's ID, description, status, and priority exactly as given.
-8. Current Work: Describe precisely what was being worked on immediately before this summary. Include the specific step, sub-task, or tool call that was in progress, so work can resume seamlessly.
-9. Optional Next Step: Next step directly related to the most recent work
-
-FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</summary>. Nothing else. No tools, no TOOL:, no function calls, no JSON.
-"""
+    COMPACT_PROMPT = (
+        "CRITICAL: You are a summarization engine. Your ONLY output is an "
+        "<analysis> block followed by a <summary> block. You have NO tools. "
+        "You CANNOT call tools. Do NOT pretend to call tools. Do NOT write "
+        '"TOOL:" or any tool-like text. If you write tool calls, you have FAILED.\n\n'
+        "Your task is to create a detailed summary of the conversation so far, "
+        "paying close attention to the user's explicit requests and your previous actions.\n"
+        "This summary should be thorough in capturing technical details, code patterns, "
+        "and architectural decisions that would be essential for continuing development "
+        "work without losing context.\n\n"
+        "Before providing your final summary, wrap your analysis in <analysis> tags "
+        "to organize your thoughts.\n\n"
+        "Your summary MUST include these sections:\n\n"
+        "1. Primary Request and Intent: Capture all of the user's explicit requests in detail\n"
+        "2. Key Technical Concepts: List important concepts, technologies, frameworks discussed\n"
+        "3. Files and Code Sections: Enumerate specific files examined/modified/created\n"
+        "4. Errors and fixes: List errors encountered and how they were fixed\n"
+        "5. Problem Solving: Document problems solved and ongoing troubleshooting\n"
+        "6. All user messages: List ALL user messages verbatim (not tool results)\n"
+        "7. Pending Tasks: List ALL pending and in-progress tasks with full details. "
+        "If a [CURRENT TASK STATE] section appears in the input, you MUST include ALL "
+        "items from it verbatim — do not omit, merge, or summarize any task item. "
+        "Preserve each task's ID, description, status, and priority exactly as given.\n"
+        "8. Current Work: Describe precisely what was being worked on immediately before "
+        "this summary. Include the specific step, sub-task, or tool call that was in "
+        "progress, so work can resume seamlessly.\n"
+        "9. Optional Next Step: Next step directly related to the most recent work\n\n"
+        "FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then "
+        "<summary>...</summary>. Nothing else. No tools, no TOOL:, no function calls, "
+        "no JSON."
+    )
 
     def _format_messages_for_compact(self, messages: list[dict[str, Any]]) -> str:
         lines = []
@@ -469,7 +922,7 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
                                 text = ""
                             text_parts.append(text)
                         elif block.get("type") == "image":
-                            text_parts.append("[image]")
+                            text_parts.append("[image omitted]")
                         elif block.get("type") == "tool_use":
                             text_parts.append(f"[tool_use: {block.get('name', 'unknown')}]")
                         elif block.get("type") == "tool_result":
@@ -481,8 +934,6 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
     async def _generate_summary(self, conversation_text: str) -> str:
         if self.fallback_manager:
             try:
-                from markbot.providers.base import LLMResponse
-
                 response, _ = await self.fallback_manager.chat_with_fallback(
                     messages=[
                         {"role": "system", "content": self.COMPACT_PROMPT},
@@ -500,14 +951,9 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
 
         logger.warning("[Compactor] No LLM available, using simple truncation summary")
         lines = conversation_text.split("\n\n")[:5]
-        return f"[Simple summary - first 5 message pairs]\n" + "\n\n".join(lines)
+        return "[Simple summary - first 5 message pairs]\n" + "\n\n".join(lines)
 
     def _simple_truncation_summary(self, messages: list[dict[str, Any]]) -> str:
-        """Generate a simple summary without LLM when auto-compaction LLM fails.
-
-        Extracts key information: user messages, tool calls, and errors.
-        Much better than history snip which drops everything.
-        """
         user_msgs = []
         tool_calls = []
         errors = []
@@ -549,7 +995,6 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
 
     @staticmethod
     def _format_summary(summary: str) -> str:
-        # Strip hallucinated tool-call patterns that weak models sometimes emit
         summary = re.sub(
             r'(?:TOOL:\s*)?<tool_calls?>[\s\S]*?</tool_calls?>', '', summary,
         )
@@ -560,15 +1005,12 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
             r'^TOOL:\s*#\s*Search\s*Results.*?(?=\n\n|\n\*|\Z)', '',
             summary, flags=re.MULTILINE | re.IGNORECASE,
         )
-        # Strip <function_call> patterns
         summary = re.sub(
             r'<function_calls?>[\s\S]*?</function_calls?>', '', summary,
         )
-        # Strip JSON tool_call blocks
         summary = re.sub(
             r'\{\s*"tool_calls?"\s*:[\s\S]*?\}', '', summary,
         )
-        # Strip stray TOOL: lines
         summary = re.sub(r'^TOOL:.*$', '', summary, flags=re.MULTILINE)
 
         formatted = re.sub(r'<analysis>[\s\S]*?</analysis>', '', summary)
@@ -581,15 +1023,7 @@ FINAL REMINDER: Plain text ONLY. <analysis>...</analysis> then <summary>...</sum
                 formatted,
             )
         else:
-            # If no <summary> block found (weak model), treat everything after
-            # <analysis> (or the whole text) as the summary
             formatted = re.sub(r'<analysis>[\s\S]*?</analysis>', '', summary)
 
         formatted = re.sub(r'\n{3,}', '\n\n', formatted).strip()
         return formatted
-
-
-
-
-
-
