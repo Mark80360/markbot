@@ -27,6 +27,10 @@ class ToolRegistry:
         self._permission_handlers: list[
             Callable[[BaseTool, dict, ToolContext], PermissionDecision]
         ] = []
+        self._definitions_cache: list[dict[str, Any]] | None = None
+
+    def _invalidate_cache(self) -> None:
+        self._definitions_cache = None
 
     def register(self, tool: BaseTool) -> None:
         """Register a tool."""
@@ -37,6 +41,7 @@ class ToolRegistry:
         for alias in tool.definition.aliases:
             self._aliases[alias] = name
 
+        self._invalidate_cache()
         logger.debug(f"Registered tool: {name}")
 
     def unregister(self, name: str) -> None:
@@ -49,6 +54,8 @@ class ToolRegistry:
             for alias in list(self._aliases.keys()):
                 if self._aliases[alias] == name:
                     del self._aliases[alias]
+
+            self._invalidate_cache()
 
     def get(self, name: str) -> Optional[BaseTool]:
         """Get a tool by name or alias."""
@@ -74,11 +81,10 @@ class ToolRegistry:
         return [t.definition for t in self._tools.values() if t.is_enabled]
 
     def get_definitions(self) -> list[dict[str, Any]]:
-        """Get tool definitions in OpenAI format.
-
-        This is the legacy method used by the agent loop.
-        """
-        return [d.to_openai_schema() for d in self.definitions]
+        """Get tool definitions in OpenAI format (cached)."""
+        if self._definitions_cache is None:
+            self._definitions_cache = [d.to_openai_schema() for d in self.definitions]
+        return self._definitions_cache
 
     @property
     def tool_names(self) -> list[str]:

@@ -916,6 +916,10 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
+        cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
+        cron_session.retain_recent_legal_suffix(8)
+        agent.sessions.save(cron_session)
+
         response = resp.content if resp else ""
 
         message_tool = agent.tools.get("message")

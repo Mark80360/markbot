@@ -33,6 +33,7 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    _written_count: int = 0  # Number of messages already persisted to disk
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -101,6 +102,7 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self._written_count = 0
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
@@ -132,6 +134,7 @@ class Session:
         dropped = len(self.messages) - len(retained)
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)
+        self._written_count = 0
         self.updated_at = datetime.now()
 
 
@@ -250,7 +253,8 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                _written_count=len(messages),
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -271,11 +275,27 @@ class SessionManager:
             except Exception as e:
                 logger.warning(f"Failed to save evicted session {evicted_key}: {e}")
 
+    _APPEND_COMPACT_THRESHOLD = 100
+
     def _save_to_disk(self, session: Session) -> None:
-        """Save a session to disk (extracted from save() for reuse)."""
+        """Save a session to disk using append-only writes with periodic compaction."""
         path = self._get_session_path(session.key)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
+        new_messages = session.messages[session._written_count:]
+        append_count = len(new_messages)
+
+        if append_count == 0 and path.exists():
+            return
+
+        if append_count > self._APPEND_COMPACT_THRESHOLD or not path.exists():
+            self._full_write(session, path)
+            session._written_count = len(session.messages)
+        else:
+            self._append_write(session, path, new_messages)
+            session._written_count += append_count
+
+    def _full_write(self, session: Session, path: Path) -> None:
         temp_path = path.with_suffix(".tmp")
         try:
             with open(temp_path, "w", encoding="utf-8") as f:
@@ -299,6 +319,15 @@ class SessionManager:
                     temp_path.unlink()
                 except Exception:
                     pass
+            raise
+
+    def _append_write(self, session: Session, path: Path, new_messages: list[dict[str, Any]]) -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                for msg in new_messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        except Exception:
+            self._full_write(session, path)
             raise
 
     def invalidate(self, key: str) -> None:

@@ -338,7 +338,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> tuple[str | None, list[str], list[dict], int]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.

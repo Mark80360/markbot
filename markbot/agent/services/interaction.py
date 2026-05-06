@@ -9,6 +9,7 @@ but also parseable for automated analysis.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,11 @@ class InteractionLogger:
       the last logged interaction for this session, avoiding duplicates)
     - Tool definitions summary
     - Complete LLM response (content, tool calls, usage, reasoning)
+
+    Deduplication: system messages and tool definitions are hashed per session.
+    When context compaction resets the message counter, unchanged system
+    messages and tool defs are replaced with a short ``[unchanged, skipped]``
+    marker instead of being re-logged in full.
     """
 
     def __init__(self, log_dir: Path | None = None):
@@ -38,6 +44,8 @@ class InteractionLogger:
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._logged_msg_counts: dict[str, int] = {}
+        self._system_msg_hash: dict[str, str] = {}
+        self._tool_defs_hash: dict[str, str] = {}
 
     def log_interaction(
         self,
@@ -70,8 +78,9 @@ class InteractionLogger:
         """
         session_key = f"{channel}:{chat_id}"
         prev_count = self._logged_msg_counts.get(session_key, 0)
+        compacted = len(messages) < prev_count
 
-        if len(messages) < prev_count:
+        if compacted:
             prev_count = 0
 
         new_messages = messages[prev_count:]
@@ -86,7 +95,10 @@ class InteractionLogger:
         parts.append(self._build_header(now, iteration, channel, chat_id, model))
         parts.append(
             self._build_request_section(
-                new_messages, tool_defs, tokens_before, total_msg_count=len(messages),
+                new_messages, tool_defs, tokens_before,
+                total_msg_count=len(messages),
+                compacted=compacted,
+                session_key=session_key,
             )
         )
         parts.append(self._build_response_section(response))
@@ -124,6 +136,8 @@ class InteractionLogger:
         tokens_before: int,
         *,
         total_msg_count: int | None = None,
+        compacted: bool = False,
+        session_key: str = "",
     ) -> str:
         display_total = total_msg_count if total_msg_count is not None else len(messages)
         lines = [
@@ -132,9 +146,22 @@ class InteractionLogger:
             "",
         ]
 
+        if compacted:
+            lines.append("[Context was compacted - previously logged messages summarized]")
+            lines.append("")
+
         for idx, msg in enumerate(messages):
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
+
+            if role == "system" and session_key:
+                content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                content_hash = hashlib.md5(content_str.encode()).hexdigest()
+                if self._system_msg_hash.get(session_key) == content_hash:
+                    lines.append(f"--- [{idx}] role=system [unchanged, content skipped]")
+                    lines.append("")
+                    continue
+                self._system_msg_hash[session_key] = content_hash
 
             if isinstance(content, list):
                 content = self._format_multimodal_content(content)
@@ -152,16 +179,32 @@ class InteractionLogger:
             lines.append(content)
             lines.append("")
 
-        tool_names = []
-        for td in tool_defs:
-            fn = td.get("function", {})
-            name = fn.get("name", "?")
-            desc = fn.get("description", "")
-            tool_names.append(f"  - {name}: {desc}")
+        if session_key and tool_defs:
+            tool_defs_str = json.dumps(tool_defs, ensure_ascii=False, sort_keys=True)
+            tool_defs_hash = hashlib.md5(tool_defs_str.encode()).hexdigest()
+            if self._tool_defs_hash.get(session_key) == tool_defs_hash:
+                lines.append(f"[Tool Definitions ({len(tool_defs)})] [unchanged, skipped]")
+            else:
+                self._tool_defs_hash[session_key] = tool_defs_hash
+                tool_names = []
+                for td in tool_defs:
+                    fn = td.get("function", {})
+                    name = fn.get("name", "?")
+                    desc = fn.get("description", "")
+                    tool_names.append(f"  - {name}: {desc}")
+                lines.append(f"[Tool Definitions ({len(tool_defs)})]")
+                lines.extend(tool_names)
+        else:
+            tool_names = []
+            for td in tool_defs:
+                fn = td.get("function", {})
+                name = fn.get("name", "?")
+                desc = fn.get("description", "")
+                tool_names.append(f"  - {name}: {desc}")
+            lines.append(f"[Tool Definitions ({len(tool_defs)})]")
+            lines.extend(tool_names)
 
-        lines.append(f"[Tool Definitions ({len(tool_defs)})]")
-        lines.extend(tool_names)
-        if not tool_names:
+        if not tool_defs:
             lines.append("  (none)")
         lines.append("")
         lines.append("--- END REQUEST ---")

@@ -1,5 +1,6 @@
 """Multi-model fallback chain management."""
 
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -7,6 +8,19 @@ from loguru import logger
 
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.providers.base import LLMProvider, LLMResponse
+
+
+@dataclass
+class CircuitState:
+    """Per-provider circuit breaker state."""
+
+    failure_count: int = 0
+    last_failure_time: float = 0.0
+    state: str = "closed"
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == "open"
 
 
 @dataclass
@@ -19,6 +33,7 @@ class FallbackAttempt:
     success: bool = False
     error: str | None = None
     response: LLMResponse | None = None
+    circuit_skipped: bool = False
 
 
 class AllModelsFailedError(Exception):
@@ -31,7 +46,7 @@ class AllModelsFailedError(Exception):
 
 
 class FallbackManager:
-    """Manages multi-model fallback chain.
+    """Manages multi-model fallback chain with circuit breaker.
 
     Usage:
         manager = FallbackManager(config)
@@ -46,14 +61,68 @@ class FallbackManager:
         "invalid function arguments", "invalid params",
     )
 
+    _TRANSIENT_ERROR_MARKERS = (
+        "timeout", "timed out", "connection", "rate limit", "rate_limit",
+        "too many requests", "server error", "internal server error",
+        "service unavailable", "overloaded", "capacity", "busy",
+        "try again", "retry", "503", "502", "504", "529",
+        "temporarily unavailable", "throttle",
+    )
+
+    DEFAULT_CIRCUIT_THRESHOLD = 3
+    DEFAULT_CIRCUIT_COOLDOWN = 60.0
+
     def __init__(self, config: Config):
         self.config = config
         self._providers_cache: dict[str, LLMProvider] = {}
+        self._circuits: dict[str, CircuitState] = {}
+        self._circuit_threshold = self.DEFAULT_CIRCUIT_THRESHOLD
+        self._circuit_cooldown = self.DEFAULT_CIRCUIT_COOLDOWN
 
     @staticmethod
     def _is_retryable_error(error: Exception | str) -> bool:
         err_str = str(error).lower()
-        return any(marker in err_str for marker in LLMProvider._TRANSIENT_ERROR_MARKERS)
+        return any(marker in err_str for marker in FallbackManager._TRANSIENT_ERROR_MARKERS)
+
+    def _get_circuit(self, provider_name: str) -> CircuitState:
+        if provider_name not in self._circuits:
+            self._circuits[provider_name] = CircuitState()
+        return self._circuits[provider_name]
+
+    def _check_circuit(self, provider_name: str) -> bool:
+        circuit = self._get_circuit(provider_name)
+        if circuit.state == "closed":
+            return True
+        if circuit.state == "open":
+            elapsed = time.monotonic() - circuit.last_failure_time
+            if elapsed >= self._circuit_cooldown:
+                circuit.state = "half-open"
+                logger.info(f"[CircuitBreaker] {provider_name} half-open (cooldown elapsed)")
+                return True
+            logger.warning(
+                f"[CircuitBreaker] {provider_name} circuit open, skipping "
+                f"(failures={circuit.failure_count}, retry in {self._circuit_cooldown - elapsed:.0f}s)"
+            )
+            return False
+        return True
+
+    def _record_success(self, provider_name: str) -> None:
+        circuit = self._get_circuit(provider_name)
+        if circuit.state != "closed":
+            logger.info(f"[CircuitBreaker] {provider_name} circuit closed (recovered)")
+        circuit.failure_count = 0
+        circuit.state = "closed"
+
+    def _record_failure(self, provider_name: str) -> None:
+        circuit = self._get_circuit(provider_name)
+        circuit.failure_count += 1
+        circuit.last_failure_time = time.monotonic()
+        if circuit.failure_count >= self._circuit_threshold:
+            circuit.state = "open"
+            logger.warning(
+                f"[CircuitBreaker] {provider_name} circuit OPEN "
+                f"({circuit.failure_count} consecutive failures)"
+            )
 
     def _is_model_unavailable_error(self, error: Exception | str) -> bool:
         err_str = str(error).lower()
@@ -105,10 +174,10 @@ class FallbackManager:
     ) -> tuple[LLMResponse, list[FallbackAttempt]]:
         """Try each model in chain using *caller* for the actual LLM invocation.
 
-        All error classification, attempt recording, and retry logic is
-        handled here so that ``chat_with_fallback`` and
-        ``chat_stream_with_fallback`` only differ in the provider method
-        they pass as the *caller*.
+        All error classification, attempt recording, circuit breaker,
+        and retry logic is handled here so that ``chat_with_fallback``
+        and ``chat_stream_with_fallback`` only differ in the provider
+        method they pass as the *caller*.
         """
         attempts: list[FallbackAttempt] = []
         last_error: Exception | None = None
@@ -117,9 +186,22 @@ class FallbackManager:
         for model_ref in defaults.model_chain:
             provider_config: ProviderConfig | None = None
             model_config: ModelConfig | None = None
+            provider_name = model_ref.split("/")[0]
+
+            if not self._check_circuit(provider_name):
+                attempt = FallbackAttempt(
+                    model_ref=model_ref,
+                    provider=provider_config,
+                    model=model_config,
+                    success=False,
+                    error="Circuit breaker open",
+                    circuit_skipped=True,
+                )
+                attempts.append(attempt)
+                continue
+
             try:
                 provider_config, model_config = self.config.resolve_model(model_ref)
-                provider_name = model_ref.split("/")[0]
                 provider = self._get_or_create_provider(provider_config, provider_name)
 
                 _max_tokens = max_tokens or model_config.max_tokens or defaults.max_tokens
@@ -149,23 +231,27 @@ class FallbackManager:
                             f"Model {model_ref} returned error (retryable): {error_msg}. Trying next..."
                         )
                         last_error = Exception(error_msg)
+                        self._record_failure(provider_name)
                         continue
                     elif self._is_model_unavailable_error(error_msg):
                         logger.warning(
                             f"Model {model_ref} unavailable: {error_msg}. Trying next..."
                         )
                         last_error = Exception(error_msg)
+                        self._record_failure(provider_name)
                         continue
                     else:
                         logger.error(
                             f"Model {model_ref} returned error (non-retryable): {error_msg}"
                         )
+                        self._record_failure(provider_name)
                         raise AllModelsFailedError(
                             f"Model {model_ref} failed with non-retryable error",
                             attempts=attempts,
                             last_error=Exception(error_msg),
                         )
 
+                self._record_success(provider_name)
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
                     provider=provider_config,
@@ -194,15 +280,18 @@ class FallbackManager:
                         f"Model {model_ref} failed (retryable): {e}. Trying next..."
                     )
                     last_error = e
+                    self._record_failure(provider_name)
                     continue
                 elif self._is_model_unavailable_error(e):
                     logger.warning(
                         f"Model {model_ref} unavailable: {e}. Trying next..."
                     )
                     last_error = e
+                    self._record_failure(provider_name)
                     continue
                 else:
                     logger.error(f"Model {model_ref} failed (non-retryable): {e}")
+                    self._record_failure(provider_name)
                     raise
 
         raise AllModelsFailedError(

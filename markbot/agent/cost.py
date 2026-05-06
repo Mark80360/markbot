@@ -13,7 +13,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from loguru import logger
 
@@ -92,9 +92,11 @@ def _match_pricing_key(model_name: str) -> str:
     name = model_name.lower().strip()
     if name in DEFAULT_PRICING:
         return name
-    for key in DEFAULT_PRICING:
-        if name.startswith(key) or key.startswith(name.split("-")[0]):
+
+    for key in sorted(DEFAULT_PRICING, key=len, reverse=True):
+        if name.startswith(key):
             return key
+
     if "opus" in name:
         return "claude-opus-4-5"
     if "sonnet" in name:

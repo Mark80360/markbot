@@ -80,7 +80,11 @@ class MessagePipeline:
                     logger.debug("[Pipeline] Short-circuited by middleware")
                     return result
             except Exception as e:
-                logger.warning(f"[Pipeline] Middleware before hook failed: {e}")
+                logger.error(f"[Pipeline] Middleware before hook failed: {e}")
+                try:
+                    await mw.on_error(ctx, e)
+                except Exception:
+                    pass
 
         try:
             response = await handler(ctx)
