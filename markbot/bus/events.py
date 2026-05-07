@@ -12,6 +12,7 @@ class EventType(Enum):
     STATE_CHANGED = auto()
     TOOL_CALLED = auto()
     TOOL_COMPLETED = auto()
+    TOOL_FAILED = auto()
     PERMISSION_REQUESTED = auto()
     PERMISSION_GRANTED = auto()
     PERMISSION_DENIED = auto()
@@ -19,6 +20,23 @@ class EventType(Enum):
     MESSAGE_SENT = auto()
     SESSION_CREATED = auto()
     SESSION_LOADED = auto()
+    SESSION_CLEARED = auto()
+    MODEL_CALLED = auto()
+    MODEL_SUCCEEDED = auto()
+    MODEL_FAILED = auto()
+    CIRCUIT_OPENED = auto()
+    CIRCUIT_CLOSED = auto()
+    CIRCUIT_HALF_OPEN = auto()
+    BUDGET_WARNING = auto()
+    BUDGET_EXCEEDED = auto()
+    COMPACTION_STARTED = auto()
+    COMPACTION_COMPLETED = auto()
+    SKILL_ACTIVATED = auto()
+    SKILL_DEACTIVATED = auto()
+    SUBAGENT_SPAWNED = auto()
+    SUBAGENT_COMPLETED = auto()
+    SUBAGENT_FAILED = auto()
+    HEALTH_CHECK = auto()
 
 
 @dataclass
@@ -28,6 +46,8 @@ class Event:
     timestamp: str = field(
         default_factory=lambda: __import__("datetime").datetime.now().isoformat()
     )
+    correlation_id: str = ""
+    session_key: str = ""
 
 
 @dataclass

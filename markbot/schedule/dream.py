@@ -2,6 +2,9 @@
 
 Extracted from cli/commands.py to decouple dream scheduling from
 the gateway lifecycle.  Can be used standalone anywhere the agent runs.
+
+If a CronService is available, prefer registering via ``as_cron_job()``
+to avoid duplicating cron scheduling logic.
 """
 
 from __future__ import annotations
@@ -22,6 +25,14 @@ class DreamService:
         await service.start()
         ...
         await service.stop()
+
+    Or register as a CronService job::
+
+        cron_service.add_job(
+            name="dream",
+            schedule=CronSchedule(kind="cron", expr="0 3 * * *", tz="Asia/Shanghai"),
+            message="Run memory optimisation (Dream)",
+        )
     """
 
     def __init__(
@@ -35,6 +46,10 @@ class DreamService:
         self._timezone = timezone
         self._task: asyncio.Task[None] | None = None
         self._running = False
+
+    def as_cron_schedule(self) -> dict:
+        """Return a CronSchedule-compatible dict for use with CronService."""
+        return {"kind": "cron", "expr": self._cron_expr, "tz": self._timezone}
 
     async def start(self) -> None:
         """Start the dream scheduler loop."""
@@ -59,8 +74,9 @@ class DreamService:
             self._task = None
 
     async def _run(self) -> None:
-        from croniter import croniter  # noqa: PLC0415
         from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+        from croniter import croniter  # noqa: PLC0415
 
         tz = ZoneInfo(self._timezone)
         while self._running:

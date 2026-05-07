@@ -12,79 +12,108 @@ verification and update the task status.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from markbot.tools.base import Tool
-from markbot.types.tool import ToolContext
+from markbot.tools.base import BaseTool
+from markbot.types.permission import PermissionDecision
+from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
+
+if TYPE_CHECKING:
+    from markbot.autopilot.store import AutopilotStore
 
 
-class AutopilotIntakeTool(Tool):
+_store_cache: dict[Path, AutopilotStore] = {}
+
+
+def _get_store(workspace: Path) -> AutopilotStore:
+    from markbot.autopilot.store import AutopilotStore
+
+    resolved = workspace.resolve()
+    if resolved not in _store_cache:
+        _store_cache[resolved] = AutopilotStore(resolved)
+    return _store_cache[resolved]
+
+
+def _invalidate_store(workspace: Path) -> None:
+    resolved = workspace.resolve()
+    _store_cache.pop(resolved, None)
+
+
+class AutopilotIntakeTool(BaseTool):
     """Submit a new task to the autopilot pipeline."""
 
-    _is_read_only = False
-
     @property
-    def name(self) -> str:
-        return "autopilot_intake"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Submit a new task to the autopilot pipeline. "
-            "The task will be scored, queued, and can be executed later. "
-            "Use this when the user wants to schedule an automated task "
-            "that should be independently executed and verified. "
-            "For simple step tracking within the current session, "
-            "use the `todo` tool instead."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Short title describing the task",
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Detailed description of what the task should accomplish",
-                },
-                "source_kind": {
-                    "type": "string",
-                    "description": "Origin of the task",
-                    "enum": [
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_intake",
+            description=(
+                "Submit a new task to the autopilot pipeline. "
+                "The task will be scored, queued, and can be executed later. "
+                "Use this when the user wants to schedule an automated task "
+                "that should be independently executed and verified. "
+                "For simple step tracking within the current session, "
+                "use the `todo` tool instead."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="title",
+                    type="string",
+                    description="Short title describing the task",
+                    required=True,
+                ),
+                ToolParameter(
+                    name="body",
+                    type="string",
+                    description="Detailed description of what the task should accomplish",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="source_kind",
+                    type="string",
+                    description="Origin of the task",
+                    required=False,
+                    enum=[
                         "manual_idea", "github_issue",
                         "github_pr", "agent_candidate", "cron_trigger",
                     ],
-                },
-                "source_ref": {
-                    "type": "string",
-                    "description": "Reference to the source (e.g., 'issue:42')",
-                },
-                "labels": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Labels to tag the task with",
-                },
-            },
-            "required": ["title"],
-        }
+                ),
+                ToolParameter(
+                    name="source_ref",
+                    type="string",
+                    description="Reference to the source (e.g., 'issue:42')",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="labels",
+                    type="array",
+                    description="Labels to tag the task with",
+                    required=False,
+                ),
+            ],
+            is_read_only=False,
+            is_destructive=False,
+        )
 
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
-
-        context: ToolContext = kwargs.pop("_tool_context")
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
+        store = _get_store(workspace)
+        config = store.load_config()
+        if config.autopilot_policy.default_human_gate:
+            return PermissionDecision(behavior="ask")
+        return PermissionDecision(behavior="allow")
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        workspace = Path(context.workspace)
+        store = _get_store(workspace)
 
         card, created = store.enqueue_card(
-            source_kind=kwargs.get("source_kind", "agent_candidate"),
-            title=kwargs["title"],
-            body=kwargs.get("body", ""),
-            source_ref=kwargs.get("source_ref", ""),
-            labels=kwargs.get("labels"),
+            source_kind=params.get("source_kind", "agent_candidate"),
+            title=params["title"],
+            body=params.get("body", ""),
+            source_ref=params.get("source_ref", ""),
+            labels=params.get("labels"),
         )
         action = "Created" if created else "Updated"
         return (
@@ -99,44 +128,43 @@ class AutopilotIntakeTool(Tool):
         )
 
 
-class AutopilotListTool(Tool):
+class AutopilotListTool(BaseTool):
     """List autopilot tasks."""
 
-    _is_read_only = True
-
     @property
-    def name(self) -> str:
-        return "autopilot_list"
-
-    @property
-    def description(self) -> str:
-        return "List all autopilot tasks, optionally filtered by status."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "description": "Filter by task status",
-                    "enum": [
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_list",
+            description="List all autopilot tasks, optionally filtered by status.",
+            parameters=[
+                ToolParameter(
+                    name="status",
+                    type="string",
+                    description="Filter by task status",
+                    required=False,
+                    enum=[
                         "queued", "accepted", "preparing", "running",
                         "verifying", "repairing", "completed", "failed",
                         "rejected", "superseded",
                     ],
-                },
-            },
-        }
+                ),
+            ],
+            is_read_only=True,
+            is_destructive=False,
+        )
 
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
+        return PermissionDecision(behavior="allow")
 
-        context: ToolContext = kwargs.pop("_tool_context")
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        from markbot.autopilot.store import _shorten
+
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
+        store = _get_store(workspace)
 
-        status = kwargs.get("status")
+        status = params.get("status")
         cards = store.list_cards(status=status)
         stats = store.stats()
 
@@ -152,7 +180,6 @@ class AutopilotListTool(Tool):
                 f"(score={card.score}, source={card.source_kind})"
             )
             if card.body:
-                from markbot.autopilot.store import _shorten
                 lines.append(f"  > {_shorten(card.body, limit=100)}")
         accepted = [c for c in cards if c.status == "accepted"]
         if accepted:
@@ -165,38 +192,35 @@ class AutopilotListTool(Tool):
         return "\n".join(lines)
 
 
-class AutopilotPickNextTool(Tool):
+class AutopilotPickNextTool(BaseTool):
     """Pick the next queued task and prepare it for execution."""
 
-    _is_read_only = True
-
     @property
-    def name(self) -> str:
-        return "autopilot_pick_next"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Pick the highest-scored queued autopilot task and return its execution prompt. "
-            "This does NOT execute the task — it returns the task details and a prompt that "
-            "you can use to work on the task in the current session. "
-            "After completing the work, call `autopilot_verify` "
-            "to run verification and update the task status."
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_pick_next",
+            description=(
+                "Pick the highest-scored queued autopilot task and return its execution prompt. "
+                "This does NOT execute the task — it returns the task details and a prompt that "
+                "you can use to work on the task in the current session. "
+                "After completing the work, call `autopilot_verify` "
+                "to run verification and update the task status."
+            ),
+            parameters=[],
+            is_read_only=True,
+            is_destructive=False,
         )
 
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {},
-        }
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
+        return PermissionDecision(behavior="allow")
 
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        from markbot.autopilot.service import _build_execution_prompt
 
-        context: ToolContext = kwargs.pop("_tool_context")
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
+        store = _get_store(workspace)
 
         card = store.pick_next_card()
         if card is None:
@@ -205,7 +229,6 @@ class AutopilotPickNextTool(Tool):
         store.update_status(card.id, status="accepted", note="picked by agent")
 
         config = store.load_config()
-        from markbot.autopilot.service import _build_execution_prompt
         prompt = _build_execution_prompt(card, config)
 
         return (
@@ -221,54 +244,58 @@ class AutopilotPickNextTool(Tool):
         )
 
 
-class AutopilotVerifyTool(Tool):
+class AutopilotVerifyTool(BaseTool):
     """Run verification for a task and update its status."""
 
-    _is_read_only = False
-
     @property
-    def name(self) -> str:
-        return "autopilot_verify"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Run verification commands for an autopilot task and update its status. "
-            "Call this after you have completed work on a task. "
-            "If verification passes, the task is marked as completed. "
-            "If verification fails, the task is marked for repair."
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_verify",
+            description=(
+                "Run verification commands for an autopilot task and update its status. "
+                "Call this after you have completed work on a task. "
+                "If verification passes, the task is marked as completed. "
+                "If verification fails, the task is marked for repair."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="task_id",
+                    type="string",
+                    description="The autopilot task ID to verify",
+                    required=True,
+                ),
+                ToolParameter(
+                    name="summary",
+                    type="string",
+                    description="Summary of what was done for this task",
+                    required=False,
+                ),
+            ],
+            is_read_only=False,
+            is_destructive=False,
         )
 
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "The autopilot task ID to verify",
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "Summary of what was done for this task",
-                },
-            },
-            "required": ["task_id"],
-        }
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
+        workspace = Path(context.workspace)
+        store = _get_store(workspace)
+        config = store.load_config()
+        if config.autopilot_policy.default_human_gate:
+            return PermissionDecision(behavior="ask")
+        return PermissionDecision(behavior="allow")
 
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         from markbot.autopilot.verification import (
             render_verification_report,
             run_verification_steps,
             verification_passed,
         )
 
-        context: ToolContext = kwargs.pop("_tool_context")
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
-        task_id = kwargs["task_id"]
-        summary = kwargs.get("summary", "")
+        store = _get_store(workspace)
+        task_id = params["task_id"]
+        summary = params.get("summary", "")
 
         card = store.get_card(task_id)
         if card is None:
@@ -341,42 +368,38 @@ class AutopilotVerifyTool(Tool):
         return "\n".join(lines)
 
 
-class AutopilotStatusTool(Tool):
+class AutopilotStatusTool(BaseTool):
     """Get detailed status of a specific autopilot task."""
 
-    _is_read_only = True
-
     @property
-    def name(self) -> str:
-        return "autopilot_status"
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_status",
+            description="Get detailed status of a specific autopilot task by its ID.",
+            parameters=[
+                ToolParameter(
+                    name="task_id",
+                    type="string",
+                    description="The autopilot task ID (e.g., 'ap-abc12345')",
+                    required=True,
+                ),
+            ],
+            is_read_only=True,
+            is_destructive=False,
+        )
 
-    @property
-    def description(self) -> str:
-        return "Get detailed status of a specific autopilot task by its ID."
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
+        return PermissionDecision(behavior="allow")
 
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "The autopilot task ID (e.g., 'ap-abc12345')",
-                },
-            },
-            "required": ["task_id"],
-        }
-
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
-
-        context: ToolContext = kwargs.pop("_tool_context")
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
+        store = _get_store(workspace)
 
-        card = store.get_card(kwargs["task_id"])
+        card = store.get_card(params["task_id"])
         if card is None:
-            return f"Task '{kwargs['task_id']}' not found."
+            return f"Task '{params['task_id']}' not found."
 
         lines = [
             f"## Task: {card.id}",
@@ -396,43 +419,46 @@ class AutopilotStatusTool(Tool):
         return "\n".join(lines)
 
 
-class AutopilotRejectTool(Tool):
+class AutopilotRejectTool(BaseTool):
     """Reject an autopilot task."""
 
-    _is_read_only = False
-
     @property
-    def name(self) -> str:
-        return "autopilot_reject"
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_reject",
+            description="Reject an autopilot task, removing it from the queue.",
+            parameters=[
+                ToolParameter(
+                    name="task_id",
+                    type="string",
+                    description="The autopilot task ID to reject",
+                    required=True,
+                ),
+                ToolParameter(
+                    name="reason",
+                    type="string",
+                    description="Reason for rejection",
+                    required=False,
+                ),
+            ],
+            is_read_only=False,
+            is_destructive=True,
+        )
 
-    @property
-    def description(self) -> str:
-        return "Reject an autopilot task, removing it from the queue."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "The autopilot task ID to reject",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for rejection",
-                },
-            },
-            "required": ["task_id"],
-        }
-
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
-
-        context: ToolContext = kwargs.pop("_tool_context")
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
-        task_id = kwargs["task_id"]
+        store = _get_store(workspace)
+        config = store.load_config()
+        if config.autopilot_policy.default_human_gate:
+            return PermissionDecision(behavior="ask")
+        return PermissionDecision(behavior="allow")
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        workspace = Path(context.workspace)
+        store = _get_store(workspace)
+        task_id = params["task_id"]
 
         card = store.get_card(task_id)
         if card is None:
@@ -446,7 +472,7 @@ class AutopilotRejectTool(Tool):
             )
 
         try:
-            reason = kwargs.get("reason", "")
+            reason = params.get("reason", "")
             card = store.update_status(
                 task_id, status="rejected", note=reason,
             )
@@ -455,42 +481,43 @@ class AutopilotRejectTool(Tool):
             return str(exc)
 
 
-class AutopilotRequeueTool(Tool):
+class AutopilotRequeueTool(BaseTool):
     """Requeue a previously failed or rejected task."""
 
-    _is_read_only = False
-
     @property
-    def name(self) -> str:
-        return "autopilot_requeue"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Requeue an autopilot task for another attempt. "
-            "Works on tasks in 'failed', 'rejected', or 'repairing' status."
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="autopilot_requeue",
+            description=(
+                "Requeue an autopilot task for another attempt. "
+                "Works on tasks in 'failed', 'rejected', or 'repairing' status."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="task_id",
+                    type="string",
+                    description="The autopilot task ID to requeue",
+                    required=True,
+                ),
+            ],
+            is_read_only=False,
+            is_destructive=False,
         )
 
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "The autopilot task ID to requeue",
-                },
-            },
-            "required": ["task_id"],
-        }
-
-    async def _legacy_execute(self, **kwargs: Any) -> Any:
-        from markbot.autopilot.store import AutopilotStore
-
-        context: ToolContext = kwargs.pop("_tool_context")
+    async def check_permission(
+        self, params: dict[str, Any], context: ToolContext
+    ) -> PermissionDecision:
         workspace = Path(context.workspace)
-        store = AutopilotStore(workspace)
-        task_id = kwargs["task_id"]
+        store = _get_store(workspace)
+        config = store.load_config()
+        if config.autopilot_policy.default_human_gate:
+            return PermissionDecision(behavior="ask")
+        return PermissionDecision(behavior="allow")
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+        workspace = Path(context.workspace)
+        store = _get_store(workspace)
+        task_id = params["task_id"]
 
         card = store.get_card(task_id)
         if card is None:

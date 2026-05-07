@@ -82,6 +82,8 @@ class FallbackManager:
     @staticmethod
     def _is_retryable_error(error: Exception | str) -> bool:
         err_str = str(error).lower()
+        if not err_str or err_str.isspace():
+            return True
         return any(marker in err_str for marker in FallbackManager._TRANSIENT_ERROR_MARKERS)
 
     def _get_circuit(self, provider_name: str) -> CircuitState:
@@ -131,29 +133,18 @@ class FallbackManager:
     def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
         cache_key = provider_name
         if cache_key not in self._providers_cache:
-            from markbot.providers.registry import find_by_name
+            from markbot.providers.registry import create_provider, find_by_name
 
             spec = find_by_name(provider_name)
             backend = spec.backend if spec else "openai_compat"
 
-            if backend == "anthropic":
-                from markbot.providers.anthropic import AnthropicProvider
-                self._providers_cache[cache_key] = AnthropicProvider(
-                    api_key=provider_config.api_key,
-                    api_base=provider_config.api_base,
-                )
-            elif backend == "azure_openai":
-                from markbot.providers.azure_openai import AzureOpenAIProvider
-                self._providers_cache[cache_key] = AzureOpenAIProvider(
-                    api_key=provider_config.api_key,
-                    api_base=provider_config.api_base,
-                )
-            else:
-                from markbot.providers.openai_compat import OpenAICompatProvider
-                self._providers_cache[cache_key] = OpenAICompatProvider(
-                    api_key=provider_config.api_key,
-                    api_base=provider_config.api_base,
-                )
+            self._providers_cache[cache_key] = create_provider(
+                backend=backend,
+                api_key=provider_config.api_key,
+                api_base=provider_config.api_base,
+                extra_headers=provider_config.extra_headers,
+                spec=spec,
+            )
 
         return self._providers_cache[cache_key]
 
@@ -230,26 +221,17 @@ class FallbackManager:
                         logger.warning(
                             f"Model {model_ref} returned error (retryable): {error_msg}. Trying next..."
                         )
-                        last_error = Exception(error_msg)
-                        self._record_failure(provider_name)
-                        continue
                     elif self._is_model_unavailable_error(error_msg):
                         logger.warning(
                             f"Model {model_ref} unavailable: {error_msg}. Trying next..."
                         )
-                        last_error = Exception(error_msg)
-                        self._record_failure(provider_name)
-                        continue
                     else:
                         logger.error(
-                            f"Model {model_ref} returned error (non-retryable): {error_msg}"
+                            f"Model {model_ref} returned error (non-retryable): {error_msg}. Trying next..."
                         )
-                        self._record_failure(provider_name)
-                        raise AllModelsFailedError(
-                            f"Model {model_ref} failed with non-retryable error",
-                            attempts=attempts,
-                            last_error=Exception(error_msg),
-                        )
+                    last_error = Exception(error_msg)
+                    self._record_failure(provider_name)
+                    continue
 
                 self._record_success(provider_name)
                 attempt = FallbackAttempt(
@@ -263,8 +245,6 @@ class FallbackManager:
                 logger.info(f"Model {model_ref} succeeded")
                 return response, attempts
 
-            except AllModelsFailedError:
-                raise
             except Exception as e:
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
@@ -279,20 +259,15 @@ class FallbackManager:
                     logger.warning(
                         f"Model {model_ref} failed (retryable): {e}. Trying next..."
                     )
-                    last_error = e
-                    self._record_failure(provider_name)
-                    continue
                 elif self._is_model_unavailable_error(e):
                     logger.warning(
                         f"Model {model_ref} unavailable: {e}. Trying next..."
                     )
-                    last_error = e
-                    self._record_failure(provider_name)
-                    continue
                 else:
-                    logger.error(f"Model {model_ref} failed (non-retryable): {e}")
-                    self._record_failure(provider_name)
-                    raise
+                    logger.error(f"Model {model_ref} failed (non-retryable): {e}. Trying next...")
+                last_error = e
+                self._record_failure(provider_name)
+                continue
 
         raise AllModelsFailedError(
             f"All {len(attempts)} models in chain failed",

@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from loguru import logger
 from pydantic.alias_generators import to_snake
 
 
@@ -352,3 +353,68 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == normalized:
             return spec
     return None
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from markbot.providers.base import LLMProvider
+
+_PROVIDER_FACTORIES: dict[str, type["LLMProvider"]] = {}
+_FACTORIES_LOADED = False
+
+
+def register_provider_factory(backend: str, cls: type["LLMProvider"]) -> None:
+    """Register a provider class for a backend name.
+
+    Called from each provider module at import time so that
+    ``create_provider`` can instantiate the right class without
+    if-elif chains.
+    """
+    _PROVIDER_FACTORIES[backend] = cls
+
+
+def _ensure_factories_loaded() -> None:
+    """Lazy-load provider modules so their ``register_provider_factory`` calls execute.
+
+    Defers imports until first call to :func:`create_provider` to avoid
+    circular-import issues at module level.
+    """
+    global _FACTORIES_LOADED
+    if _FACTORIES_LOADED:
+        return
+    _FACTORIES_LOADED = True
+    for backend, module_path in (
+        ("anthropic", "markbot.providers.anthropic"),
+        ("azure_openai", "markbot.providers.azure_openai"),
+        ("openai_compat", "markbot.providers.openai_compat"),
+        ("openai_codex", "markbot.providers.openai_codex"),
+    ):
+        if backend not in _PROVIDER_FACTORIES:
+            try:
+                __import__(module_path)
+            except ImportError:
+                pass
+
+
+def create_provider(
+    backend: str,
+    api_key: str | None = None,
+    api_base: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    spec: "ProviderSpec | None" = None,
+) -> "LLMProvider":
+    """Instantiate a provider by backend name using the factory registry.
+
+    Falls back to OpenAICompatProvider for unknown backends.
+    """
+    _ensure_factories_loaded()
+
+    cls = _PROVIDER_FACTORIES.get(backend)
+    if cls is not None:
+        return cls(api_key=api_key, api_base=api_base, extra_headers=extra_headers, spec=spec)
+
+    from markbot.providers.openai_compat import OpenAICompatProvider
+
+    logger.warning(f"Unknown backend '{backend}', falling back to OpenAICompatProvider")
+    return OpenAICompatProvider(api_key=api_key, api_base=api_base, extra_headers=extra_headers, spec=spec)

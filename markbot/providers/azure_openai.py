@@ -307,3 +307,8 @@ class AzureOpenAIProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model (also used as default deployment name)."""
         return self.default_model
+
+
+from markbot.providers.registry import register_provider_factory
+
+register_provider_factory("azure_openai", AzureOpenAIProvider)

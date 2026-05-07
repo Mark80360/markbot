@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from loguru import logger
 
 if TYPE_CHECKING:
-    from markbot.providers.base import LLMProvider
     from typing import Callable, Coroutine
 
 _HEARTBEAT_TOOL = [
@@ -72,6 +71,9 @@ class HeartbeatService:
         self.timezone = timezone
         self._running = False
         self._task: asyncio.Task | None = None
+
+        if self.fallback_manager is None:
+            logger.warning("HeartbeatService created without fallback_manager; _decide/evaluate will fail")
 
     @property
     def heartbeat_file(self) -> Path:

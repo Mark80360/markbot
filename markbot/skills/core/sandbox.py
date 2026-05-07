@@ -193,29 +193,28 @@ class Sandbox:
                 process_env["PATH"] = ":".join(essential_paths)
 
         try:
-            # Create subprocess
+            def _set_child_limits() -> None:
+                if os.name == "nt" or resource is None or not hasattr(resource, "setrlimit"):
+                    return
+                try:
+                    resource.setrlimit(
+                        resource.RLIMIT_CPU,
+                        (self.config.max_cpu_time, self.config.max_cpu_time + 5),
+                    )
+                    max_memory = self.config.max_memory_mb * 1024 * 1024
+                    resource.setrlimit(resource.RLIMIT_AS, (max_memory, max_memory))
+                except (ValueError, OSError):
+                    pass
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=cwd,
                 env=process_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=1024 * 1024,  # 1MB buffer
+                limit=1024 * 1024,
+                preexec_fn=_set_child_limits if os.name != "nt" else None,
             )
-
-            # Set resource limits (Unix only)
-            if os.name != "nt" and resource is not None and hasattr(resource, "setrlimit"):
-                try:
-                    # CPU time limit
-                    resource.setrlimit(
-                        resource.RLIMIT_CPU,
-                        (self.config.max_cpu_time, self.config.max_cpu_time + 5),
-                    )
-                    # Memory limit
-                    max_memory = self.config.max_memory_mb * 1024 * 1024
-                    resource.setrlimit(resource.RLIMIT_AS, (max_memory, max_memory))
-                except (ValueError, OSError):
-                    pass
 
             # Wait with timeout
             try:

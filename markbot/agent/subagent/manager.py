@@ -1,19 +1,25 @@
 """Subagent manager for background task execution."""
 
+from __future__ import annotations
+
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from markbot.agent.subagent.capability import CapabilityToken
+from markbot.agent.subagent.progress import SubagentProgressManager
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
 from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
-from markbot.agent.subagent.progress import SubagentProgressManager
 from markbot.tools.registry import ToolRegistry
 from markbot.utils.helpers import build_assistant_message
+
+if TYPE_CHECKING:
+    from markbot.skills import SkillRegistry
 
 
 class SubagentManager:
@@ -32,12 +38,14 @@ class SubagentManager:
         filesystem_config: "FilesystemToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         cost_tracker=None,
+        skill_registry=None,
     ):
         self.fallback_manager = fallback_manager
         self.config = config
         self.workspace = workspace
         self.bus = bus
         self.cost_tracker = cost_tracker
+        self._skill_registry = skill_registry
 
         # Get model name from config if available
         if config and config.primary_model_ref:
@@ -67,14 +75,18 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        capability: CapabilityToken | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        if capability is None:
+            capability = CapabilityToken.read_only()
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, capability)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -98,6 +110,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        capability: CapabilityToken,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -106,19 +119,22 @@ class SubagentManager:
 
         try:
             tools = ToolRegistry()
-            self._register_subagent_tools(tools)
+            self._register_subagent_tools(tools, capability)
 
             from markbot.skills import SkillRegistry
-            skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
-            skill_registry.load_all()
+            if self._skill_registry is not None:
+                skill_registry = self._skill_registry
+            else:
+                skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
+                skill_registry.load_all()
 
-            system_prompt = self._build_subagent_prompt(skill_registry)
+            system_prompt = self._build_subagent_prompt(skill_registry, capability)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
 
-            max_iterations = 15
+            max_iterations = capability.max_iterations
             iteration = 0
             final_result: str | None = None
 
@@ -221,8 +237,8 @@ class SubagentManager:
         finally:
             await self.progress_manager.remove_tracker(task_id)
 
-    def _register_subagent_tools(self, tools: ToolRegistry) -> None:
-        """Register read-only safe tools for subagent (no exec, no write, no message sending)."""
+    def _register_subagent_tools(self, tools: ToolRegistry, capability: CapabilityToken) -> None:
+        """Register tools for subagent based on capability token."""
         from markbot.tools.filesystem import ListDirTool, ReadFileTool
         from markbot.tools.search import GlobTool, GrepTool
         from markbot.tools.web import WebExtractTool, WebFetchTool, WebSearchTool
@@ -230,20 +246,26 @@ class SubagentManager:
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
 
-        tools.register(ReadFileTool(
-            workspace=self.workspace,
-            allowed_dir=allowed_dir,
-            extra_allowed_dirs=extra_read,
-        ))
-        tools.register(ListDirTool(
-            workspace=self.workspace,
-            allowed_dir=allowed_dir,
-        ))
-        tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-        tools.register(WebFetchTool(proxy=self.web_proxy))
-        tools.register(WebExtractTool(proxy=self.web_proxy))
+        _tool_builders = {
+            "read_file": lambda: ReadFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=extra_read,
+            ),
+            "list_dir": lambda: ListDirTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+            ),
+            "glob": lambda: GlobTool(workspace=self.workspace, allowed_dir=allowed_dir),
+            "grep": lambda: GrepTool(workspace=self.workspace, allowed_dir=allowed_dir),
+            "web_search": lambda: WebSearchTool(config=self.web_search_config, proxy=self.web_proxy),
+            "web_fetch": lambda: WebFetchTool(proxy=self.web_proxy),
+            "web_extract": lambda: WebExtractTool(proxy=self.web_proxy),
+        }
+
+        for name, builder in _tool_builders.items():
+            if capability.allows(name):
+                tools.register(builder())
 
     def _get_activity_description(self, tool_name: str, args: dict[str, Any]) -> str:
         """Generate a human-readable description for a tool activity."""
@@ -315,9 +337,22 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
-    def _build_subagent_prompt(self, skill_registry: "SkillRegistry | None" = None) -> str:
+    def _build_subagent_prompt(self, skill_registry: SkillRegistry | None = None, capability: CapabilityToken | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from markbot.agent.context import ContextBuilder
+
+        if capability is None:
+            capability = CapabilityToken.read_only()
+
+        if capability.allowed_tools:
+            allowed_list = ", ".join(capability.allowed_tools)
+        else:
+            allowed_list = "(inherit from parent — all registered tools)"
+
+        if capability.forbidden_tools:
+            forbidden_list = "\n".join(f"- {t}" for t in capability.forbidden_tools)
+        else:
+            forbidden_list = "- (none explicitly forbidden by token)"
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [f"""# Subagent
@@ -328,16 +363,12 @@ You are a subagent spawned by the main agent. Stay focused on the assigned task.
 
 ## Restrictions (READ CAREFULLY)
 
-You are READ-ONLY with limited permissions.
+You have limited permissions based on your capability profile.
 
-ALLOWED: read_file, list_dir, glob, grep, web_search, web_fetch, web_extract
+ALLOWED: {allowed_list}
 
 FORBIDDEN (violating these is a critical failure):
-- exec (shell commands)
-- Writing, editing, or deleting files
-- Sending messages to users (feishu, lark-cli, email, etc.)
-- Spawning other subagents
-- Any command that sends notifications or messages
+{forbidden_list}
 
 Your ONLY job: gather information and return it as your final response.
 

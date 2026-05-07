@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
-from markbot.types.skill import SkillDefinition
-from markbot.skills.core.loader import SkillLoader
-from markbot.skills.core.tool import SkillTool
-from markbot.skills.core.helpers import load_skill_body, build_constraint_block
 from markbot.skills.core.config import SkillConfigResolver
-from markbot.skills.core.scanner import SecurityScanner, ScanResult, Finding, should_allow
+from markbot.skills.core.helpers import build_constraint_block, load_skill_body
+from markbot.skills.core.loader import SkillLoader
+from markbot.skills.core.scanner import Finding, ScanResult, SecurityScanner, should_allow
+from markbot.skills.core.tool import SkillTool
+from markbot.types.skill import SkillDefinition
 
 if TYPE_CHECKING:
     from markbot.tools.registry import ToolRegistry
@@ -72,17 +72,22 @@ class SkillRegistry:
                 if config:
                     self._config_cache[skill.name] = config
 
-            if self.tool_registry:
-                self._register_scripts(skill)
-
         logger.info(f"Loaded {len(self._skills)} skills")
 
-    def _register_scripts(self, skill: SkillDefinition) -> None:
-        """Register skill scripts as tools."""
-        for script in skill.scripts:
-            tool = SkillTool(skill.name, script, self.workspace)
-            self.tool_registry.register(tool)
-            logger.debug(f"Registered skill tool: {tool.definition.name}")
+    def register_script_tools(self) -> None:
+        """Register all skill scripts as tools into the associated tool_registry.
+
+        Call this after ``load_all()`` and after the ToolBinder has set up
+        the shared ToolRegistry.  This centralises skill-tool registration
+        in one place rather than splitting it between here and ToolBinder.
+        """
+        if not self.tool_registry:
+            return
+        for skill in self._skills.values():
+            for script in skill.scripts:
+                tool = SkillTool(skill.name, script, self.workspace)
+                self.tool_registry.register(tool)
+                logger.debug(f"Registered skill tool: {tool.definition.name}")
 
     def get(self, name: str) -> Optional[SkillDefinition]:
         """Get a skill by name."""

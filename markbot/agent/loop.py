@@ -363,6 +363,7 @@ class AgentLoop:
         tools_used: list[str] = []
         _budget_exceeded = False
         _new_msg_start = _initial_count
+        _stream_finalized = False
 
         logger.info(
             "[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages)
@@ -711,6 +712,7 @@ class AgentLoop:
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=False)
                     _stream_filter.reset()
+                    _stream_finalized = True
 
                 clean = strip_think(response.content) or None
                 if response.finish_reason == "error":
@@ -742,6 +744,13 @@ class AgentLoop:
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+
+        if on_stream and on_stream_end and not _stream_finalized:
+            if final_content:
+                await on_stream(final_content)
+            await on_stream_end(resuming=False)
+            _stream_filter.reset()
+            _stream_finalized = True
 
         logger.info(
             "[AgentLoop] Loop ended: iterations={}, tools_used={}, has_final_content={}",

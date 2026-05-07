@@ -439,3 +439,8 @@ class AnthropicProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+
+from markbot.providers.registry import register_provider_factory
+
+register_provider_factory("anthropic", AnthropicProvider)

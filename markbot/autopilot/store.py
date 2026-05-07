@@ -35,10 +35,8 @@ _URGENT_HINTS = ("urgent", "p0", "p1", "high", "critical", "blocker")
 
 
 def _shorten(text: str, *, limit: int = 120) -> str:
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
+    from markbot.utils.helpers import shorten
+    return shorten(text, limit=limit)
 
 
 def _safe_text(value: object) -> str:
@@ -74,6 +72,7 @@ class AutopilotStore:
         self._context_path = self._autopilot_dir / "active_context.md"
         self._runs_dir = self._autopilot_dir / "runs"
         self._policy_path = self._autopilot_dir / "policy.json"
+        self._file_config: AutopilotConfig | None = None
         self._ensure_layout()
 
     def _ensure_layout(self) -> None:
@@ -410,18 +409,23 @@ class AutopilotStore:
         return counts
 
     def load_config(self) -> AutopilotConfig:
+        if self._file_config is not None:
+            return self._file_config
         if not self._policy_path.exists():
-            return AutopilotConfig()
-        try:
-            data = json.loads(self._policy_path.read_text(encoding="utf-8"))
-            ap_data = data.get("autopilot_policy", {})
-            vp_data = data.get("verification_policy", {})
-            return AutopilotConfig(
-                autopilot_policy=AutopilotPolicy(**ap_data),
-                verification_policy=VerificationPolicy(**vp_data),
-            )
-        except Exception:
-            return AutopilotConfig()
+            config = AutopilotConfig()
+        else:
+            try:
+                data = json.loads(self._policy_path.read_text(encoding="utf-8"))
+                ap_data = data.get("autopilot_policy", {})
+                vp_data = data.get("verification_policy", {})
+                config = AutopilotConfig(
+                    autopilot_policy=AutopilotPolicy(**ap_data),
+                    verification_policy=VerificationPolicy(**vp_data),
+                )
+            except Exception:
+                config = AutopilotConfig()
+        self._file_config = config
+        return config
 
     def save_config(self, config: AutopilotConfig) -> None:
         data = {
@@ -432,3 +436,4 @@ class AutopilotStore:
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        self._file_config = config

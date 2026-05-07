@@ -74,6 +74,13 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
         if isinstance(getattr(providers, attr, None), type(providers.custom))
     ]
 
+    referenced_providers: set[str] = set()
+    chain = config.agents.defaults.model_chain
+    for ref in chain:
+        parts = ref.split("/", 1)
+        if len(parts) == 2:
+            referenced_providers.add(parts[0])
+
     for provider_name in provider_fields:
         pc: "ProviderConfig" = getattr(providers, provider_name)
 
@@ -81,11 +88,13 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
             continue
 
         if not pc.api_key and not pc.api_base:
+            is_referenced = provider_name in referenced_providers
             result.add(
                 f"providers.{provider_name}",
                 f"Provider '{provider_name}' has models configured but no api_key or api_base",
-                severity=Severity.WARNING,
-                suggestion=f"Set providers.{provider_name}.api_key or .api_base in config",
+                severity=Severity.ERROR if is_referenced else Severity.WARNING,
+                suggestion=f"Set providers.{provider_name}.api_key or .api_base in config"
+                + (" (referenced in model_chain)" if is_referenced else ""),
             )
 
         model_ids_seen: set[str] = set()
@@ -104,6 +113,15 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
                     severity=Severity.WARNING,
                     suggestion="Increase context_window or decrease max_tokens",
                 )
+
+    for provider_name in referenced_providers:
+        if provider_name not in provider_fields:
+            result.add(
+                "agents.defaults.model_chain",
+                f"model_chain references provider '{provider_name}' which is not configured",
+                severity=Severity.ERROR,
+                suggestion=f"Add provider '{provider_name}' to providers config",
+            )
 
     return result
 

@@ -515,7 +515,12 @@ class OpenAICompatProvider(LLMProvider):
     @staticmethod
     def _handle_error(e: Exception) -> LLMResponse:
         body = getattr(e, "doc", None) or getattr(getattr(e, "response", None), "text", None)
-        msg = f"Error: {body.strip()[:500]}" if body and body.strip() else f"Error calling LLM: {e}"
+        if body and body.strip():
+            msg = f"Error: {body.strip()[:500]}"
+        elif str(e).strip():
+            msg = f"Error calling LLM: {e}"
+        else:
+            msg = "Error calling LLM: connection failed or timed out (empty error from provider)"
         return LLMResponse(content=msg, finish_reason="error")
 
     # ------------------------------------------------------------------
@@ -576,3 +581,8 @@ class OpenAICompatProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+
+from markbot.providers.registry import register_provider_factory
+
+register_provider_factory("openai_compat", OpenAICompatProvider)

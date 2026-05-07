@@ -34,10 +34,8 @@ if TYPE_CHECKING:
 
 
 def _shorten(text: str, *, limit: int = 120) -> str:
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
+    from markbot.utils.helpers import shorten
+    return shorten(text, limit=limit)
 
 
 def _build_execution_prompt(card: TaskCard, config: AutopilotConfig) -> str:

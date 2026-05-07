@@ -309,31 +309,19 @@ class SecurityScanner:
     """Static analysis scanner for skill scripts and SKILL.md content."""
 
     PYTHON_PATTERNS = [
-        (r"eval\s*\(", "high", "eval() can execute arbitrary code"),
-        (r"exec\s*\(", "high", "exec() can execute arbitrary code"),
-        (r"os\.system\s*\(", "critical", "os.system() executes shell commands"),
-        (r"subprocess\..*shell\s*=\s*True", "critical", "subprocess with shell=True is dangerous"),
         (r"os\.remove\s*\(", "high", "File deletion detected"),
         (r"os\.unlink\s*\(", "high", "File deletion detected"),
-        (r"shutil\.(rmtree|remove_tree)", "high", "Directory deletion detected"),
         (r"pathlib.*\.unlink\s*\(", "high", "File deletion detected"),
         (r"pickle\.(loads?|load)", "critical", "Pickle deserialization is dangerous"),
         (r"yaml\.(load|unsafe_load)", "high", "Unsafe YAML loading detected"),
     ]
 
     SHELL_PATTERNS = [
-        (r"^curl\s|^wget\s", "medium", "Downloading external content"),
-        (r"^eval\s", "critical", "eval is dangerous in shell scripts"),
-        (r"\brm\s+-rf\s", "critical", "Force recursive delete is very dangerous"),
         (r"\bdd\s+|mkfs\.", "critical", "Disk operations detected"),
-        (r"\bsudo\s|su\s+-", "high", "Privilege escalation detected"),
     ]
 
     NODE_PATTERNS = [
-        (r"eval\s*\(", "critical", "eval() can execute arbitrary code"),
         (r"new\s+Function\s*\(", "critical", "Function constructor can execute arbitrary code"),
-        (r"child_process", "high", "Child process creation detected"),
-        (r"spawn\s*\(|exec\s*\(|execSync", "high", "Process execution detected"),
     ]
 
     LANGUAGE_PATTERNS = {

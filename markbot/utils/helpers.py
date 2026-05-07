@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any
 
 
+def shorten(text: str, *, limit: int = 120) -> str:
+    """Normalize whitespace and truncate text to *limit* characters."""
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
 def strip_think(text: str | None) -> str | None:
     """Remove  blocks and any unclosed trailing  tag."""
     if not text:

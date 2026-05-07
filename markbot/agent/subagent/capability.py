@@ -48,7 +48,7 @@ class CapabilityToken:
     def read_only(description: str = "Read-only research") -> CapabilityToken:
         """Factory for a common read-only capability profile."""
         return CapabilityToken(
-            allowed_tokens=(
+            allowed_tools=(
                 "read_file", "glob", "grep",
                 "web_search", "web_fetch", "web_extract",
             ),

@@ -211,13 +211,14 @@ class ToolBinder:
         self._tools.register(self._question_tool)
 
     def _register_skill_tools(self) -> None:
-        """Register skill progressive disclosure tools."""
+        """Register skill progressive disclosure tools and script tools."""
         from markbot.skills import SkillsListTool, SkillViewTool
         from markbot.skills.core.manage import SkillManageTool
 
         if self._skill_registry:
             self._tools.register(SkillViewTool(registry=self._skill_registry))
             self._tools.register(SkillsListTool(registry=self._skill_registry))
+            self._skill_registry.register_script_tools()
         self._tools.register(SkillManageTool(workspace=self._workspace))
 
     def _register_autopilot_tools(self) -> None:

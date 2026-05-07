@@ -97,6 +97,11 @@ class OpenAICodexProvider(LLMProvider):
         return self.default_model
 
 
+from markbot.providers.registry import register_provider_factory
+
+register_provider_factory("openai_codex", OpenAICodexProvider)
+
+
 def _strip_model_prefix(model: str) -> str:
     if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
         return model.split("/", 1)[1]
