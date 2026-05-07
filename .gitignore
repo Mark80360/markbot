@@ -34,3 +34,6 @@ logs/
 .vscode/
 .ruff_cache/
 run_debug.py
+tests/
+test/
+test_*.py
