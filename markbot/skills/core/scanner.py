@@ -36,7 +36,7 @@ TRUST_POLICY = {
     "builtin":       {"safe": "allow", "caution": "allow", "dangerous": "allow"},
     "workspace":     {"safe": "allow", "caution": "allow", "dangerous": "block"},
     "external":      {"safe": "allow", "caution": "block", "dangerous": "block"},
-    "agent-created": {"safe": "allow", "caution": "allow", "dangerous": "ask"},
+    "agent-created": {"safe": "allow", "caution": "allow", "dangerous": "block"},
 }
 
 BLOCKING_SEVERITIES = {"critical", "high"}
@@ -435,6 +435,66 @@ class SecurityScanner:
 
         verdict = self._compute_verdict(findings)
         is_safe = verdict == "safe" or not any(f.severity in BLOCKING_SEVERITIES for f in findings)
+
+        scan_duration = (time.perf_counter() - start_time) * 1000
+
+        return ScanResult(
+            is_safe=is_safe,
+            findings=findings,
+            scan_duration_ms=scan_duration,
+            verdict=verdict,
+        )
+
+    def scan_code(
+        self,
+        code: str,
+        language: str = "python",
+        trust_level: str = "agent-created",
+    ) -> ScanResult:
+        """Scan a code string (not a file) for dangerous patterns.
+
+        Used by CodeExecutionTool to validate agent-generated code before
+        execution.  Reuses the same threat and language-specific patterns
+        as ``scan()`` but operates on an in-memory string.
+        """
+        import time
+
+        start_time = time.perf_counter()
+
+        if not code.strip():
+            return ScanResult(is_safe=True, verdict="safe")
+
+        findings: list[Finding] = []
+
+        patterns = self._get_compiled_patterns(language)
+        for pattern, severity, message in patterns:
+            for match in pattern.finditer(code):
+                line_num = code[: match.start()].count("\n") + 1
+                findings.append(Finding(
+                    line=line_num,
+                    pattern=pattern.pattern,
+                    severity=severity,
+                    message=message,
+                ))
+
+        threats = self._get_compiled_threats()
+        for pattern, pid, severity, category, description in threats:
+            for match in pattern.finditer(code):
+                line_num = code[: match.start()].count("\n") + 1
+                findings.append(Finding(
+                    line=line_num,
+                    pattern=pid,
+                    severity=severity,
+                    message=description,
+                ))
+
+        findings.extend(self._check_obfuscation(code))
+
+        verdict = self._compute_verdict(findings)
+
+        policy = TRUST_POLICY.get(trust_level, TRUST_POLICY["workspace"])
+        action = policy.get(verdict, "block")
+        is_safe = action != "block"
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 

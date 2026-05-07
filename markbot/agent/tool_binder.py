@@ -31,6 +31,7 @@ class ToolBinder:
         web_proxy: str | None = None,
         exec_config: Any = None,
         filesystem_config: Any = None,
+        code_execution_config: Any = None,
         cron_service: "CronService | None" = None,
         subagent_manager: "SubagentManager | None" = None,
         memory_manager: "ReMeLightMemoryManager | None" = None,
@@ -45,6 +46,7 @@ class ToolBinder:
         self._web_proxy = web_proxy
         self._exec_config = exec_config
         self._filesystem_config = filesystem_config
+        self._code_execution_config = code_execution_config
         self._cron_service = cron_service
         self._subagent_manager = subagent_manager
         self._memory_manager = memory_manager
@@ -145,6 +147,11 @@ class ToolBinder:
         self._tools.register(WebExtractTool(proxy=self._web_proxy))
         self._tools.register(GlobTool(workspace=self._workspace, allowed_dir=self._allowed_dir))
         self._tools.register(GrepTool(workspace=self._workspace, allowed_dir=self._allowed_dir))
+
+        if self._code_execution_config is None or self._code_execution_config.enable:
+            from markbot.tools.code import CodeExecutionTool
+
+            self._tools.register(CodeExecutionTool())
 
     def _register_agent_tools(self) -> None:
         """Register tools specific to agent operation."""

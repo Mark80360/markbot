@@ -1597,7 +1597,11 @@ def gateway_status():
 
     # ─ Runtime ───────────────────────────────────────────────────────────────
     section("Runtime", "magenta")
-    kv("Model Chain", ", ".join(config.agents.defaults.model_chain) or "[not configured]")
+    if config.agents.defaults.model_chain:
+        for i, model in enumerate(config.agents.defaults.model_chain):
+            kv("Model Chain" if i == 0 else "", model)
+    else:
+        kv("Model Chain", "[not configured]")
     kv("Context Window", f"{config.agents.defaults.context_window_tokens} tokens")
     hb_on = config.gateway.heartbeat.enabled
     kv("Heartbeat", f"[green]●[/green] Enabled every {config.gateway.heartbeat.interval_s}s" if hb_on else "[yellow]○[/yellow] Disabled")
@@ -1972,7 +1976,11 @@ def status():
     section("Configuration", "blue")
     kv("Config Path", f"{config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
     kv("Workspace", f"{workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
-    kv("Model Chain", ", ".join(config.agents.defaults.model_chain) or "[not configured]")
+    if config.agents.defaults.model_chain:
+        for i, model in enumerate(config.agents.defaults.model_chain):
+            kv("Model Chain" if i == 0 else "", model)
+    else:
+        kv("Model Chain", "[not configured]")
 
     divider()
 

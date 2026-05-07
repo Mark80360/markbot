@@ -87,6 +87,7 @@ class SkillGuardrail:
         "glob",
         "grep",
         "exec",
+        "run_code",
         "web_search",
         "web_fetch",
         "web_extract",

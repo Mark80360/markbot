@@ -124,9 +124,12 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
 
-        from markbot.config.schema import MemoryToolsConfig
+        from markbot.config.schema import MemoryToolsConfig, CodeExecutionConfig
 
         self.memory_config = memory_config or MemoryToolsConfig()
+        self.code_execution_config = getattr(
+            config.tools if config else None, "code_execution", None
+        ) or CodeExecutionConfig()
 
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -264,6 +267,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             filesystem_config=self.filesystem_config,
+            code_execution_config=self.code_execution_config,
             cron_service=cron_service,
             subagent_manager=self.subagents,
             memory_manager=self.memory_manager,

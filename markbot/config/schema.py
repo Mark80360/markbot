@@ -174,6 +174,27 @@ class FilesystemToolConfig(Base):
         description="If true, deleted files are moved to backup_dir (recycle bin mode). If false, files are permanently deleted."
     )
 
+class CodeExecutionConfig(Base):
+    """Code execution tool (run_code) configuration."""
+
+    enable: bool = True
+    timeout: int = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description="Default execution timeout in seconds",
+    )
+    max_memory_mb: int = Field(
+        default=256,
+        ge=64,
+        le=4096,
+        description="Maximum memory (MB) for sandbox execution",
+    )
+    allowed_dependencies: list[str] = Field(
+        default_factory=list,
+        description="If non-empty, only these pip packages are allowed to be installed. Empty = allow all.",
+    )
+
 class MemoryToolsConfig(Base):
     """Memory system configuration (ReMeLight)."""
 
@@ -235,6 +256,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
+    code_execution: CodeExecutionConfig = Field(default_factory=CodeExecutionConfig)
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
