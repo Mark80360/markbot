@@ -74,6 +74,11 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
         if isinstance(getattr(providers, attr, None), type(providers.custom))
     ]
 
+    dynamic_providers = getattr(providers, '_dynamic_providers', {})
+    for dp_name, dp_config in dynamic_providers.items():
+        if dp_name not in provider_fields:
+            provider_fields.append(dp_name)
+
     referenced_providers: set[str] = set()
     chain = config.agents.defaults.model_chain
     for ref in chain:
@@ -82,7 +87,7 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
             referenced_providers.add(parts[0])
 
     for provider_name in provider_fields:
-        pc: "ProviderConfig" = getattr(providers, provider_name)
+        pc: "ProviderConfig" = providers.get_provider(provider_name) or getattr(providers, provider_name)
 
         if not pc.models:
             continue

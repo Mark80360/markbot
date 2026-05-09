@@ -225,7 +225,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         log_cfg = {**emb_config, "api_key": self._mask_key(emb_config.get("api_key", ""))}
         logger.info(
-            "[ReMeLightMemoryManager] Embedding config: {}, vector_enabled={}, memory_backend={}",
+            "[ReMeLightMemoryManager] Embedding config: %s, vector_enabled=%s, memory_backend=%s",
             json.dumps(log_cfg, ensure_ascii=False), vector_enabled, memory_backend,
         )
 
@@ -248,22 +248,32 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
         _t0 = time.time()
         logger.info("[ReMeLightMemoryManager] Creating ReMeLight instance...")
-        self._reme = ReMeLight(
-            working_dir=self.working_dir,
-            llm_api_key=llm_api_key or None,
-            llm_base_url=llm_base_url or None,
-            default_as_llm_config=default_as_llm_config,
-            default_embedding_model_config=emb_config,
-            default_file_store_config={
-                "backend": memory_backend,
-                "store_name": "markbot",
-                "vector_enabled": vector_enabled,
-                "fts_enabled": fts_enabled,
-            },
-            default_file_watcher_config={
-                "rebuild_index_on_start": False,
-            },
-        )
+        
+        import logging as _std_logging
+        _reme_logger = _std_logging.getLogger('reme')
+        _old_level = _reme_logger.level
+        _reme_logger.setLevel(_std_logging.WARNING)
+        
+        try:
+            self._reme = ReMeLight(
+                working_dir=self.working_dir,
+                llm_api_key=llm_api_key or None,
+                llm_base_url=llm_base_url or None,
+                default_as_llm_config=default_as_llm_config,
+                default_embedding_model_config=emb_config,
+                default_file_store_config={
+                    "backend": memory_backend,
+                    "store_name": "markbot",
+                    "vector_enabled": vector_enabled,
+                    "fts_enabled": fts_enabled,
+                },
+                default_file_watcher_config={
+                    "rebuild_index_on_start": False,
+                },
+            )
+        finally:
+            _reme_logger.setLevel(_old_level)
+        
         logger.info("[ReMeLightMemoryManager] ReMeLight instance created, took {:.3f}s", time.time() - _t0)
 
         self._setup_summary_toolkit()
@@ -289,7 +299,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
 
             logger.info("Summary toolkit registered with read/write/edit file tools")
         except Exception as e:
-            logger.warning("Failed to setup summary toolkit: {}", e)
+            logger.warning("Failed to setup summary toolkit: %s", e)
             self._summary_toolkit = None
 
     def _build_embedding_config(self) -> dict:
@@ -357,13 +367,13 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             result = await self._reme.start()
             logger.info("[ReMeLightMemoryManager] _reme.start() took {:.3f}s", time.time() - _t0)
             self._started = True
-            logger.info("[ReMeLightMemoryManager] Started successfully, working_dir={}", self.working_dir)
+            logger.info("[ReMeLightMemoryManager] Started successfully, working_dir=%s", self.working_dir)
             memory_dir = Path(self.working_dir) / "memory"
-            logger.info("[ReMeLightMemoryManager] Memory directory: {}, exists={}", memory_dir, memory_dir.exists())
+            logger.info("[ReMeLightMemoryManager] Memory directory: %s, exists=%s", memory_dir, memory_dir.exists())
             logger.info("[ReMeLightMemoryManager] start() complete, total took {:.3f}s", time.time() - _start_begin)
             return result
         except Exception as e:
-            logger.error("[ReMeLightMemoryManager] Failed to start: {}", e)
+            logger.error("[ReMeLightMemoryManager] Failed to start: %s", e)
             return None
 
     async def close(self) -> bool:

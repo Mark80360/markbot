@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from markbot.cli.slash_commands import CommandRouter
     from markbot.config.schema import (
         ChannelsConfig,
+        CodeExecutionConfig,
         CompactionConfig as SchemaCompactionConfig,
         Config,
         ExecToolConfig,
@@ -94,6 +95,7 @@ class AgentContext:
     exec_config: "ExecToolConfig | None" = None
     filesystem_config: "FilesystemToolConfig | None" = None
     memory_config: "MemoryToolsConfig | None" = None
+    code_execution_config: "CodeExecutionConfig | None" = None
     cron_service: "CronService | None" = None
     restrict_to_workspace: bool = False
     timezone: str | None = None
@@ -101,6 +103,7 @@ class AgentContext:
     max_budget_usd: float | None = None
     warn_threshold_usd: float = 0.5
     budget_config: Any = None
+    mcp_servers: dict | None = None
 
     tools: "ToolRegistry | None" = None
     skill_registry: "SkillRegistry | None" = None
@@ -183,6 +186,10 @@ class AgentContext:
             self._params["memory_config"] = cfg
             return self
 
+        def with_code_execution_config(self, cfg: "CodeExecutionConfig") -> "AgentContext.Builder":
+            self._params["code_execution_config"] = cfg
+            return self
+
         def with_cron_service(self, svc: "CronService") -> "AgentContext.Builder":
             self._params["cron_service"] = svc
             return self
@@ -203,6 +210,10 @@ class AgentContext:
             self._params["max_budget_usd"] = max_usd
             self._params["warn_threshold_usd"] = warn_usd
             self._params["budget_config"] = budget_config
+            return self
+
+        def with_mcp_servers(self, servers: dict | None) -> "AgentContext.Builder":
+            self._params["mcp_servers"] = servers
             return self
 
         def with_tools(self, tools: "ToolRegistry") -> "AgentContext.Builder":
@@ -260,6 +271,287 @@ class AgentContext:
     @classmethod
     def builder(cls) -> Builder:
         return cls.Builder()
+
+    @classmethod
+    def from_legacy_params(
+        cls,
+        bus: "MessageBus",
+        fallback_manager: "FallbackManager",
+        config: "Config | None" = None,
+        workspace: Path | None = None,
+        max_iterations: int = 40,
+        context_window_tokens: int = 65_536,
+        web_search_config: "WebSearchConfig | None" = None,
+        web_proxy: str | None = None,
+        exec_config: "ExecToolConfig | None" = None,
+        filesystem_config: "FilesystemToolConfig | None" = None,
+        memory_config: "MemoryToolsConfig | None" = None,
+        cron_service: "CronService | None" = None,
+        restrict_to_workspace: bool = False,
+        session_manager: "SessionManager | None" = None,
+        mcp_servers: dict | None = None,
+        channels_config: "ChannelsConfig | None" = None,
+        timezone: str | None = None,
+        compaction_config: "CompactionConfig | None" = None,
+        max_budget_usd: float | None = None,
+        warn_threshold_usd: float = 0.5,
+        budget_config: Any = None,
+    ) -> "AgentContext":
+        """Create a fully initialized AgentContext from the legacy parameter list.
+
+        This encapsulates all the component creation that was previously
+        inlined in ``AgentLoop.__init__``.
+        """
+        from markbot.agent.compact import CompactionConfig as _CC, MultiLevelCompactor as _MLC
+        from markbot.agent.cost import CostTracker as _CT, PricingTable as _PT, ModelPricing as _MP
+        from markbot.agent.context import ContextBuilder as _CB
+        from markbot.agent.hooks.bootstrap import BootstrapHook as _BH
+        from markbot.agent.hooks.compaction import MemoryCompactionHook as _MCH
+        from markbot.agent.mcp.manager import McpManager as _MM
+        from markbot.agent.pipeline.engine import MessagePipeline as _MP2
+        from markbot.agent.pipeline.middleware import (
+            MemoryLifecycleMiddleware as _MLM,
+            QuestionResponseMiddleware as _QRM,
+        )
+        from markbot.agent.services.executor import ToolExecutor as _TE
+        from markbot.agent.services.interaction import InteractionLogger as _IL
+        from markbot.agent.stream import StreamFilter
+        from markbot.agent.subagent import SubagentManager as _SM
+        from markbot.agent.tool_binder import ToolBinder as _TB
+        from markbot.config.schema import (
+            MemoryToolsConfig as _MTC,
+            CodeExecutionConfig as _CEC,
+            WebSearchConfig as _WSC,
+            ExecToolConfig as _ETC,
+            FilesystemToolConfig as _FTC,
+        )
+        from markbot.memory.daily_log import DailyLogManager as _DLM
+        from markbot.memory.manager import ReMeLightMemoryManager as _RML
+        from markbot.session.session import SessionManager as _SM2
+        from markbot.skills import SkillRegistry as _SR
+        from markbot.skills.core.guardrail import SkillGuardrailManager as _SGM
+        from markbot.tools.registry import ToolRegistry as _TR
+        from markbot.cli.slash_commands import CommandRouter as _CR, register_builtin_commands as _rbc
+
+        _init_start = time.time()
+        logger.info("[AgentContext] Starting initialization...")
+
+        timings: dict[str, float] = {}
+
+        _primary_provider_config = None
+        model = "unknown"
+        if config and config.primary_model_ref:
+            primary_provider, primary_model = config.resolve_model(config.primary_model_ref)
+            model = primary_model.name
+            _primary_provider_config = primary_provider
+
+        _web_search_config = web_search_config or _WSC()
+        _exec_config = exec_config or _ETC()
+        _filesystem_config = filesystem_config or _FTC()
+        _memory_config = memory_config or _MTC()
+        _code_execution_config = getattr(
+            config.tools if config else None, "code_execution", None
+        ) or _CEC()
+
+        _t0 = time.time()
+        _compaction_cfg = compaction_config or _CC()
+        compactor = _MLC(fallback_manager=fallback_manager, config=_compaction_cfg)
+        timings["compactor"] = time.time() - _t0
+
+        _pricing: _PT | None = None
+        if budget_config and getattr(budget_config, "custom_pricing", None):
+            _custom = {k: _MP(**v) for k, v in budget_config.custom_pricing.items()}
+            _pricing = _PT(custom=_custom)
+        cost_tracker = _CT(
+            max_budget_usd=max_budget_usd,
+            warn_threshold_usd=warn_threshold_usd,
+            pricing=_pricing,
+        )
+
+        _t0 = time.time()
+        tools = _TR()
+        timings["tools"] = time.time() - _t0
+
+        _t0 = time.time()
+        skill_registry = _SR(workspace, tool_registry=tools)
+        skill_registry.load_all()
+        timings["skill_registry"] = time.time() - _t0
+
+        guardrail_manager = _SGM(context="main")
+
+        _t0 = time.time()
+        sessions = session_manager or _SM2(workspace)
+        subagents = _SM(
+            fallback_manager=fallback_manager,
+            config=config,
+            workspace=workspace,
+            bus=bus,
+            model=model,
+            web_search_config=_web_search_config,
+            web_proxy=web_proxy,
+            exec_config=_exec_config,
+            filesystem_config=_filesystem_config,
+            restrict_to_workspace=restrict_to_workspace,
+            cost_tracker=cost_tracker,
+        )
+        timings["subagents"] = time.time() - _t0
+
+        mcp = _MM(mcp_servers)
+
+        memory_cfg = _memory_config
+        embedding_config: dict[str, Any] = {}
+        if memory_cfg:
+            embedding_config = {
+                "backend": getattr(memory_cfg, "embedding_backend", "openai"),
+                "api_key": getattr(memory_cfg, "embedding_api_key", ""),
+                "base_url": getattr(memory_cfg, "embedding_base_url", ""),
+                "model_name": getattr(memory_cfg, "embedding_model_name", ""),
+            }
+
+        llm_config: dict[str, Any] = {
+            "backend": "openai",
+            "api_key": getattr(_primary_provider_config, 'api_key', '') or "",
+            "base_url": getattr(_primary_provider_config, 'api_base', '') or "",
+            "model_name": model,
+        }
+
+        _t0 = time.time()
+        memory_manager = _RML(
+            working_dir=str(workspace),
+            agent_id="markbot",
+            fallback_manager=fallback_manager,
+            model=model,
+            embedding_config=embedding_config,
+            llm_config=llm_config,
+            language="zh",
+            timezone=timezone,
+            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
+            memory_compact_ratio=getattr(memory_cfg, "memory_compact_ratio", 0.75),
+            memory_reserve_ratio=getattr(memory_cfg, "memory_reserve_ratio", 0.1),
+            compact_with_thinking_block=True,
+            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
+            force_memory_search=getattr(memory_cfg, "force_memory_search", False),
+            force_max_results=getattr(memory_cfg, "force_max_results", 1),
+            force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
+        )
+        timings["memory_manager"] = time.time() - _t0
+
+        bootstrap_hook = _BH(working_dir=workspace, language="zh")
+
+        memory_compact_threshold = int(context_window_tokens * 0.75)
+        compaction_hook = _MCH(
+            memory_manager=memory_manager,
+            memory_compact_threshold=memory_compact_threshold,
+            memory_compact_reserve=getattr(memory_cfg, "memory_compact_reserve", 10000),
+            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
+            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
+        )
+
+        _system_prompt_token_budget = 16_000
+        if compaction_config and hasattr(compaction_config, "system_prompt_token_budget"):
+            _system_prompt_token_budget = compaction_config.system_prompt_token_budget
+
+        context_builder = _CB(
+            workspace,
+            timezone=timezone,
+            tool_registry=tools,
+            skill_registry=skill_registry,
+            memory_manager=memory_manager,
+            system_prompt_token_budget=_system_prompt_token_budget,
+        )
+
+        _allowed_dir = workspace if restrict_to_workspace else None
+        _t0 = time.time()
+        binder = _TB(
+            tools,
+            workspace=workspace,
+            allowed_dir=_allowed_dir,
+            web_search_config=_web_search_config,
+            web_proxy=web_proxy,
+            exec_config=_exec_config,
+            filesystem_config=_filesystem_config,
+            code_execution_config=_code_execution_config,
+            cron_service=cron_service,
+            subagent_manager=subagents,
+            memory_manager=memory_manager,
+            skill_registry=skill_registry,
+            timezone=timezone,
+            publish_outbound=bus.publish_outbound,
+        )
+        binder.register_all()
+        timings["tool_binder"] = time.time() - _t0
+
+        _memory_search_tool = binder.memory_search_tool
+        question_tool = binder.question_tool
+
+        logger.info("[AgentContext] Agent has {} tools available", len(tools))
+
+        commands = _CR()
+        _rbc(commands)
+
+        tool_executor = _TE(tools)
+
+        pipeline = _MP2()
+        pipeline.use(_QRM(get_question_tool=lambda: question_tool))
+        daily_log = _DLM(workspace=workspace)
+        interaction_log = _IL()
+        if hasattr(memory_manager, "_daily_log_manager"):
+            memory_manager._daily_log_manager = daily_log
+        pipeline.use(
+            _MLM(
+                memory_manager=memory_manager,
+                daily_log=daily_log,
+                session_manager=sessions,
+            )
+        )
+
+        timings["total"] = time.time() - _init_start
+        logger.info("[AgentContext] Initialization complete, total took {:.3f}s", timings["total"])
+
+        return cls(
+            config=config,
+            workspace=workspace,
+            bus=bus,
+            fallback_manager=fallback_manager,
+            model=model,
+            max_iterations=max_iterations,
+            context_window_tokens=context_window_tokens,
+            channels_config=channels_config,
+            web_search_config=_web_search_config,
+            web_proxy=web_proxy,
+            exec_config=_exec_config,
+            filesystem_config=_filesystem_config,
+            memory_config=_memory_config,
+            code_execution_config=_code_execution_config,
+            cron_service=cron_service,
+            restrict_to_workspace=restrict_to_workspace,
+            timezone=timezone,
+            compaction_config=compaction_config,
+            max_budget_usd=max_budget_usd,
+            warn_threshold_usd=warn_threshold_usd,
+            budget_config=budget_config,
+            mcp_servers=mcp_servers,
+            tools=tools,
+            skill_registry=skill_registry,
+            guardrail_manager=guardrail_manager,
+            sessions=sessions,
+            subagents=subagents,
+            memory_manager=memory_manager,
+            compactor=compactor,
+            cost_tracker=cost_tracker,
+            mcp=mcp,
+            context_builder=context_builder,
+            pipeline=pipeline,
+            commands=commands,
+            tool_executor=tool_executor,
+            bootstrap_hook=bootstrap_hook,
+            compaction_hook=compaction_hook,
+            daily_log=daily_log,
+            interaction_log=interaction_log,
+            memory_search_tool=_memory_search_tool,
+            question_tool=question_tool,
+            _init_timings=timings,
+        )
 
     def record_timing(self, component: str, elapsed_s: float) -> None:
         self._init_timings[component] = elapsed_s

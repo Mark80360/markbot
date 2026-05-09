@@ -867,7 +867,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     cron = CronService(cron_store_path)
 
     agent = AgentLoop(
-        bus=bus,
+        ctx_or_bus=bus,
         fallback_manager=provider,
         config=config,
         workspace=config.workspace_path,
@@ -1119,7 +1119,7 @@ def agent(
     _t0 = time.time()
     logger.info("[CLI] Creating AgentLoop...")
     agent_loop = AgentLoop(
-        bus=bus,
+        ctx_or_bus=bus,
         fallback_manager=provider,
         config=config,
         workspace=config.workspace_path,

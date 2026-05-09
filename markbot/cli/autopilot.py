@@ -173,7 +173,7 @@ def tick(
     cron = CronService(cron_store_path)
 
     agent_loop = AgentLoop(
-        bus=bus,
+        ctx_or_bus=bus,
         fallback_manager=provider,
         config=runtime_config,
         workspace=ws,

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from filelock import FileLock, Timeout
 from loguru import logger
 
 from markbot.config.paths import get_legacy_sessions_dir
@@ -181,6 +182,15 @@ class SessionManager:
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
+    def _get_lock_path(self, key: str) -> Path:
+        """Get the lock file path for a session."""
+        safe_key = safe_filename(key.replace(":", "_"))
+        return self.sessions_dir / f"{safe_key}.lock"
+
+    def _get_lock(self, key: str) -> FileLock:
+        """Get a file lock for a session."""
+        return FileLock(str(self._get_lock_path(key)), timeout=30)
+
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.markbot/sessions/)."""
         safe_key = safe_filename(key.replace(":", "_"))
@@ -209,7 +219,7 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """Load a session from disk (with file lock for concurrency safety)."""
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
@@ -223,6 +233,16 @@ class SessionManager:
         if not path.exists():
             return None
 
+        lock = self._get_lock(key)
+        try:
+            with lock:
+                return self._read_session_file(key, path)
+        except Timeout:
+            logger.warning("Failed to acquire lock for session {}, loading without lock", key)
+            return self._read_session_file(key, path)
+
+    def _read_session_file(self, key: str, path: Path) -> Session | None:
+        """Read and parse a session JSONL file."""
         try:
             messages = []
             metadata = {}
@@ -278,7 +298,10 @@ class SessionManager:
     _APPEND_COMPACT_THRESHOLD = 100
 
     def _save_to_disk(self, session: Session) -> None:
-        """Save a session to disk using append-only writes with periodic compaction."""
+        """Save a session to disk using append-only writes with periodic compaction.
+
+        Uses file locking to prevent concurrent writes from corrupting the file.
+        """
         path = self._get_session_path(session.key)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -288,12 +311,22 @@ class SessionManager:
         if append_count == 0 and path.exists():
             return
 
-        if append_count > self._APPEND_COMPACT_THRESHOLD or not path.exists():
-            self._full_write(session, path)
-            session._written_count = len(session.messages)
-        else:
-            self._append_write(session, path, new_messages)
-            session._written_count += append_count
+        lock = self._get_lock(session.key)
+        try:
+            with lock:
+                if append_count > self._APPEND_COMPACT_THRESHOLD or not path.exists():
+                    self._full_write(session, path)
+                    session._written_count = len(session.messages)
+                else:
+                    self._append_write(session, path, new_messages)
+                    session._written_count += append_count
+        except Timeout:
+            logger.error(
+                "Failed to acquire lock for session {} within timeout, "
+                "data may be lost",
+                session.key,
+            )
+            raise
 
     def _full_write(self, session: Session, path: Path) -> None:
         temp_path = path.with_suffix(".tmp")

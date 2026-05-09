@@ -215,7 +215,7 @@ class LogSink(AuditSink):
     """Emit audit events through loguru (for development / testing)."""
 
     def write(self, event: AuditEvent) -> None:
-        logger.info("[Audit] {} {} {} by {} — {}", event.action, event.outcome, event.resource, event.actor, json.dumps(event.details, default=str)[:200])
+        logger.info("[Audit] %s %s by %s — %s", event.action, event.outcome, event.resource, event.actor, json.dumps(event.details, default=str)[:200])
 
     def flush(self) -> None:
         pass

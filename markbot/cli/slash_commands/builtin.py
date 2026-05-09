@@ -45,8 +45,8 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     """Build an outbound status message for a session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    tracker = loop.token_tracker
-    cumulative = tracker.total_usage
+    token_summary = loop.cost_tracker.get_token_summary()
+    cumulative = token_summary["total"]
     last = loop._last_usage
     cache_created = last.get("cache_creation_input_tokens", 0)
     cache_read = last.get("cache_read_input_tokens", 0)
@@ -63,11 +63,11 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             session_history_count=len(session.get_history(max_messages=0)),
             tool_count=len(loop.tools.get_definitions()),
             last_usage=last,
-            cumulative_input=cumulative.input_tokens,
-            cumulative_output=cumulative.output_tokens,
-            cumulative_cache_creation=cumulative.cache_creation_input_tokens,
-            cumulative_cache_read=cumulative.cache_read_input_tokens,
-            api_calls=len(tracker.usage_history),
+            cumulative_input=cumulative["input_tokens"],
+            cumulative_output=cumulative["output_tokens"],
+            cumulative_cache_creation=cumulative["cache_creation_input_tokens"],
+            cumulative_cache_read=cumulative["cache_read_input_tokens"],
+            api_calls=token_summary["api_calls"],
         ),
         metadata={"render_as": "text"},
     )

@@ -38,6 +38,12 @@ class CapabilityToken:
     max_iterations: int = 15
     """Maximum tool-call iterations before the subagent must respond."""
 
+    max_budget_usd: float | None = None
+    """Maximum cost in USD this subagent may incur. None = no subagent-level limit."""
+
+    timeout_seconds: float | None = None
+    """Maximum wall-clock time for the subagent. None = no timeout."""
+
     description: str = ""
     """Human-readable summary of what this delegation covers."""
 
@@ -56,6 +62,8 @@ class CapabilityToken:
                 "exec", "write_file", "edit_file", "delete_file",
                 "message", "spawn", "ask_user_question",
             ),
+            max_budget_usd=0.5,
+            timeout_seconds=300,
             description=description,
         )
 

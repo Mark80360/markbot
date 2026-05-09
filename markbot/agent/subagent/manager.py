@@ -9,8 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from markbot.agent.cost import BudgetExceededError, CostTracker
 from markbot.agent.subagent.capability import CapabilityToken
-from markbot.agent.subagent.progress import SubagentProgressManager
+from markbot.agent.subagent.progress import NullProgressTracker, SubagentProgressManager
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.config.schema import ExecToolConfig, FilesystemToolConfig, WebSearchConfig
@@ -115,119 +116,46 @@ class SubagentManager:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
-        tracker = await self.progress_manager.create_tracker(task_id, label)
+        if self.progress_manager:
+            tracker = await self.progress_manager.create_tracker(task_id, label)
+        else:
+            tracker = NullProgressTracker(task_id)
+
+        sub_budget = capability.max_budget_usd
+        sub_cost_tracker = CostTracker(
+            max_budget_usd=sub_budget,
+            warn_threshold_usd=(sub_budget * 0.8) if sub_budget else 0.5,
+        ) if sub_budget else None
+
+        timeout = capability.timeout_seconds
 
         try:
-            tools = ToolRegistry()
-            self._register_subagent_tools(tools, capability)
-
-            from markbot.skills import SkillRegistry
-            if self._skill_registry is not None:
-                skill_registry = self._skill_registry
-            else:
-                skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
-                skill_registry.load_all()
-
-            system_prompt = self._build_subagent_prompt(skill_registry, capability)
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
-
-            max_iterations = capability.max_iterations
-            iteration = 0
-            final_result: str | None = None
-
-            while iteration < max_iterations:
-                iteration += 1
-
-                response, attempts = await self.fallback_manager.chat_with_fallback(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                )
-
-                if response.usage:
-                    await tracker.record_tokens(
-                        input_tokens=response.usage.get("input_tokens", 0),
-                        output_tokens=response.usage.get("output_tokens", 0),
-                    )
-
-                if self.cost_tracker and response.usage:
-                    try:
-                        _actual_model = self.model
-                        for _a in reversed(attempts):
-                            if _a.success and _a.model:
-                                _actual_model = _a.model.name
-                                break
-                        self.cost_tracker.update_from_response(response, model=_actual_model)
-                    except Exception:
-                        pass
-
-                if response.has_tool_calls:
-                    tool_call_dicts = [
-                        tc.to_openai_tool_call()
-                        for tc in response.tool_calls
-                    ]
-                    messages.append(build_assistant_message(
-                        response.content or "",
-                        tool_calls=tool_call_dicts,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    ))
-
-                    for tool_call in response.tool_calls:
-                        is_search = tool_call.name in ["glob", "grep", "web_search"]
-                        is_read = tool_call.name in ["read_file", "web_fetch"]
-                        description = self._get_activity_description(tool_call.name, tool_call.arguments)
-                        await tracker.record_tool_use(
-                            tool_name=tool_call.name,
-                            input_args=tool_call.arguments,
-                            description=description,
-                            is_search=is_search,
-                            is_read=is_read,
-                        )
-
-                    from markbot.types.permission import PermissionMode as _PM
-                    from markbot.types.permission import ToolPermissionContext as _TPC
-                    from markbot.types.tool import ToolContext as _TC
-                    _sub_tool_ctx = _TC(
-                        session_id=f"subagent:{task_id}",
-                        workspace=str(self.workspace),
-                        permission_mode=_PM.AUTO,
-                        tool_permission_context=_TPC(mode=_PM.AUTO),
-                        is_non_interactive=True,
-                    )
-                    results = await asyncio.gather(
-                        *(tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx) for tc in response.tool_calls),
-                        return_exceptions=True,
-                    )
-
-                    for tool_call, result in zip(response.tool_calls, results):
-                        if isinstance(result, BaseException):
-                            logger.error(
-                                "Subagent [{}] tool {} failed: {}", task_id, tool_call.name, result
-                            )
-                            result = f"Error: {type(result).__name__}: {result}"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
-
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
-
-            await tracker.complete(final_result)
-
-            logger.info("Subagent [{}] completed successfully", task_id)
-
+            await asyncio.wait_for(
+                self._execute_subagent_loop(
+                    task_id, task, label, capability, tracker, sub_cost_tracker,
+                    origin=origin,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            error_msg = f"Timed out after {timeout}s"
+            logger.warning("Subagent [{}] {}", task_id, error_msg)
+            await tracker.fail(error_msg)
             progress = tracker.get_progress()
-            await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
-
+            await self._announce_result(task_id, label, task, error_msg, origin, "error", progress)
+        except BudgetExceededError as exc:
+            error_msg = f"Subagent budget exceeded: ${exc.current_cost:.4f} > ${exc.budget:.2f}"
+            logger.warning("Subagent [{}] {}", task_id, error_msg)
+            await tracker.fail(error_msg)
+            progress = tracker.get_progress()
+            await self._announce_result(task_id, label, task, error_msg, origin, "error", progress)
+        except asyncio.CancelledError:
+            error_msg = "Cancelled"
+            logger.info("Subagent [{}] {}", task_id, error_msg)
+            await tracker.fail(error_msg)
+            progress = tracker.get_progress()
+            await self._announce_result(task_id, label, task, error_msg, origin, "cancelled", progress)
+            raise
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
@@ -235,7 +163,140 @@ class SubagentManager:
             progress = tracker.get_progress()
             await self._announce_result(task_id, label, task, error_msg, origin, "error", progress)
         finally:
-            await self.progress_manager.remove_tracker(task_id)
+            if sub_cost_tracker:
+                sub_summary = sub_cost_tracker.get_summary()
+                logger.info(
+                    "Subagent [{}] cost: ${:.6f} (budget={})",
+                    task_id,
+                    sub_summary["total_cost_usd"],
+                    f"${sub_budget}" if sub_budget else "unlimited",
+                )
+            if self.progress_manager:
+                await self.progress_manager.remove_tracker(task_id)
+
+    async def _execute_subagent_loop(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        capability: CapabilityToken,
+        tracker: Any,
+        sub_cost_tracker: CostTracker | None,
+        origin: dict[str, str] | None = None,
+    ) -> None:
+        """Core subagent execution loop with isolated budget."""
+        tools = ToolRegistry()
+        self._register_subagent_tools(tools, capability)
+
+        from markbot.skills import SkillRegistry
+        if self._skill_registry is not None:
+            skill_registry = self._skill_registry
+        else:
+            skill_registry = SkillRegistry(self.workspace, tool_registry=tools)
+            skill_registry.load_all()
+
+        system_prompt = self._build_subagent_prompt(skill_registry, capability)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
+
+        max_iterations = capability.max_iterations
+        iteration = 0
+        final_result: str | None = None
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            response, attempts = await self.fallback_manager.chat_with_fallback(
+                messages=messages,
+                tools=tools.get_definitions(),
+            )
+
+            _actual_model = self.model
+            for _a in reversed(attempts):
+                if _a.success and _a.model:
+                    _actual_model = _a.model.name
+                    break
+
+            if response.usage:
+                await tracker.record_tokens(
+                    input_tokens=response.usage.get("input_tokens", 0),
+                    output_tokens=response.usage.get("output_tokens", 0),
+                )
+
+            cost_tracker_to_use = sub_cost_tracker or self.cost_tracker
+            if cost_tracker_to_use and response.usage:
+                try:
+                    cost_tracker_to_use.update_from_response(response, model=_actual_model)
+                except BudgetExceededError:
+                    raise
+                except Exception:
+                    pass
+
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    tc.to_openai_tool_call()
+                    for tc in response.tool_calls
+                ]
+                messages.append(build_assistant_message(
+                    response.content or "",
+                    tool_calls=tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ))
+
+                for tool_call in response.tool_calls:
+                    is_search = tool_call.name in ["glob", "grep", "web_search"]
+                    is_read = tool_call.name in ["read_file", "web_fetch"]
+                    description = self._get_activity_description(tool_call.name, tool_call.arguments)
+                    await tracker.record_tool_use(
+                        tool_name=tool_call.name,
+                        input_args=tool_call.arguments,
+                        description=description,
+                        is_search=is_search,
+                        is_read=is_read,
+                    )
+
+                from markbot.types.permission import PermissionMode as _PM
+                from markbot.types.permission import ToolPermissionContext as _TPC
+                from markbot.types.tool import ToolContext as _TC
+                _sub_tool_ctx = _TC(
+                    session_id=f"subagent:{task_id}",
+                    workspace=str(self.workspace),
+                    permission_mode=_PM.AUTO,
+                    tool_permission_context=_TPC(mode=_PM.AUTO),
+                    is_non_interactive=True,
+                )
+                results = await asyncio.gather(
+                    *(tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx) for tc in response.tool_calls),
+                    return_exceptions=True,
+                )
+
+                for tool_call, result in zip(response.tool_calls, results):
+                    if isinstance(result, BaseException):
+                        logger.error(
+                            "Subagent [{}] tool {} failed: {}", task_id, tool_call.name, result
+                        )
+                        result = f"Error: {type(result).__name__}: {result}"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "content": result,
+                    })
+            else:
+                final_result = response.content
+                break
+
+        if final_result is None:
+            final_result = "Task completed but no final response was generated."
+
+        await tracker.complete(final_result)
+        logger.info("Subagent [{}] completed successfully", task_id)
+
+        progress = tracker.get_progress()
+        await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
 
     def _register_subagent_tools(self, tools: ToolRegistry, capability: CapabilityToken) -> None:
         """Register tools for subagent based on capability token."""
@@ -313,7 +374,7 @@ class SubagentManager:
 <duration_seconds>{progress.duration_seconds:.1f}</duration_seconds>
 <total_tokens>{progress.total_tokens}</total_tokens>
 <tool_uses>{progress.tool_use_count}</tool_uses>
-<output_file>{self.progress_manager.get_output_file(task_id)}</output_file>
+<output_file>{self.progress_manager.get_output_file(task_id) if self.progress_manager else 'N/A'}</output_file>
 </task_info>"""
 
         announce_content = f"""[Subagent '{label}' {status_text}]

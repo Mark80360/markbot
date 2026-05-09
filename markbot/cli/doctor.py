@@ -143,7 +143,9 @@ def check_all_providers_credentials(cfg: Config) -> list[str]:
     notes: list[str] = []
 
     for field_name in cfg.providers.model_fields:
-        provider_cfg = getattr(cfg.providers, field_name, None)
+        provider_cfg = cfg.providers.get_provider(field_name)
+        if provider_cfg is None:
+            provider_cfg = getattr(cfg.providers, field_name, None)
         if not isinstance(provider_cfg, ProviderConfig):
             continue
         if not provider_cfg.models:

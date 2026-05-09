@@ -89,10 +89,19 @@ class ProviderConfig(Base):
 
 
 class ProvidersConfig(Base):
-    """Configuration for LLM providers."""
+    """Configuration for LLM providers.
 
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
-    azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
+    Supports both named fields (for YAML/config file compatibility) and
+    dynamic dict-based provider registration.
+
+    Named providers (e.g. providers.anthropic) work as before.
+    Dynamic providers can be added at runtime via ``set_provider()``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    custom: ProviderConfig = Field(default_factory=ProviderConfig)
+    azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -101,21 +110,54 @@ class ProvidersConfig(Base):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
-    ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)
+    ovms: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
-    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
-    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
-    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
-    volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
-    byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
-    byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)
+    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)
+    siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)
+    volcengine: ProviderConfig = Field(default_factory=ProviderConfig)
+    volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
+    byteplus: ProviderConfig = Field(default_factory=ProviderConfig)
+    byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)
+    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)
+    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)
+
+    _dynamic_providers: dict[str, ProviderConfig] = {}
+
+    def get_provider(self, provider_id: str) -> ProviderConfig | None:
+        """Get a provider by ID, checking both named fields and dynamic providers."""
+        if hasattr(self, provider_id):
+            val = getattr(self, provider_id)
+            if isinstance(val, ProviderConfig):
+                return val
+        return self._dynamic_providers.get(provider_id)
+
+    def set_provider(self, provider_id: str, config: ProviderConfig) -> None:
+        """Register or update a provider dynamically.
+
+        For built-in provider names, updates the named field.
+        For custom names, stores in the dynamic dict.
+        """
+        if hasattr(self, provider_id) and isinstance(getattr(self, provider_id, None), ProviderConfig):
+            setattr(self, provider_id, config)
+        else:
+            self._dynamic_providers[provider_id] = config
+
+    def list_provider_ids(self) -> list[str]:
+        """List all available provider IDs (named + dynamic)."""
+        ids = []
+        for field_name in self.model_fields:
+            val = getattr(self, field_name, None)
+            if isinstance(val, ProviderConfig) and val.is_configured:
+                ids.append(field_name)
+        for pid in self._dynamic_providers:
+            if pid not in ids:
+                ids.append(pid)
+        return ids
 
 
 class HeartbeatConfig(Base):
@@ -399,12 +441,9 @@ class Config(BaseSettings):
 
         provider_id, model_id = model_ref.split("/", 1)
 
-        if not hasattr(self.providers, provider_id):
+        provider = self.providers.get_provider(provider_id)
+        if provider is None:
             raise ValueError(f"Provider '{provider_id}' not found in config")
-
-        provider = getattr(self.providers, provider_id)
-        if not isinstance(provider, ProviderConfig):
-            raise ValueError(f"Invalid provider config for '{provider_id}'")
 
         model = provider.get_model(model_id)
         if model is None:

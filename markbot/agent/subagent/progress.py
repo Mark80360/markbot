@@ -81,6 +81,59 @@ class SubagentProgress:
         return self.recent_activities[-1] if self.recent_activities else None
 
 
+class NullProgressTracker:
+    """No-op progress tracker used when SubagentProgressManager is unavailable.
+
+    Implements the same async interface as ProgressTracker so callers
+    don't need None checks.
+    """
+
+    def __init__(self, task_id: str = "") -> None:
+        self.task_id = task_id
+        self._progress = SubagentProgress(task_id=task_id or "null")
+
+    async def start(self, description: str = "") -> Optional[Path]:
+        return None
+
+    async def record_tool_use(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def record_tokens(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        pass
+
+    async def update_summary(self, summary: str = "") -> None:
+        pass
+
+    async def complete(self, result: str = "") -> None:
+        self._progress.status = "completed"
+        self._progress.end_time = time.time()
+
+    async def fail(self, error: str = "") -> None:
+        self._progress.status = "failed"
+        self._progress.end_time = time.time()
+
+    async def cancel(self) -> None:
+        self._progress.status = "cancelled"
+        self._progress.end_time = time.time()
+
+    def get_progress(self) -> SubagentProgress:
+        return SubagentProgress(
+            task_id=self._progress.task_id,
+            tool_use_count=self._progress.tool_use_count,
+            input_tokens=self._progress.input_tokens,
+            output_tokens=self._progress.output_tokens,
+            recent_activities=[],
+            summary=self._progress.summary,
+            status=self._progress.status,
+            start_time=self._progress.start_time,
+            end_time=self._progress.end_time,
+        )
+
+    @property
+    def output_file(self) -> Optional[Path]:
+        return None
+
+
 class ProgressTracker:
     """Tracks progress for a single subagent task."""
     

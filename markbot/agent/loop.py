@@ -6,60 +6,23 @@ Refactored to use new core types and skill system inspired by MarkBot.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from markbot.agent.compact import (
-    CompactAction,
-    CompactionConfig,
-    MultiLevelCompactor,
-    is_prompt_too_long_error,
-    offload_tool_output,
-)
-from markbot.agent.context import ContextBuilder
-from markbot.agent.cost import BudgetExceededError, CostTracker, PricingTable
-from markbot.agent.hooks.bootstrap import BootstrapHook
-from markbot.agent.hooks.compaction import MemoryCompactionHook
-from markbot.agent.mcp.manager import McpManager
-from markbot.agent.pipeline.engine import MessagePipeline, ProcessContext
-from markbot.agent.pipeline.middleware import (
-    MemoryLifecycleMiddleware,
-    QuestionResponseMiddleware,
-)
-from markbot.agent.services.executor import ToolExecutor
-from markbot.agent.services.interaction import InteractionLogger
-from markbot.agent.stream import StreamFilter
-from markbot.agent.subagent import SubagentManager
-from markbot.agent.tokens import token_count_with_estimation
-from markbot.agent.tool_binder import ToolBinder
+from markbot.agent.compact import CompactionConfig
+from markbot.agent.container import AgentContext
+from markbot.agent.pipeline.engine import ProcessContext
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.cli.slash_commands import CommandContext, CommandRouter, register_builtin_commands
-from markbot.memory.daily_log import DailyLogManager
-from markbot.memory.manager import ReMeLightMemoryManager
-from markbot.session.session import SessionManager
-from markbot.skills import SkillRegistry
-from markbot.skills.core.guardrail import SkillGuardrailManager
+from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
-from markbot.tools.registry import ToolRegistry
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
-from markbot.utils.helpers import strip_think
-
-if TYPE_CHECKING:
-    from markbot.config.schema import (
-        ChannelsConfig,
-        ExecToolConfig,
-        FilesystemToolConfig,
-        WebSearchConfig,
-    )
-    from markbot.schedule.cron import CronService
 
 
 class AgentLoop:
@@ -76,234 +39,114 @@ class AgentLoop:
 
     def __init__(
         self,
-        bus: MessageBus,
-        fallback_manager,
+        ctx_or_bus: AgentContext | MessageBus,
+        fallback_manager=None,
         config=None,
         workspace: Path | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
-        web_search_config: WebSearchConfig | None = None,
+        web_search_config=None,
         web_proxy: str | None = None,
-        exec_config: ExecToolConfig | None = None,
-        filesystem_config: FilesystemToolConfig | None = None,
+        exec_config=None,
+        filesystem_config=None,
         memory_config=None,
-        cron_service: CronService | None = None,
+        cron_service=None,
         restrict_to_workspace: bool = False,
-        session_manager: SessionManager | None = None,
+        session_manager=None,
         mcp_servers: dict | None = None,
-        channels_config: ChannelsConfig | None = None,
+        channels_config=None,
         timezone: str | None = None,
         compaction_config: CompactionConfig | None = None,
         max_budget_usd: float | None = None,
         warn_threshold_usd: float = 0.5,
         budget_config=None,
     ):
-        _init_start = time.time()
-        logger.info("[AgentLoop] Starting initialization...")
-
-        self.bus = bus
-        self.channels_config = channels_config
-        self.fallback_manager = fallback_manager
-        self.config = config
-        self.workspace = workspace
-
-        _t0 = time.time()
-        self._primary_provider_config = None
-        if config and config.primary_model_ref:
-            primary_provider, primary_model = config.resolve_model(config.primary_model_ref)
-            self.model = primary_model.name
-            self._primary_provider_config = primary_provider
+        if isinstance(ctx_or_bus, AgentContext):
+            self._init_from_context(ctx_or_bus)
         else:
-            self.model = "unknown"
-        logger.debug("[AgentLoop] Model resolution took {:.3f}s", time.time() - _t0)
+            ctx = AgentContext.from_legacy_params(
+                bus=ctx_or_bus,
+                fallback_manager=fallback_manager,
+                config=config,
+                workspace=workspace,
+                max_iterations=max_iterations,
+                context_window_tokens=context_window_tokens,
+                web_search_config=web_search_config,
+                web_proxy=web_proxy,
+                exec_config=exec_config,
+                filesystem_config=filesystem_config,
+                memory_config=memory_config,
+                cron_service=cron_service,
+                restrict_to_workspace=restrict_to_workspace,
+                session_manager=session_manager,
+                mcp_servers=mcp_servers,
+                channels_config=channels_config,
+                timezone=timezone,
+                compaction_config=compaction_config,
+                max_budget_usd=max_budget_usd,
+                warn_threshold_usd=warn_threshold_usd,
+                budget_config=budget_config,
+            )
+            self._init_from_context(ctx)
 
-        self.max_iterations = max_iterations
-        self.context_window_tokens = context_window_tokens
-        self.web_search_config = web_search_config or WebSearchConfig()
-        self.web_proxy = web_proxy
-        self.exec_config = exec_config or ExecToolConfig()
-        self.filesystem_config = filesystem_config or FilesystemToolConfig()
+    def _init_from_context(self, ctx: AgentContext) -> None:
+        _init_start = time.time()
+        logger.info("[AgentLoop] Starting initialization from AgentContext...")
 
-        from markbot.config.schema import MemoryToolsConfig, CodeExecutionConfig
+        self.ctx = ctx
+        self.bus = ctx.bus
+        self.channels_config = ctx.channels_config
+        self.fallback_manager = ctx.fallback_manager
+        self.config = ctx.config
+        self.workspace = ctx.workspace
+        self.model = ctx.model
+        self.max_iterations = ctx.max_iterations
+        self.context_window_tokens = ctx.context_window_tokens
+        self.web_search_config = ctx.web_search_config
+        self.web_proxy = ctx.web_proxy
+        self.exec_config = ctx.exec_config
+        self.filesystem_config = ctx.filesystem_config
+        self.memory_config = ctx.memory_config
+        self.code_execution_config = ctx.code_execution_config
+        self.cron_service = ctx.cron_service
+        self.restrict_to_workspace = ctx.restrict_to_workspace
 
-        self.memory_config = memory_config or MemoryToolsConfig()
-        self.code_execution_config = getattr(
-            config.tools if config else None, "code_execution", None
-        ) or CodeExecutionConfig()
-
-        self.cron_service = cron_service
-        self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._last_context_tokens: int = 0
 
-        _compaction_cfg = compaction_config or CompactionConfig()
-        self.compactor = MultiLevelCompactor(
-            fallback_manager=fallback_manager, config=_compaction_cfg
-        )
-        _pricing: PricingTable | None = None
-        if budget_config and getattr(budget_config, "custom_pricing", None):
-            from markbot.agent.cost import ModelPricing as _MP
-
-            _custom = {k: _MP(**v) for k, v in budget_config.custom_pricing.items()}
-            _pricing = PricingTable(custom=_custom)
-        self.cost_tracker = CostTracker(
-            max_budget_usd=max_budget_usd,
-            warn_threshold_usd=warn_threshold_usd,
-            pricing=_pricing,
-        )
-
-        _t0 = time.time()
-        self.tools = ToolRegistry()
-        logger.debug("[AgentLoop] ToolRegistry init took {:.3f}s", time.time() - _t0)
-
-        _t0 = time.time()
-        self.skill_registry = SkillRegistry(workspace, tool_registry=self.tools)
-        self.skill_registry.load_all()
-        logger.debug("[AgentLoop] SkillRegistry load_all took {:.3f}s", time.time() - _t0)
-
-        # Skill execution guardrail manager — validates tool calls against
-        # active skill constraints. SkillTool auto-activates its guardrail
-        # on execution.
-        self.guardrail_manager = SkillGuardrailManager(context="main")
-
-        _t0 = time.time()
-        self.sessions = session_manager or SessionManager(workspace)
-        self.subagents = SubagentManager(
-            fallback_manager=fallback_manager,
-            config=config,
-            workspace=workspace,
-            bus=bus,
-            model=self.model,
-            web_search_config=self.web_search_config,
-            web_proxy=web_proxy,
-            exec_config=self.exec_config,
-            filesystem_config=self.filesystem_config,
-            restrict_to_workspace=restrict_to_workspace,
-            cost_tracker=self.cost_tracker,
-        )
-        logger.debug("[AgentLoop] SubagentManager init took {:.3f}s", time.time() - _t0)
+        self.compactor = ctx.compactor
+        self.cost_tracker = ctx.cost_tracker
+        self.tools = ctx.tools
+        self.skill_registry = ctx.skill_registry
+        self.guardrail_manager = ctx.guardrail_manager
+        self.sessions = ctx.sessions
+        self.subagents = ctx.subagents
 
         self._running = False
-        self.mcp = McpManager(mcp_servers)
-        self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self.mcp = ctx.mcp
+        self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
 
-        memory_cfg = self.memory_config
-        embedding_config = {}
-        if memory_cfg:
-            embedding_config = {
-                "backend": getattr(memory_cfg, "embedding_backend", "openai"),
-                "api_key": getattr(memory_cfg, "embedding_api_key", ""),
-                "base_url": getattr(memory_cfg, "embedding_base_url", ""),
-                "model_name": getattr(memory_cfg, "embedding_model_name", ""),
-            }
-
-        llm_config = {
-            "backend": "openai",
-            "api_key": getattr(self._primary_provider_config, 'api_key', '') or "",
-            "base_url": getattr(self._primary_provider_config, 'api_base', '') or "",
-            "model_name": self.model,
-        }
-
-        _t0 = time.time()
-        self.memory_manager = ReMeLightMemoryManager(
-            working_dir=str(workspace),
-            agent_id="markbot",
-            fallback_manager=fallback_manager,
-            model=self.model,
-            embedding_config=embedding_config,
-            llm_config=llm_config,
-            language="zh",
-            timezone=timezone,
-            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
-            memory_compact_ratio=getattr(memory_cfg, "memory_compact_ratio", 0.75),
-            memory_reserve_ratio=getattr(memory_cfg, "memory_reserve_ratio", 0.1),
-            compact_with_thinking_block=True,
-            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
-            force_memory_search=getattr(memory_cfg, "force_memory_search", False),
-            force_max_results=getattr(memory_cfg, "force_max_results", 1),
-            force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
-        )
-        logger.info("[AgentLoop] Memory manager initialized (ReMeLight) took {:.3f}s", time.time() - _t0)
-
-        self.bootstrap_hook = BootstrapHook(
-            working_dir=workspace,
-            language="zh",
-        )
-
-        memory_compact_threshold = int(context_window_tokens * 0.75)
-        self.compaction_hook = MemoryCompactionHook(
-            memory_manager=self.memory_manager,
-            memory_compact_threshold=memory_compact_threshold,
-            memory_compact_reserve=getattr(memory_cfg, "memory_compact_reserve", 10000),
-            context_compact_enabled=getattr(memory_cfg, "context_compact_enabled", True),
-            memory_summary_enabled=getattr(memory_cfg, "memory_summary_enabled", True),
-        )
-
-        _system_prompt_token_budget = 16_000
-        if compaction_config and hasattr(compaction_config, "system_prompt_token_budget"):
-            _system_prompt_token_budget = compaction_config.system_prompt_token_budget
-
-        self.context = ContextBuilder(
-            workspace,
-            timezone=timezone,
-            tool_registry=self.tools,
-            skill_registry=self.skill_registry,
-            memory_manager=self.memory_manager,
-            system_prompt_token_budget=_system_prompt_token_budget,
-        )
-        _allowed_dir = workspace if restrict_to_workspace else None
-        _t0 = time.time()
-        binder = ToolBinder(
-            self.tools,
-            workspace=workspace,
-            allowed_dir=_allowed_dir,
-            web_search_config=self.web_search_config,
-            web_proxy=web_proxy,
-            exec_config=self.exec_config,
-            filesystem_config=self.filesystem_config,
-            code_execution_config=self.code_execution_config,
-            cron_service=cron_service,
-            subagent_manager=self.subagents,
-            memory_manager=self.memory_manager,
-            skill_registry=self.skill_registry,
-            timezone=timezone,
-            publish_outbound=self.bus.publish_outbound,
-        )
-        binder.register_all()
-        logger.debug("[AgentLoop] ToolBinder register_all took {:.3f}s", time.time() - _t0)
-        self._memory_search_tool = binder.memory_search_tool
-        self.question_tool = binder.question_tool
+        self.memory_manager = ctx.memory_manager
+        self.bootstrap_hook = ctx.bootstrap_hook
+        self.compaction_hook = ctx.compaction_hook
+        self.context = ctx.context_builder
+        self._memory_search_tool = ctx.memory_search_tool
+        self.question_tool = ctx.question_tool
 
         logger.info("[AgentLoop] Agent has {} tools available", len(self.tools))
-        self.commands = CommandRouter()
-        register_builtin_commands(self.commands)
-
-        self.tool_executor = ToolExecutor(self.tools)
-        self._setup_pipeline()
+        self.commands = ctx.commands
+        self.tool_executor = ctx.tool_executor
+        self.pipeline = ctx.pipeline
+        self._daily_log = ctx.daily_log
+        self._interaction_log = ctx.interaction_log
 
         logger.info("[AgentLoop] Initialization complete, total took {:.3f}s", time.time() - _init_start)
-
-    def _setup_pipeline(self) -> None:
-        """Initialize the message processing pipeline with middleware."""
-        self.pipeline = MessagePipeline()
-        self.pipeline.use(QuestionResponseMiddleware(get_question_tool=lambda: self.question_tool))
-        self._daily_log = DailyLogManager(workspace=self.workspace)
-        self._interaction_log = InteractionLogger()
-        if hasattr(self.memory_manager, "_daily_log_manager"):
-            self.memory_manager._daily_log_manager = self._daily_log
-        self.pipeline.use(
-            MemoryLifecycleMiddleware(
-                memory_manager=self.memory_manager,
-                daily_log=self._daily_log,
-                session_manager=self.sessions,
-            )
-        )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -353,437 +196,18 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
-        """Run the agent iteration loop.
+        from markbot.agent.iteration import IterationRunner
 
-        *on_stream*: called with each content delta during streaming.
-        *on_stream_end(resuming)*: called when a streaming session finishes.
-        ``resuming=True`` means tool calls follow (spinner should restart);
-        ``resuming=False`` means this is the final response.
-        """
-        messages = initial_messages
-        _initial_count = len(initial_messages)
-        iteration = 0
-        final_content = None
-        tools_used: list[str] = []
-        _budget_exceeded = False
-        _new_msg_start = _initial_count
-        _stream_finalized = False
-
-        logger.info(
-            "[AgentLoop] Starting agent loop with {} initial messages", len(initial_messages)
+        runner = IterationRunner(
+            loop=self,
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            on_progress=on_progress,
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
         )
-
-        # Wrap on_stream with stateful think-tag filter so downstream
-        # consumers (CLI, channels) never see  <think>  blocks.
-        _stream_filter = StreamFilter(on_stream)
-
-        while iteration < self.max_iterations:
-            iteration += 1
-            logger.info(
-                "[AgentLoop] === Iteration {}/{} (channel={}, chat_id={}) ===",
-                iteration,
-                self.max_iterations,
-                channel,
-                chat_id,
-            )
-            logger.info("[AgentLoop] Current message count: {}", len(messages))
-
-            current_tokens = token_count_with_estimation(messages)
-            logger.debug("[AgentLoop] Estimated context tokens: {}", current_tokens)
-
-            task_context = self._gather_task_context()
-
-            messages, compact_result = await self.compactor.maybe_compact(
-                messages, current_tokens, self.context_window_tokens,
-                task_context=task_context,
-            )
-            if compact_result.action != CompactAction.NONE:
-                logger.info(
-                    "[AgentLoop] Compaction applied: action={}, "
-                    "messages: {} -> {}, tokens: {} -> {}{}",
-                    compact_result.action.value,
-                    compact_result.messages_before,
-                    compact_result.messages_after,
-                    compact_result.tokens_before,
-                    compact_result.tokens_after,
-                    f", summary={compact_result.summary[:100]}..."
-                    if compact_result.summary
-                    else "",
-                )
-                current_tokens = compact_result.tokens_after
-                if len(messages) < _new_msg_start:
-                    _new_msg_start = self._recalc_new_msg_start_after_compact(
-                        messages, _initial_count, _new_msg_start,
-                    )
-
-            if iteration == 1:
-                if self._memory_search_tool:
-                    try:
-                        user_text = ""
-                        for m in reversed(messages):
-                            if m.get("role") == "user":
-                                content = m.get("content", "")
-                                if content is None:
-                                    content = ""
-                                if isinstance(content, list):
-                                    for block in content:
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            block_text = block.get("text", "")
-                                            if block_text is None:
-                                                block_text = ""
-                                            user_text += block_text
-                                elif isinstance(content, str):
-                                    user_text = content
-                                if user_text:
-                                    break
-                        if user_text:
-                            forced_ctx = await self._memory_search_tool.get_forced_context(user_text)
-                            if forced_ctx:
-                                sys_idx = next(
-                                    (i for i, m in enumerate(messages) if m.get("role") == "system"),
-                                    None,
-                                )
-                                if sys_idx is not None:
-                                    messages[sys_idx]["content"] = (
-                                        messages[sys_idx]["content"] + "\n\n" + forced_ctx
-                                    )
-                                    logger.info("[AgentLoop] Forced memory search context injected")
-                    except Exception as e:
-                        logger.warning(f"[AgentLoop] Forced memory search failed: {e}")
-
-            tool_defs = self.tools.get_definitions()
-            logger.debug(
-                "[AgentLoop] Available tools: {}",
-                [t.get("function", {}).get("name") for t in tool_defs[:5]],
-            )
-
-            messages = self._strip_orphan_tool_results(messages)
-
-            if current_tokens > self.context_window_tokens * 0.6:
-                _skip_context_compact = compact_result.action in (
-                    CompactAction.AUTO_COMPACT,
-                    CompactAction.HISTORY_SNIP,
-                )
-                system_msg = next(
-                    (m.get("content", "") for m in messages if m.get("role") == "system"), ""
-                )
-                new_summary = await self.compaction_hook(
-                    messages=messages,
-                    system_prompt=system_msg,
-                    skip_context_compact=_skip_context_compact,
-                    channel=channel,
-                    chat_id=chat_id,
-                )
-                if new_summary:
-                    logger.info("[AgentLoop] Memory compaction applied, summary updated")
-
-            try:
-                if on_stream:
-                    logger.info("[AgentLoop] Calling LLM with streaming...")
-                    response, attempts = await self.fallback_manager.chat_stream_with_fallback(
-                        messages=messages,
-                        tools=tool_defs,
-                        on_content_delta=_stream_filter,
-                    )
-                else:
-                    logger.info("[AgentLoop] Calling LLM without streaming...")
-                    response, attempts = await self.fallback_manager.chat_with_fallback(
-                        messages=messages,
-                        tools=tool_defs,
-                    )
-            except Exception as llm_exc:
-                if is_prompt_too_long_error(llm_exc):
-                    logger.warning("[AgentLoop] Prompt-too-long error, attempting reactive compaction")
-                    reactive_result = await self.compactor.reactive_compact(
-                        messages, self.context_window_tokens, llm_exc,
-                        task_context=task_context,
-                    )
-                    if reactive_result is not None:
-                        messages, compact_result_ptl = reactive_result
-                        current_tokens = compact_result_ptl.tokens_after
-                        if len(messages) < _new_msg_start:
-                            _new_msg_start = self._recalc_new_msg_start_after_compact(
-                                messages, _initial_count, _new_msg_start,
-                            )
-                        logger.info(
-                            "[AgentLoop] Reactive compaction applied: {} -> {} tokens",
-                            compact_result_ptl.tokens_before,
-                            compact_result_ptl.tokens_after,
-                        )
-                        try:
-                            if on_stream:
-                                response, attempts = await self.fallback_manager.chat_stream_with_fallback(
-                                    messages=messages,
-                                    tools=tool_defs,
-                                    on_content_delta=_stream_filter,
-                                )
-                            else:
-                                response, attempts = await self.fallback_manager.chat_with_fallback(
-                                    messages=messages,
-                                    tools=tool_defs,
-                                )
-                        except Exception as retry_exc:
-                            logger.error("[AgentLoop] LLM call failed after reactive compaction: {}", retry_exc)
-                            final_content = "Sorry, the conversation context became too large and compaction was unable to reduce it enough. Please start a new session or simplify your request."
-                            break
-                    else:
-                        logger.error("[AgentLoop] LLM call failed (not a PTL error): {}", llm_exc)
-                        final_content = f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
-                        break
-                else:
-                    logger.error("[AgentLoop] LLM call failed: {}", llm_exc)
-                    final_content = f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
-                    break
-
-            logger.info(
-                "[AgentLoop] LLM response received: finish_reason={}, has_tool_calls={}, content_length={}",
-                response.finish_reason,
-                response.has_tool_calls,
-                len(response.content or ""),
-            )
-
-            # Use the actual model from the successful fallback attempt for correct billing
-            _actual_model = self.model
-            for _a in reversed(attempts):
-                if _a.success and _a.model:
-                    _actual_model = _a.model.name
-                    break
-
-            self._interaction_log.log_interaction(
-                iteration=iteration,
-                messages=messages,
-                tool_defs=tool_defs,
-                response=response,
-                model=_actual_model,
-                channel=channel,
-                chat_id=chat_id,
-                tokens_before=current_tokens,
-            )
-
-            usage = response.usage or {}
-            self._last_usage = {
-                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-                "total_tokens": int(usage.get("total_tokens", 0) or 0),
-                "cache_creation_input_tokens": int(
-                    usage.get("cache_creation_input_tokens", 0) or 0
-                ),
-                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
-            }
-            self._last_context_tokens = current_tokens
-
-            try:
-                call_cost = self.cost_tracker.update_from_response(response, model=_actual_model)
-                if call_cost > 0:
-                    logger.debug("[AgentLoop] API cost this call: ${:.6f}", call_cost)
-            except BudgetExceededError as exc:
-                logger.error("[AgentLoop] Budget exceeded: {}. Stopping loop early.", exc)
-                _budget_exceeded = True
-                break
-
-            if response.has_tool_calls:
-                logger.info(
-                    "[AgentLoop] LLM requested {} tool call(s): {}",
-                    len(response.tool_calls),
-                    [tc.name for tc in response.tool_calls],
-                )
-
-                if on_stream and on_stream_end:
-                    await on_stream_end(resuming=True)
-                    _stream_filter.reset()
-
-                if on_progress:
-                    if not on_stream:
-                        thought = strip_think(response.content) or None
-                        if thought:
-                            await on_progress(thought)
-                    tool_hint = self._tool_hint(response.tool_calls)
-                    tool_hint = strip_think(tool_hint) or None
-                    await on_progress(tool_hint, tool_hint=True)
-
-                tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
-                messages = self.context.add_assistant_message(
-                    messages,
-                    response.content,
-                    tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-                logger.debug(
-                    "[AgentLoop] Added assistant message with tool calls, total messages: {}",
-                    len(messages),
-                )
-
-                for tc in response.tool_calls:
-                    tools_used.append(tc.name)
-                    args_str = json.dumps(tc.arguments, ensure_ascii=False)
-                    safe_args = args_str[:200].replace("{", "{{").replace("}", "}}")
-                    logger.info("Tool call: {}({})", tc.name, safe_args)
-
-                # Re-bind tool context right before execution so that
-                # concurrent sessions don't clobber each other's routing.
-                self._set_tool_context(channel, chat_id, message_id)
-
-                # Guardrail check: validate tool calls against active skill constraints.
-                # Also auto-activate guardrails when a skill tool is called.
-                for tc in response.tool_calls:
-                    # Auto-activate guardrail for skill script calls
-                    if "." in tc.name:
-                        skill_name = tc.name.split(".", 1)[0]
-                        skill_def = self.skill_registry.get(skill_name)
-                        if skill_def and skill_name not in self.guardrail_manager.active_skills:
-                            self.guardrail_manager.start_guarding(skill_def)
-                            logger.info("Guardrail activated for skill: {}", skill_name)
-
-                    violations = self.guardrail_manager.check_all(tc.name, tc.arguments)
-                    for v in violations:
-                        logger.warning(
-                            "Guardrail violation [{}] {} (tool: {}, skill: {})",
-                            v.severity.upper(),
-                            v.message,
-                            tc.name,
-                            getattr(v, 'tool_name', 'unknown'),
-                        )
-
-                # Execute all tool calls concurrently — the LLM batches
-                # independent calls in a single response on purpose.
-                # return_exceptions=True ensures all results are collected
-                # even if one tool is cancelled or raises BaseException.
-                logger.info("[AgentLoop] Executing {} tool calls...", len(response.tool_calls))
-
-                _tool_ctx = ToolContext(
-                    session_id=f"{channel}:{chat_id}",
-                    workspace=str(self.workspace),
-                    permission_mode=PermissionMode.AUTO,
-                    tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
-                    is_non_interactive=False,
-                    channel=channel,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                )
-                results = await asyncio.gather(
-                    *(
-                        self.tools.execute(tc.name, tc.arguments, context=_tool_ctx)
-                        for tc in response.tool_calls
-                    ),
-                    return_exceptions=True,
-                )
-                logger.info("[AgentLoop] Tool execution completed, {} results", len(results))
-
-                for idx, (tool_call, result) in enumerate(zip(response.tool_calls, results)):
-                    if isinstance(result, BaseException):
-                        logger.error(
-                            "[AgentLoop] Tool {} failed with exception: {}", tool_call.name, result
-                        )
-                        result = f"Error: {type(result).__name__}: {result}"
-                    else:
-                        result_str = str(result)
-                        if len(result_str) > self.compactor.config.tool_output_inline_chars:
-                            inline, artifact_path = offload_tool_output(
-                                result_str,
-                                tool_call.name,
-                                tool_call.id,
-                                inline_limit=self.compactor.config.tool_output_inline_chars,
-                                preview_chars=self.compactor.config.tool_output_preview_chars,
-                            )
-                            if artifact_path:
-                                logger.info(
-                                    "[AgentLoop] Tool {} output offloaded to {} ({} chars)",
-                                    tool_call.name, artifact_path, len(result_str),
-                                )
-                                result = inline
-                            else:
-                                result_preview = (
-                                    result_str[:100] + "..." if len(result_str) > 100 else result_str
-                                )
-                                safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                                logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
-                        else:
-                            result_preview = (
-                                result_str[:100] + "..." if len(result_str) > 100 else result_str
-                            )
-                            safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                            logger.info("[AgentLoop] Tool {} result: {}", tool_call.name, safe_preview)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                logger.info(
-                    "[AgentLoop] Added {} tool results to messages, continue to next iteration",
-                    len(results),
-                )
-            else:
-                logger.info("[AgentLoop] LLM returned final response (no tool calls)")
-                if on_stream and on_stream_end:
-                    await on_stream_end(resuming=False)
-                    _stream_filter.reset()
-                    _stream_finalized = True
-
-                clean = strip_think(response.content) or None
-                if response.finish_reason == "error":
-                    safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
-                    logger.error("[AgentLoop] LLM returned error finish_reason: {}", safe_clean)
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
-                    break
-                messages = self.context.add_assistant_message(
-                    messages,
-                    clean,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-                final_content = clean
-                logger.info("[AgentLoop] Final response captured, length={}", len(clean or ""))
-                break
-
-        if final_content is None and _budget_exceeded:
-            cost_summary = self.cost_tracker.get_summary()
-            final_content = (
-                f"Budget limit reached (${cost_summary['total_cost_usd']:.4f} / "
-                f"${cost_summary['budget_limit_usd']:.2f}). "
-                "I've stopped to avoid exceeding the spending limit. "
-                "You can increase the budget or break the task into smaller steps."
-            )
-        elif final_content is None and iteration >= self.max_iterations:
-            logger.warning("[AgentLoop] Max iterations ({}) reached", self.max_iterations)
-            final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
-            )
-
-        if on_stream and on_stream_end and not _stream_finalized:
-            if final_content:
-                await on_stream(final_content)
-            await on_stream_end(resuming=False)
-            _stream_filter.reset()
-            _stream_finalized = True
-
-        logger.info(
-            "[AgentLoop] Loop ended: iterations={}, tools_used={}, has_final_content={}",
-            iteration,
-            len(tools_used),
-            final_content is not None,
-        )
-
-        token_summary = self.cost_tracker.get_token_summary()
-        logger.info(
-            "[AgentLoop] Token usage - Total: input={}, output={}, cache_creation={}, cache_read={}",
-            token_summary["total"]["input_tokens"],
-            token_summary["total"]["output_tokens"],
-            token_summary["total"]["cache_creation_input_tokens"],
-            token_summary["total"]["cache_read_input_tokens"],
-        )
-
-        cost_summary = self.cost_tracker.get_summary()
-        logger.info(
-            "[AgentLoop] Cost - total=${:.6f}, calls={}, budget={}{}",
-            cost_summary["total_cost_usd"],
-            cost_summary["total_api_calls"],
-            f"${cost_summary['budget_limit_usd']}"
-            if cost_summary["budget_limit_usd"]
-            else "unlimited",
-            ", OVER BUDGET" if cost_summary["over_budget"] else "",
-        )
-
-        return final_content, tools_used, messages, _new_msg_start
+        return await runner.run(initial_messages)
 
     def _gather_task_context(self) -> str:
         max_task_context_chars = 2000
