@@ -507,6 +507,7 @@ class AgentContext:
 
         timings["total"] = time.time() - _init_start
         logger.info("[AgentContext] Initialization complete, total took {:.3f}s", timings["total"])
+        logger.info("[AgentContext] Timings breakdown:\n%s", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
 
         return cls(
             config=config,

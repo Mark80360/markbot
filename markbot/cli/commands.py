@@ -1118,6 +1118,8 @@ def agent(
 
     _t0 = time.time()
     logger.info("[CLI] Creating AgentLoop...")
+    import time as _cli_time
+    _cli_t0 = _cli_time.time()
     agent_loop = AgentLoop(
         ctx_or_bus=bus,
         fallback_manager=provider,
@@ -1140,7 +1142,12 @@ def agent(
         warn_threshold_usd=config.budget.warn_threshold_usd,
         budget_config=config.budget if config.budget.enabled else None,
     )
+    _cli_elapsed = _cli_time.time() - _cli_t0
     logger.info("[CLI] AgentLoop created, took {:.3f}s", time.time() - _t0)
+    if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
+        logger.info("[CLI] AgentContext init breakdown:\n%s", agent_loop.ctx.init_summary)
+    else:
+        logger.warning("[CLI] No timing data available from AgentContext")
 
     # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None
