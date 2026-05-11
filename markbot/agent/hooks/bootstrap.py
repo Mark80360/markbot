@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from ..base import BaseMemoryManager
+    from markbot.memory.base import BaseMemoryManager
 
 
 class BootstrapHook:

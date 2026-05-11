@@ -376,6 +376,24 @@ def truncate_head_for_ptl_retry(
 class MultiLevelCompactor:
     """4-tier progressive conversation compaction.
 
+    **Scope**: Immediate context-window pressure relief.
+    This compactor operates on the *in-flight message list* to keep
+    the current conversation within the model's token limit.  It does
+    NOT touch long-term memory (MEMORY.md, compressed_summary).
+
+    **Coordination with MemoryCompactionHook**:
+    After this compactor applies AUTO_COMPACT or HISTORY_SNIP, the
+    iteration runner sets ``skip_context_compact=True`` when calling
+    MemoryCompactionHook, so that hook only triggers async summary
+    archival (Phase 1) and skips its own context compaction (Phase 2),
+    avoiding redundant LLM summarization calls.
+
+    Tier strategy (cheapest first):
+      Level 1: Context Collapse  — Truncate oversized tool_result blocks
+      Level 2: Micro-Compact      — Remove old tool_result content
+      Level 3: Auto-Compaction    — LLM generates summary to replace old history
+      Level 4: History Snip       — Force-drop oldest messages (last resort)
+
     Usage:
         compactor = MultiLevelCompactor(fallback_manager=fallback_manager)
         result = await compactor.maybe_compact(messages, current_tokens, max_tokens)

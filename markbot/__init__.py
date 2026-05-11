@@ -1,6 +1,6 @@
 """
-MarkBot - A lightweight AI agent framework
+MarkBot - An advanced AI-powered automation and development assistant designed for developers and power users. 
 """
 
-__version__ = "2.2.9"
+__version__ = "2.2.10"
 __logo__ = "🦞"

@@ -2,6 +2,11 @@
 
 Each phase is a separate method, making the loop logic testable and
 extensible without touching the 400+ line method directly.
+
+Enhanced with:
+- Session handoff generation on loop finalization
+- Session bootstrap validation on first iteration
+- Active memory encoding on loop finalization
 """
 
 from __future__ import annotations
@@ -9,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -17,6 +22,7 @@ from markbot.agent.compact import CompactAction, is_prompt_too_long_error, offlo
 from markbot.agent.cost import BudgetExceededError
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
+from markbot.session.handoff import build_handoff_from_session
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
 from markbot.utils.helpers import strip_think
@@ -66,6 +72,7 @@ class IterationRunner:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        session_key: str | None = None,
     ) -> None:
         self.loop = loop
         self.channel = channel
@@ -74,7 +81,9 @@ class IterationRunner:
         self.on_progress = on_progress
         self.on_stream = on_stream
         self.on_stream_end = on_stream_end
+        self.session_key = session_key or f"{channel}:{chat_id}"
         self._stream_filter = StreamFilter(on_stream)
+        self._bootstrap_report: Any | None = None
 
     async def run(
         self,
@@ -117,6 +126,7 @@ class IterationRunner:
         await self._phase_compact(state)
         if state.iteration == 1:
             await self._phase_inject_memory_context(state)
+            await self._phase_session_bootstrap(state)
 
         tool_defs = self.loop.tools.get_definitions()
         logger.debug(
@@ -229,9 +239,67 @@ class IterationRunner:
         if new_summary:
             logger.info("[IterationRunner] Memory compaction applied, summary updated")
 
+    async def _phase_session_bootstrap(self, state: LoopState) -> None:
+        bootstrap = getattr(self.loop, "session_bootstrap", None)
+        if bootstrap is None:
+            return
+        try:
+            report = await bootstrap.run(self.session_key)
+            self._bootstrap_report = report
+            if report.handoff_loaded or report.has_warnings or report.feature_list_loaded or report.init_sh_available:
+                context_block = report.to_context_block()
+                if context_block:
+                    sys_idx = next(
+                        (i for i, m in enumerate(state.messages) if m.get("role") == "system"),
+                        None,
+                    )
+                    if sys_idx is not None:
+                        state.messages[sys_idx]["content"] = (
+                            state.messages[sys_idx]["content"] + "\n\n" + context_block
+                        )
+                        logger.info(
+                            "[IterationRunner] Session bootstrap context injected "
+                            "(handoff={}, warnings={}, features={}, init_sh={})",
+                            report.handoff_loaded,
+                            len(report.warnings),
+                            report.feature_list_loaded,
+                            report.init_sh_available,
+                        )
+        except Exception as e:
+            logger.warning("[IterationRunner] Session bootstrap failed: {}", e)
+
+    def _phase_active_memory_encoding(self, state: LoopState) -> None:
+        encoder = getattr(self.loop, "memory_encoder", None)
+        if encoder is None:
+            return
+        try:
+            matches = encoder.scan_messages(state.messages)
+            if matches:
+                encoded = encoder.encode_preferences(matches)
+                if encoded > 0:
+                    logger.info(
+                        "[IterationRunner] Active memory encoding: {} new preferences",
+                        encoded,
+                    )
+        except Exception as e:
+            logger.debug("[IterationRunner] Active memory encoding failed: {}", e)
+
     async def _phase_call_llm(
         self, state: LoopState, tool_defs: list[dict]
     ) -> IterationResult | None:
+        # If a previous model returned content_filter, the stream buffer may be
+        # polluted. Discard it before starting a new LLM call.
+        if self.on_stream and self.on_stream_end and state.last_attempts:
+            had_content_filter = any(
+                getattr(a, "error", "") == "content_filter"
+                for a in state.last_attempts
+            )
+            if had_content_filter:
+                logger.info(
+                    "[IterationRunner] Discarding polluted stream buffer before new LLM call"
+                )
+                await self.on_stream_end(discard=True)
+                self._stream_filter.reset()
         try:
             if self.on_stream:
                 logger.info("[IterationRunner] Calling LLM with streaming...")
@@ -341,8 +409,8 @@ class IterationRunner:
 
         usage = response.usage or {}
         self.loop._last_usage = {
-            "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-            "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+            "prompt_tokens": int(usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0),
             "total_tokens": int(usage.get("total_tokens", 0) or 0),
             "cache_creation_input_tokens": int(
                 usage.get("cache_creation_input_tokens", 0) or 0
@@ -382,8 +450,20 @@ class IterationRunner:
         )
 
         if self.on_stream and self.on_stream_end:
-            await self.on_stream_end(resuming=True)
-            self._stream_filter.reset()
+            had_content_filter = any(
+                getattr(a, "error", "") == "content_filter"
+                for a in (state.last_attempts or [])
+            )
+            if had_content_filter:
+                logger.info(
+                    "[IterationRunner] Discarding polluted stream buffer "
+                    "(content_filter in fallback chain)"
+                )
+                await self.on_stream_end(resuming=True, discard=True)
+                self._stream_filter.reset()
+            else:
+                await self.on_stream_end(resuming=True)
+                self._stream_filter.reset()
 
         if self.on_progress:
             if not self.on_stream:
@@ -507,8 +587,25 @@ class IterationRunner:
         logger.info("[IterationRunner] LLM returned final response (no tool calls)")
 
         if self.on_stream and self.on_stream_end:
-            await self.on_stream_end(resuming=False)
-            self._stream_filter.reset()
+            had_content_filter = any(
+                getattr(a, "error", "") == "content_filter"
+                for a in (state.last_attempts or [])
+            )
+            if had_content_filter:
+                logger.info(
+                    "[IterationRunner] Discarding polluted stream buffer "
+                    "(content_filter in fallback chain)"
+                )
+                await self.on_stream_end(discard=True)
+                self._stream_filter.reset()
+                clean = strip_think(response.content) or None
+                if clean and response.finish_reason not in ("error", "content_filter"):
+                    await self._stream_filter(clean)
+                    await self.on_stream_end(resuming=False)
+                    self._stream_filter.reset()
+            else:
+                await self.on_stream_end(resuming=False)
+                self._stream_filter.reset()
             state.stream_finalized = True
 
         clean = strip_think(response.content) or None
@@ -516,6 +613,15 @@ class IterationRunner:
             safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
             logger.error("[IterationRunner] LLM returned error finish_reason: {}", safe_clean)
             state.final_content = clean or "Sorry, I encountered an error calling the AI model."
+            return IterationResult(should_break=True)
+        if response.finish_reason == "content_filter":
+            logger.warning(
+                "[IterationRunner] LLM returned content_filter (content safety block), "
+                "not saving filtered response to history"
+            )
+            state.final_content = (
+                "抱歉，模型的内容安全策略阻止了本次回复，请尝试换一种方式描述您的请求。"
+            )
             return IterationResult(should_break=True)
         state.messages = self.loop.context.add_assistant_message(
             state.messages,
@@ -580,3 +686,29 @@ class IterationRunner:
             else "unlimited",
             ", OVER BUDGET" if cost_summary["over_budget"] else "",
         )
+
+        self._phase_active_memory_encoding(state)
+
+        await self._phase_generate_handoff(state, cost_summary)
+
+    async def _phase_generate_handoff(self, state: LoopState, cost_summary: dict) -> None:
+        handoff_manager = getattr(self.loop, "handoff_manager", None)
+        if handoff_manager is None:
+            return
+        try:
+            handoff = build_handoff_from_session(
+                session_key=self.session_key,
+                messages=state.messages,
+                tools_used=state.tools_used,
+                cost_usd=cost_summary.get("total_cost_usd", 0.0),
+                task_tracker=getattr(self.loop, "task_tracker", None),
+                memory_manager=getattr(self.loop, "memory_manager", None),
+            )
+            handoff_manager.save(handoff)
+            logger.info(
+                "[IterationRunner] Session handoff saved: {} tasks, {} decisions",
+                len(handoff.active_tasks),
+                len(handoff.key_decisions),
+            )
+        except Exception as e:
+            logger.warning("[IterationRunner] Failed to generate session handoff: {}", e)

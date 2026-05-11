@@ -782,6 +782,8 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
             return False
         if record["name"] == "asyncio" and "selector" in msg.lower():
             return False
+        if record["name"].startswith("reme") and len(msg) > 2000:
+            record["message"] = msg[:2000] + "... [truncated]"
         return True
 
     _MAX_CONSOLE_MSG_LEN = 4000
@@ -1145,7 +1147,7 @@ def agent(
     _cli_elapsed = _cli_time.time() - _cli_t0
     logger.info("[CLI] AgentLoop created, took {:.3f}s", time.time() - _t0)
     if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
-        logger.info("[CLI] AgentContext init breakdown:\n%s", agent_loop.ctx.init_summary)
+        logger.info("[CLI] AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
     else:
         logger.warning("[CLI] No timing data available from AgentContext")
 

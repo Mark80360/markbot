@@ -17,16 +17,7 @@ from typing import Any
 
 from loguru import logger
 
-
-class BudgetExceededError(Exception):
-    """Raised when total cost exceeds the configured budget limit."""
-
-    def __init__(self, current_cost: float, budget: float) -> None:
-        self.current_cost = current_cost
-        self.budget = budget
-        super().__init__(
-            f"Budget exceeded: ${current_cost:.6f} > ${budget:.6f}"
-        )
+from markbot.types.exceptions import BudgetExceededError
 
 
 @dataclass

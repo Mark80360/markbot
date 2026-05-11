@@ -500,6 +500,15 @@ Dynamically load background info when you need more context:
                 except Exception as e:
                     logger.warning("Failed to load {}: {}", filename, e)
 
+        feature_path = self.workspace / "feature_list.json"
+        if feature_path.exists():
+            try:
+                content = feature_path.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(f"## feature_list.json\n\n```json\n{content}\n```")
+            except Exception as e:
+                logger.warning("Failed to load feature_list.json: {}", e)
+
         return "\n\n".join(parts) if parts else ""
 
     async def build_messages(

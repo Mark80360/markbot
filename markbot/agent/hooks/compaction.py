@@ -26,7 +26,7 @@ from loguru import logger
 from markbot.agent.tokens import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
-    from ..base import BaseMemoryManager
+    from markbot.memory.base import BaseMemoryManager
 
 MEMORY_COMPACT_KEEP_RECENT = 4
 
@@ -36,13 +36,26 @@ _COMPACTED_MARKER = "_markbot_compacted"
 class MemoryCompactionHook:
     """Hook for automatic memory archival when context is full.
 
+    **Scope**: Long-term memory archival and session-level compression.
+    This hook persists conversation knowledge into MEMORY.md (via async
+    summary tasks) and compresses older messages into ``compressed_summary``
+    (via ``memory_manager.compact_memory()``).  It does NOT truncate
+    tool results or drop messages — that is MultiLevelCompactor's job.
+
+    **Coordination with MultiLevelCompactor**:
+    Both systems may run in the same iteration.  When MultiLevelCompactor
+    has already performed aggressive compaction (AUTO_COMPACT / HISTORY_SNIP),
+    the iteration runner passes ``skip_context_compact=True`` so this hook
+    only runs Phase 1 (async summary archival) and skips Phase 2 (context
+    compaction), avoiding redundant LLM summarization.
+
     Two-phase operation:
     1. **Async summary archival** (always runs when messages need archiving):
        Schedules a background summary task via ``add_async_summary_task()``
        to persist conversation knowledge into MEMORY.md.
     2. **Context compaction** (skipped when MultiLevelCompactor already handled it):
        Compresses older messages into ``compressed_summary`` to free up
-       context window space. This is the "session-level" compression that
+       context window space.  This is the "session-level" compression that
        keeps the current conversation flowing.
 
     The ``skip_context_compact`` parameter allows the agent loop to

@@ -303,18 +303,34 @@ class OpenAICompatProvider(LLMProvider):
 
         usage_map = cls._maybe_mapping(usage_obj)
         if usage_map is not None:
-            return {
-                "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
-                "completion_tokens": int(usage_map.get("completion_tokens") or 0),
-                "total_tokens": int(usage_map.get("total_tokens") or 0),
+            pt = int(usage_map.get("prompt_tokens") or 0)
+            ct = int(usage_map.get("completion_tokens") or 0)
+            tt = int(usage_map.get("total_tokens") or 0)
+            result = {
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": tt,
+                "input_tokens": int(usage_map.get("input_tokens") or pt),
+                "output_tokens": int(usage_map.get("output_tokens") or ct),
+                "cache_creation_input_tokens": int(usage_map.get("cache_creation_input_tokens") or 0),
+                "cache_read_input_tokens": int(usage_map.get("cache_read_input_tokens") or 0),
             }
+            return result
 
         if usage_obj:
-            return {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
+            pt = getattr(usage_obj, "prompt_tokens", 0) or 0
+            ct = getattr(usage_obj, "completion_tokens", 0) or 0
+            tt = getattr(usage_obj, "total_tokens", 0) or 0
+            result = {
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": tt,
+                "input_tokens": getattr(usage_obj, "input_tokens", 0) or pt,
+                "output_tokens": getattr(usage_obj, "output_tokens", 0) or ct,
+                "cache_creation_input_tokens": getattr(usage_obj, "cache_creation_input_tokens", 0) or 0,
+                "cache_read_input_tokens": getattr(usage_obj, "cache_read_input_tokens", 0) or 0,
             }
+            return result
         return {}
 
     def _parse(self, response: Any) -> LLMResponse:
@@ -494,6 +510,9 @@ class OpenAICompatProvider(LLMProvider):
                 content_parts.append(delta.content)
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
+
+        if finish_reason == "content_filter":
+            content_parts = []
 
         return LLMResponse(
             content="".join(content_parts) or "",

@@ -125,6 +125,10 @@ class AgentContext:
     memory_search_tool: "MemorySearchTool | None" = None
     question_tool: "QuestionTool | None" = None
     message_tool: "MessageTool | None" = None
+    handoff_manager: Any = None
+    session_bootstrap: Any = None
+    task_tracker: Any = None
+    memory_encoder: Any = None
 
     _init_timings: dict[str, float] = field(default_factory=dict)
 
@@ -327,7 +331,11 @@ class AgentContext:
         )
         from markbot.memory.daily_log import DailyLogManager as _DLM
         from markbot.memory.manager import ReMeLightMemoryManager as _RML
+        from markbot.memory.encoder import MemoryEncoder as _ME
         from markbot.session.session import SessionManager as _SM2
+        from markbot.session.handoff import HandoffManager as _HM
+        from markbot.session.bootstrap import SessionBootstrap as _SB
+        from markbot.session.task_tracker import TaskTracker as _TT
         from markbot.skills import SkillRegistry as _SR
         from markbot.skills.core.guardrail import SkillGuardrailManager as _SGM
         from markbot.tools.registry import ToolRegistry as _TR
@@ -505,9 +513,21 @@ class AgentContext:
             )
         )
 
+        _t0 = time.time()
+        handoff_manager = _HM(workspace)
+        task_tracker = _TT(workspace)
+        memory_encoder = _ME(workspace)
+        session_bootstrap = _SB(
+            workspace,
+            handoff_manager=handoff_manager,
+            mcp_manager=mcp,
+            task_tracker=task_tracker,
+        )
+        timings["session_extensions"] = time.time() - _t0
+
         timings["total"] = time.time() - _init_start
         logger.info("[AgentContext] Initialization complete, total took {:.3f}s", timings["total"])
-        logger.info("[AgentContext] Timings breakdown:\n%s", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
+        logger.info("[AgentContext] Timings breakdown:\n{}", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
 
         return cls(
             config=config,
@@ -551,6 +571,10 @@ class AgentContext:
             interaction_log=interaction_log,
             memory_search_tool=_memory_search_tool,
             question_tool=question_tool,
+            handoff_manager=handoff_manager,
+            session_bootstrap=session_bootstrap,
+            task_tracker=task_tracker,
+            memory_encoder=memory_encoder,
             _init_timings=timings,
         )
 

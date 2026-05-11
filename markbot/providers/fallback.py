@@ -233,6 +233,22 @@ class FallbackManager:
                     self._record_failure(provider_name)
                     continue
 
+                if response.finish_reason == "content_filter":
+                    logger.warning(
+                        f"Model {model_ref} returned content_filter, trying next model..."
+                    )
+                    attempt = FallbackAttempt(
+                        model_ref=model_ref,
+                        provider=provider_config,
+                        model=model_config,
+                        success=False,
+                        error="content_filter",
+                    )
+                    attempts.append(attempt)
+                    last_error = Exception("content_filter")
+                    self._record_failure(provider_name)
+                    continue
+
                 self._record_success(provider_name)
                 attempt = FallbackAttempt(
                     model_ref=model_ref,

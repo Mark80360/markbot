@@ -8,19 +8,49 @@ read_when:
 
 > **重要**: 遇到困难时，**先搜索再回答** — 详见 [`agents/SEARCH_PROTOCOL.md`](agents/SEARCH_PROTOCOL.md)
 
-## 首次运行
+## 技术栈
 
-如果 `BOOTSTRAP.md` 存在，按它执行。完成后删除它。
+- Python 3.12+
+- 依赖管理: `pyproject.toml` + pip
+- 测试: pytest
+- Lint: ruff
+- 类型检查: mypy (可选)
 
-## 每次会话
+## 启动流程
 
-启动时按顺序读取：
+每次会话开始时，按顺序执行：
 
-1. `SOUL.md` — 你是谁
-2. `PROFILE.md` — 你的身份和用户资料
-3. **主会话**（与用户直接对话）时：读取 `MEMORY.md`
+1. 确认工作目录：`pwd`
+2. 读取 `SOUL.md` — 你是谁
+3. 读取 `PROFILE.md` — 身份和用户资料
+4. **主会话**时：读取 `MEMORY.md`
+5. 读取 `feature_list.json` — 选择最高优先级未完成特性
+6. 查看最近提交：`git log --oneline -5`
+7. 运行 `./init.sh` — 同步依赖 + 基线验证
+8. 如果基线验证失败 → **先修复基线**，再开始新工作
+9. 选择一个未完成特性，专注完成直到验证通过
 
-直接做，不用问。
+如果 `BOOTSTRAP.md` 存在，首次运行时按它执行。完成后删除它。
+
+## 验证命令
+
+```
+测试:     pytest tests/ -x -q
+Lint:     ruff check src/
+类型检查:  mypy src/ --strict
+完整验证:  ./init.sh
+```
+
+特性完成 = 目标行为实现 + 验证命令通过 + 证据记录到 `feature_list.json`
+
+## 完成定义
+
+一个特性只有在以下全部满足时才算完成：
+
+- 目标行为已实现
+- 验证命令实际运行并通过
+- 证据已记录到 `feature_list.json` 或 `MEMORY.md`
+- 仓库仍可通过 `./init.sh` 干净重启
 
 ## 记忆
 
@@ -109,3 +139,20 @@ Skills 提供工具。需要时查看 `SKILL.md`。本地设置记在 `TOOLS.md`
 - 完成后验证 → `autopilot_verify`
 
 **典型协作**：用户提交 autopilot 任务 → 你用 `autopilot_pick_next` 拿到任务 → 用 `todo` 记录执行步骤 → 逐步完成 → `autopilot_verify` 验证。
+
+## 必需制品
+
+- `feature_list.json` — 特性状态的唯一真相源
+- `MEMORY.md` — 会话日志和当前验证状态
+- `init.sh` — 标准启动和验证路径
+- `session-handoff.md` — 可选的跨会话紧凑交接
+
+## 会话结束
+
+结束会话前：
+
+1. 更新 `MEMORY.md` — 记录进度和发现
+2. 更新 `feature_list.json` — 反映实际通过/未验证状态
+3. 记录未解决的风险或阻塞项
+4. 一旦工作处于安全状态，提交并附带描述性消息
+5. 留下干净的重启路径 — 下次会话能直接运行 `./init.sh`

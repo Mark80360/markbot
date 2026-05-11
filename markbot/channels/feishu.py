@@ -749,6 +749,7 @@ class FeishuChannel(BaseChannel):
 
         Supported metadata keys:
             _stream_end: Finalize the streaming card.
+            _stream_discard: Discard the current stream buffer without sending.
             _tool_hint:  Delta is a formatted tool hint (for display only).
             message_id:  Original message id (used with _stream_end for reaction cleanup).
             reaction_id: Reaction id to remove on stream end.
@@ -758,6 +759,24 @@ class FeishuChannel(BaseChannel):
         meta = metadata or {}
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+
+        # --- stream discard: silently drop the current buffer ---
+        if meta.get("_stream_discard"):
+            buf = self._stream_bufs.pop(chat_id, None)
+            is_resuming = meta.get("_resuming", False)
+            if not is_resuming:
+                if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
+                    await self._remove_reaction(message_id, reaction_id)
+                    self._cleaned_reactions.add(message_id)
+                    logger.info("[FEISHU DELTA] _stream_discard: removed reaction {}", reaction_id)
+                    if self.config.done_emoji and message_id:
+                        await self._add_reaction(message_id, self.config.done_emoji)
+            logger.info(
+                "[FEISHU DELTA] _stream_discard: dropped buffer with {} chars, resuming={}",
+                len(buf.text) if buf else 0,
+                is_resuming,
+            )
+            return
 
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):

@@ -101,12 +101,15 @@ class ExecTool(Tool):
             env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
 
         try:
+            shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else None
+
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                executable=shell_bin,
             )
 
             try:

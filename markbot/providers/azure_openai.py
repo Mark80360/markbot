@@ -188,10 +188,14 @@ class AzureOpenAIProvider(LLMProvider):
             usage = {}
             if response.get("usage"):
                 usage_data = response["usage"]
+                pt = usage_data.get("prompt_tokens", 0)
+                ct = usage_data.get("completion_tokens", 0)
                 usage = {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "prompt_tokens": pt,
+                    "completion_tokens": ct,
                     "total_tokens": usage_data.get("total_tokens", 0),
+                    "input_tokens": pt,
+                    "output_tokens": ct,
                 }
 
             reasoning_content = message.get("reasoning_content") or None
@@ -298,10 +302,24 @@ class AzureOpenAIProvider(LLMProvider):
             for buf in tool_call_buffers.values()
         ]
 
+        usage = {}
+        if chunk.get("usage"):
+            u = chunk["usage"]
+            pt = u.get("prompt_tokens", 0)
+            ct = u.get("completion_tokens", 0)
+            usage = {
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": u.get("total_tokens", 0),
+                "input_tokens": pt,
+                "output_tokens": ct,
+            }
+
         return LLMResponse(
             content="".join(content_parts) or "",
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            usage=usage,
         )
 
     def get_default_model(self) -> str:

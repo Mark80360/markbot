@@ -518,11 +518,11 @@ async def _process_content_with_llm(
         
         # Check if chunked processing needed
         if content_len > CHUNK_THRESHOLD:
-            logger.info("Content large (%d chars). Using chunked processing...", content_len)
+            logger.info("Content large ({} chars). Using chunked processing...", content_len)
             return await _process_large_content_chunked(content, context_str, CHUNK_SIZE, MAX_OUTPUT_SIZE)
         
         # Standard single-pass processing
-        logger.info("Processing content with LLM (%d characters)", content_len)
+        logger.info("Processing content with LLM ({} characters)", content_len)
         
         system_prompt = """You are an expert content analyst. Create a comprehensive yet concise markdown summary preserving all important information.
 
@@ -548,7 +548,7 @@ Create a markdown summary that captures all key information in a well-organized,
                 processed_content = processed_content[:MAX_OUTPUT_SIZE] + "\n\n[... summary truncated ...]"
             
             compression_ratio = len(processed_content) / content_len if content_len > 0 else 1.0
-            logger.info("Content processed: %d -> %d chars (%.1f%%)", content_len, len(processed_content), compression_ratio * 100)
+            logger.info("Content processed: {} -> {} chars ({:.1f}%)", content_len, len(processed_content), compression_ratio * 100)
         
         return processed_content
         
@@ -609,7 +609,7 @@ async def _process_large_content_chunked(
     chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
     total_chunks = len(chunks)
     
-    logger.info("Processing %d chunks in parallel...", total_chunks)
+    logger.info("Processing {} chunks in parallel...", total_chunks)
     
     # Process chunks in parallel
     async def process_chunk(idx: int, chunk: str) -> str:

@@ -146,6 +146,11 @@ class AgentLoop:
         self._daily_log = ctx.daily_log
         self._interaction_log = ctx.interaction_log
 
+        self.handoff_manager = ctx.handoff_manager
+        self.session_bootstrap = ctx.session_bootstrap
+        self.task_tracker = ctx.task_tracker
+        self.memory_encoder = ctx.memory_encoder
+
         logger.info("[AgentLoop] Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     async def _connect_mcp(self) -> None:
@@ -206,6 +211,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            session_key=f"{channel}:{chat_id}",
         )
         return await runner.run(initial_messages)
 
@@ -233,6 +239,28 @@ class AgentLoop:
                     parts.append(text)
             except Exception as e:
                 logger.debug("Failed to gather todo context for compaction: {}", e)
+
+        task_tracker = getattr(self, "task_tracker", None)
+        if task_tracker is not None:
+            try:
+                active = task_tracker.list_active()
+                if active:
+                    lines = ["[TASK TRACKER STATE — preserve verbatim in summary]"]
+                    for t in active:
+                        lines.append(
+                            f"  - [{t.id}] {t.title} (status={t.status}, progress={t.progress})"
+                        )
+                    pending = task_tracker.list_pending()
+                    for t in pending[:3]:
+                        lines.append(
+                            f"  - [{t.id}] {t.title} (status=stated, priority={t.priority})"
+                        )
+                    text = "\n".join(lines)
+                    if len(text) > max_task_context_chars:
+                        text = text[:max_task_context_chars] + "\n  ... (truncated)"
+                    parts.append(text)
+            except Exception as e:
+                logger.debug("Failed to gather task tracker context for compaction: {}", e)
 
         return "\n\n".join(parts) if parts else ""
 
@@ -360,22 +388,26 @@ class AgentLoop:
                             )
                         )
 
-                    async def on_stream_end(*, resuming: bool = False) -> None:
+                    async def on_stream_end(*, resuming: bool = False, discard: bool = False) -> None:
+                        meta: dict[str, Any] = {
+                            "_resuming": resuming,
+                            "message_id": msg.metadata.get("message_id")
+                            if msg.metadata
+                            else None,
+                            "reaction_id": msg.metadata.get("reaction_id")
+                            if msg.metadata
+                            else None,
+                        }
+                        if discard:
+                            meta["_stream_discard"] = True
+                        else:
+                            meta["_stream_end"] = True
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content="",
-                                metadata={
-                                    "_stream_end": True,
-                                    "_resuming": resuming,
-                                    "message_id": msg.metadata.get("message_id")
-                                    if msg.metadata
-                                    else None,
-                                    "reaction_id": msg.metadata.get("reaction_id")
-                                    if msg.metadata
-                                    else None,
-                                },
+                                metadata=meta,
                             )
                         )
 

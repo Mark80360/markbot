@@ -125,7 +125,7 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\b/dev/tcp/",
 ]
 
-BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md"]
+BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md", "ARCHITECTURE.md"]
 
 # Context builder cache TTL (seconds)
 CONTEXT_CACHE_TTL: float = 300.0
