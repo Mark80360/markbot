@@ -40,6 +40,7 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         cost_tracker=None,
         skill_registry=None,
+        memory_manager=None,
     ):
         self.fallback_manager = fallback_manager
         self.config = config
@@ -47,6 +48,7 @@ class SubagentManager:
         self.bus = bus
         self.cost_tracker = cost_tracker
         self._skill_registry = skill_registry
+        self._memory_manager = memory_manager
 
         # Get model name from config if available
         if config and config.primary_model_ref:
@@ -397,6 +399,16 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+
+        if self._memory_manager and hasattr(self._memory_manager, "on_delegation"):
+            try:
+                self._memory_manager.on_delegation(
+                    task=task,
+                    result=result,
+                    child_session_id=task_id,
+                )
+            except Exception as e:
+                logger.debug("Subagent [{}] on_delegation failed: {}", task_id, e)
 
     def _build_subagent_prompt(self, skill_registry: SkillRegistry | None = None, capability: CapabilityToken | None = None) -> str:
         """Build a focused system prompt for the subagent."""

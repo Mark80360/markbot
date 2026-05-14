@@ -77,10 +77,10 @@ class MessagePipeline:
             try:
                 result = await mw.before(ctx)
                 if result is not None:
-                    logger.debug("[Pipeline] Short-circuited by middleware")
+                    logger.debug("Short-circuited by middleware")
                     return result
             except Exception as e:
-                logger.error(f"[Pipeline] Middleware before hook failed: {e}")
+                logger.error("Middleware before hook failed: {}", e)
                 try:
                     await mw.on_error(ctx, e)
                 except Exception:
@@ -89,7 +89,7 @@ class MessagePipeline:
         try:
             response = await handler(ctx)
         except Exception as e:
-            logger.error(f"[Pipeline] Handler failed: {e}")
+            logger.error("Handler failed: {}", e)
             for mw in reversed(self._middlewares):
                 try:
                     await mw.on_error(ctx, e)
@@ -101,7 +101,7 @@ class MessagePipeline:
             try:
                 response = await mw.after(ctx, response)
             except Exception as e:
-                logger.warning(f"[Pipeline] Middleware after hook failed: {e}")
+                logger.warning("Middleware after hook failed: {}", e)
 
         return response
 

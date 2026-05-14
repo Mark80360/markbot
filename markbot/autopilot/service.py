@@ -146,7 +146,7 @@ class AutopilotService:
             metadata=metadata,
         )
         action = "queued" if created else "refreshed"
-        logger.info(f"Autopilot intake {action}: {card.id} - {card.title}")
+        logger.info("Autopilot intake {}: {} - {}", action, card.id, card.title)
         return card
 
     async def run_next(
@@ -231,7 +231,7 @@ class AutopilotService:
                 )
                 assistant_summary = response.content if response else ""
             except Exception as exc:
-                logger.error(f"Autopilot agent execution failed: {exc}")
+                logger.error("Autopilot agent execution failed: {}", exc)
                 assistant_summary = ""
                 self._store.update_status(
                     card.id,
@@ -318,15 +318,15 @@ class AutopilotService:
 
                 if should_stop:
                     logger.info(
-                        f"Autopilot: stopping repairs for "
-                        f"{card.id} due to {prior_failure_stage}"
+                        "Autopilot: stopping repairs for {} due to {}",
+                        card.id, prior_failure_stage,
                     )
                     break
 
                 if not should_retry:
                     logger.info(
-                        f"Autopilot: not retrying {card.id} "
-                        f"for failure type {prior_failure_stage}"
+                        "Autopilot: not retrying {} for failure type {}",
+                        card.id, prior_failure_stage,
                     )
                     break
 

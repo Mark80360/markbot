@@ -104,7 +104,7 @@ class MemorySearchTool(Tool):
                 return f"No memories found for query: '{query}'"
             return self._format_results(results, query)
         except Exception as e:
-            logger.error(f"Memory search failed: {e}")
+            logger.error("Memory search failed: {}", e)
             return f"Error: Memory search failed — {e}"
 
     async def get_forced_context(self, user_message: str) -> str:
@@ -152,7 +152,7 @@ class MemorySearchTool(Tool):
             return "\n".join(lines)
 
         except Exception as e:
-            logger.warning(f"Forced memory search failed: {e}")
+            logger.warning("Forced memory search failed: {}", e)
             return ""
 
     @staticmethod

@@ -293,7 +293,7 @@ class SessionManager:
             try:
                 self._save_to_disk(evicted_session)
             except Exception as e:
-                logger.warning(f"Failed to save evicted session {evicted_key}: {e}")
+                logger.warning("Failed to save evicted session {}: {}", evicted_key, e)
 
     _APPEND_COMPACT_THRESHOLD = 100
 

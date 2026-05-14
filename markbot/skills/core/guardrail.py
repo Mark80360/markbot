@@ -75,7 +75,7 @@ class SkillGuardrail:
         guardrail = SkillGuardrail(skill, context="main")
         result = guardrail.check_tool_call("write_file", {"path": "..."})
         if not result.passed:
-            logger.warning(f"Violation: {result.format_report()}")
+            logger.warning("Violation: {}", result.format_report())
     """
 
     MAIN_AGENT_ALLOWED_TOOLS = {

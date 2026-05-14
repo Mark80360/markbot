@@ -36,7 +36,7 @@ from markbot.cli.skills import app as skills_app
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.config.paths import get_cron_dir, get_workspace_path
 from markbot.config.schema import Config
-from markbot.utils.helpers import strip_ansi, sync_workspace_templates
+from markbot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
     name="markbot",
@@ -751,107 +751,19 @@ def _start_daemon(port: int, workspace: str | None, config_path: str | None, ver
 
 def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
     """Run the gateway in foreground mode."""
-    # Configure logging
-    import logging
-
     from loguru import logger
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.channels.manager import ChannelManager
     from markbot.config.loader import load_config
+    from markbot.log.core import setup_logging
     from markbot.schedule.cron import CronService
     from markbot.schedule.cron import CronJob
     from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
-    logging.basicConfig(level=logging.WARNING)
 
-    logger.remove()
-    log_level = "DEBUG" if verbose else "INFO"
-
-    def log_filter(record):
-        msg = record["message"]
-        if "PING" in msg or "PONG" in msg:
-            if "keepalive" in msg.lower() or "websockets" in record["name"]:
-                return False
-        if record["name"].startswith("websockets"):
-            return False
-        if record["name"].startswith("urllib3") and record["level"].name == "DEBUG":
-            return False
-        if record["name"].startswith("httpcore") and record["level"].name == "DEBUG":
-            return False
-        if record["name"] == "asyncio" and "selector" in msg.lower():
-            return False
-        if record["name"].startswith("reme") and len(msg) > 2000:
-            record["message"] = msg[:2000] + "... [truncated]"
-        return True
-
-    _MAX_CONSOLE_MSG_LEN = 4000
-
-    def _console_format(record):
-        msg = record["message"]
-        if len(msg) > _MAX_CONSOLE_MSG_LEN:
-            record["message"] = msg[:_MAX_CONSOLE_MSG_LEN] + "... [truncated]"
-        return (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>\n"
-        )
-
-    logger.add(
-        sys.stderr,
-        level=log_level,
-        format=_console_format,
-        colorize=True,
-        backtrace=True,
-        diagnose=True,
-        catch=True,
-        filter=log_filter,
-    )
-
-    _MAX_FILE_MSG_LEN = 10000
-
-    def _file_format(record):
-        time_str = record["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        level_str = f"{record['level'].name: <8}"
-        msg = strip_ansi(record["message"])
-        if len(msg) > _MAX_FILE_MSG_LEN:
-            msg = msg[:_MAX_FILE_MSG_LEN] + "... [truncated]"
-        return f"{time_str} | {level_str} | {record['name']}:{record['function']}:{record['line']} - {msg}\n"
-
-    logger.add(
-        GATEWAY_LOG_FILE,
-        level="DEBUG",
-        format=_file_format,
-        rotation="10 MB",
-        retention="7 days",
-        backtrace=True,
-        diagnose=True,
-        catch=True,
-        encoding="utf-8",
-        filter=log_filter,
-    )
-
-    logger.info("Logging configured: level={}, backtrace=True, diagnose=True", log_level)
-
-    # Global exception hooks
-    import threading
-
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        logger.exception("Unhandled exception: {}:{}",
-                        exc_type.__name__, exc_value,
-                        exc_info=(exc_type, exc_value, exc_traceback))
-
-    def thread_exception_hook(args):
-        logger.exception("Unhandled exception in thread {}: {}:{}",
-                        args.thread.name if args.thread else "unknown",
-                        args.exc_type.__name__, args.exc_value,
-                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-    sys.excepthook = handle_exception
-    threading.excepthook = thread_exception_hook
-    logger.info("Global exception hooks installed")
+    setup_logging(verbose=verbose, log_file=GATEWAY_LOG_FILE)
 
     config_path = Path(config) if config else None
     config = load_config(config_path)
@@ -1029,14 +941,14 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
                             if delay < 0:
                                 delay = 0
                             next_dt = datetime.fromtimestamp(next_ts, tz=tz)
-                            logger.info(f"[Dream] Next dream at {next_dt} (in {delay:.0f}s)")
+                            logger.info("Next dream at {} (in {:.0f}s)", next_dt, delay)
                             await asyncio.sleep(delay)
-                            logger.info("[Dream] Triggering dream-based memory optimization")
+                            logger.info("Triggering dream-based memory optimization")
                             await agent.memory_manager.dream()
                         except asyncio.CancelledError:
                             break
                         except Exception as e:
-                            logger.error(f"[Dream] Dream optimization failed: {e}")
+                            logger.error("Dream optimization failed: {}", e)
                             await asyncio.sleep(60)
 
                 dream_task = asyncio.create_task(_dream_loop())
@@ -1087,39 +999,35 @@ def agent(
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
+    from markbot.log.core import setup_logging
     from markbot.schedule.cron import CronService
 
+    setup_logging(verbose=logs)
+
     _cmd_start = time.time()
-    logger.info("[CLI] agent command starting...")
+    logger.info("agent command starting...")
 
     _t0 = time.time()
     config = _load_runtime_config(config, workspace)
-    logger.debug("[CLI] Config loaded, took {:.3f}s", time.time() - _t0)
+    logger.debug("Config loaded, took {:.3f}s", time.time() - _t0)
 
     _t0 = time.time()
     sync_workspace_templates(config.workspace_path)
-    logger.debug("[CLI] Workspace templates synced, took {:.3f}s", time.time() - _t0)
+    logger.debug("Workspace templates synced, took {:.3f}s", time.time() - _t0)
 
     _t0 = time.time()
     bus = MessageBus()
-    logger.debug("[CLI] MessageBus created, took {:.3f}s", time.time() - _t0)
+    logger.debug("MessageBus created, took {:.3f}s", time.time() - _t0)
 
     _t0 = time.time()
     provider = _make_provider(config)
-    logger.debug("[CLI] Provider created, took {:.3f}s", time.time() - _t0)
+    logger.debug("Provider created, took {:.3f}s", time.time() - _t0)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
     cron = CronService(cron_store_path)
 
-    if logs:
-        logger.enable("markbot")
-        logger.enable("reme")
-    else:
-        logger.disable("markbot")
-        logger.disable("reme")
-
     _t0 = time.time()
-    logger.info("[CLI] Creating AgentLoop...")
+    logger.info("Creating AgentLoop...")
     import time as _cli_time
     _cli_t0 = _cli_time.time()
     agent_loop = AgentLoop(
@@ -1145,11 +1053,11 @@ def agent(
         budget_config=config.budget if config.budget.enabled else None,
     )
     _cli_elapsed = _cli_time.time() - _cli_t0
-    logger.info("[CLI] AgentLoop created, took {:.3f}s", time.time() - _t0)
+    logger.info("AgentLoop created, took {:.3f}s", time.time() - _t0)
     if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
-        logger.info("[CLI] AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
+        logger.info("AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
     else:
-        logger.warning("[CLI] No timing data available from AgentContext")
+        logger.warning("No timing data available from AgentContext")
 
     # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None

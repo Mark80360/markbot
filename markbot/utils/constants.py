@@ -38,46 +38,26 @@ IGNORE_DIRS = frozenset({
 
     # OS generated
     ".Trashes", ".Spotlight-V100", ".fseventsd",
-
-    # CI/CD
-    ".circleci", ".gitlab", ".github/workflows" if False else "",  # Keep .github for configs
 }).union({".github", ".gitlab"}) - {""}
 
 # Binary file extensions to skip in content search
 BINARY_EXTENSIONS = frozenset({
-    # Images
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
     ".tiff", ".tif", ".psd", ".raw", ".heic", ".heif", ".avif",
-
-    # Audio
     ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus",
     ".aiff", ".pcm", ".ape",
-
-    # Video
     ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mkv", ".m4v",
     ".3gp", ".ts", ".mts", ".vob",
-
-    # Archives
     ".zip", ".tar", ".gz", ".rar", ".7z", ".bz2", ".xz", ".lzma",
     ".cab", ".iso", ".dmg", ".deb", ".rpm",
-
-    # Documents
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".odt", ".ods", ".odp", ".rtf",
-
-    # Compiled code
     ".pyc", ".pyo", ".pyd", ".class", ".o", ".obj", ".so", ".dll",
     ".dylib", ".lib", ".a", ".exe", ".msi", ".app", ".out",
     ".jar", ".war", ".ear", ".node",
-
-    # Fonts
     ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pfb",
-
-    # Databases
     ".sqlite", ".db", ".sqlite3", ".parquet", ".h5", ".hdf5",
     ".accdb", ".mdb",
-
-    # Other binary
     ".bin", ".dat", ".pak", ".wasm", ".swf", ".unity3d",
 })
 
@@ -110,17 +90,14 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\bcp\b.*\s+/(etc|boot|s?bin|root|lib64?|usr/(?:s?bin|lib))\b",
     r"\bmv\b.*[A-Za-z]:[\\/](Windows|Program\s*Files|ProgramData)[\\/]",
     r"\bcp\b.*[A-Za-z]:[\\/](Windows|Program\s*Files|ProgramData)[\\/]",
-    # Argument injection / option splitting
     r"\$\{IFS\}",
     r"\$@\s",
     r"\bxargs\s+.*\b(sh|bash|python|perl)\b",
     r"\b(base64|xxd)\s+.*-d.*\|\s*(sh|bash)\b",
     r"\bopenssl\s+enc\s+.*-d.*\|\s*(sh|bash)\b",
-    # Dangerous privilege escalation
     r"\bsudo\s+.*\brm\s+-[rf]{1,2}\b",
     r"\bsudo\s+su\b",
     r"\bchmod\s+[0-7]*7[0-7]*7[0-7]*\s+/",
-    # Network exfiltration patterns
     r"\bnc\s+.*-e\s+/bin/",
     r"\b/dev/tcp/",
 ]
@@ -150,3 +127,29 @@ DEFAULT_CONTEXT_WINDOW_TOKENS: int = 65_536
 
 # Default compaction threshold ratio
 DEFAULT_COMPACTION_THRESHOLD: float = 0.75
+
+# -- Memory system constants ------------------------------------------------
+
+# Default character limits for MemoryStore entries
+DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
+DEFAULT_USER_CHAR_LIMIT: int = 2000
+
+# Maximum prefetch results per turn
+MAX_PREFETCH_RESULTS: int = 3
+
+# Minimum relevance score for prefetch recall
+MIN_PREFETCH_SCORE: float = 0.15
+
+# Maximum entries in MemoryStore before cleanup hint
+MAX_MEMORY_ENTRIES: int = 100
+MAX_USER_ENTRIES: int = 50
+
+# Memory security scanner cooldown (seconds) between same-pattern detections
+MEMORY_SCANNER_COOLDOWN: int = 300
+
+# Frozen snapshot refresh interval (turns)
+MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 10
+
+# Context fencing tags
+MEMORY_CONTEXT_TAG_OPEN: str = "<memory-context>"
+MEMORY_CONTEXT_TAG_CLOSE: str = "</memory-context>"

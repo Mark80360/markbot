@@ -46,7 +46,7 @@ class SessionIntegrity:
         try:
             wal_path.unlink(missing_ok=True)
         except Exception as e:
-            logger.warning("[SessionIntegrity] WAL cleanup failed for {}: {}", session_path, e)
+            logger.warning("WAL cleanup failed for {}: {}", session_path, e)
 
     def recover_from_wal(self, session_path: Path) -> str | None:
         """Attempt to recover data from WAL if the main file is corrupted.
@@ -59,10 +59,10 @@ class SessionIntegrity:
 
         try:
             data = wal_path.read_text(encoding="utf-8")
-            logger.info("[SessionIntegrity] Recovered from WAL: {}", session_path.name)
+            logger.info("Recovered from WAL: {}", session_path.name)
             return data
         except Exception as e:
-            logger.error("[SessionIntegrity] WAL recovery failed for {}: {}", session_path, e)
+            logger.error("WAL recovery failed for {}: {}", session_path, e)
             return None
 
     def compute_checksum(self, data: str) -> str:
@@ -90,13 +90,13 @@ class SessionIntegrity:
             actual = self.compute_checksum(session_path.read_text(encoding="utf-8"))
             if expected != actual:
                 logger.error(
-                    "[SessionIntegrity] Checksum mismatch for {}: expected={}, actual={}",
+                    "Checksum mismatch for {}: expected={}, actual={}",
                     session_path.name, expected[:16], actual[:16],
                 )
                 return False
             return True
         except Exception as e:
-            logger.error("[SessionIntegrity] Checksum verification failed for {}: {}", session_path, e)
+            logger.error("Checksum verification failed for {}: {}", session_path, e)
             return False
 
     def archive_session(self, session_path: Path) -> Path | None:
@@ -118,10 +118,10 @@ class SessionIntegrity:
                 if sidecar.exists():
                     sidecar_archive = archive_path.with_suffix(suffix)
                     shutil.move(str(sidecar), str(sidecar_archive))
-            logger.info("[SessionIntegrity] Archived session: {} → {}", session_path.name, archive_path.name)
+            logger.info("Archived session: {} → {}", session_path.name, archive_path.name)
             return archive_path
         except Exception as e:
-            logger.error("[SessionIntegrity] Archive failed for {}: {}", session_path, e)
+            logger.error("Archive failed for {}: {}", session_path, e)
             return None
 
     def cleanup_archive(self) -> int:
@@ -144,5 +144,5 @@ class SessionIntegrity:
                 continue
 
         if removed:
-            logger.info("[SessionIntegrity] Cleaned up {} archived session(s)", removed)
+            logger.info("Cleaned up {} archived session(s)", removed)
         return removed

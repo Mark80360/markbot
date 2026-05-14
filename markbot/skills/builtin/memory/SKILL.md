@@ -1,8 +1,8 @@
 ---
 name: memory
 description: >
-  ReMeLight memory system with conversation compaction, async summarization,
-  and semantic search. Use memory_search tool to recall past conversations,
+  File-based memory system with conversation compaction, async summarization,
+  and keyword search. Use memory_search tool to recall past conversations,
   user preferences, decisions, or project context stored in MEMORY.md and
   daily notes. Auto-compacts context when conversation grows too long.
   Trigger when: user asks about prior discussions, preferences, decisions,
@@ -12,7 +12,7 @@ always: true
 
 # Memory System
 
-Memory system using ReMeLight for conversation compaction, async summarization, and semantic search.
+Memory system using file-based storage for conversation compaction, async summarization, and keyword search.
 
 ## Architecture
 
@@ -45,10 +45,10 @@ Memory system using ReMeLight for conversation compaction, async summarization, 
 ## Memory Tools
 
 ### memory_search
-Search MEMORY.md and daily notes semantically. Use before answering questions about prior work, decisions, or user preferences.
+Search MEMORY.md and daily notes by keyword. Use before answering questions about prior work, decisions, or user preferences.
 
 **Parameters:**
-- `query` (required): Semantic search query
+- `query` (required): Search query
 - `max_results` (default: 5): Maximum results to return
 - `min_score` (default: 0.1): Minimum similarity score
 

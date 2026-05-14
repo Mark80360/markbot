@@ -105,7 +105,7 @@ class DailyLogManager:
             finally:
                 os.close(fd)
         except Exception as e:
-            logger.warning(f"[DailyLog] Failed to append to {filepath}: {e}")
+            logger.warning("Failed to append to {}: {}", filepath, e)
 
     def search(
         self,

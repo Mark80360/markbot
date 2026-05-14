@@ -99,11 +99,12 @@ class FallbackManager:
             elapsed = time.monotonic() - circuit.last_failure_time
             if elapsed >= self._circuit_cooldown:
                 circuit.state = "half-open"
-                logger.info(f"[CircuitBreaker] {provider_name} half-open (cooldown elapsed)")
+                logger.info("{} half-open (cooldown elapsed)", provider_name)
                 return True
             logger.warning(
-                f"[CircuitBreaker] {provider_name} circuit open, skipping "
-                f"(failures={circuit.failure_count}, retry in {self._circuit_cooldown - elapsed:.0f}s)"
+                "{} circuit open, skipping "
+                "(failures={}, retry in {:.0f}s)",
+                provider_name, circuit.failure_count, self._circuit_cooldown - elapsed,
             )
             return False
         return True
@@ -111,7 +112,7 @@ class FallbackManager:
     def _record_success(self, provider_name: str) -> None:
         circuit = self._get_circuit(provider_name)
         if circuit.state != "closed":
-            logger.info(f"[CircuitBreaker] {provider_name} circuit closed (recovered)")
+            logger.info("{} circuit closed (recovered)", provider_name)
         circuit.failure_count = 0
         circuit.state = "closed"
 
@@ -122,8 +123,8 @@ class FallbackManager:
         if circuit.failure_count >= self._circuit_threshold:
             circuit.state = "open"
             logger.warning(
-                f"[CircuitBreaker] {provider_name} circuit OPEN "
-                f"({circuit.failure_count} consecutive failures)"
+                "{} circuit OPEN ({} consecutive failures)",
+                provider_name, circuit.failure_count,
             )
 
     def _is_model_unavailable_error(self, error: Exception | str) -> bool:
@@ -203,7 +204,7 @@ class FallbackManager:
                 )
                 _reasoning = model_config.reasoning_effort or defaults.reasoning_effort
 
-                logger.info(f"Trying model: {model_ref}")
+                logger.info("Trying model: {}", model_ref)
                 response = await caller(provider, model_config, _max_tokens, _temperature, _reasoning)
 
                 if response.finish_reason == "error":
@@ -219,15 +220,18 @@ class FallbackManager:
 
                     if self._is_retryable_error(error_msg):
                         logger.warning(
-                            f"Model {model_ref} returned error (retryable): {error_msg}. Trying next..."
+                            "Model {} returned error (retryable): {}. Trying next...",
+                            model_ref, error_msg,
                         )
                     elif self._is_model_unavailable_error(error_msg):
                         logger.warning(
-                            f"Model {model_ref} unavailable: {error_msg}. Trying next..."
+                            "Model {} unavailable: {}. Trying next...",
+                            model_ref, error_msg,
                         )
                     else:
                         logger.error(
-                            f"Model {model_ref} returned error (non-retryable): {error_msg}. Trying next..."
+                            "Model {} returned error (non-retryable): {}. Trying next...",
+                            model_ref, error_msg,
                         )
                     last_error = Exception(error_msg)
                     self._record_failure(provider_name)
@@ -235,7 +239,8 @@ class FallbackManager:
 
                 if response.finish_reason == "content_filter":
                     logger.warning(
-                        f"Model {model_ref} returned content_filter, trying next model..."
+                        "Model {} returned content_filter, trying next model...",
+                        model_ref,
                     )
                     attempt = FallbackAttempt(
                         model_ref=model_ref,
@@ -258,7 +263,7 @@ class FallbackManager:
                     response=response,
                 )
                 attempts.append(attempt)
-                logger.info(f"Model {model_ref} succeeded")
+                logger.info("Model {} succeeded", model_ref)
                 return response, attempts
 
             except Exception as e:
@@ -273,14 +278,15 @@ class FallbackManager:
 
                 if self._is_retryable_error(e):
                     logger.warning(
-                        f"Model {model_ref} failed (retryable): {e}. Trying next..."
+                        "Model {} failed (retryable): {}. Trying next...",
+                        model_ref, e,
                     )
                 elif self._is_model_unavailable_error(e):
                     logger.warning(
-                        f"Model {model_ref} unavailable: {e}. Trying next..."
+                        "Model {} unavailable: {}. Trying next...", model_ref, e,
                     )
                 else:
-                    logger.error(f"Model {model_ref} failed (non-retryable): {e}. Trying next...")
+                    logger.error("Model {} failed (non-retryable): {}. Trying next...", model_ref, e)
                 last_error = e
                 self._record_failure(provider_name)
                 continue

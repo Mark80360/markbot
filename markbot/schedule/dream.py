@@ -58,7 +58,7 @@ class DreamService:
         self._running = True
         self._task = asyncio.create_task(self._run())
         logger.info(
-            "[Dream] Scheduler started (cron={}, tz={})",
+            "Scheduler started (cron={}, tz={})",
             self._cron_expr, self._timezone,
         )
 
@@ -88,14 +88,14 @@ class DreamService:
                 if delay < 0:
                     delay = 0
                 next_dt = datetime.fromtimestamp(next_ts, tz=tz)
-                logger.info("[Dream] Next dream at {} (in {:.0f}s)", next_dt, delay)
+                logger.info("Next dream at {} (in {:.0f}s)", next_dt, delay)
                 await asyncio.sleep(delay)
                 if not self._running:
                     break
-                logger.info("[Dream] Triggering memory optimisation")
+                logger.info("Triggering memory optimisation")
                 await self._dream_fn()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[Dream] Optimisation failed: {}", e)
+                logger.error("Optimisation failed: {}", e)
                 await asyncio.sleep(60)

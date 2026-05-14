@@ -1,10 +1,10 @@
-"""`markbot doctor` — diagnostic checks and fixes.
+"""`markbot doctor` diagnostic checks and fixes.
 
 Layout
 ------
-Section 1 — Read-only check functions (no config or disk mutations).
-Section 2 — Fix runner (conservative filesystem repairs with backups).
-Section 3 — CLI entry points (typer app, ``doctor`` and ``doctor fix``).
+Section 1 Read-only check functions (no config or disk mutations).
+Section 2 Fix runner (conservative filesystem repairs with backups).
+Section 3 CLI entry points (typer app, ``doctor`` and ``doctor fix``).
 """
 
 from __future__ import annotations
@@ -32,9 +32,7 @@ from markbot.config.schema import Config, ProviderConfig
 
 console = Console()
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Section 1 — Read-only checks
-# ═══════════════════════════════════════════════════════════════════════════
+# Section 1 Read-only checks
 
 
 def environment_summary_lines() -> list[str]:
@@ -89,7 +87,7 @@ def check_model_chain(cfg: Config) -> tuple[bool, str]:
 
     chain = cfg.agents.defaults.model_chain
     if not chain:
-        return False, "model_chain is empty — no LLM configured"
+        return False, "model_chain is empty no LLM configured"
 
     return True, f"{len(chain)} model(s): {', '.join(chain)}"
 
@@ -233,28 +231,16 @@ def check_channels(cfg: Config) -> tuple[bool, str]:
     enabled: list[str] = []
     warnings: list[str] = []
 
-    import logging
+    from loguru import logger
 
-    prev_level = logging.getLogger("markbot.channels.discovery").level
-    logging.getLogger("markbot.channels.discovery").setLevel(logging.WARNING)
-
-    try:
-        from loguru import logger as _loguru_logger
-        _loguru_logger.disable("markbot.channels.discovery")
-    except ImportError:
-        _loguru_logger = None
+    logger.disable("markbot.channels.discovery")
 
     try:
         from markbot.channels.discovery import discover_all
 
         channel_classes = discover_all()
     finally:
-        logging.getLogger("markbot.channels.discovery").setLevel(prev_level)
-        if _loguru_logger is not None:
-            try:
-                _loguru_logger.enable("markbot.channels.discovery")
-            except Exception:
-                pass
+        logger.enable("markbot.channels.discovery")
 
     for name in cfg.channels.model_fields:
         section = getattr(cfg.channels, name, None)
@@ -497,7 +483,7 @@ def check_python_version() -> list[str]:
 
     if vi < (3, 10):
         notes.append(
-            f"Python {vi.major}.{vi.minor} is below minimum 3.10 — "
+            f"Python {vi.major}.{vi.minor} is below minimum 3.10 "
             "markbot requires Python 3.10+"
         )
 
@@ -510,7 +496,7 @@ def check_optional_dependencies() -> list[str]:
     optional = [
         ("psutil", "system monitoring in gateway status"),
         ("yaml", "YAML frontmatter in skills (PyYAML)"),
-        ("reme-ai", "ReMeLight memory system"),
+        ("markbot.memory.manager", "MemoryManager file-based memory"),
         ("chromadb", "vector storage for memory search"),
     ]
 
@@ -523,9 +509,9 @@ def check_optional_dependencies() -> list[str]:
     return notes
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Section 2 — Fix runner
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Section 2 Fix runner
+# ---------------------------------------------------------------------------
 
 DATA_DIR = Path.home() / ".markbot"
 BACKUP_SUBDIR = "doctor-fix-backups"
@@ -800,7 +786,7 @@ def plan_fixes(
                 planned.append(
                     PlannedFix(
                         "trim-gateway-log",
-                        f"trim {log_file} ({size_mb:.1f} MB → keep last {max_lines} lines)",
+                        f"trim {log_file} ({size_mb:.1f} MB 鈫?keep last {max_lines} lines)",
                         (log_file,),
                         _trim,
                     )
@@ -855,7 +841,7 @@ def run_doctor_fix(
 
     if no_backup:
         echo_err(
-            "WARNING: --no-backup — no copies under doctor-fix-backups "
+            "WARNING: --no-backup no copies under doctor-fix-backups "
             "if something goes wrong."
         )
 
@@ -911,9 +897,9 @@ def run_doctor_fix(
     return 0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Section 3 — CLI entry points
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Section 3 CLI entry points
+# ---------------------------------------------------------------------------
 
 doctor_app = typer.Typer(
     name="doctor",
@@ -930,7 +916,7 @@ def _section(title: str, color: str = "cyan") -> None:
     W = 60
     title_text = f"  {title}  "
     pad = W - len(title_text) - 2
-    line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+    line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'鈹€' * pad}[/]")
     console.print(line)
 
 
@@ -940,11 +926,11 @@ def _kv(key: str, value: str, key_w: int = 16) -> None:
 
 
 def _ok(detail: str) -> None:
-    console.print(Text.from_markup(f"  [green]OK[/green] — {detail}"))
+    console.print(Text.from_markup(f"  [green]OK[/green] {detail}"))
 
 
 def _fail(detail: str) -> None:
-    console.print(Text.from_markup(f"  [red]FAIL[/red] — {detail}"))
+    console.print(Text.from_markup(f"  [red]FAIL[/red] {detail}"))
 
 
 def _note(detail: str) -> None:
@@ -956,7 +942,7 @@ def _hint(message: str) -> None:
 
 
 def _divider() -> None:
-    console.print(Text.from_markup(f"[dim]{'─' * 58}[/dim]"))
+    console.print(Text.from_markup(f"[dim]{'鈹€' * 58}[/dim]"))
 
 
 @doctor_app.callback(invoke_without_command=True)
@@ -976,7 +962,7 @@ def doctor_main(
 
     failed = False
 
-    # ── Environment ──────────────────────────────────────────────────────
+    # 鈹€鈹€ Environment 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Environment")
     for line in environment_summary_lines():
         console.print(f"  {line}")
@@ -988,7 +974,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Config ───────────────────────────────────────────────────────────
+    # 鈹€鈹€ Config 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Config")
     config_ok, config_detail = check_config_file()
     if config_ok:
@@ -1005,7 +991,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Load config for further checks ───────────────────────────────────
+    # 鈹€鈹€ Load config for further checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     cfg = None
     if config_ok:
         try:
@@ -1016,14 +1002,14 @@ def doctor_main(
 
     if cfg is None:
         _section("Skipped", "yellow")
-        _note("Config is invalid — remaining checks skipped.")
+        _note("Config is invalid remaining checks skipped.")
         _hint("Fix config first, then re-run 'markbot doctor'.")
         console.print()
         if failed:
             raise typer.Exit(1)
         return
 
-    # ── Model Chain ──────────────────────────────────────────────────────
+    # 鈹€鈹€ Model Chain 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Model Chain")
     chain_ok, chain_detail = check_model_chain(cfg)
     if chain_ok:
@@ -1046,7 +1032,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Workspace ────────────────────────────────────────────────────────
+    # 鈹€鈹€ Workspace 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Workspace")
     ws_ok, ws_detail = check_workspace(cfg)
     if ws_ok:
@@ -1065,7 +1051,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Channels ─────────────────────────────────────────────────────────
+    # 鈹€鈹€ Channels 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Channels")
     ch_ok, ch_detail = check_channels(cfg)
     if ch_ok:
@@ -1080,7 +1066,7 @@ def doctor_main(
 
     _divider()
 
-    # ── MCP Servers ──────────────────────────────────────────────────────
+    # 鈹€鈹€ MCP Servers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("MCP Servers")
     mcp_notes = check_mcp_servers(cfg)
     if mcp_notes:
@@ -1092,7 +1078,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Skills ───────────────────────────────────────────────────────────
+    # 鈹€鈹€ Skills 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Skills")
     sk_ok, sk_detail = check_skills(cfg)
     if sk_ok:
@@ -1103,7 +1089,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Memory / Embedding ───────────────────────────────────────────────
+    # 鈹€鈹€ Memory / Embedding 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Memory / Embedding")
     mem_notes = check_memory_config(cfg)
     if mem_notes:
@@ -1114,7 +1100,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Cron ─────────────────────────────────────────────────────────────
+    # 鈹€鈹€ Cron 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Cron")
     cron_ok, cron_detail = check_cron_jobs(cfg)
     if cron_ok:
@@ -1125,7 +1111,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Sessions ─────────────────────────────────────────────────────────
+    # 鈹€鈹€ Sessions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Sessions")
     sess_ok, sess_detail = check_sessions(cfg)
     if sess_ok:
@@ -1136,7 +1122,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Gateway ──────────────────────────────────────────────────────────
+    # 鈹€鈹€ Gateway 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Gateway")
     gw_ok, gw_detail = check_gateway_pid()
     if gw_ok:
@@ -1152,7 +1138,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Data Directory ───────────────────────────────────────────────────
+    # 鈹€鈹€ Data Directory 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Data Directory")
     dd_ok, dd_detail = check_data_dir_writable()
     if dd_ok:
@@ -1163,7 +1149,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Optional Dependencies ────────────────────────────────────────────
+    # 鈹€鈹€ Optional Dependencies 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     _section("Optional Dependencies")
     dep_notes = check_optional_dependencies()
     if dep_notes:
@@ -1174,7 +1160,7 @@ def doctor_main(
 
     _divider()
 
-    # ── Deep Checks ──────────────────────────────────────────────────────
+    # 鈹€鈹€ Deep Checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     if deep:
         _section("Deep Checks", "magenta")
 
@@ -1185,19 +1171,19 @@ def doctor_main(
 
         _divider()
 
-    # ── Summary ──────────────────────────────────────────────────────────
+    # 鈹€鈹€ Summary 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     console.print()
     if failed:
         console.print(
             Text.from_markup(
-                "  [bold red]✗ Issues found[/bold red] — review the FAIL items above"
+                "  [bold red]鉁?Issues found[/bold red] review the FAIL items above"
             )
         )
         raise typer.Exit(1)
     else:
         console.print(
             Text.from_markup(
-                "  [bold green]✓ All checks passed[/bold green]"
+                "  [bold green]鉁?All checks passed[/bold green]"
             )
         )
 
@@ -1227,11 +1213,11 @@ def _check_provider_connectivity(cfg: Config) -> None:
     is_oauth = spec.is_oauth if spec else False
 
     if is_local:
-        _note("local provider — skipping connectivity check")
+        _note("local provider skipping connectivity check")
         return
 
     if is_oauth:
-        _note("OAuth provider — skipping connectivity check")
+        _note("OAuth provider skipping connectivity check")
         return
 
     if not provider_cfg.api_key:
@@ -1313,7 +1299,7 @@ def _check_channel_connectivity(cfg: Config) -> None:
                 with socket.create_connection((host, port), timeout=5):
                     _ok(f"{name}: {host}:{port} reachable")
             except OSError as e:
-                _note(f"{name}: {host}:{port} — {e}")
+                _note(f"{name}: {host}:{port} {e}")
         else:
             _note(f"{name}: no host/port to probe")
 
@@ -1358,7 +1344,7 @@ def _extract_channel_port(name: str, section: Any) -> int | None:
     return None
 
 
-# ── fix sub-command ──────────────────────────────────────────────────────
+# 鈹€鈹€ fix sub-command 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 @doctor_app.command("fix")
@@ -1395,11 +1381,11 @@ def doctor_fix(
         console.print("\nAvailable fix ids:\n")
         console.print("  [green]Safe[/green] (run by default, no --yes needed):")
         for fid in sorted(SAFE_FIX_IDS):
-            console.print(f"    • {fid}")
+            console.print(f"    {fid}")
         console.print()
         console.print("  [yellow]Risky[/yellow] (require --yes / -y):")
         for fid in sorted(RISKY_FIX_IDS):
-            console.print(f"    • {fid}")
+            console.print(f"    {fid}")
         console.print()
         return
 
@@ -1425,3 +1411,4 @@ def doctor_fix(
         argv=sys.argv,
     )
     raise typer.Exit(rc)
+

@@ -152,7 +152,7 @@ class HandoffManager:
             json.dumps(handoff.to_dict(), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        logger.info("[HandoffManager] Saved handoff for session {}", handoff.session_key)
+        logger.info("Saved handoff for session {}", handoff.session_key)
         return path
 
     def load(self, session_key: str) -> SessionHandoff | None:
@@ -164,7 +164,7 @@ class HandoffManager:
             handoff = SessionHandoff.from_dict(data)
             return handoff
         except Exception as e:
-            logger.warning("[HandoffManager] Failed to load handoff for {}: {}", session_key, e)
+            logger.warning("Failed to load handoff for {}: {}", session_key, e)
             return None
 
     def load_markdown(self, session_key: str) -> str | None:
@@ -177,7 +177,7 @@ class HandoffManager:
         path = self._handoff_path(session_key)
         if path.exists():
             path.unlink()
-            logger.debug("[HandoffManager] Deleted handoff for {}", session_key)
+            logger.debug("Deleted handoff for {}", session_key)
 
     def cleanup_stale(self) -> int:
         now = time.time()
@@ -188,7 +188,7 @@ class HandoffManager:
                 path.unlink()
                 removed += 1
         if removed:
-            logger.info("[HandoffManager] Cleaned up {} stale handoff files", removed)
+            logger.info("Cleaned up {} stale handoff files", removed)
         return removed
 
 
@@ -232,7 +232,7 @@ def build_handoff_from_session(
                     task_id=task.id,
                 ))
         except Exception as e:
-            logger.debug("[Handoff] Failed to extract tasks from tracker: {}", e)
+            logger.debug("Failed to extract tasks from tracker: {}", e)
 
     key_decisions = _extract_decisions(messages)
 
@@ -241,7 +241,7 @@ def build_handoff_from_session(
             prefs = _extract_preferences_from_memory(memory_manager)
             user_preferences.extend(prefs)
         except Exception as e:
-            logger.debug("[Handoff] Failed to extract preferences: {}", e)
+            logger.debug("Failed to extract preferences: {}", e)
 
     next_step = ""
     if active_tasks:

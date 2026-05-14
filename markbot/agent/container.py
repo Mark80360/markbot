@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from markbot.skills.core.guardrail import SkillGuardrailManager
     from markbot.tools.memory_tools import MemorySearchTool
     from markbot.tools.message import MessageTool
-    from markbot.tools.question import QuestionTool
+    from markbot.tools.question import AskUserQuestionTool
     from markbot.tools.registry import ToolRegistry
 
 
@@ -79,7 +79,7 @@ class ProvidesMemory(Protocol):
 class AgentContext:
     """Immutable container for all agent dependencies.
 
-    Built via ``AgentContext.builder()`` — never instantiate directly.
+    Built via ``AgentContext.builder()`` 鈥?never instantiate directly.
     """
 
     config: "Config | None" = None
@@ -123,7 +123,7 @@ class AgentContext:
     daily_log: "DailyLogManager | None" = None
     interaction_log: "InteractionLogger | None" = None
     memory_search_tool: "MemorySearchTool | None" = None
-    question_tool: "QuestionTool | None" = None
+    question_tool: "AskUserQuestionTool | None" = None
     message_tool: "MessageTool | None" = None
     handoff_manager: Any = None
     session_bootstrap: Any = None
@@ -330,7 +330,7 @@ class AgentContext:
             FilesystemToolConfig as _FTC,
         )
         from markbot.memory.daily_log import DailyLogManager as _DLM
-        from markbot.memory.manager import ReMeLightMemoryManager as _RML
+        from markbot.memory.manager import MemoryManager as _HMM
         from markbot.memory.encoder import MemoryEncoder as _ME
         from markbot.session.session import SessionManager as _SM2
         from markbot.session.handoff import HandoffManager as _HM
@@ -342,7 +342,7 @@ class AgentContext:
         from markbot.cli.slash_commands import CommandRouter as _CR, register_builtin_commands as _rbc
 
         _init_start = time.time()
-        logger.info("[AgentContext] Starting initialization...")
+        logger.info("Starting initialization...")
 
         timings: dict[str, float] = {}
 
@@ -424,7 +424,7 @@ class AgentContext:
         }
 
         _t0 = time.time()
-        memory_manager = _RML(
+        memory_manager = _HMM(
             working_dir=str(workspace),
             agent_id="markbot",
             fallback_manager=fallback_manager,
@@ -443,6 +443,8 @@ class AgentContext:
             force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
         )
         timings["memory_manager"] = time.time() - _t0
+
+        subagents._memory_manager = memory_manager
 
         bootstrap_hook = _BH(working_dir=workspace, language="zh")
 
@@ -492,7 +494,7 @@ class AgentContext:
         _memory_search_tool = binder.memory_search_tool
         question_tool = binder.question_tool
 
-        logger.info("[AgentContext] Agent has {} tools available", len(tools))
+        logger.info("Agent has {} tools available", len(tools))
 
         commands = _CR()
         _rbc(commands)
@@ -503,8 +505,8 @@ class AgentContext:
         pipeline.use(_QRM(get_question_tool=lambda: question_tool))
         daily_log = _DLM(workspace=workspace)
         interaction_log = _IL()
-        if hasattr(memory_manager, "_daily_log_manager"):
-            memory_manager._daily_log_manager = daily_log
+        if hasattr(memory_manager, "_daily_log"):
+            memory_manager._daily_log = daily_log
         pipeline.use(
             _MLM(
                 memory_manager=memory_manager,
@@ -512,7 +514,6 @@ class AgentContext:
                 session_manager=sessions,
             )
         )
-
         _t0 = time.time()
         handoff_manager = _HM(workspace)
         task_tracker = _TT(workspace)
@@ -526,8 +527,8 @@ class AgentContext:
         timings["session_extensions"] = time.time() - _t0
 
         timings["total"] = time.time() - _init_start
-        logger.info("[AgentContext] Initialization complete, total took {:.3f}s", timings["total"])
-        logger.info("[AgentContext] Timings breakdown:\n{}", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
+        logger.info("Initialization complete, total took {:.3f}s", timings["total"])
+        logger.info("Timings breakdown:\n{}", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
 
         return cls(
             config=config,
@@ -589,3 +590,4 @@ class AgentContext:
         total = sum(self._init_timings.values())
         lines.append(f"  TOTAL: {total:.3f}s")
         return "\n".join(lines)
+

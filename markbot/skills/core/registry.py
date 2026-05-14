@@ -50,7 +50,7 @@ class SkillRegistry:
 
         for skill in skills:
             if not self._loader.check_requirements(skill):
-                logger.debug(f"Skill '{skill.name}' requirements not met, skipping")
+                logger.debug("Skill '{}' requirements not met, skipping", skill.name)
                 continue
 
             trust_level = "builtin" if skill.is_builtin else "workspace"
@@ -72,7 +72,7 @@ class SkillRegistry:
                 if config:
                     self._config_cache[skill.name] = config
 
-        logger.info(f"Loaded {len(self._skills)} skills")
+        logger.info("Loaded {} skills", len(self._skills))
 
     def register_script_tools(self) -> None:
         """Register all skill scripts as tools into the associated tool_registry.
@@ -87,7 +87,7 @@ class SkillRegistry:
             for script in skill.scripts:
                 tool = SkillTool(skill.name, script, self.workspace)
                 self.tool_registry.register(tool)
-                logger.debug(f"Registered skill tool: {tool.definition.name}")
+                logger.debug("Registered skill tool: {}", tool.definition.name)
 
     def get(self, name: str) -> Optional[SkillDefinition]:
         """Get a skill by name."""

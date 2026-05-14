@@ -416,5 +416,5 @@ def create_provider(
 
     from markbot.providers.openai_compat import OpenAICompatProvider
 
-    logger.warning(f"Unknown backend '{backend}', falling back to OpenAICompatProvider")
+    logger.warning("Unknown backend '{}', falling back to OpenAICompatProvider", backend)
     return OpenAICompatProvider(api_key=api_key, api_base=api_base, extra_headers=extra_headers, spec=spec)

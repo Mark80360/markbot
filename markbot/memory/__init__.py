@@ -1,14 +1,14 @@
-"""Memory system for markbot architecture.
+"""Memory system for markbot.
 
-Provides ReMeLight-backed memory management with:
-- Abstract BaseMemoryManager interface
-- ReMeLightMemoryManager concrete implementation
-- Bootstrap hook for first-time user guidance
-- Memory compaction hook for context window management
+Provides file-based memory management with:
+- MemoryManager for conversation memory and context compression
+- BaseMemoryManager interface with lifecycle hooks
+- MemoryStore for persistent curated memory (add/replace/remove)
+- MemorySecurityScanner for injection/exfiltration detection
+- ContextFencing for memory-context tags and streaming scrubber
+- MemoryProvider ABC for pluggable memory backends
 - DailyLogManager for lightweight interaction logging
 - MemoryEncoder for active preference detection and encoding
-
-Architecture ported from tiered memory system.
 """
 
 from markbot.agent.hooks import BootstrapHook, MemoryCompactionHook
@@ -16,13 +16,35 @@ from markbot.agent.hooks import BootstrapHook, MemoryCompactionHook
 from .base import BaseMemoryManager
 from .daily_log import DailyLogManager
 from .encoder import MemoryEncoder
-from .manager import ReMeLightMemoryManager
+from .fencing import (
+    MEMORY_CONTEXT_CLOSE,
+    MEMORY_CONTEXT_OPEN,
+    StreamingContextScrubber,
+    fence_context,
+    is_fenced,
+    sanitize_context,
+)
+from .manager import MemoryManager
+from .provider import MemoryProvider
+from .scanner import MemorySecurityScanner
+from .tool import MEMORY_TOOL_SCHEMA, MemoryStore, memory_tool_handler
 
 __all__ = [
     "BaseMemoryManager",
     "DailyLogManager",
-    "ReMeLightMemoryManager",
+    "MemoryManager",
     "MemoryEncoder",
+    "MemorySecurityScanner",
+    "MemoryProvider",
+    "MemoryStore",
     "BootstrapHook",
     "MemoryCompactionHook",
+    "MEMORY_TOOL_SCHEMA",
+    "memory_tool_handler",
+    "fence_context",
+    "sanitize_context",
+    "is_fenced",
+    "StreamingContextScrubber",
+    "MEMORY_CONTEXT_OPEN",
+    "MEMORY_CONTEXT_CLOSE",
 ]

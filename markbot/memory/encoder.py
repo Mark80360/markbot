@@ -166,7 +166,7 @@ class MemoryEncoder:
             self._recent_detections[key] = now
 
         if encoded > 0:
-            logger.info("[MemoryEncoder] Encoded {} new preferences", encoded)
+            logger.info("Encoded {} new preferences", encoded)
 
         return encoded
 
@@ -257,17 +257,17 @@ class MemoryEncoder:
                     section_entries += 1
 
             if section_entries >= max_entries:
-                logger.debug("[MemoryEncoder] Section {} full ({} entries)", section_title, max_entries)
+                logger.debug("Section {} full ({} entries)", section_title, max_entries)
                 return False
 
             lines.insert(insert_pos, entry.to_line())
 
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.info("[MemoryEncoder] Appended to {}: {}", path.name, match.content[:60])
+            logger.info("Appended to {}: {}", path.name, match.content[:60])
             return True
 
         except Exception as e:
-            logger.warning("[MemoryEncoder] Failed to append to {}: {}", path.name, e)
+            logger.warning("Failed to append to {}: {}", path.name, e)
             return False
 
     def _increment_confidence(self, content: str) -> None:

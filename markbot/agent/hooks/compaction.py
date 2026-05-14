@@ -1,4 +1,4 @@
-"""Memory compaction hook for long-term memory archival.
+﻿"""Memory compaction hook for long-term memory archival.
 
 Responsible for archiving older conversation messages into long-term
 memory (compressed_summary + async summary tasks) when the context
@@ -40,7 +40,7 @@ class MemoryCompactionHook:
     This hook persists conversation knowledge into MEMORY.md (via async
     summary tasks) and compresses older messages into ``compressed_summary``
     (via ``memory_manager.compact_memory()``).  It does NOT truncate
-    tool results or drop messages — that is MultiLevelCompactor's job.
+    tool results or drop messages 鈥?that is MultiLevelCompactor's job.
 
     **Coordination with MultiLevelCompactor**:
     Both systems may run in the same iteration.  When MultiLevelCompactor
@@ -101,7 +101,7 @@ class MemoryCompactionHook:
             New compressed summary if context compaction occurred, None otherwise
         """
         try:
-            if not self.memory_manager._reme:
+            if not getattr(self.memory_manager, "_started", False) and not getattr(self.memory_manager, "_memory_store", None):
                 return None
 
             session_key = f"{channel}:{chat_id}" if channel and chat_id else None
@@ -222,7 +222,7 @@ class MemoryCompactionHook:
                 return None
 
             logger.info(
-                "[Compaction] Starting — compacting {} messages "
+                "[Compaction] Starting 鈥?compacting {} messages "
                 "({} tokens), total context ~{} tokens",
                 len(messages_to_compact),
                 pre_compact_tokens,
@@ -241,7 +241,7 @@ class MemoryCompactionHook:
                     post_summary_tokens = _estimate_tokens(compact_content)
                     saved_tokens = pre_compact_tokens - post_summary_tokens
                     logger.info(
-                        "[Compaction] Completed — summary: {} tokens, "
+                        "[Compaction] Completed 鈥?summary: {} tokens, "
                         "saved ~{} tokens ({:.0f}% reduction)",
                         post_summary_tokens,
                         max(saved_tokens, 0),
@@ -260,7 +260,7 @@ class MemoryCompactionHook:
             return None
 
         except Exception as e:
-            logger.exception(f"Failed to compact memory in pre_reasoning hook: {e}")
+            logger.exception("Failed to compact memory in pre_reasoning hook: {}", e)
             return None
 
     @staticmethod
@@ -286,3 +286,4 @@ class MemoryCompactionHook:
         return all(
             isinstance(m, dict) and "role" in m for m in messages
         )
+

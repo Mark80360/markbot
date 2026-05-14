@@ -91,7 +91,7 @@ class AgentLoop:
 
     def _init_from_context(self, ctx: AgentContext) -> None:
         _init_start = time.time()
-        logger.info("[AgentLoop] Starting initialization from AgentContext...")
+        logger.info("Starting initialization from AgentContext...")
 
         self.ctx = ctx
         self.bus = ctx.bus
@@ -139,7 +139,7 @@ class AgentLoop:
         self._memory_search_tool = ctx.memory_search_tool
         self.question_tool = ctx.question_tool
 
-        logger.info("[AgentLoop] Agent has {} tools available", len(self.tools))
+        logger.info("Agent has {} tools available", len(self.tools))
         self.commands = ctx.commands
         self.tool_executor = ctx.tool_executor
         self.pipeline = ctx.pipeline
@@ -151,17 +151,17 @@ class AgentLoop:
         self.task_tracker = ctx.task_tracker
         self.memory_encoder = ctx.memory_encoder
 
-        logger.info("[AgentLoop] Initialization complete, total took {:.3f}s", time.time() - _init_start)
+        logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if not self.mcp._mcp_servers:
-            logger.debug("[AgentLoop] No MCP servers configured, skipping connection")
+            logger.debug("No MCP servers configured, skipping connection")
             return
         _t0 = time.time()
-        logger.info("[AgentLoop] Connecting to MCP servers...")
+        logger.info("Connecting to MCP servers...")
         await self.mcp.connect(self.tools)
-        logger.info("[AgentLoop] MCP connection took {:.3f}s", time.time() - _t0)
+        logger.info("MCP connection took {:.3f}s", time.time() - _t0)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -317,17 +317,17 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         _run_start = time.time()
-        logger.info("[AgentLoop] Starting run()...")
+        logger.info("Starting run()...")
         self._running = True
         await self._connect_mcp()
         try:
             _t0 = time.time()
-            logger.info("[AgentLoop] Starting memory manager...")
+            logger.info("Starting memory manager...")
             await self.memory_manager.start()
-            logger.info("[AgentLoop] Memory manager started, took {:.3f}s", time.time() - _t0)
+            logger.info("Memory manager started, took {:.3f}s", time.time() - _t0)
         except Exception as e:
-            logger.warning("[AgentLoop] Memory manager start failed: {}", e)
-        logger.info("[AgentLoop] Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
+            logger.warning("Memory manager start failed: {}", e)
+        logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
         while self._running:
             try:
@@ -561,7 +561,7 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", channel, msg.sender_id, preview)
 
         logger.info(
-            "[AgentLoop] _process_message started for channel={}, chat_id={}, content={}...",
+            "_process_message started for channel={}, chat_id={}, content={}...",
             channel,
             chat_id,
             msg.content[:50],
@@ -570,7 +570,7 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
         ctx.session = session
 
-        logger.debug("[AgentLoop] Starting memory session for key={}", key)
+        logger.debug("Starting memory session for key={}", key)
 
         # Slash commands
         raw = msg.content.strip()
@@ -622,7 +622,7 @@ class AgentLoop:
                 )
             )
 
-        logger.info("[AgentLoop] Calling _run_agent_loop...")
+        logger.info("Calling _run_agent_loop...")
         try:
             final_content, tools_used, all_msgs, _new_start = await self._run_agent_loop(
                 initial_messages,
@@ -635,33 +635,33 @@ class AgentLoop:
             )
 
             logger.info(
-                "[AgentLoop] _run_agent_loop returned: final_content_length={}",
+                "_run_agent_loop returned: final_content_length={}",
                 len(final_content or ""),
             )
 
             if final_content is None:
                 final_content = "I've completed processing but have no response to give."
-                logger.warning("[AgentLoop] final_content was None, using default message")
+                logger.warning("final_content was None, using default message")
 
-            logger.info("[AgentLoop] Saving session with {} messages (new_msg_start={})", len(all_msgs), _new_start)
+            logger.info("Saving session with {} messages (new_msg_start={})", len(all_msgs), _new_start)
             self.tool_executor.save_turn(session, all_msgs, _new_start)
         except Exception as e:
-            logger.error("[AgentLoop] _run_agent_loop failed with exception: {}", e)
+            logger.error("_run_agent_loop failed with exception: {}", e)
             raise
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            logger.info("[AgentLoop] MessageTool sent in turn, returning None")
+            logger.info("MessageTool sent in turn, returning None")
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         safe_preview = preview.replace("{", "{{").replace("}", "}}")
-        logger.info("[AgentLoop] Response to {}:{}: {}", channel, msg.sender_id, safe_preview)
+        logger.info("Response to {}:{}: {}", channel, msg.sender_id, safe_preview)
 
         meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
 
-        logger.info("[AgentLoop] _process_message completed, returning response")
+        logger.info("_process_message completed, returning response")
         return OutboundMessage(
             channel=channel,
             chat_id=chat_id,
@@ -681,17 +681,17 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         _direct_start = time.time()
-        logger.info("[AgentLoop] process_direct starting...")
+        logger.info("process_direct starting...")
         await self._connect_mcp()
         if self.memory_manager and not getattr(self.memory_manager, "_started", False):
             try:
                 _t0 = time.time()
-                logger.info("[AgentLoop] Starting memory manager in process_direct...")
+                logger.info("Starting memory manager in process_direct...")
                 await self.memory_manager.start()
-                logger.info("[AgentLoop] Memory manager started in process_direct, took {:.3f}s", time.time() - _t0)
+                logger.info("Memory manager started in process_direct, took {:.3f}s", time.time() - _t0)
             except Exception as e:
-                logger.warning("[AgentLoop] Memory manager start failed in process_direct: {}", e)
-        logger.info("[AgentLoop] process_direct startup took {:.3f}s", time.time() - _direct_start)
+                logger.warning("Memory manager start failed in process_direct: {}", e)
+        logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg,

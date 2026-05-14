@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Optional
+
+from loguru import logger
 
 from markbot.types.skill import SkillConditions, SkillConfigVar, SkillDefinition, SkillScriptDef
 from markbot.types.tool import ToolParameter
@@ -25,7 +26,7 @@ except ImportError:
         return None
 
 
-logger = logging.getLogger(__name__)
+
 
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "builtin"
 
@@ -62,7 +63,7 @@ class SkillLoader:
                             skills.append(skill)
                             loaded_names.add(skill.name)
                     except Exception as e:
-                        logger.warning(f"Failed to load skill from {skill_dir}: {e}")
+                        logger.warning("Failed to load skill from {}: {}", skill_dir, e)
 
         if self.builtin_skills.exists():
             for skill_dir in sorted(self.builtin_skills.iterdir()):
@@ -74,7 +75,7 @@ class SkillLoader:
                                 skills.append(skill)
                                 loaded_names.add(skill.name)
                         except Exception as e:
-                            logger.warning(f"Failed to load builtin skill from {skill_dir}: {e}")
+                            logger.warning("Failed to load builtin skill from {}: {}", skill_dir, e)
 
         return skills
 

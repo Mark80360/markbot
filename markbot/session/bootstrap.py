@@ -142,7 +142,7 @@ class SessionBootstrap:
 
         if report.handoff_loaded:
             logger.info(
-                "[SessionBootstrap] Loaded handoff for {}: {} active tasks",
+                "Loaded handoff for {}: {} active tasks",
                 session_key,
                 len(report.handoff.active_tasks) if report.handoff else 0,
             )
@@ -155,7 +155,7 @@ class SessionBootstrap:
         if report.feature_list_loaded:
             unfinished = [f for f in report.feature_list if f.status in ("not_started", "in_progress", "blocked")]
             logger.info(
-                "[SessionBootstrap] Loaded feature_list.json: {} features, {} unfinished",
+                "Loaded feature_list.json: {} features, {} unfinished",
                 len(report.feature_list),
                 len(unfinished),
             )
@@ -287,7 +287,7 @@ class SessionBootstrap:
 
             return features, next_feature
         except Exception as e:
-            logger.warning("[SessionBootstrap] Failed to load feature_list.json: {}", e)
+            logger.warning("Failed to load feature_list.json: {}", e)
             return None, None
 
     def _check_init_sh(self) -> BootstrapCheckResult:

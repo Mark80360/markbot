@@ -42,7 +42,7 @@ class ToolRegistry:
             self._aliases[alias] = name
 
         self._invalidate_cache()
-        logger.debug(f"Registered tool: {name}")
+        logger.debug("Registered tool: {}", name)
 
     def unregister(self, name: str) -> None:
         """Unregister a tool."""
@@ -131,7 +131,7 @@ class ToolRegistry:
                     decision = handler_decision
 
             except Exception as e:
-                logger.error(f"Permission handler failed: {e}")
+                logger.error("Permission handler failed: {}", e)
 
         return decision
 
@@ -178,11 +178,11 @@ class ToolRegistry:
 
         # Execute
         try:
-            logger.info(f"Executing tool: {name}")
+            logger.info("Executing tool: {}", name)
             result = await tool.execute(params, context)
             return result
         except Exception as e:
-            logger.error(f"Tool execution failed: {e}")
+            logger.error("Tool execution failed: {}", e)
             return f"Error executing {name}: {str(e)}"
 
     def get_definitions_for_provider(self, provider: str = "openai") -> list[dict[str, Any]]:

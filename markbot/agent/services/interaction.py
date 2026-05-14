@@ -109,7 +109,7 @@ class InteractionLogger:
             with open(filepath, "a", encoding="utf-8") as f:
                 f.write(entry)
         except Exception as e:
-            logger.warning("[InteractionLog] Failed to write to {}: {}", filepath, e)
+            logger.warning("Failed to write to {}: {}", filepath, e)
 
     def _build_header(
         self,

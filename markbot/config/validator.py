@@ -335,13 +335,13 @@ async def dry_run(config: "Config") -> bool:
         msg = f"  [{level}] {issue.field}: {issue.message}"
         if issue.suggestion:
             msg += f" — {issue.suggestion}"
-        logger.info(f"[DryRun] {msg}")
+        logger.info("{}", msg)
 
     if not result.is_valid:
-        logger.error("[DryRun] Configuration has {} error(s), aborting dry-run", len(result.errors))
+        logger.error("Configuration has {} error(s), aborting dry-run", len(result.errors))
         return False
 
-    logger.info("[DryRun] Configuration validation passed, checking connectivity...")
+    logger.info("Configuration validation passed, checking connectivity...")
 
     connectivity_ok = True
     chain = config.agents.defaults.model_chain
@@ -358,10 +358,10 @@ async def dry_run(config: "Config") -> bool:
                 if spec and spec.env_key:
                     import os
                     if not os.environ.get(spec.env_key):
-                        logger.warning("[DryRun] Env var {} not set for provider '{}'", spec.env_key, provider_name)
+                        logger.warning("Env var {} not set for provider '{}'", spec.env_key, provider_name)
                         connectivity_ok = False
         except Exception as e:
-            logger.warning("[DryRun] Provider connectivity check failed: {}", e)
+            logger.warning("Provider connectivity check failed: {}", e)
             connectivity_ok = False
 
     if config.tools.web.search.api_key:
@@ -376,10 +376,10 @@ async def dry_run(config: "Config") -> bool:
                         headers={"X-Subscription-Token": config.tools.web.search.api_key},
                     )
         except Exception:
-            logger.warning("[DryRun] Web search connectivity check failed (non-fatal)")
+            logger.warning("Web search connectivity check failed (non-fatal)")
 
     logger.info(
-        "[DryRun] Result: config_valid={}, connectivity_ok={}",
+        "Result: config_valid={}, connectivity_ok={}",
         result.is_valid, connectivity_ok,
     )
     return result.is_valid and connectivity_ok

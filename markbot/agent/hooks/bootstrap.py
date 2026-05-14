@@ -57,7 +57,7 @@ class BootstrapHook:
                 return None
 
             guidance = self._build_bootstrap_guidance()
-            logger.debug(f"Found BOOTSTRAP.md [{self.language}], returning guidance")
+            logger.debug("Found BOOTSTRAP.md [{}], returning guidance", self.language)
 
             bootstrap_completed_flag.touch()
             logger.debug("Created bootstrap completion flag")
@@ -65,7 +65,7 @@ class BootstrapHook:
             return guidance
 
         except Exception as e:
-            logger.error(f"Failed to process bootstrap: {e}")
+            logger.error("Failed to process bootstrap: {}", e)
             return None
 
     @staticmethod

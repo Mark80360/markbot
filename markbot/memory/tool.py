@@ -1,0 +1,414 @@
+"""Memory tool — persistent curated memory with add/replace/remove actions.
+
+Provides bounded, file-backed memory that persists across sessions. Two stores:
+
+- MEMORY.md: agent's personal notes and observations
+- PROFILE.md (or USER.md): what the agent knows about the user
+
+Uses frozen snapshot pattern:
+- System prompt gets a frozen snapshot at session start (stable prefix cache)
+- Mid-session writes update files on disk immediately but do NOT change
+  the system prompt
+- Tool responses always reflect the live state
+
+Security: all content is scanned by MemorySecurityScanner before writing.
+Context fencing: memory context is wrapped in <memory-context> tags.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+
+from .scanner import MemorySecurityScanner
+from .fencing import fence_context
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ENTRY_DELIMITER = "\n\n---\n\n"
+
+# Default character limits (not tokens 鈥?char counts are model-independent)
+DEFAULT_MEMORY_CHAR_LIMIT = 4000
+DEFAULT_USER_CHAR_LIMIT = 2000
+
+# Files
+MEMORY_FILENAME = "MEMORY.md"
+USER_FILENAME = "PROFILE.md"  # Also checks USER.md as fallback
+
+
+# ---------------------------------------------------------------------------
+# Memory Store
+# ---------------------------------------------------------------------------
+
+
+class MemoryStore:
+    """Bounded curated memory with file persistence.
+
+    Maintains two parallel states:
+      - _system_prompt_snapshot: frozen at load time, used for system prompt
+        injection. Never mutated mid-session. Keeps prefix cache stable.
+      - memory_entries / user_entries: live state, mutated by tool calls,
+        persisted to disk. Tool responses always reflect this live state.
+    """
+
+    def __init__(
+        self,
+        working_dir: str | Path,
+        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
+    ):
+        self._working_dir = Path(working_dir)
+        self._memory_path = self._working_dir / MEMORY_FILENAME
+        self._user_path = self._working_dir / USER_FILENAME
+        # Also check USER.md as fallback
+        self._user_fallback_path = self._working_dir / "USER.md"
+
+        self.memory_char_limit = memory_char_limit
+        self.user_char_limit = user_char_limit
+
+        self.memory_entries: List[str] = []
+        self.user_entries: List[str] = []
+
+        # Frozen snapshot for system prompt injection
+        self._system_prompt_snapshot: str = ""
+
+        self._scanner = MemorySecurityScanner()
+
+        self._load_all()
+
+    # -- Public API ----------------------------------------------------------
+
+    @property
+    def system_prompt_snapshot(self) -> str:
+        """Frozen snapshot for system prompt injection.
+
+        Returns empty string if no entries exist, or a formatted block
+        wrapped in memory-context fence tags.
+        """
+        return self._system_prompt_snapshot
+
+    def refresh_snapshot(self) -> None:
+        """Refresh the frozen snapshot from current entries.
+
+        Called at session start and after bulk operations. Does NOT
+        need to be called after every tool write (that would defeat
+        the frozen snapshot purpose), but can be called explicitly
+        when needed.
+        """
+        self._build_snapshot()
+
+    def add(self, target: str, content: str) -> Dict[str, Any]:
+        """Add a new entry to the specified store.
+
+        Args:
+            target: 'memory' or 'user'.
+            content: The entry content.
+
+        Returns:
+            Dict with keys: success, message, entries.
+        """
+        # Security scan
+        error = self._scanner.scan(content)
+        if error:
+            return {"success": False, "message": error, "entries": []}
+
+        content = self._scanner.sanitize(content)
+
+        if target == "memory":
+            entries = self.memory_entries
+            char_limit = self.memory_char_limit
+        else:
+            entries = self.user_entries
+            char_limit = self.user_char_limit
+
+        # Check total char limit
+        current_total = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries), 1)
+        if current_total + len(content) > char_limit:
+            return {
+                "success": False,
+                "message": f"Character limit reached ({char_limit}). "
+                           f"Remove or replace existing entries first.",
+                "entries": list(entries),
+            }
+
+        entries.append(content)
+        self._persist(target)
+        logger.info("Added entry to {}: {}...", target, content[:60])
+        return {"success": True, "message": "Entry added.", "entries": list(entries)}
+
+    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+        """Replace an existing entry identified by substring match.
+
+        Args:
+            target: 'memory' or 'user'.
+            old_text: Substring to identify the entry to replace.
+            new_content: The new entry content.
+
+        Returns:
+            Dict with keys: success, message, entries.
+        """
+        # Security scan
+        error = self._scanner.scan(new_content)
+        if error:
+            return {"success": False, "message": error, "entries": []}
+
+        new_content = self._scanner.sanitize(new_content)
+
+        if target == "memory":
+            entries = self.memory_entries
+        else:
+            entries = self.user_entries
+
+        for i, entry in enumerate(entries):
+            if old_text in entry:
+                entries[i] = new_content
+                self._persist(target)
+                logger.info("Replaced entry in {}: {}...", target, old_text[:40])
+                return {"success": True, "message": "Entry replaced.", "entries": list(entries)}
+
+        return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
+
+    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+        """Remove an entry identified by substring match.
+
+        Args:
+            target: 'memory' or 'user'.
+            old_text: Substring to identify the entry to remove.
+
+        Returns:
+            Dict with keys: success, message, entries.
+        """
+        if target == "memory":
+            entries = self.memory_entries
+        else:
+            entries = self.user_entries
+
+        for i, entry in enumerate(entries):
+            if old_text in entry:
+                removed = entries.pop(i)
+                self._persist(target)
+                logger.info("Removed entry from {}: {}...", target, removed[:40])
+                return {"success": True, "message": "Entry removed.", "entries": list(entries)}
+
+        return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
+
+    def read(self, target: str) -> Dict[str, Any]:
+        """Read all entries from the specified store.
+
+        Args:
+            target: 'memory' or 'user'.
+
+        Returns:
+            Dict with keys: success, message, entries.
+        """
+        if target == "memory":
+            entries = self.memory_entries
+        else:
+            entries = self.user_entries
+
+        return {"success": True, "message": f"{len(entries)} entries.", "entries": list(entries)}
+
+    def get_memory_context(self, query: str | None = None) -> str:
+        """Get formatted memory context for system prompt injection.
+
+        Returns the frozen snapshot, or builds one if empty. The result
+        is wrapped in <memory-context> fence tags.
+
+        Args:
+            query: Optional search query (not yet used, reserved for future).
+
+        Returns:
+            Fenced memory context string, or empty string.
+        """
+        if not self._system_prompt_snapshot:
+            self._build_snapshot()
+        if not self._system_prompt_snapshot:
+            return ""
+        return fence_context(self._system_prompt_snapshot, system_note=True)
+
+    # -- Internal ------------------------------------------------------------
+
+    def _load_all(self) -> None:
+        """Load entries from disk into memory."""
+        self.memory_entries = self._load_entries(self._memory_path)
+        # Try PROFILE.md first, then USER.md as fallback
+        if self._user_path.exists():
+            self.user_entries = self._load_entries(self._user_path)
+        elif self._user_fallback_path.exists():
+            self.user_entries = self._load_entries(self._user_fallback_path)
+            self._user_path = self._user_fallback_path
+        self._build_snapshot()
+
+    def _load_entries(self, path: Path) -> List[str]:
+        """Load entries from a file, splitting by delimiter."""
+        if not path.exists():
+            return []
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("Failed to read {}: {}", path, e)
+            return []
+
+        # Split by delimiter and strip each entry
+        raw_entries = re.split(r"\n---\n", text)
+        entries: List[str] = []
+        for raw in raw_entries:
+            stripped = raw.strip()
+            # Skip headers and empty sections
+            if not stripped or stripped.startswith("#"):
+                continue
+            entries.append(stripped)
+        return entries
+
+    def _build_snapshot(self) -> None:
+        """Build the frozen system prompt snapshot from current entries."""
+        parts: List[str] = []
+
+        if self.memory_entries:
+            memory_block = "\n".join(f"- {e}" for e in self.memory_entries)
+            parts.append(f"## Agent Memory\n\n{memory_block}")
+
+        if self.user_entries:
+            user_block = "\n".join(f"- {e}" for e in self.user_entries)
+            parts.append(f"## User Profile\n\n{user_block}")
+
+        self._system_prompt_snapshot = "\n\n".join(parts)
+
+    def _persist(self, target: str) -> None:
+        """Write entries to disk."""
+        if target == "memory":
+            path = self._memory_path
+            entries = self.memory_entries
+            header = "# Agent Memory\n\n"
+        else:
+            path = self._user_path
+            entries = self.user_entries
+            header = "# User Profile\n\n"
+
+        if not entries:
+            # Write empty header to keep the file
+            try:
+                path.write_text(header, encoding="utf-8")
+            except Exception as e:
+                logger.warning("Failed to write {}: {}", path, e)
+            return
+
+        content = header + ENTRY_DELIMITER.join(entries) + "\n"
+        try:
+            path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to write {}: {}", path, e)
+
+
+# ---------------------------------------------------------------------------
+# Tool schema and handler
+# ---------------------------------------------------------------------------
+
+MEMORY_TOOL_SCHEMA = {
+    "name": "memory",
+    "description": (
+        "Save durable information to persistent memory that survives across sessions. "
+        "Memory is injected into future turns, so keep it compact and focused on facts "
+        "that will still matter later.\n\n"
+        "WHEN TO SAVE (proactive 鈥?don't wait to be asked):\n"
+        "- User corrects you or says 'remember this' / 'don't do that again'\n"
+        "- User shares a preference, habit, or personal detail\n"
+        "- You discover something about the environment (OS, installed tools, project structure)\n"
+        "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
+        "- You identify a stable fact that will be useful again in future sessions\n\n"
+        "TWO TARGETS:\n"
+        "- 'user': who the user is 鈥?name, role, preferences, communication style\n"
+        "- 'memory': your notes 鈥?environment facts, project conventions, tool quirks\n\n"
+        "ACTIONS:\n"
+        "- add: Add a new entry\n"
+        "- replace: Update an existing entry (old_text identifies it)\n"
+        "- remove: Delete an entry (old_text identifies it)\n"
+        "- read: List all entries\n"
+        "\n"
+        "Do NOT save task progress, session outcomes, or temporary TODO state.\n"
+        "If you've discovered a reusable solution, save it as a skill instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["add", "replace", "remove", "read"],
+                "description": "The action to perform.",
+            },
+            "target": {
+                "type": "string",
+                "enum": ["memory", "user"],
+                "description": "Which memory store: 'memory' for agent notes, 'user' for user profile.",
+            },
+            "content": {
+                "type": "string",
+                "description": "The entry content. Required for 'add' and 'replace'.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Short unique substring identifying the entry to replace or remove.",
+            },
+        },
+        "required": ["action", "target"],
+    },
+}
+
+
+def memory_tool_handler(
+    action: str,
+    target: str = "memory",
+    content: str | None = None,
+    old_text: str | None = None,
+    store: MemoryStore | None = None,
+) -> str:
+    """Dispatch to MemoryStore methods and return JSON result."""
+    import json
+
+    if store is None:
+        return json.dumps({"success": False, "message": "Memory store is not available."}, ensure_ascii=False)
+
+    if target not in {"memory", "user"}:
+        return json.dumps({"success": False, "message": f"Invalid target '{target}'. Use 'memory' or 'user'."}, ensure_ascii=False)
+
+    if action == "add":
+        if not content:
+            return json.dumps({"success": False, "message": "Content is required for 'add' action."}, ensure_ascii=False)
+        result = store.add(target, content)
+
+    elif action == "replace":
+        if not old_text:
+            return json.dumps({"success": False, "message": "old_text is required for 'replace' action."}, ensure_ascii=False)
+        if not content:
+            return json.dumps({"success": False, "message": "content is required for 'replace' action."}, ensure_ascii=False)
+        result = store.replace(target, old_text, content)
+
+    elif action == "remove":
+        if not old_text:
+            return json.dumps({"success": False, "message": "old_text is required for 'remove' action."}, ensure_ascii=False)
+        result = store.remove(target, old_text)
+
+    elif action == "read":
+        result = store.read(target)
+
+    else:
+        return json.dumps({"success": False, "message": f"Unknown action '{action}'."}, ensure_ascii=False)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+__all__ = [
+    "MemoryStore",
+    "MEMORY_TOOL_SCHEMA",
+    "memory_tool_handler",
+    "MEMORY_FILENAME",
+    "USER_FILENAME",
+]

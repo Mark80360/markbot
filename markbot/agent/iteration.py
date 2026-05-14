@@ -96,20 +96,20 @@ class IterationRunner:
         )
 
         logger.info(
-            "[IterationRunner] Starting agent loop with {} initial messages",
+            "Starting agent loop with {} initial messages",
             len(initial_messages),
         )
 
         while state.iteration < self.loop.max_iterations:
             state.iteration += 1
             logger.info(
-                "[IterationRunner] === Iteration {}/{} (channel={}, chat_id={}) ===",
+                "=== Iteration {}/{} (channel={}, chat_id={}) ===",
                 state.iteration,
                 self.loop.max_iterations,
                 self.channel,
                 self.chat_id,
             )
-            logger.info("[IterationRunner] Current message count: {}", len(state.messages))
+            logger.info("Current message count: {}", len(state.messages))
 
             result = await self._run_one_iteration(state)
             if result.should_break:
@@ -121,7 +121,7 @@ class IterationRunner:
 
     async def _run_one_iteration(self, state: LoopState) -> IterationResult:
         state.current_tokens = token_count_with_estimation(state.messages)
-        logger.debug("[IterationRunner] Estimated context tokens: {}", state.current_tokens)
+        logger.debug("Estimated context tokens: {}", state.current_tokens)
 
         await self._phase_compact(state)
         if state.iteration == 1:
@@ -130,7 +130,7 @@ class IterationRunner:
 
         tool_defs = self.loop.tools.get_definitions()
         logger.debug(
-            "[IterationRunner] Available tools: {}",
+            "Available tools: {}",
             [t.get("function", {}).get("name") for t in tool_defs[:5]],
         )
 
@@ -165,7 +165,7 @@ class IterationRunner:
         state.last_compact_action = compact_result.action
         if compact_result.action != CompactAction.NONE:
             logger.info(
-                "[IterationRunner] Compaction applied: action={}, "
+                "Compaction applied: action={}, "
                 "messages: {} -> {}, tokens: {} -> {}{}",
                 compact_result.action.value,
                 compact_result.messages_before,
@@ -184,40 +184,60 @@ class IterationRunner:
 
     async def _phase_inject_memory_context(self, state: LoopState) -> None:
         mem_tool = self.loop._memory_search_tool
+        memory_manager = getattr(self.loop, "memory_manager", None)
+
+        user_text = ""
+        for m in reversed(state.messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if content is None:
+                    content = ""
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            block_text = block.get("text", "")
+                            if block_text is None:
+                                block_text = ""
+                                user_text += block_text
+                elif isinstance(content, str):
+                    user_text = content
+                if user_text:
+                    break
+
+        if not user_text:
+            return
+
+        sys_idx = next(
+            (i for i, m in enumerate(state.messages) if m.get("role") == "system"),
+            None,
+        )
+        if sys_idx is None:
+            return
+
+        if memory_manager and hasattr(memory_manager, "prefetch"):
+            try:
+                session_id = self.session_key or ""
+                prefetch_ctx = memory_manager.prefetch(user_text, session_id=session_id)
+                if prefetch_ctx and prefetch_ctx.strip():
+                    state.messages[sys_idx]["content"] = (
+                        state.messages[sys_idx]["content"] + "\n\n" + prefetch_ctx
+                    )
+                    logger.info("Memory prefetch context injected")
+            except Exception as e:
+                logger.warning("Memory prefetch failed: {}", e)
+
         if not mem_tool:
             return
         try:
-            user_text = ""
-            for m in reversed(state.messages):
-                if m.get("role") == "user":
-                    content = m.get("content", "")
-                    if content is None:
-                        content = ""
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                block_text = block.get("text", "")
-                                if block_text is None:
-                                    block_text = ""
-                                user_text += block_text
-                    elif isinstance(content, str):
-                        user_text = content
-                    if user_text:
-                        break
             if user_text:
                 forced_ctx = await mem_tool.get_forced_context(user_text)
                 if forced_ctx:
-                    sys_idx = next(
-                        (i for i, m in enumerate(state.messages) if m.get("role") == "system"),
-                        None,
+                    state.messages[sys_idx]["content"] = (
+                        state.messages[sys_idx]["content"] + "\n\n" + forced_ctx
                     )
-                    if sys_idx is not None:
-                        state.messages[sys_idx]["content"] = (
-                            state.messages[sys_idx]["content"] + "\n\n" + forced_ctx
-                        )
-                        logger.info("[IterationRunner] Forced memory search context injected")
+                    logger.info("Forced memory search context injected")
         except Exception as e:
-            logger.warning(f"[IterationRunner] Forced memory search failed: {e}")
+            logger.warning("Forced memory search failed: {}", e)
 
     async def _phase_memory_compaction_hook(self, state: LoopState) -> None:
         if state.current_tokens <= self.loop.context_window_tokens * 0.6:
@@ -237,7 +257,7 @@ class IterationRunner:
             chat_id=self.chat_id,
         )
         if new_summary:
-            logger.info("[IterationRunner] Memory compaction applied, summary updated")
+            logger.info("Memory compaction applied, summary updated")
 
     async def _phase_session_bootstrap(self, state: LoopState) -> None:
         bootstrap = getattr(self.loop, "session_bootstrap", None)
@@ -258,7 +278,7 @@ class IterationRunner:
                             state.messages[sys_idx]["content"] + "\n\n" + context_block
                         )
                         logger.info(
-                            "[IterationRunner] Session bootstrap context injected "
+                            "Session bootstrap context injected "
                             "(handoff={}, warnings={}, features={}, init_sh={})",
                             report.handoff_loaded,
                             len(report.warnings),
@@ -266,7 +286,7 @@ class IterationRunner:
                             report.init_sh_available,
                         )
         except Exception as e:
-            logger.warning("[IterationRunner] Session bootstrap failed: {}", e)
+            logger.warning("Session bootstrap failed: {}", e)
 
     def _phase_active_memory_encoding(self, state: LoopState) -> None:
         encoder = getattr(self.loop, "memory_encoder", None)
@@ -278,11 +298,49 @@ class IterationRunner:
                 encoded = encoder.encode_preferences(matches)
                 if encoded > 0:
                     logger.info(
-                        "[IterationRunner] Active memory encoding: {} new preferences",
+                        "Active memory encoding: {} new preferences",
                         encoded,
                     )
         except Exception as e:
-            logger.debug("[IterationRunner] Active memory encoding failed: {}", e)
+            logger.debug("Active memory encoding failed: {}", e)
+
+    def _phase_memory_sync(self, state: LoopState) -> None:
+        memory_manager = getattr(self.loop, "memory_manager", None)
+        if memory_manager is None:
+            return
+        try:
+            user_content = ""
+            assistant_content = state.final_content or ""
+            for m in reversed(state.messages):
+                if m.get("role") == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, str):
+                        user_content = content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                user_content = block.get("text", "")
+                                break
+                    if user_content:
+                        break
+
+            session_id = self.session_key or ""
+            if user_content or assistant_content:
+                if hasattr(memory_manager, "sync_turn"):
+                    memory_manager.sync_turn(
+                        user_content=user_content,
+                        assistant_content=assistant_content,
+                        session_id=session_id,
+                    )
+                    logger.debug("Memory sync_turn completed")
+                if hasattr(memory_manager, "queue_prefetch"):
+                    memory_manager.queue_prefetch(
+                        query=user_content,
+                        session_id=session_id,
+                    )
+                    logger.debug("Memory queue_prefetch completed")
+        except Exception as e:
+            logger.debug("Memory sync failed: {}", e)
 
     async def _phase_call_llm(
         self, state: LoopState, tool_defs: list[dict]
@@ -296,20 +354,20 @@ class IterationRunner:
             )
             if had_content_filter:
                 logger.info(
-                    "[IterationRunner] Discarding polluted stream buffer before new LLM call"
+                    "Discarding polluted stream buffer before new LLM call"
                 )
                 await self.on_stream_end(discard=True)
                 self._stream_filter.reset()
         try:
             if self.on_stream:
-                logger.info("[IterationRunner] Calling LLM with streaming...")
+                logger.info("Calling LLM with streaming...")
                 response, attempts = await self.loop.fallback_manager.chat_stream_with_fallback(
                     messages=state.messages,
                     tools=tool_defs,
                     on_content_delta=self._stream_filter,
                 )
             else:
-                logger.info("[IterationRunner] Calling LLM without streaming...")
+                logger.info("Calling LLM without streaming...")
                 response, attempts = await self.loop.fallback_manager.chat_with_fallback(
                     messages=state.messages,
                     tools=tool_defs,
@@ -324,20 +382,20 @@ class IterationRunner:
         self, state: LoopState, tool_defs: list[dict], llm_exc: Exception
     ) -> IterationResult:
         if not is_prompt_too_long_error(llm_exc):
-            logger.error("[IterationRunner] LLM call failed: {}", llm_exc)
+            logger.error("LLM call failed: {}", llm_exc)
             state.final_content = (
                 f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
             )
             return IterationResult(should_break=True)
 
-        logger.warning("[IterationRunner] Prompt-too-long error, attempting reactive compaction")
+        logger.warning("Prompt-too-long error, attempting reactive compaction")
         task_context = self.loop._gather_task_context()
         reactive_result = await self.loop.compactor.reactive_compact(
             state.messages, self.loop.context_window_tokens, llm_exc,
             task_context=task_context,
         )
         if reactive_result is None:
-            logger.error("[IterationRunner] LLM call failed (not a PTL error): {}", llm_exc)
+            logger.error("LLM call failed (not a PTL error): {}", llm_exc)
             state.final_content = (
                 f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
             )
@@ -350,7 +408,7 @@ class IterationRunner:
                 state.messages, state.initial_count, state.new_msg_start,
             )
         logger.info(
-            "[IterationRunner] Reactive compaction applied: {} -> {} tokens",
+            "Reactive compaction applied: {} -> {} tokens",
             compact_result_ptl.tokens_before,
             compact_result_ptl.tokens_after,
         )
@@ -371,7 +429,7 @@ class IterationRunner:
             return None
         except Exception as retry_exc:
             logger.error(
-                "[IterationRunner] LLM call failed after reactive compaction: {}", retry_exc
+                "LLM call failed after reactive compaction: {}", retry_exc
             )
             state.final_content = (
                 "Sorry, the conversation context became too large and compaction was unable "
@@ -383,7 +441,7 @@ class IterationRunner:
         self, state: LoopState, response: Any, attempts: list[Any]
     ) -> None:
         logger.info(
-            "[IterationRunner] LLM response received: finish_reason={}, "
+            "LLM response received: finish_reason={}, "
             "has_tool_calls={}, content_length={}",
             response.finish_reason,
             response.has_tool_calls,
@@ -433,10 +491,10 @@ class IterationRunner:
                 response, model=_actual_model
             )
             if call_cost > 0:
-                logger.debug("[IterationRunner] API cost this call: ${:.6f}", call_cost)
+                logger.debug("API cost this call: ${:.6f}", call_cost)
             return None
         except BudgetExceededError as exc:
-            logger.error("[IterationRunner] Budget exceeded: {}. Stopping loop early.", exc)
+            logger.error("Budget exceeded: {}. Stopping loop early.", exc)
             state.budget_exceeded = True
             return IterationResult(should_break=True)
 
@@ -444,7 +502,7 @@ class IterationRunner:
         self, state: LoopState, response: Any, tool_defs: list[dict]
     ) -> IterationResult:
         logger.info(
-            "[IterationRunner] LLM requested {} tool call(s): {}",
+            "LLM requested {} tool call(s): {}",
             len(response.tool_calls),
             [tc.name for tc in response.tool_calls],
         )
@@ -456,7 +514,7 @@ class IterationRunner:
             )
             if had_content_filter:
                 logger.info(
-                    "[IterationRunner] Discarding polluted stream buffer "
+                    "Discarding polluted stream buffer "
                     "(content_filter in fallback chain)"
                 )
                 await self.on_stream_end(resuming=True, discard=True)
@@ -483,7 +541,7 @@ class IterationRunner:
             thinking_blocks=response.thinking_blocks,
         )
         logger.debug(
-            "[IterationRunner] Added assistant message with tool calls, total messages: {}",
+            "Added assistant message with tool calls, total messages: {}",
             len(state.messages),
         )
 
@@ -513,7 +571,7 @@ class IterationRunner:
                     getattr(v, 'tool_name', 'unknown'),
                 )
 
-        logger.info("[IterationRunner] Executing {} tool calls...", len(response.tool_calls))
+        logger.info("Executing {} tool calls...", len(response.tool_calls))
 
         _tool_ctx = ToolContext(
             session_id=f"{self.channel}:{self.chat_id}",
@@ -532,12 +590,12 @@ class IterationRunner:
             ),
             return_exceptions=True,
         )
-        logger.info("[IterationRunner] Tool execution completed, {} results", len(results))
+        logger.info("Tool execution completed, {} results", len(results))
 
         for idx, (tool_call, result) in enumerate(zip(response.tool_calls, results)):
             if isinstance(result, BaseException):
                 logger.error(
-                    "[IterationRunner] Tool {} failed with exception: {}", tool_call.name, result
+                    "Tool {} failed with exception: {}", tool_call.name, result
                 )
                 result = f"Error: {type(result).__name__}: {result}"
             else:
@@ -552,7 +610,7 @@ class IterationRunner:
                     )
                     if artifact_path:
                         logger.info(
-                            "[IterationRunner] Tool {} output offloaded to {} ({} chars)",
+                            "Tool {} output offloaded to {} ({} chars)",
                             tool_call.name, artifact_path, len(result_str),
                         )
                         result = inline
@@ -562,7 +620,7 @@ class IterationRunner:
                         )
                         safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
                         logger.info(
-                            "[IterationRunner] Tool {} result: {}", tool_call.name, safe_preview
+                            "Tool {} result: {}", tool_call.name, safe_preview
                         )
                 else:
                     result_preview = (
@@ -570,13 +628,13 @@ class IterationRunner:
                     )
                     safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
                     logger.info(
-                        "[IterationRunner] Tool {} result: {}", tool_call.name, safe_preview
+                        "Tool {} result: {}", tool_call.name, safe_preview
                     )
             state.messages = self.loop.context.add_tool_result(
                 state.messages, tool_call.id, tool_call.name, result
             )
         logger.info(
-            "[IterationRunner] Added {} tool results to messages, continue to next iteration",
+            "Added {} tool results to messages, continue to next iteration",
             len(results),
         )
         return IterationResult(should_continue=True)
@@ -584,7 +642,7 @@ class IterationRunner:
     async def _phase_final_response(
         self, state: LoopState, response: Any
     ) -> IterationResult:
-        logger.info("[IterationRunner] LLM returned final response (no tool calls)")
+        logger.info("LLM returned final response (no tool calls)")
 
         if self.on_stream and self.on_stream_end:
             had_content_filter = any(
@@ -593,7 +651,7 @@ class IterationRunner:
             )
             if had_content_filter:
                 logger.info(
-                    "[IterationRunner] Discarding polluted stream buffer "
+                    "Discarding polluted stream buffer "
                     "(content_filter in fallback chain)"
                 )
                 await self.on_stream_end(discard=True)
@@ -611,12 +669,12 @@ class IterationRunner:
         clean = strip_think(response.content) or None
         if response.finish_reason == "error":
             safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
-            logger.error("[IterationRunner] LLM returned error finish_reason: {}", safe_clean)
+            logger.error("LLM returned error finish_reason: {}", safe_clean)
             state.final_content = clean or "Sorry, I encountered an error calling the AI model."
             return IterationResult(should_break=True)
         if response.finish_reason == "content_filter":
             logger.warning(
-                "[IterationRunner] LLM returned content_filter (content safety block), "
+                "LLM returned content_filter (content safety block), "
                 "not saving filtered response to history"
             )
             state.final_content = (
@@ -630,7 +688,7 @@ class IterationRunner:
             thinking_blocks=response.thinking_blocks,
         )
         state.final_content = clean
-        logger.info("[IterationRunner] Final response captured, length={}", len(clean or ""))
+        logger.info("Final response captured, length={}", len(clean or ""))
         return IterationResult(should_break=True)
 
     async def _finalize_loop(self, state: LoopState) -> None:
@@ -644,7 +702,7 @@ class IterationRunner:
             )
         elif state.final_content is None and state.iteration >= self.loop.max_iterations:
             logger.warning(
-                "[IterationRunner] Max iterations ({}) reached", self.loop.max_iterations
+                "Max iterations ({}) reached", self.loop.max_iterations
             )
             state.final_content = (
                 f"I reached the maximum number of tool call iterations "
@@ -660,7 +718,7 @@ class IterationRunner:
             state.stream_finalized = True
 
         logger.info(
-            "[IterationRunner] Loop ended: iterations={}, tools_used={}, has_final_content={}",
+            "Loop ended: iterations={}, tools_used={}, has_final_content={}",
             state.iteration,
             len(state.tools_used),
             state.final_content is not None,
@@ -668,7 +726,7 @@ class IterationRunner:
 
         token_summary = self.loop.cost_tracker.get_token_summary()
         logger.info(
-            "[IterationRunner] Token usage - Total: input={}, output={}, "
+            "Token usage - Total: input={}, output={}, "
             "cache_creation={}, cache_read={}",
             token_summary["total"]["input_tokens"],
             token_summary["total"]["output_tokens"],
@@ -678,7 +736,7 @@ class IterationRunner:
 
         cost_summary = self.loop.cost_tracker.get_summary()
         logger.info(
-            "[IterationRunner] Cost - total=${:.6f}, calls={}, budget={}{}",
+            "Cost - total=${:.6f}, calls={}, budget={}{}",
             cost_summary["total_cost_usd"],
             cost_summary["total_api_calls"],
             f"${cost_summary['budget_limit_usd']}"
@@ -688,6 +746,8 @@ class IterationRunner:
         )
 
         self._phase_active_memory_encoding(state)
+
+        self._phase_memory_sync(state)
 
         await self._phase_generate_handoff(state, cost_summary)
 
@@ -706,9 +766,9 @@ class IterationRunner:
             )
             handoff_manager.save(handoff)
             logger.info(
-                "[IterationRunner] Session handoff saved: {} tasks, {} decisions",
+                "Session handoff saved: {} tasks, {} decisions",
                 len(handoff.active_tasks),
                 len(handoff.key_decisions),
             )
         except Exception as e:
-            logger.warning("[IterationRunner] Failed to generate session handoff: {}", e)
+            logger.warning("Failed to generate session handoff: {}", e)

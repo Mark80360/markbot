@@ -119,7 +119,7 @@ class EventEmitter:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:
-                logger.error(f"[EventEmitter] Subscriber error for {event_type.name}: {e}")
+                logger.error("Subscriber error for {}: {}", event_type.name, e)
 
             if sub.once:
                 to_remove.append(sub)
@@ -145,7 +145,7 @@ class EventEmitter:
             self._persist_file.flush()
             self._log_count += 1
         except Exception as e:
-            logger.warning(f"[EventEmitter] Persist failed: {e}")
+            logger.warning("Persist failed: {}", e)
 
     @property
     def history(self) -> list[Event]:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from loguru import logger
 
@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from markbot.memory.daily_log import DailyLogManager
 
 _AUTO_SUMMARY_INTERVAL = 5
+
+
+@runtime_checkable
+class _HasHandleResponse(Protocol):
+    def handle_response(self, question_id: str, response: str) -> None: ...
 
 
 class QuestionResponseMiddleware(Middleware):
@@ -41,8 +46,8 @@ class QuestionResponseMiddleware(Middleware):
         if self._get_question_tool:
             tool = self._get_question_tool()
 
-        if tool and hasattr(tool, "handle_response"):
-            logger.debug(f"[QuestionMW] Handling response to question {question_id}")
+        if isinstance(tool, _HasHandleResponse):
+            logger.debug("Handling response to question {}", question_id)
             tool.handle_response(question_id, ctx.msg.content)
             return OutboundMessage(
                 channel=ctx.channel,
@@ -56,26 +61,29 @@ class QuestionResponseMiddleware(Middleware):
     async def after(
         self, ctx: ProcessContext, response: OutboundMessage | None
     ) -> OutboundMessage | None:
+        _ = ctx
         return response
 
     async def on_error(self, ctx: ProcessContext, error: Exception) -> None:
-        pass
+        _ = ctx, error
 
 
 class MemoryLifecycleMiddleware(Middleware):
     """Bridges MemoryManager operations into the pipeline.
 
-    - Appends raw interaction logs to daily markdown files (no LLM cost).
     - Periodically triggers background summarization every
       ``auto_summary_interval`` user messages.
     - Summary is also triggered during context compaction
       (MemoryCompactionHook) or manual commands (/compact, /new).
+
+    Note: Daily log writing is handled by MemoryManager.sync_turn()
+    in IterationRunner._phase_memory_sync(), not here.
     """
 
     def __init__(
         self,
         memory_manager: object = None,
-        daily_log: "DailyLogManager | None" = None,
+        daily_log: DailyLogManager | None = None,
         session_manager: object = None,
         auto_summary_interval: int = _AUTO_SUMMARY_INTERVAL,
     ):
@@ -86,6 +94,7 @@ class MemoryLifecycleMiddleware(Middleware):
         self._session_message_counts: dict[str, int] = {}
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
+        _ = ctx
         return None
 
     async def after(
@@ -93,19 +102,6 @@ class MemoryLifecycleMiddleware(Middleware):
         ctx: ProcessContext,
         response: OutboundMessage | None,
     ) -> OutboundMessage | None:
-        final_content = response.content if response else None
-
-        if self._daily_log and final_content is not None:
-            try:
-                self._daily_log.append_turn(
-                    user_content=ctx.msg.content,
-                    assistant_content=final_content,
-                    channel=ctx.channel,
-                    chat_id=ctx.chat_id,
-                )
-            except Exception as e:
-                logger.warning(f"[MemoryMW] Daily log append failed: {e}")
-
         if ctx.session:
             try:
                 if self._session_manager and hasattr(self._session_manager, 'save'):
@@ -113,7 +109,7 @@ class MemoryLifecycleMiddleware(Middleware):
                 elif hasattr(ctx.session, 'save'):
                     ctx.session.save()
             except Exception as e:
-                logger.warning(f"[MemoryMW] Session save failed: {e}")
+                logger.warning("Session save failed: {}", e)
 
         session_key = ctx.session_key or "_default"
         count = self._session_message_counts.get(session_key, 0) + 1
@@ -135,15 +131,16 @@ class MemoryLifecycleMiddleware(Middleware):
                     if summary_messages:
                         self._memory.add_async_summary_task(messages=summary_messages)
                         logger.info(
-                            f"[MemoryMW] Auto summary triggered "
-                            f"(session={session_key}, msg_count={count})"
+                            "Auto summary triggered (session={}, msg_count={})",
+                            session_key, count,
                         )
             except Exception as e:
-                logger.warning(f"[MemoryMW] Auto summary trigger failed: {e}")
+                logger.warning("Auto summary trigger failed: {}", e)
 
         return response
 
     async def on_error(self, ctx: ProcessContext, error: Exception) -> None:
+        _ = error
         if ctx.session:
             try:
                 if self._session_manager and hasattr(self._session_manager, 'save'):
@@ -151,4 +148,4 @@ class MemoryLifecycleMiddleware(Middleware):
                 elif hasattr(ctx.session, 'save'):
                     ctx.session.save()
             except Exception as e:
-                logger.warning(f"[MemoryMW] Session save on error failed: {e}")
+                logger.warning("Session save on error failed: {}", e)

@@ -117,7 +117,7 @@ def normalize_timezone(tz: str | None) -> str:
         except (KeyError, Exception):
             pass
 
-    logger = __import__("loguru").logger
+    from loguru import logger
     logger.warning("Unrecognised timezone '{}', falling back to UTC", tz)
     return "UTC"
 

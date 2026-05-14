@@ -119,7 +119,7 @@ async def _retry_with_backoff(
                         except ValueError:
                             pass
 
-                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {delay:.1f}s...")
+                logger.warning("Request failed (attempt {}/{}): {}. Retrying in {:.1f}s...", attempt + 1, max_retries + 1, e, delay)
                 await asyncio.sleep(delay)
 
             continue
@@ -197,7 +197,7 @@ class WebSearchTool(Tool):
             else:
                 return json.dumps({"success": False, "error": f"Unknown search provider '{provider}'"}, ensure_ascii=False)
             
-            # Return structured JSON like hermes-agent
+            # Return structured JSON
             return json.dumps({
                 "success": True,
                 "data": {

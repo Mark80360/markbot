@@ -768,11 +768,11 @@ class FeishuChannel(BaseChannel):
                 if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
                     await self._remove_reaction(message_id, reaction_id)
                     self._cleaned_reactions.add(message_id)
-                    logger.info("[FEISHU DELTA] _stream_discard: removed reaction {}", reaction_id)
+                    logger.info("_stream_discard: removed reaction {}", reaction_id)
                     if self.config.done_emoji and message_id:
                         await self._add_reaction(message_id, self.config.done_emoji)
             logger.info(
-                "[FEISHU DELTA] _stream_discard: dropped buffer with {} chars, resuming={}",
+                "_stream_discard: dropped buffer with {} chars, resuming={}",
                 len(buf.text) if buf else 0,
                 is_resuming,
             )
@@ -781,7 +781,7 @@ class FeishuChannel(BaseChannel):
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             logger.info(
-                "[FEISHU DELTA] _stream_end: message_id={}, reaction_id={}, resuming={}",
+                "_stream_end: message_id={}, reaction_id={}, resuming={}",
                 meta.get("message_id"),
                 meta.get("reaction_id"),
                 meta.get("_resuming"),
@@ -791,22 +791,22 @@ class FeishuChannel(BaseChannel):
                 if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
                     await self._remove_reaction(message_id, reaction_id)
                     self._cleaned_reactions.add(message_id)
-                    logger.info("[FEISHU DELTA] removed reaction {}", reaction_id)
+                    logger.info("removed reaction {}", reaction_id)
                     if self.config.done_emoji and message_id:
                         await self._add_reaction(message_id, self.config.done_emoji)
-                        logger.info("[FEISHU DELTA] added done_emoji {}", self.config.done_emoji)
+                        logger.info("added done_emoji {}", self.config.done_emoji)
 
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
-                logger.info("[FEISHU DELTA] _stream_end: no buffer or empty text, returning")
+                logger.info("_stream_end: no buffer or empty text, returning")
                 return
             logger.info(
-                "[FEISHU DELTA] _stream_end: buf.text first 200 chars='{}...'",
+                "_stream_end: buf.text first 200 chars='{}...'",
                 buf.text[:200] if len(buf.text) > 200 else buf.text,
             )
             clean_text = self._THINK_TAG_RE.sub("", buf.text).strip()
             logger.info(
-                "[FEISHU DELTA] _stream_end: clean_text first 200 chars='{}...'",
+                "_stream_end: clean_text first 200 chars='{}...'",
                 clean_text[:200] if len(clean_text) > 200 else clean_text,
             )
             if not clean_text:
@@ -815,12 +815,12 @@ class FeishuChannel(BaseChannel):
                 if think_match:
                     clean_text = think_match.group(1).strip()
                     logger.info(
-                        "[FEISHU DELTA] _stream_end: using think tag content, first 200 chars='{}...'",
+                        "_stream_end: using think tag content, first 200 chars='{}...'",
                         clean_text[:200] if len(clean_text) > 200 else clean_text,
                     )
                 else:
                     logger.info(
-                        "[FEISHU DELTA] _stream_end: no clean text after stripping thinking tags"
+                        "_stream_end: no clean text after stripping thinking tags"
                     )
                     return
             # Try to finalize via streaming card; if that fails (e.g.
@@ -849,13 +849,13 @@ class FeishuChannel(BaseChannel):
                     buf.card_id,
                 )
             elements = self._build_card_elements(clean_text)
-            logger.info("[FEISHU DELTA] _stream_end: built {} card elements", len(elements))
+            logger.info("_stream_end: built {} card elements", len(elements))
             for i, el in enumerate(elements):
                 el_content = (
                     el.get("content", "")[:100] if isinstance(el.get("content"), str) else str(el)
                 )
                 logger.info(
-                    "[FEISHU DELTA]   element[{}] tag={}, content='{}...'",
+                    "  element[{}] tag={}, content='{}...'",
                     i,
                     el.get("tag"),
                     el_content,
@@ -1483,9 +1483,9 @@ class FeishuChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
-        logger.info("[FEISHU SEND] === send() ENTER ===")
+        logger.info("=== send() ENTER ===")
         logger.info(
-            "[FEISHU SEND] chat_id={}, content_len={}, media_count={}, metadata={}",
+            "chat_id={}, content_len={}, media_count={}, metadata={}",
             msg.chat_id,
             len(msg.content or ""),
             len(msg.media),
@@ -1505,7 +1505,7 @@ class FeishuChannel(BaseChannel):
             reaction_id and message_id and not is_progress and not is_tool_hint
         )
         logger.info(
-            "[FEISHU SEND] reaction_id={}, message_id={}, is_progress={}, is_tool_hint={}, should_cleanup={}",
+            "reaction_id={}, message_id={}, is_progress={}, is_tool_hint={}, should_cleanup={}",
             reaction_id,
             message_id,
             is_progress,
@@ -1519,11 +1519,11 @@ class FeishuChannel(BaseChannel):
 
             if is_tool_hint:
                 if msg.content and msg.content.strip():
-                    logger.info("[FEISHU SEND] Sending tool_hint card")
+                    logger.info("Sending tool_hint card")
                     await self._send_tool_hint_card(
                         receive_id_type, msg.chat_id, msg.content.strip()
                     )
-                    logger.info("[FEISHU SEND] === send() EXIT (tool_hint) ===")
+                    logger.info("=== send() EXIT (tool_hint) ===")
                 return
 
             reply_message_id: str | None = None
@@ -1536,17 +1536,17 @@ class FeishuChannel(BaseChannel):
 
             def _do_send(m_type: str, content: str) -> None:
                 logger.info(
-                    "[FEISHU SEND] _do_send() type={}, content_preview='{}...'",
+                    "_do_send() type={}, content_preview='{}...'",
                     m_type,
                     content[:100] if len(content) > 100 else content,
                 )
                 if reply_message_id:
                     ok = self._reply_message_sync(reply_message_id, m_type, content)
                     if ok:
-                        logger.info("[FEISHU SEND] _do_send() replied successfully")
+                        logger.info("_do_send() replied successfully")
                         return
                 result = self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
-                logger.info("[FEISHU SEND] _do_send() result={}", result)
+                logger.info("_do_send() result={}", result)
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -1581,11 +1581,11 @@ class FeishuChannel(BaseChannel):
             if msg.content and msg.content.strip():
                 content_preview = msg.content.strip()[:200]
                 logger.info(
-                    "[FEISHU SEND] content='{}...'",
+                    "content='{}...'",
                     content_preview if len(msg.content.strip()) > 200 else content_preview,
                 )
                 fmt = self._detect_msg_format(msg.content)
-                logger.info("[FEISHU SEND] detected format={}", fmt)
+                logger.info("detected format={}", fmt)
 
                 if fmt == "text":
                     text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
@@ -1597,7 +1597,7 @@ class FeishuChannel(BaseChannel):
 
                 else:
                     elements = self._build_card_elements(msg.content)
-                    logger.info("[FEISHU SEND] built {} card elements", len(elements))
+                    logger.info("built {} card elements", len(elements))
                     for i, el in enumerate(elements):
                         el_content = (
                             el.get("content", "")[:100]
@@ -1605,7 +1605,7 @@ class FeishuChannel(BaseChannel):
                             else str(el)
                         )
                         logger.info(
-                            "[FEISHU SEND]   element[{}] tag={}, content='{}...'",
+                            "  element[{}] tag={}, content='{}...'",
                             i,
                             el.get("tag"),
                             el_content,
@@ -1619,17 +1619,17 @@ class FeishuChannel(BaseChannel):
                             json.dumps(card, ensure_ascii=False),
                         )
 
-            logger.info("[FEISHU SEND] === send() EXIT (success) ===")
+            logger.info("=== send() EXIT (success) ===")
 
         except Exception as e:
-            logger.error("[FEISHU SEND] === send() EXIT (error) === {}", e)
+            logger.error("=== send() EXIT (error) === {}", e)
             raise
         finally:
             if should_cleanup_reaction and message_id not in self._cleaned_reactions:
                 pending_rid = self._pending_reactions.pop(message_id, None)
                 rid_to_remove = pending_rid or reaction_id
                 logger.info(
-                    "[FEISHU SEND] finally: pending_rid={}, rid_to_remove={}",
+                    "finally: pending_rid={}, rid_to_remove={}",
                     pending_rid,
                     rid_to_remove,
                 )
@@ -1637,20 +1637,20 @@ class FeishuChannel(BaseChannel):
                     try:
                         await self._remove_reaction(message_id, rid_to_remove)
                         self._cleaned_reactions.add(message_id)
-                        logger.info("[FEISHU SEND] finally: removed reaction {}", rid_to_remove)
+                        logger.info("finally: removed reaction {}", rid_to_remove)
                     except Exception as e:
-                        logger.warning("[FEISHU SEND] finally: failed to remove reaction {}", e)
+                        logger.warning("finally: failed to remove reaction {}", e)
                 if self.config.done_emoji:
                     try:
                         await self._add_reaction(message_id, self.config.done_emoji)
                         logger.info(
-                            "[FEISHU SEND] finally: added done_emoji {}", self.config.done_emoji
+                            "finally: added done_emoji {}", self.config.done_emoji
                         )
                     except Exception as e:
-                        logger.warning("[FEISHU SEND] finally: failed to add done_emoji {}", e)
+                        logger.warning("finally: failed to add done_emoji {}", e)
             else:
                 logger.info(
-                    "[FEISHU SEND] finally: skipped cleanup (should_cleanup={}, already_cleaned={})",
+                    "finally: skipped cleanup (should_cleanup={}, already_cleaned={})",
                     should_cleanup_reaction,
                     message_id in self._cleaned_reactions if message_id else False,
                 )

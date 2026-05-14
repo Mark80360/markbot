@@ -168,7 +168,7 @@ class ProgressTracker:
         # Start drain task
         self._drain_task = asyncio.create_task(self._drain_loop())
         
-        logger.debug(f"Progress tracking started for task {self.task_id}")
+        logger.debug("Progress tracking started for task {}", self.task_id)
         return self._output_file
     
     async def record_tool_use(
@@ -201,7 +201,7 @@ class ProgressTracker:
             log_entry = f"[{time.strftime('%H:%M:%S')}] {activity.description}\n"
             await self._write(log_entry)
             
-            logger.debug(f"Task {self.task_id}: {activity.description}")
+            logger.debug("Task {}: {}", self.task_id, activity.description)
     
     async def record_tokens(self, input_tokens: int, output_tokens: int) -> None:
         """Record token usage."""
@@ -235,7 +235,7 @@ class ProgressTracker:
             await self._write(footer)
             await self._flush()
             
-            logger.info(f"Task {self.task_id} completed in {self._progress.duration_seconds:.1f}s")
+            logger.info("Task {} completed in {:.1f}s", self.task_id, self._progress.duration_seconds)
     
     async def fail(self, error: str) -> None:
         """Mark task as failed."""
@@ -252,7 +252,7 @@ class ProgressTracker:
             await self._write(footer)
             await self._flush()
             
-            logger.error(f"Task {self.task_id} failed: {error}")
+            logger.error("Task {} failed: {}", self.task_id, error)
     
     async def cancel(self) -> None:
         """Mark task as cancelled."""
@@ -306,7 +306,7 @@ class ProgressTracker:
                 except asyncio.CancelledError:
                     break
         except Exception as e:
-            logger.error(f"Drain loop error for task {self.task_id}: {e}")
+            logger.error("Drain loop error for task {}: {}", self.task_id, e)
     
     async def _flush(self) -> None:
         """Flush remaining content and close file."""
@@ -353,7 +353,7 @@ class SubagentProgressManager:
         """Create a new progress tracker for a task."""
         async with self._lock:
             if task_id in self._trackers:
-                logger.warning(f"Tracker already exists for task {task_id}")
+                logger.warning("Tracker already exists for task {}", task_id)
                 return self._trackers[task_id]
             
             tracker = ProgressTracker(task_id, self.output_dir)
@@ -424,7 +424,7 @@ class SubagentProgressManager:
                 return f"... [truncated, showing last {max_bytes} chars]\n\n{truncated}"
             return content
         except Exception as e:
-            logger.error(f"Failed to read output for task {task_id}: {e}")
+            logger.error("Failed to read output for task {}: {}", task_id, e)
             return f"[Error reading output: {e}]"
     
     async def tail_output(self, task_id: str, lines: int = 50) -> str:
@@ -442,7 +442,7 @@ class SubagentProgressManager:
             all_lines = content.split("\n")
             return "\n".join(all_lines[-lines:])
         except Exception as e:
-            logger.error(f"Failed to tail output for task {task_id}: {e}")
+            logger.error("Failed to tail output for task {}: {}", task_id, e)
             return f"[Error reading output: {e}]"
     
     def get_task_summary(self, task_id: str) -> Optional[dict[str, Any]]:
@@ -476,5 +476,5 @@ class SubagentProgressManager:
             
             return summary
         except Exception as e:
-            logger.error(f"Failed to get task summary for {task_id}: {e}")
+            logger.error("Failed to get task summary for {}: {}", task_id, e)
             return None

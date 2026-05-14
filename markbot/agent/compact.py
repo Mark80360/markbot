@@ -437,7 +437,7 @@ class MultiLevelCompactor:
             try:
                 await self._on_progress(phase, message, details or {})
             except Exception as e:
-                logger.debug("[Compactor] Progress callback error: {}", e)
+                logger.debug("Progress callback error: {}", e)
 
     @staticmethod
     def _get_protected_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
@@ -484,7 +484,7 @@ class MultiLevelCompactor:
 
         if self._consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
             logger.warning(
-                "[Compactor] Skipping compaction: {} consecutive failures reached",
+                "Skipping compaction: {} consecutive failures reached",
                 self._consecutive_failures,
             )
             return messages, CompactResult(
@@ -496,7 +496,7 @@ class MultiLevelCompactor:
             )
 
         logger.info(
-            "[Compactor] Tokens {} / {} (threshold {}), starting multi-level compaction",
+            "Tokens {} / {} (threshold {}), starting multi-level compaction",
             current_tokens, effective_max, int(threshold),
         )
 
@@ -512,7 +512,7 @@ class MultiLevelCompactor:
 
         messages = self._apply_collapse(messages)
         tokens_after_collapse = _estimate_messages_tokens(messages)
-        logger.debug("[Compactor] After collapse: {} tokens (saved {})", tokens_after_collapse, tokens_before - tokens_after_collapse)
+        logger.debug("After collapse: {} tokens (saved {})", tokens_after_collapse, tokens_before - tokens_after_collapse)
 
         if tokens_after_collapse < threshold:
             self._consecutive_failures = 0
@@ -532,7 +532,7 @@ class MultiLevelCompactor:
 
         messages = self._apply_micro_compact(messages)
         tokens_after_micro = _estimate_messages_tokens(messages)
-        logger.debug("[Compactor] After micro-compact: {} tokens (saved {})", tokens_after_micro, tokens_before - tokens_after_micro)
+        logger.debug("After micro-compact: {} tokens (saved {})", tokens_after_micro, tokens_before - tokens_after_micro)
 
         if tokens_after_micro < threshold:
             self._consecutive_failures = 0
@@ -556,7 +556,7 @@ class MultiLevelCompactor:
 
         messages, summary = await self._apply_auto_compaction(messages, task_context=task_context)
         tokens_after_auto = _estimate_messages_tokens(messages)
-        logger.debug("[Compactor] After auto-compaction: {} tokens (saved {})", tokens_after_auto, tokens_before - tokens_after_auto)
+        logger.debug("After auto-compaction: {} tokens (saved {})", tokens_after_auto, tokens_before - tokens_after_auto)
 
         if tokens_after_auto < threshold:
             self._consecutive_failures = 0
@@ -582,7 +582,7 @@ class MultiLevelCompactor:
         self._record_savings(tokens_before, tokens_after_snip)
         messages = self._inject_attachments(messages, attachments)
         logger.warning(
-            "[Compactor] Had to use history snip (last resort): {} -> {} tokens",
+            "Had to use history snip (last resort): {} -> {} tokens",
             tokens_before, tokens_after_snip,
         )
         await self._emit_progress("compaction_end", "History snip applied (last resort)", {
@@ -616,7 +616,7 @@ class MultiLevelCompactor:
             return None
 
         logger.warning(
-            "[Compactor] Prompt-too-long error detected, attempting reactive compaction"
+            "Prompt-too-long error detected, attempting reactive compaction"
         )
         await self._emit_progress("reactive_compact", "Prompt too long; compacting and retrying", {
             "error": str(error)[:200],
@@ -633,7 +633,7 @@ class MultiLevelCompactor:
             if truncated is not None:
                 tokens_after = _estimate_messages_tokens(truncated)
                 logger.info(
-                    "[Compactor] PTL retry: truncated head, {} -> {} tokens",
+                    "PTL retry: truncated head, {} -> {} tokens",
                     current_tokens, tokens_after,
                 )
                 return truncated, CompactResult(
@@ -701,7 +701,7 @@ class MultiLevelCompactor:
                 block[key] = collapse_text_head_tail(text, limit, head_chars=head, tail_chars=tail)
                 collapsed += 1
         if collapsed:
-            logger.info("[Compactor] Collapsed {} oversized blocks (head+tail)", collapsed)
+            logger.info("Collapsed {} oversized blocks (head+tail)", collapsed)
         return messages
 
     # ------------------------------------------------------------------
@@ -750,9 +750,9 @@ class MultiLevelCompactor:
                 msg["content"] = new_content
                 cleared += 1
         if cleared:
-            logger.info("[Compactor] Micro-compacted {} old tool results", cleared)
+            logger.info("Micro-compacted {} old tool results", cleared)
         if protected_count:
-            logger.info("[Compactor] Protected {} task-related tool results from micro-compact", protected_count)
+            logger.info("Protected {} task-related tool results from micro-compact", protected_count)
         return messages
 
     # ------------------------------------------------------------------
@@ -812,7 +812,7 @@ class MultiLevelCompactor:
         try:
             summary = await self._generate_summary(conversation_text)
         except Exception as e:
-            logger.error(f"[Compactor] Auto-compaction LLM failed: {e}")
+            logger.error("Auto-compaction LLM failed: {}", e)
             self._consecutive_failures += 1
             summary = self._simple_truncation_summary(messages_to_compact)
             if not summary:
@@ -837,7 +837,7 @@ class MultiLevelCompactor:
             ),
         }
         logger.info(
-            "[Compactor] Auto-compacted: {} old messages summarized, {} recent kept",
+            "Auto-compacted: {} old messages summarized, {} recent kept",
             len(messages_to_compact), len(recent_messages),
         )
         return [compact_msg] + recent_messages, formatted
@@ -875,14 +875,14 @@ class MultiLevelCompactor:
                 tid = msg.get("tool_call_id")
                 if tid and str(tid) not in declared:
                     logger.debug(
-                        "[Compactor] History snip dropped orphan tool_result (id={})",
+                        "History snip dropped orphan tool_result (id={})",
                         tid,
                     )
                     continue
             cleaned.append(msg)
 
         logger.warning(
-            "[Compactor] History snip: {} -> {} messages (dropped {}, cleaned {} orphan tools)",
+            "History snip: {} -> {} messages (dropped {}, cleaned {} orphan tools)",
             len(messages), len(cleaned), len(messages) - keep, len(result) - len(cleaned),
         )
         return cleaned
@@ -960,14 +960,14 @@ class MultiLevelCompactor:
                 )
                 if response.finish_reason == "error":
                     error_msg = response.content or "Unknown error"
-                    logger.error(f"[Compactor] LLM returned error: {error_msg}")
+                    logger.error("LLM returned error: {}", error_msg)
                     raise RuntimeError(f"Summary generation failed: {error_msg}")
                 return response.content or "[Empty summary]"
             except Exception as e:
-                logger.error(f"[Compactor] Failed to generate summary with provider: {e}")
+                logger.error("Failed to generate summary with provider: {}", e)
                 raise
 
-        logger.warning("[Compactor] No LLM available, using simple truncation summary")
+        logger.warning("No LLM available, using simple truncation summary")
         lines = conversation_text.split("\n\n")[:5]
         return "[Simple summary - first 5 message pairs]\n" + "\n\n".join(lines)
 

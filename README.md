@@ -1,8 +1,8 @@
 # MarkBot 🦞
 
-> Version 2.2.8
+> Version 2.2.11
 
-An advanced AI-powered automation and development assistant designed for developers and power users. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
+A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
 
 ## Core Strengths
 
@@ -17,7 +17,7 @@ An advanced AI-powered automation and development assistant designed for develop
 
 ### Core Capabilities
 
-- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (30+ providers supported)
+- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (25 providers supported)
 - **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
 - **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, with auto-reconnect and health monitoring
 - **OAuth Authentication**: Native support for OpenAI Codex and GitHub Copilot with OAuth flow
@@ -31,17 +31,18 @@ An advanced AI-powered automation and development assistant designed for develop
 
 ### Tool System
 
-- **Built-in Tools**: 15+ tools including Filesystem, Shell, Web, Search, MCP, Memory, Todo, Think, Question, Context Explorer, Cron, Explore, Message
+- **Built-in Tools**: 25+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot
 - **MCP Support**: Model Context Protocol for seamless tool integration (stdio, SSE, streamable HTTP)
 - **Web Integration**: Built-in web browsing, content extraction, and search (Brave, Tavily, DuckDuckGo, SearXNG, Jina)
+- **Code Execution**: Sandboxed Python code execution with security scanning and resource limits
 - **Voice Transcription**: Audio transcription via Groq Whisper integration
 
 ### Agent Architecture
 
-- **Sub-Agent System**: Delegate specialized tasks with capability-based delegation tokens (CapabilityToken)
-- **Pipeline Engine**: Middleware-based message processing with pluggable pipeline stages
+- **Sub-Agent System**: Delegate specialized tasks with capability-based delegation tokens (CapabilityToken) and budget/timeout controls
+- **Pipeline Engine**: Middleware-based message processing with pluggable pipeline stages (QuestionResponse, MemoryLifecycle)
 - **Token & Cost Tracking**: Real-time token usage monitoring with cache token support and per-model pricing
-- **Budget Control**: Configurable per-session budget caps with custom pricing overrides
+- **Budget Control**: Configurable per-session budget caps with custom pricing overrides and warning thresholds
 
 ### Automation & Skills
 
@@ -52,12 +53,12 @@ An advanced AI-powered automation and development assistant designed for develop
 
 ### Developer Experience
 
-- **Slash Commands**: Built-in commands like `/new`, `/compact`, `/stop`, `/status`, `/restart`, and more
+- **Slash Commands**: Built-in commands like `/new`, `/compact`, `/compact_str`, `/clear`, `/stop`, `/status`, `/restart`, `/help`
 - **Event Bus**: Event-driven architecture for message passing and component communication
-- **Context Explorer**: Explore project context with semantic search and catalog
+- **Context Explorer**: Explore project context with semantic search and catalog (explore_context_catalog, search_context, load_context)
 - **Todo Management**: Built-in persistent todo tracking tool for task management
-- **Codebase Exploration**: Understand project structure and code context with deep exploration tools
-- **Interaction Logging**: Full audit trail of LLM request/response pairs for analysis
+- **Codebase Exploration**: Understand project structure and code context with deep exploration tools (AST parsing, multi-file analysis)
+- **Interaction Logging**: Full audit trail of LLM request/response pairs with incremental deduplication for analysis
 - **Doctor Diagnostics**: Built-in diagnostic tool for environment checks and issue resolution
 
 ## Architecture
@@ -116,8 +117,9 @@ An advanced AI-powered automation and development assistant designed for develop
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Fallback Manager                                 │
 │          (Multi-Model Chain with Auto-Failover)                     │
-│  Retryable: 429, 529, 500-504, timeout, overloaded                  │
-│  Unavailable: 401-403, 402, model not found                         │
+│  Circuit Breaker: 3 failures → open (60s cooldown)                 │
+│  Retryable: timeout, rate limit, 429, 529, 502-504, overloaded     │
+│  Unavailable: 401-403, 402, model not found, quota exceeded        │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -195,6 +197,18 @@ pip install -e ".[langsmith]"  # LangSmith tracing
 ### Basic Usage
 
 ```bash
+# Initialize configuration and workspace
+markbot onboard
+
+# Interactive wizard setup
+markbot onboard --wizard
+
+# Guided step-by-step setup (recommended for first-time users)
+markbot onboard --guided
+
+# Non-interactive defaults (for scripts/Docker)
+markbot onboard --defaults
+
 # Start interactive mode
 markbot
 
@@ -202,12 +216,24 @@ markbot
 markbot --workspace /path/to/workspace
 
 # Run as gateway server
-markbot gateway
+markbot gateway start
 ```
 
 ### CLI Commands
 
 ```bash
+# Onboarding and setup
+markbot onboard                  # Initialize config and workspace
+markbot onboard --wizard         # Interactive menu-driven wizard
+markbot onboard --guided         # Linear step-by-step guided setup
+markbot onboard --defaults       # Non-interactive defaults
+
+# Gateway management
+markbot gateway start            # Start gateway server
+markbot gateway stop             # Stop gateway server
+markbot gateway restart          # Restart gateway server
+markbot gateway status           # Check gateway status
+
 # Skill management
 markbot skills list
 markbot skills install <skill-name>
@@ -229,13 +255,16 @@ markbot doctor fix
 |---------|-------------|
 | `/new` | Start fresh session with memory summary |
 | `/compact` | Force manual context compaction |
-| `/stop` | Cancel all active tasks |
-| `/status` | Show session status and statistics |
+| `/compact_str` | View current compressed summary |
+| `/clear` | Clear history and compressed summary |
+| `/stop` | Cancel all active tasks and subagents |
+| `/status` | Show session status, token usage, and statistics |
 | `/restart` | Restart the agent process |
+| `/help` | Show available slash commands |
 
 ## Supported LLM Providers
 
-MarkBot supports 30+ LLM providers out of the box:
+MarkBot supports 25 LLM providers out of the box:
 
 ### Direct Providers
 | Provider | Models | Authentication | Prompt Caching |
@@ -297,6 +326,7 @@ agents:
       - deepseek/deepseek-chat
     max_tokens: 8192
     temperature: 0.1
+    timezone: Asia/Shanghai
     workspace: ~/.markbot/workspace
 
 providers:
@@ -312,6 +342,38 @@ channels:
   dingtalk:
     enabled: true
     # ... channel-specific config
+
+tools:
+  web:
+    search:
+      provider: brave
+      api_key: ${BRAVE_API_KEY}
+  exec:
+    enable: true
+    timeout: 60
+  filesystem:
+    backup_dir: ~/.markbot/.markbot_backups
+    safe_delete: true
+  code_execution:
+    enable: true
+    timeout: 60
+    max_memory_mb: 256
+  memory:
+    embedding_backend: openai
+    memory_summary_enabled: true
+    context_compact_enabled: true
+    dream_cron: "0 23 * * *"
+
+compaction:
+  collapse_tool_result_chars: 4000
+  micro_compact_keep_turns: 6
+  auto_compact_keep_recent: 5
+  threshold_ratio: 0.85
+
+budget:
+  enabled: true
+  max_budget_usd: null
+  warn_threshold_usd: 0.5
 ```
 
 ### Environment Variables
@@ -320,21 +382,84 @@ Most sensitive configuration values can be provided via environment variables us
 
 ## Built-in Tools
 
-| Tool | Description |
-|------|-------------|
-| **filesystem** | File read/write/edit operations with backup support |
-| **shell** | Command execution with timeout and safety controls |
-| **web** | Web browsing and content extraction |
-| **search** | Multi-provider web search (Brave, Tavily, DuckDuckGo, SearXNG, Jina) |
-| **mcp** | Model Context Protocol integration |
-| **memory** | Memory search and management |
-| **todo** | Persistent task tracking |
-| **think** | Structured thinking and reasoning |
-| **question** | Ask clarifying questions |
-| **context_explorer** | Project context exploration |
-| **cron** | Cron job management |
-| **explore** | Codebase exploration |
-| **message** | Message sending and formatting |
+### Filesystem & Search
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Read File** | `read_file` | Read file contents with image detection and encoding support |
+| **Write File** | `write_file` | Write/create files with automatic backup |
+| **Edit File** | `edit_file` | Search-and-replace file editing with diff support |
+| **List Dir** | `list_dir` | List directory contents with ignore patterns |
+| **Delete File** | `delete_file` | Delete files with safe-delete (recycle bin) support |
+| **Glob** | `glob` | Fast file pattern matching (find files by name) |
+| **Grep** | `grep` | Content search with regex, binary detection, and context lines |
+
+### Web & Search
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Web Search** | `web_search` | Multi-provider web search (Brave, Tavily, DuckDuckGo, SearXNG, Jina) |
+| **Web Fetch** | `web_fetch` | Fetch and extract content from a URL |
+| **Web Extract** | `web_extract` | Enhanced URL content extraction with LLM summarization |
+
+### Execution
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Shell** | `exec` | Command execution with timeout, rate limiting, and safety controls |
+| **Run Code** | `run_code` | Sandboxed Python code execution with security scanning |
+
+### Memory & Context
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Memory Search** | `memory_search` | Semantic/full-text search in memory files |
+| **Memory Save** | `memory_save` | Save important information to long-term memory |
+| **Memory Forget** | `memory_forget` | Remove information from long-term memory |
+| **Memory List** | `memory_list` | List all memory entries with optional tag filtering |
+| **Dream** | `dream` | Trigger AI-driven memory optimization |
+| **Explore Catalog** | `explore_context_catalog` | View available context sources (table of contents) |
+| **Search Context** | `search_context` | Search within specific context sources |
+| **Load Context** | `load_context` | Load full content from a specific context entry |
+
+### Agent & Planning
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Think** | `think` | Unified cognitive tool: analyze, plan, reflect, code-analysis, research-plan |
+| **Todo** | `todo` | Persistent task tracking with status and priority |
+| **Message** | `message` | Send messages to users on chat channels |
+| **Ask Question** | `ask_user_question` | Ask users structured questions with predefined options |
+| **Explore** | `explore` | Deep code exploration with AST parsing and multi-file analysis |
+
+### Subagent
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Spawn** | `spawn` | Spawn a subagent with capability-based delegation token |
+| **Check Subagent** | `check_subagent` | Check status of a spawned subagent |
+| **List Subagents** | `list_subagents` | List all active subagents |
+
+### Scheduling & Automation
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Cron** | `cron` | Schedule reminders and recurring tasks |
+
+### Skills & Autopilot
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **Skills List** | `skills_list` | List available skills |
+| **Skill View** | `skill_view` | View skill details and instructions |
+| **Skill Manage** | `skill_manage` | Install, uninstall, and manage skills |
+| **Autopilot Tools** | `autopilot_*` | Intake, score, accept, execute, verify, and repair tasks |
+
+### Integration
+
+| Tool | Name | Description |
+|------|------|-------------|
+| **MCP** | `mcp_*` | Model Context Protocol tools (auto-registered from MCP servers) |
 
 ## Skills System
 
@@ -369,10 +494,10 @@ The Autopilot system provides automated task execution with intelligence:
 1. **Intake**: Receive and parse task definitions
 2. **Score**: Evaluate task complexity and priority
 3. **Accept**: Determine if task should be executed
-4. **Execute**: Run the task with AI assistance
-5. **Verify**: Validate results against acceptance criteria
+4. **Execute**: Run the task with AI assistance via AgentLoop.process_direct()
+5. **Verify**: Validate results against verification steps and acceptance criteria
 6. **Repair**: Automatically fix issues if verification fails
-7. **Complete/Fail**: Finalize task status
+7. **Complete/Fail**: Finalize task status with verification report
 
 ### Use Cases
 
@@ -406,12 +531,17 @@ Advanced memory management powered by reme-ai:
 
 ### Features
 
-- **Semantic Search**: Vector-based similarity search across memories
-- **Compaction**: Intelligent compression of long conversations
-- **Summarization**: Extract key information from interactions
-- **Dream Optimization**: Periodic AI-driven memory reorganization
-- **Daily Logs**: Time-based memory organization
-- **Embedding Support**: OpenAI and Ollama embedding backends
+- **Semantic Search**: Vector-based similarity search across memories (OpenAI and Ollama embedding backends)
+- **4-Tier Progressive Compaction**: Context Collapse → Micro-Compact → Auto-Compaction → History Snip, escalating only when needed
+- **Head+Tail Context Collapse**: Preserves both beginning and end of content during truncation
+- **CompactAttachment**: Preserves key context across compaction rounds
+- **Tool Output Offloading**: Oversized tool results offloaded to files with inline previews
+- **PTL Retry**: Prompt-Too-Long retry with head truncation
+- **Summarization**: Extract key information from interactions into MEMORY.md
+- **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule
+- **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
+- **Security Scanner**: Injection and exfiltration detection for memory content
+- **Context Fencing**: `<memory-context>` tags with streaming scrubber
 
 ### Configuration
 
@@ -419,23 +549,44 @@ Advanced memory management powered by reme-ai:
 tools:
   memory:
     embedding_backend: openai  # or "ollama" for local models
+    embedding_api_key: ""
+    embedding_base_url: ""
+    embedding_model_name: ""
     memory_compact_threshold: 0  # 0 = auto (75% of context window)
+    memory_compact_reserve: 10000
+    memory_summary_enabled: true
+    context_compact_enabled: true
+    dream_cron: "0 23 * * *"  # Cron expression for dream optimization
+
+compaction:
+  collapse_tool_result_chars: 4000
+  collapse_head_chars: 900
+  collapse_tail_chars: 500
+  micro_compact_keep_turns: 6
+  auto_compact_keep_recent: 5
+  snip_keep_messages: 10
+  threshold_ratio: 0.85
+  max_compact_output_tokens: 4000
+  tool_output_inline_chars: 16000
+  tool_output_preview_chars: 3000
+  system_prompt_token_budget: 16000
 ```
 
 ## Monitoring & Diagnostics
 
 ### Health Checks
 
-Automatic health monitoring for all channels with configurable intervals.
+Automatic health monitoring for all channels with auto-reconnect and configurable intervals.
 
 ### Status Command
 
 Real-time statistics including:
-- Model information and token usage
-- Cache hit rates
+- Model information and context window usage
+- Token usage (input, output, cache creation, cache read)
+- Cumulative cost tracking per model
 - Active tasks and sessions
-- Cost tracking
 - API call counts
+- Subagent status
 
 ### Doctor Tool
 
@@ -451,11 +602,11 @@ markbot doctor fix
 
 Checks include:
 - Python version compatibility
-- Configuration validity
-- Database integrity
+- Configuration validity and model chain verification
 - File system permissions
-- Network connectivity
 - Provider authentication
+- Channel configuration
+- Workspace integrity
 
 ## Development
 
@@ -464,35 +615,159 @@ Checks include:
 ```
 markbot/
 ├── agent/              # Core agent loop and processing
-│   ├── loop.py        # Main agent processing engine
-│   ├── pipeline/      # Message pipeline middleware
-│   ├── subagent/      # Background task delegation
-│   ├── mcp/           # MCP protocol support
-│   └── tools/         # Tool binding and execution
-├── channels/          # Multi-channel messaging
-│   ├── dingtalk.py    # DingTalk integration
-│   ├── feishu.py      # Feishu/Lark integration
-│   ├── qq.py          # QQ Bot integration
-│   ├── weixin.py      # WeChat integration
-│   └── email.py       # Email support
-├── tools/             # Built-in tool implementations
-├── skills/            # Skill system
-│   ├── core/          # Skill framework
-│   └── builtin/       # Built-in skills
-├── providers/         # LLM provider integrations
-├── config/            # Configuration management
-├── memory/            # ReMeLight memory system
-├── bus/               # Event bus infrastructure
-├── session/           # Session management
-├── schedule/          # Cron and scheduling
-├── autopilot/         # Automated task pipeline
-├── cli/               # Command-line interface
-│   ├── commands.py    # Main CLI entry point
-│   ├── skills.py      # Skill management commands
-│   ├── autopilot.py   # Autopilot commands
-│   └── doctor.py      # Diagnostic commands
-├── types/             # Type definitions
-└── utils/             # Utility functions
+│   ├── loop.py         # Main agent processing engine
+│   ├── compact.py      # 4-tier progressive compaction
+│   ├── container.py    # Agent context container
+│   ├── context.py      # Context builder for agent prompts
+│   ├── cost.py         # Token & cost tracking with budget control
+│   ├── stream.py       # Stream filtering (think-tag removal)
+│   ├── tokens.py       # Token estimation
+│   ├── iteration.py    # Iteration runner for agent loop
+│   ├── tool_binder.py  # Tool registration and binding
+│   ├── pipeline/       # Message pipeline middleware
+│   │   ├── engine.py   # Pipeline engine
+│   │   └── middleware.py # Built-in middleware (QuestionResponse, MemoryLifecycle)
+│   ├── subagent/       # Background task delegation
+│   │   ├── capability.py  # CapabilityToken for delegation
+│   │   ├── manager.py     # Subagent manager
+│   │   ├── progress.py    # Progress tracking
+│   │   ├── spawn.py       # Spawn tool
+│   │   └── tools.py       # Check/List subagent tools
+│   ├── mcp/            # MCP protocol support
+│   │   └── manager.py  # MCP connection manager
+│   ├── hooks/          # Agent lifecycle hooks
+│   │   ├── bootstrap.py   # Bootstrap hooks
+│   │   └── compaction.py  # Compaction hooks
+│   └── services/       # Agent services
+│       ├── executor.py    # Tool execution service
+│       └── interaction.py # Interaction logger
+├── channels/           # Multi-channel messaging
+│   ├── base.py         # BaseChannel ABC
+│   ├── manager.py      # ChannelManager
+│   ├── discovery.py    # Auto-discovery for built-in + plugins
+│   ├── dingtalk.py     # DingTalk integration
+│   ├── feishu.py       # Feishu/Lark integration
+│   ├── qq.py           # QQ Bot integration
+│   ├── weixin.py       # WeChat integration
+│   └── email.py        # Email (IMAP+SMTP) support
+├── tools/              # Built-in tool implementations
+│   ├── base.py         # BaseTool and Tool ABC
+│   ├── registry.py     # ToolRegistry with permission integration
+│   ├── filesystem.py   # File read/write/edit/list/delete
+│   ├── shell.py        # Shell execution with safety
+│   ├── web.py          # Web search/fetch/extract
+│   ├── search.py       # Glob and Grep
+│   ├── code.py         # Sandboxed code execution
+│   ├── memory.py       # Memory search
+│   ├── memory_tools.py # Memory save/forget/list/dream
+│   ├── think.py        # Unified cognitive tool
+│   ├── todo.py         # Persistent task tracking
+│   ├── question.py     # Ask user questions
+│   ├── message.py      # Message sending
+│   ├── explore.py      # Deep code exploration
+│   ├── context_explorer.py # Context catalog/search/load
+│   ├── cron.py         # Cron scheduling
+│   └── mcp.py          # MCP client tool wrapper
+├── skills/             # Skill system
+│   ├── core/           # Skill framework
+│   │   ├── loader.py   # Skill loading
+│   │   ├── registry.py # Skill registry
+│   │   ├── scanner.py  # Security scanning
+│   │   ├── guardrail.py # Safety guardrails
+│   │   ├── sandbox.py  # Sandboxed execution
+│   │   ├── config.py   # Config resolution
+│   │   ├── manage.py   # Skill management tool
+│   │   ├── tool.py     # Skill tools (list/view)
+│   │   └── helpers.py  # Skill helpers
+│   └── builtin/        # Built-in skills
+│       ├── weather/    # Weather lookup
+│       ├── summarize/  # Text summarization
+│       ├── surprise-me/# Fun interactions
+│       ├── tmux/       # Terminal session management
+│       ├── github/     # GitHub integration
+│       ├── clawhub/    # Skill marketplace
+│       ├── skill-creator/ # Custom skill creation
+│       ├── memory/     # Advanced memory operations
+│       └── cron/       # Scheduled task management
+├── providers/          # LLM provider integrations
+│   ├── base.py         # LLMProvider ABC
+│   ├── registry.py     # ProviderSpec registry (25 providers)
+│   ├── fallback.py     # FallbackManager with circuit breaker
+│   ├── anthropic.py    # Anthropic native SDK
+│   ├── openai_compat.py # OpenAI-compatible provider
+│   ├── azure_openai.py # Azure OpenAI
+│   ├── openai_codex.py # OpenAI Codex (OAuth)
+│   └── transcription.py # Groq Whisper transcription
+├── config/             # Configuration management
+│   ├── schema.py       # Pydantic config schema
+│   ├── loader.py       # Config loading/saving
+│   ├── paths.py        # Path resolution
+│   └── validator.py    # Config validation
+├── memory/             # ReMeLight memory system
+│   ├── base.py         # BaseMemoryManager ABC
+│   ├── manager.py      # File-based memory manager
+│   ├── provider.py     # MemoryProvider ABC
+│   ├── daily_log.py    # Daily log management
+│   ├── encoder.py      # Embedding encoder
+│   ├── scanner.py      # Security scanner
+│   ├── fencing.py      # Context fencing
+│   ├── tool.py         # MemoryStore
+│   └── manager.py      # Main MemoryManager
+├── bus/                # Event bus infrastructure
+│   ├── events.py       # Event types (25+ event types)
+│   ├── queue.py        # MessageBus (inbound/outbound)
+│   └── emitter.py      # Event emitter
+├── session/            # Session management
+│   ├── session.py      # Session data model
+│   ├── store.py        # Session persistence
+│   ├── app_state.py    # Application state
+│   ├── bootstrap.py    # Session bootstrap
+│   ├── handoff.py      # Session handoff
+│   ├── integrity.py    # Session integrity checks
+│   ├── task_tracker.py # Task tracking
+│   └── types.py        # Session types
+├── schedule/           # Cron and scheduling
+│   ├── cron.py         # CronService
+│   ├── dream.py        # DreamService
+│   ├── heartbeat.py    # HeartbeatService
+│   └── evaluator.py    # Schedule evaluator
+├── autopilot/          # Automated task pipeline
+│   ├── service.py      # AutopilotService
+│   ├── store.py        # Task store
+│   ├── tools.py        # Autopilot tools
+│   ├── types.py        # Task types
+│   └── verification.py # Verification system
+├── cli/                # Command-line interface
+│   ├── commands.py     # Main CLI entry point
+│   ├── skills.py       # Skill management commands
+│   ├── autopilot.py    # Autopilot commands
+│   ├── doctor.py       # Diagnostic commands
+│   ├── onboard.py      # Interactive onboarding
+│   ├── models.py       # Model suggestions
+│   ├── stream.py       # Stream rendering
+│   └── slash_commands/ # Slash command routing
+│       ├── router.py   # CommandRouter
+│       └── builtin.py  # Built-in commands
+├── types/              # Type definitions
+│   ├── exceptions.py   # Custom exceptions
+│   ├── permission.py   # Permission types
+│   ├── protocols.py    # Protocol definitions
+│   ├── skill.py        # Skill types
+│   └── tool.py         # Tool types
+├── utils/              # Utility functions
+│   ├── constants.py    # Shared constants
+│   ├── helpers.py      # Helper functions
+│   └── network.py      # Network utilities
+├── log/                # Logging
+│   ├── core.py         # Core logging
+│   ├── filter.py       # Log filters
+│   └── format.py       # Log formatters
+└── templates/          # Prompt templates
+    ├── SOUL.md         # Agent personality
+    ├── TOOLS.md        # Tool descriptions
+    ├── MEMORY.md       # Memory instructions
+    ├── ARCHITECTURE.md # Architecture context
+    └── agents/         # Agent-specific templates
 ```
 
 ### Contributing
@@ -509,23 +784,16 @@ markbot/
 # Run linting
 ruff check .
 
-# Run type checking (if configured)
-# ruff format .
-
 # Run tests
 pytest
+
+# Run tests with coverage
+pytest --cov=markbot
 ```
 
 ## License
 
-This project is licensed under the AGPL-3.0 License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- [reme-ai](https://github.com/remember-ai/reme-ai) for the ReMeLight memory system
-- [Anthropic](https://anthropic.com) for Claude models
-- [OpenAI](https://openai.com) for GPT models
-- All contributors and community members
+This project is licensed under the GNU Affero General Public License v3 (AGPL-3.0) - see the LICENSE file for details.
 
 ---
 

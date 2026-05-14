@@ -12,7 +12,7 @@ skills/
     ├── clawhub/             #    Search & install from ClawHub registry
     ├── cron/                #    Schedule reminders & recurring tasks
     ├── github/              #    Interact with GitHub via `gh` CLI
-    ├── memory/              #    ReMeLight memory system
+    ├── memory/              #    File-based memory system
     ├── skill-creator/       #    Create & manage new skills
     ├── summarize/           #    Summarize URLs, files, videos
     ├── surprise-me/         #    Combine skills dynamically
@@ -101,7 +101,7 @@ Agents use:
 | `clawhub` | Search and install skills from ClawHub registry | [executable] |
 | `cron` | Schedule reminders and recurring tasks | [executable] |
 | `github` | Interact with GitHub using the `gh` CLI | [executable] |
-| `memory` | ReMeLight memory system with compaction, summarization, and semantic search | [instruction] |
+| `memory` | File-based memory system with compaction, summarization, and keyword search | [instruction] |
 | `skill-creator` | Create new skills (meta-skill) | [executable] |
 | `summarize` | Summarize URLs, files, and YouTube videos | [executable] |
 | `surprise-me` | Create delightful experiences by combining skills dynamically | [instruction] |

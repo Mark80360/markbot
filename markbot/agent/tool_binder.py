@@ -12,7 +12,7 @@ from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 
 if TYPE_CHECKING:
     from markbot.agent.subagent import SubagentManager
-    from markbot.memory.manager import ReMeLightMemoryManager
+    from markbot.memory.manager import MemoryManager
     from markbot.schedule.cron import CronService
     from markbot.skills import SkillRegistry
     from markbot.tools.registry import ToolRegistry
@@ -34,7 +34,7 @@ class ToolBinder:
         code_execution_config: Any = None,
         cron_service: "CronService | None" = None,
         subagent_manager: "SubagentManager | None" = None,
-        memory_manager: "ReMeLightMemoryManager | None" = None,
+        memory_manager: "MemoryManager | None" = None,
         skill_registry: "SkillRegistry | None" = None,
         timezone: str | None = None,
         publish_outbound: Any = None,
@@ -234,3 +234,4 @@ class ToolBinder:
 
         for tool_cls in ALL_AUTOPILOT_TOOLS:
             self._tools.register(tool_cls())
+

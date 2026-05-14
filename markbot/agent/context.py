@@ -155,7 +155,7 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
         token_count = estimate_tokens(result)
         if token_count > self.system_prompt_token_budget:
             logger.warning(
-                "[ContextBuilder] System prompt {} tokens exceeds budget {}, truncating",
+                "System prompt {} tokens exceeds budget {}, truncating",
                 token_count, self.system_prompt_token_budget,
             )
             result = self._enforce_token_budget(result, parts)
@@ -183,7 +183,7 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
         remaining_budget = budget - identity_tokens
 
         if remaining_budget <= 0:
-            logger.warning("[ContextBuilder] Identity alone exceeds token budget")
+            logger.warning("Identity alone exceeds token budget")
             return identity[:budget * 4]
 
         kept_parts = [identity]
@@ -204,7 +204,7 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
                     kept_parts.append(truncated)
                     used_tokens += estimate_tokens(truncated)
                 logger.info(
-                    "[ContextBuilder] Truncated section ({} tokens -> budget remaining: {})",
+                    "Truncated section ({} tokens -> budget remaining: {})",
                     part_tokens, available,
                 )
                 break
@@ -286,7 +286,7 @@ Status:
 Recent commits:
 {log}"""
         except Exception as e:
-            logger.debug(f"Failed to get git status: {e}")
+            logger.debug("Failed to get git status: {}", e)
             return None
 
     def clear_cache(self):

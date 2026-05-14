@@ -78,7 +78,7 @@ class StateStore:
             try:
                 listener(new_state, old_state)
             except Exception as e:
-                logger.error(f"State listener error: {e}")
+                logger.error("State listener error: {}", e)
 
         # Selector-based subscriptions
         for sub in self._subscriptions:
@@ -91,7 +91,7 @@ class StateStore:
                     sub.last_value = new_value
 
             except Exception as e:
-                logger.error(f"Subscription error: {e}")
+                logger.error("Subscription error: {}", e)
 
     def subscribe(
         self, callback: Callable[[AppState, AppState], None]

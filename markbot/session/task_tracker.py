@@ -111,7 +111,7 @@ class TaskTracker:
                 updated_at=data.get("updated_at", 0.0),
             )
         except Exception as e:
-            logger.warning("[TaskTracker] Failed to load registry: {}", e)
+            logger.warning("Failed to load registry: {}", e)
             return TaskRegistry()
 
     def _save_registry(self, registry: TaskRegistry) -> None:
@@ -181,7 +181,7 @@ class TaskTracker:
             verification_method=verification_method,
         )
         self._save_task(task)
-        logger.info("[TaskTracker] Created task {}: {}", task.id, title)
+        logger.info("Created task {}: {}", task.id, title)
         return task
 
     def transition(self, task_id: str, new_status: TaskStatus, **kwargs: Any) -> Task:
@@ -218,7 +218,7 @@ class TaskTracker:
 
         self._save_task(task)
         logger.info(
-            "[TaskTracker] Task {} transitioned: {} → {}",
+            "Task {} transitioned: {} → {}",
             task_id, old_status, new_status,
         )
         return task
@@ -311,5 +311,5 @@ class TaskTracker:
         removed = before - len(registry.tasks)
         if removed > 0:
             self._save_registry(registry)
-            logger.info("[TaskTracker] Cleaned up {} completed tasks", removed)
+            logger.info("Cleaned up {} completed tasks", removed)
         return removed

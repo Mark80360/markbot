@@ -113,7 +113,7 @@ class ExploreContextCatalogTool(Tool):
             return result
 
         except Exception as e:
-            logger.error(f"Context catalog exploration failed: {e}")
+            logger.error("Context catalog exploration failed: {}", e)
             return f"Error exploring context catalog: {e}"
 
     def _build_bootstrap_catalog(self) -> str:
@@ -187,7 +187,7 @@ class ExploreContextCatalogTool(Tool):
                     lines.append("*No memory storage found*")
 
         except Exception as e:
-            logger.warning(f"Failed to build memory catalog: {e}")
+            logger.warning("Failed to build memory catalog: {}", e)
             lines.append(f"*Memory catalog unavailable: {e}*")
 
         return "\n".join(lines)
@@ -346,7 +346,7 @@ class SearchContextTool(Tool):
             return "\n".join(formatted)
 
         except Exception as e:
-            logger.error(f"Context search failed: {e}")
+            logger.error("Context search failed: {}", e)
             return f"Error searching context: {e}"
 
     async def _search_memory(self, query: str, max_results: int) -> list[dict]:
@@ -393,7 +393,7 @@ class SearchContextTool(Tool):
                         })
 
         except Exception as e:
-            logger.warning(f"Memory search failed: {e}")
+            logger.warning("Memory search failed: {}", e)
 
         return results
 
@@ -431,7 +431,7 @@ class SearchContextTool(Tool):
                         break
 
             except Exception as e:
-                logger.warning(f"Bootstrap search failed for {filename}: {e}")
+                logger.warning("Bootstrap search failed for {}: {}", filename, e)
 
         return results
 
@@ -527,7 +527,7 @@ class LoadContextTool(Tool):
             return "\n".join(formatted)
 
         except Exception as e:
-            logger.error(f"Context loading failed: {e}")
+            logger.error("Context loading failed: {}", e)
             return f"Error loading context '{context_id}': {e}"
 
     async def _load_memory(self, context_id: str) -> tuple[str | None, str]:
@@ -544,7 +544,7 @@ class LoadContextTool(Tool):
                     entry = entries[idx]
                     return entry.get('content', ''), 'memory'
         except Exception as e:
-            logger.warning(f"Failed to load memory {context_id}: {e}")
+            logger.warning("Failed to load memory {}: {}", context_id, e)
 
         memory_file = self.workspace / "MEMORY.md"
         if memory_file.exists():
@@ -586,6 +586,6 @@ class LoadContextTool(Tool):
             try:
                 return file_path.read_text(encoding='utf-8'), 'bootstrap'
             except Exception as e:
-                logger.warning(f"Failed to load bootstrap {filename}: {e}")
+                logger.warning("Failed to load bootstrap {}: {}", filename, e)
 
         return None, 'bootstrap'

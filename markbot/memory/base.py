@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 if TYPE_CHECKING:
-    from reme.memory.file_based.reme_in_memory_memory import ReMeInMemoryMemory
+    pass
 
 
 class BaseMemoryManager(ABC):
@@ -110,7 +110,7 @@ class BaseMemoryManager(ABC):
             chat_id: Optional chat ID filter for session-scoped search.
         """
 
-    def get_in_memory_memory(self, **kwargs) -> Optional["ReMeInMemoryMemory"]:
+    def get_in_memory_memory(self, **kwargs) -> Optional["Any"]:
         """Retrieve the in-memory memory object."""
         return None
 
@@ -151,37 +151,76 @@ class BaseMemoryManager(ABC):
     ) -> str | None:
         """Retrieve relevant memory based on the given messages.
 
-        Implementations should search for relevant memories and return
-        a formatted string for injection into the system prompt.
+        This is the main retrieval method called by the agent loop to get
+        memory context for system prompt injection. It combines:
+        - Compressed summary (session-level context)
+        - Relevant memory search results (semantic recall)
+        - Recent daily log entries (recency recall)
 
         Args:
-            messages: Recent conversation messages to build query from.
+            messages: Current conversation messages for context.
             channel: Optional channel filter for session-scoped retrieval.
             chat_id: Optional chat ID filter for session-scoped retrieval.
 
         Returns:
-            Formatted memory context string, or None if no relevant
-            memory found.
+            Formatted memory context string, or None if no relevant memory.
         """
-        return None
+        parts: list[str] = []
 
-    async def dream(self, **kwargs) -> None:
-        """Optimize memory files via a background agent pass.
+        # 1. Compressed summary
+        session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+        summary = self.get_compressed_summary(session_key=session_key)
+        if summary:
+            parts.append(f"## Compressed Summary\n\n{summary}")
 
-        Runs a lightweight agent with file-editing tools to consolidate
-        redundant or outdated memory entries in MEMORY.md.
-        Default implementation does nothing.
-        """
-        return None
+        # 2. Memory search (semantic recall)
+        if messages:
+            last_user_msg = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, str) and content:
+                        last_user_msg = content[:500]
+                        break
+            if last_user_msg:
+                try:
+                    search_results = await self.memory_search(
+                        query=last_user_msg,
+                        max_results=3,
+                        min_score=0.1,
+                        channel=channel,
+                        chat_id=chat_id,
+                    )
+                    if search_results:
+                        lines = []
+                        if hasattr(search_results, "__iter__"):
+                            for r in search_results[:3]:
+                                content = r.get("content", "") if isinstance(r, dict) else str(r)
+                                if content:
+                                    lines.append(f"- {content[:200]}")
+                        if lines:
+                            parts.append(f"## Related Memories\n\n" + "\n".join(lines))
+                except Exception:
+                    pass
+
+        # 3. Recent memory context from MemoryStore
+        memory_ctx = self.get_memory_context(query=last_user_msg if messages else None)
+        if memory_ctx:
+            parts.append(memory_ctx)
+
+        if not parts:
+            return None
+
+        return "\n\n".join(parts)
+
+    # -- Background summary worker (serial FIFO queue) -----------------------
 
     async def _summarize_worker(self) -> None:
-        """Background worker that processes summary tasks serially (FIFO).
+        """Background worker that processes summary tasks serially.
 
-        summary_memory() writes to MEMORY.md via its internal ReActAgent
-        with file-editing tools.  It does NOT update compressed_summary —
-        that is the sole responsibility of compact_memory(), called by
-        MemoryCompactionHook.  Keeping the two stores separate avoids
-        semantic overlap and duplicate token consumption.
+        Processes tasks from the FIFO queue one at a time.  This keeps
+        the two stores separate avoids semantic overlap and duplicate
+        token consumption.
         """
         while True:
             task_id, messages, kwargs = await self._task_queue.get()
@@ -190,20 +229,20 @@ class BaseMemoryManager(ABC):
                 continue
 
             info["status"] = "running"
-            logger.info(f"[SummaryWorker] Task {task_id} started")
+            logger.info("Task {} started", task_id)
             try:
                 result = await self.summary_memory(messages=messages, **kwargs)
                 info["status"] = "completed"
                 info["result"] = result
-                logger.info(f"[SummaryWorker] Task {task_id} completed")
+                logger.info("Task {} completed", task_id)
             except asyncio.CancelledError:
                 info["status"] = "cancelled"
-                logger.info(f"[SummaryWorker] Task {task_id} cancelled")
+                logger.info("Task {} cancelled", task_id)
                 raise
             except BaseException as e:
                 info["status"] = "failed"
                 info["error"] = str(e)
-                logger.error(f"[SummaryWorker] Task {task_id} failed: {e}")
+                logger.error("Task {} failed: {}", task_id, e)
 
     def add_async_summary_task(self, messages: list, **kwargs):
         """Schedule a background summarization task without blocking.
@@ -226,7 +265,7 @@ class BaseMemoryManager(ABC):
         }
 
         self._task_queue.put_nowait((task_id, messages, kwargs))
-        logger.info(f"[SummaryWorker] Task {task_id} enqueued")
+        logger.info("Task {} enqueued", task_id)
 
     def _update_task_statuses(self) -> None:
         """Update status for pending/running tasks if worker was cancelled."""
@@ -237,13 +276,13 @@ class BaseMemoryManager(ABC):
             if info["status"] == "running":
                 if self._worker_task.cancelled():
                     info["status"] = "cancelled"
-                    logger.info(f"[SummaryWorker] Task {task_id} cancelled (worker stopped)")
+                    logger.info("Task {} cancelled (worker stopped)", task_id)
                 else:
                     exc = self._worker_task.exception()
                     if exc is not None:
                         info["status"] = "failed"
                         info["error"] = str(exc)
-                        logger.error(f"[SummaryWorker] Task {task_id} failed: {exc}")
+                        logger.error("Task {} failed: {}", task_id, exc)
 
     def list_summarize_status(self) -> list[dict]:
         """Return status of all summary tasks as list of dicts.
@@ -292,7 +331,7 @@ class BaseMemoryManager(ABC):
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"[SummaryWorker] Worker failed: {e}")
+                logger.error("Worker failed: {}", e)
 
         self._summary_task_info.clear()
         return "\n".join(lines)
@@ -300,3 +339,106 @@ class BaseMemoryManager(ABC):
     @abstractmethod
     async def restart_embedding_model(self) -> None:
         """Restart the embedding model with current config."""
+
+    # -- Lifecycle hooks -----------------------------------------------------
+
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+    ) -> str:
+        """Recall relevant context for the upcoming turn.
+
+        Called before each API call. Return formatted text to inject as
+        context, or empty string if nothing relevant. Implementations
+        should be fast — use background threads for the actual recall
+        and return cached results here.
+
+        Default implementation returns empty string. Override in concrete
+        managers to provide prefetch recall.
+
+        Args:
+            query: The user message text to use as the search query.
+            session_id: Optional session identifier for scoped recall.
+
+        Returns:
+            Formatted context string, or empty string if nothing relevant.
+        """
+        return ""
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+    ) -> None:
+        """Persist a completed turn to the backend.
+
+        Called after each turn. Use to store conversation history,
+        update embeddings, or trigger async processing.
+
+        Default implementation is no-op. Override in concrete managers
+        to persist turn data.
+
+        Args:
+            user_content: The user's message content.
+            assistant_content: The assistant's response content.
+            session_id: Optional session identifier for scoped storage.
+        """
+
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+    ) -> None:
+        """Queue a background recall for the NEXT turn.
+
+        Called after each turn completes. The result will be consumed
+        by prefetch() on the next turn. Default is no-op — providers
+        that do background prefetching should override this.
+
+        Args:
+            query: The user message text to use as the search query.
+            session_id: Optional session identifier for scoped recall.
+        """
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs,
+    ) -> None:
+        """Called on the PARENT agent when a subagent completes.
+
+        The parent's memory manager gets the task+result pair as an
+        observation of what was delegated and what came back.
+
+        Default implementation is no-op. Override to persist subagent
+        results as memory entries.
+
+        Args:
+            task: The delegation prompt.
+            result: The subagent's final response.
+            child_session_id: The subagent's session_id.
+        """
+
+    def get_memory_context(self, query: str | None = None) -> str:
+        """Get formatted memory context for system prompt injection.
+
+        Returns a string containing the compressed summary, recent
+        memory entries, and other relevant context. The result is
+        suitable for injection into the system prompt.
+
+        Args:
+            query: Optional search query to scope the context.
+
+        Returns:
+            Formatted memory context string, or empty string.
+        """
+        return ""
+
