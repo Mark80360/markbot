@@ -40,6 +40,7 @@ class InterceptHandler(logging.Handler):
 def setup_logging(
     *,
     level: str = "INFO",
+    console_level: Optional[str] = None,
     log_file: Optional[Path] = None,
     verbose: bool = False,
     install_exception_hooks: bool = True,
@@ -53,7 +54,12 @@ def setup_logging(
     ----------
     level:
         Minimum log level for the *console* sink (e.g. ``"INFO"``,
-        ``"DEBUG"``).  Ignored when *verbose* is ``True``.
+        ``"DEBUG"``).  Ignored when *verbose* is ``True`` or
+        *console_level* is provided.
+    console_level:
+        Explicit log level for the *console* sink, overrides *level*.
+        Useful when the console should be quieter than the default
+        (e.g. ``"WARNING"`` for CLI interactive mode).
     log_file:
         Optional path for the file sink.  When provided a second sink is
         added with ``level="DEBUG"`` and file-rotation settings.
@@ -65,7 +71,12 @@ def setup_logging(
     """
     logger.remove()
 
-    effective_level = "DEBUG" if verbose else level
+    if verbose:
+        effective_level = "DEBUG"
+    elif console_level is not None:
+        effective_level = console_level
+    else:
+        effective_level = level
 
     logger.add(
         sys.stderr,

@@ -9,12 +9,27 @@ _MAX_FILE_MSG_LEN = 10000
 
 
 def _escape_markup(text: str) -> str:
-    """Escape ``<`` so loguru's Colorizer won't treat it as a markup tag.
+    """Escape special characters for loguru's format pipeline.
 
-    Only ``<`` needs escaping — loguru only looks for ``<`` to start a tag.
-    ``>`` is left as-is so the final rendered output reads naturally.
+    Three categories of escaping are needed:
+
+    1. ``\\`` → ``\\\\`` — backslash must be escaped first so that
+       subsequent replacements (``\\<``, ``{{``) are not double-escaped.
+    2. ``<`` → ``\\<`` — prevents loguru's *Colorizer* from treating
+       ``<`` as the start of a markup tag (e.g. ``<red>...</red>``).
+    3. ``{`` → ``{{`` / ``}`` → ``}}`` — prevents Python's
+       :func:`string.Formatter.parse` and :func:`str.format_map` from
+       interpreting literal braces as format-field delimiters.  This is
+       the root cause of ``ValueError: unmatched '{' in format spec`` and
+       ``KeyError`` when log messages contain dict reprs such as
+       ``Headers({'cache-control': ...})`` or tool-call payloads.
     """
-    return text.replace("\\", "\\\\").replace("<", "\\<")
+    return (
+        text.replace("\\", "\\\\")
+        .replace("<", "\\<")
+        .replace("{", "{{")
+        .replace("}", "}}")
+    )
 
 
 def console_format(record: dict[str, Any]) -> str:

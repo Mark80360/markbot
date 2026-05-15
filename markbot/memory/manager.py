@@ -1,4 +1,4 @@
-﻿﻿"""File-based memory manager for markbot.
+"""File-based memory manager for markbot.
 
 Provides a file-based memory system with:
 
@@ -805,10 +805,24 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         except Exception as e:
             logger.warning("Failed to save session summary: {}", e)
 
+        path = self._session_summary_path_daily(session_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            path.write_text(existing + "\n\n----------\n\n" + summary, encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to save daily session summary: {}", e)
+        
+
     def _session_summary_path(self, session_key: str) -> Path:
         """Get path for per-session summary file."""
         safe_key = session_key.replace(":", "_").replace("/", "_")
         return Path(self.working_dir) / "memory" / f".summary_{safe_key}"
+
+    def _session_summary_path_daily(self, session_key: str) -> Path:
+        """Get path for daily-session summary file."""
+        date = datetime.now().strftime("%Y-%m-%d")
+        return Path(self.working_dir) / "memory" / f"{date}.md"
 
 
 __all__ = ["MemoryManager"]

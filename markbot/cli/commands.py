@@ -520,6 +520,9 @@ GATEWAY_PID_DIR = Path.home() / ".markbot" / "gateway"
 GATEWAY_PID_FILE = GATEWAY_PID_DIR / "gateway.pid"
 GATEWAY_LOG_FILE = GATEWAY_PID_DIR / "gateway.log"
 
+AGENT_LOG_DIR = Path.home() / ".markbot" / "logs"
+AGENT_LOG_FILE = AGENT_LOG_DIR / "agent.log"
+
 
 def _ensure_pid_dir() -> None:
     GATEWAY_PID_DIR.mkdir(parents=True, exist_ok=True)
@@ -1002,7 +1005,11 @@ def agent(
     from markbot.log.core import setup_logging
     from markbot.schedule.cron import CronService
 
-    setup_logging(verbose=logs)
+    AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    setup_logging(
+        console_level="DEBUG" if logs else "ERROR",
+        log_file=AGENT_LOG_FILE,
+    )
 
     _cmd_start = time.time()
     logger.info("agent command starting...")
@@ -1522,8 +1529,8 @@ def gateway_status():
     kv("Context Window", f"{config.agents.defaults.context_window_tokens} tokens")
     hb_on = config.gateway.heartbeat.enabled
     kv("Heartbeat", f"[green]●[/green] Enabled every {config.gateway.heartbeat.interval_s}s" if hb_on else "[yellow]○[/yellow] Disabled")
-    kv("Channels", f"{len(enabled_channels)} enabled  ({', '.join(enabled_channels) or 'none'})")
-    kv("Cron Jobs", f"[yellow]{active_jobs}[/yellow] / {cron_jobs} active")
+    kv("Channels", f"{len(enabled_channels)} Enabled  ({', '.join(enabled_channels) or 'none'})")
+    kv("Cron Jobs", f"[yellow]{active_jobs}[/yellow] / {cron_jobs} Active")
 
     divider()
 
