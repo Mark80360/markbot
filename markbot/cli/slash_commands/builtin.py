@@ -83,7 +83,9 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
             messages=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in session.messages if m.get("content")],
         )
     if mm:
-        mm.set_compressed_summary("")
+        session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
+        if session_key:
+            mm.set_compressed_summary("", session_key=session_key)
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
@@ -109,15 +111,16 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="No messages to compact.",
         )
+    session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
     mm.add_async_summary_task(
         messages=history,
     )
     summary = await mm.compact_memory(
         messages=history,
-        previous_summary=mm.get_compressed_summary(),
+        previous_summary=mm.get_compressed_summary(session_key=session_key),
     )
     if summary:
-        mm.set_compressed_summary(summary)
+        mm.set_compressed_summary(summary, session_key=session_key)
         # Advance last_consolidated to mark old messages as archived
         # without deleting them, so get_history() still has access.
         keep_recent = 6
@@ -145,7 +148,8 @@ async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="Memory manager is not available.",
         )
-    summary = mm.get_compressed_summary()
+    session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
+    summary = mm.get_compressed_summary(session_key=session_key)
     if not summary:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,

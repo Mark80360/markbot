@@ -198,7 +198,7 @@ class IterationRunner:
                             block_text = block.get("text", "")
                             if block_text is None:
                                 block_text = ""
-                                user_text += block_text
+                            user_text += block_text
                 elif isinstance(content, str):
                     user_text = content
                 if user_text:
@@ -225,6 +225,20 @@ class IterationRunner:
                     logger.info("Memory prefetch context injected")
             except Exception as e:
                 logger.warning("Memory prefetch failed: {}", e)
+
+        if memory_manager and hasattr(memory_manager, "get_memory_context"):
+            try:
+                memory_ctx = memory_manager.get_memory_context(
+                    query=user_text,
+                    session_key=self.session_key,
+                )
+                if memory_ctx and memory_ctx.strip():
+                    state.messages[sys_idx]["content"] = (
+                        state.messages[sys_idx]["content"] + "\n\n" + memory_ctx
+                    )
+                    logger.info("Memory context injected (summary + store)")
+            except Exception as e:
+                logger.warning("Memory context injection failed: {}", e)
 
         if not mem_tool:
             return

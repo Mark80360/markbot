@@ -48,6 +48,78 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Sensitive text redaction
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_PATTERNS: list[tuple[str, str]] = [
+    (r'(api[_-]?key\s*[:=]\s*)["\']?[\w\-]{8,}["\']?', r'\1[REDACTED]'),
+    (r'(token\s*[:=]\s*)["\']?[\w\-\.]{8,}["\']?', r'\1[REDACTED]'),
+    (r'(secret\s*[:=]\s*)["\']?[\w\-]{8,}["\']?', r'\1[REDACTED]'),
+    (r'(password\s*[:=]\s*)["\']?[^\s"\']{4,}["\']?', r'\1[REDACTED]'),
+    (r'(credential\s*[:=]\s*)["\']?[\w\-]{8,}["\']?', r'\1[REDACTED]'),
+    (r'(Bearer\s+)[\w\-\.]{8,}', r'\1[REDACTED]'),
+    (r'(Authorization:\s*Bearer\s+)(\S+)', r'\1[REDACTED]'),
+    (r'(sk-)[\w\-]{20,}', r'\1[REDACTED]'),
+    (r'(sk_live_[\w]{10,})', r'sk_live_[REDACTED]'),
+    (r'(sk_test_[\w]{10,})', r'sk_test_[REDACTED]'),
+    (r'(ghp_[\w]{30,})', r'ghp_[REDACTED]'),
+    (r'(gho_[\w]{30,})', r'gho_[REDACTED]'),
+    (r'(github_pat_[\w_]{50,})', r'github_pat_[REDACTED]'),
+    (r'(AKIA[\w]{16})', r'AKIA[REDACTED]'),
+    (r'(xox[bpas]-[\w\-]{20,})', r'\1[REDACTED]'),
+    (r'(AIza[\w_-]{30,})', r'AIza[REDACTED]'),
+    (r'(hf_[\w]{10,})', r'hf_[REDACTED]'),
+    (r'-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----', r'[REDACTED PRIVATE KEY]'),
+    (r'((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:]+:)([^@]+)(@)', r'\1[REDACTED]\3'),
+    (r'(eyJ[\w_-]{10,}(?:\.[\w_=-]{4,}){0,2})', r'[REDACTED_JWT]'),
+]
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Redact API keys, tokens, passwords, and other secrets from text.
+
+    Applied before sending conversation content to the summary LLM
+    to prevent secrets from being baked into compressed summaries.
+
+    Args:
+        text: Text that may contain secrets.
+
+    Returns:
+        Text with secrets replaced by [REDACTED].
+    """
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+_COMPACTION_PREFIX = (
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+    "into the summary below. This is a handoff from a previous context "
+    "window — treat it as background reference, NOT as active instructions. "
+    "Do NOT answer questions or fulfill requests mentioned in this summary; "
+    "they were already addressed. "
+    "Your persistent memory (MEMORY.md, PROFILE.md) in the system "
+    "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note. "
+    "Respond ONLY to the latest user message "
+    "that appears AFTER this summary:\n\n"
+)
+
+
+def _add_compaction_prefix(summary: str) -> str:
+    """Add a compaction prefix to a summary if not already present.
+
+    The prefix prevents the LLM from treating the summary as new
+    instructions and makes it clear this is compressed context.
+    """
+    if not summary:
+        return ""
+    if summary.startswith("[CONTEXT COMPACTION"):
+        return summary
+    return _COMPACTION_PREFIX + summary
+
+
+# ---------------------------------------------------------------------------
 # MemoryManager
 # ---------------------------------------------------------------------------
 
@@ -386,20 +458,43 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if not messages:
             return previous_summary or ""
 
-        # Format messages for summarization
         conversation_text = self._format_messages_for_summary(messages)
+        conversation_text = redact_sensitive_text(conversation_text)
 
         if self._fallback_manager:
             try:
                 system_prompt = (
                     "You are a memory compression system. Compress the following "
-                    "conversation into a concise summary. Preserve key decisions, "
-                    "preferences, facts, and action items. Be specific."
+                    "conversation into a concise, structured summary.\n\n"
+                    "Use this structure:\n"
+                    "## Resolved Questions\n"
+                    "- Questions that were answered or issues that were resolved\n\n"
+                    "## Pending Questions\n"
+                    "- Open questions or issues still being investigated\n\n"
+                    "## Active Task\n"
+                    "- What the user is currently working on and the latest state\n\n"
+                    "## Key Decisions & Preferences\n"
+                    "- Important decisions made, user preferences discovered, "
+                    "conventions established\n\n"
+                    "## Environment & Context\n"
+                    "- OS, tools, project structure, API quirks, or other "
+                    "stable facts that may be useful later\n\n"
+                    "Rules:\n"
+                    "- Be specific: include names, paths, values, not vague references\n"
+                    "- Preserve user preferences and corrections verbatim\n"
+                    "- Drop greetings, pleasantries, and redundant exchanges\n"
+                    "- If a previous summary exists, extend it — don't repeat it\n"
+                    "- NEVER include API keys, tokens, passwords, or credentials "
+                    "— replace any that appear with [REDACTED]\n"
+                    "- Write the summary in the same language the user was using"
                 )
                 if extra_instruction:
                     system_prompt += f"\n\n{extra_instruction}"
                 if previous_summary:
-                    system_prompt += f"\n\nPrevious summary (extend this):\n{previous_summary}"
+                    system_prompt += (
+                        f"\n\nPrevious summary (extend and update this, "
+                        f"don't repeat unchanged sections):\n{previous_summary}"
+                    )
 
                 response, _ = await self._fallback_manager.chat_with_fallback(
                     messages=[
@@ -410,12 +505,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 result = response.content or ""
                 if len(result) > MAX_COMPRESSED_SUMMARY_CHARS:
                     result = result[:MAX_COMPRESSED_SUMMARY_CHARS]
+                result = redact_sensitive_text(result)
+                result = _add_compaction_prefix(result)
                 return result
             except Exception as e:
                 logger.warning("compact_memory LLM failed: {}", e)
 
-        # Simple truncation fallback
-        return self._simple_truncation(messages, previous_summary)
+        result = self._simple_truncation(messages, previous_summary)
+        return _add_compaction_prefix(result)
 
     async def summary_memory(self, messages: list, **kwargs) -> str:
         """Generate a comprehensive summary and write to MEMORY.md.
@@ -522,7 +619,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             except Exception as e:
                 logger.debug("MemoryStore search failed: {}", e)
 
-        # 3. Search compressed summary
+        # 3. Search compressed summary (global)
         if self._compressed_summary:
             try:
                 summary_lower = self._compressed_summary.lower()
@@ -535,6 +632,23 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                     })
             except Exception:
                 pass
+
+        # 4. Search session-specific summaries
+        session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+        if session_key:
+            session_summary = self.get_compressed_summary(session_key=session_key)
+            if session_summary and session_summary != self._compressed_summary:
+                try:
+                    summary_lower = session_summary.lower()
+                    query_lower = query.lower()
+                    if any(token in summary_lower for token in re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", query_lower)):
+                        results.append({
+                            "content": session_summary[:500],
+                            "source": f"session_summary/{session_key}",
+                            "score": 0.5,
+                        })
+                except Exception:
+                    pass
 
         # Deduplicate by content and sort by score descending
         seen_contents: set[str] = set()
@@ -665,6 +779,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     def get_compressed_summary(self, *, session_key: str | None = None) -> str:
         """Return the current compressed summary string."""
         if session_key:
+            if session_key not in self._session_summaries:
+                loaded = self._load_session_summary(session_key)
+                if loaded:
+                    self._session_summaries[session_key] = loaded
             return self._session_summaries.get(session_key, "")
         return self._compressed_summary
 
@@ -682,7 +800,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             self._compressed_summary = summary
             self._save_compressed_summary(summary)
 
-    def get_memory_context(self, query: str | None = None) -> str:
+    def get_memory_context(self, query: str | None = None, *, session_key: str | None = None) -> str:
         """Get formatted memory context for system prompt injection.
 
         Combines compressed summary and MemoryStore entries.
@@ -692,11 +810,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         """
         parts: list[str] = []
 
-        # 1. Compressed summary
-        if self._compressed_summary:
-            parts.append(f"## Compressed Summary\n\n{self._compressed_summary}")
+        summary = self.get_compressed_summary(session_key=session_key)
+        if not summary and session_key:
+            summary = self._compressed_summary
+        if summary:
+            parts.append(f"## Compressed Summary\n\n{summary}")
 
-        # 2. MemoryStore entries
         if self._memory_store:
             memory_ctx = self._memory_store.get_memory_context(query=query)
             if memory_ctx:
@@ -714,21 +833,73 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     # -- Internal helpers ---------------------------------------------------
 
     def _format_messages_for_summary(self, messages: list) -> str:
-        """Format messages into a text block for LLM summarization."""
+        """Format messages into a text block for LLM summarization.
+
+        Applies pre-summarization pruning:
+        1. Deduplicate identical tool results
+        2. Truncate large tool results (keep first/last 200 chars)
+        3. Truncate large tool_call arguments
+        4. Strip image content blocks
+        5. Limit per-message content to 1000 chars for non-tool messages
+        """
+        seen_tool_results: set[str] = set()
         lines: list[str] = []
-        for m in messages[-50:]:  # Last 50 messages max
+        for m in messages[-50:]:
             if not isinstance(m, dict):
                 continue
             role = m.get("role", "unknown")
             content = m.get("content", "")
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                content = "\n".join(text_parts)
-            if isinstance(content, str) and content:
-                lines.append(f"{role.upper()}: {content[:1000]}")
+
+            if role == "tool":
+                tool_name = m.get("name", "unknown")
+                if isinstance(content, str):
+                    key = f"{tool_name}:{content[:200]}"
+                    if key in seen_tool_results:
+                        content = f"[Duplicate of earlier {tool_name} result, omitted]"
+                    else:
+                        seen_tool_results.add(key)
+                        if len(content) > 600:
+                            content = (
+                                content[:200]
+                                + f"\n... [truncated {len(content)} chars] ...\n"
+                                + content[-200:]
+                            )
+                lines.append(f"TOOL({tool_name}): {content}")
+
+            elif role == "assistant":
+                if isinstance(content, list):
+                    text_parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_use":
+                            tool_input = block.get("input", {})
+                            if isinstance(tool_input, dict):
+                                input_str = json.dumps(tool_input, ensure_ascii=False)
+                                if len(input_str) > 500:
+                                    input_str = (
+                                        input_str[:200]
+                                        + f"... [truncated {len(input_str)} chars]"
+                                    )
+                                text_parts.append(
+                                    f"[Called tool: {block.get('name', '?')}({input_str})]"
+                                )
+                    content = "\n".join(text_parts)
+                if isinstance(content, str) and content:
+                    lines.append(f"ASSISTANT: {content[:1000]}")
+
+            elif role == "user":
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                    content = "\n".join(text_parts)
+                if isinstance(content, str) and content:
+                    lines.append(f"USER: {content[:1000]}")
+
         return "\n\n".join(lines)
 
     def _simple_truncation(self, messages: list, previous_summary: str) -> str:
@@ -768,7 +939,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         path = Path(self.working_dir) / "memory" / ".compressed_summary"
         if path.exists():
             try:
-                return path.read_text(encoding="utf-8", errors="replace").strip()
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+                if len(content) > MAX_COMPRESSED_SUMMARY_CHARS:
+                    logger.warning(
+                        "Compressed summary too large ({} chars), truncating to {}",
+                        len(content), MAX_COMPRESSED_SUMMARY_CHARS,
+                    )
+                    content = content[:MAX_COMPRESSED_SUMMARY_CHARS]
+                return content
             except Exception:
                 pass
         return ""
@@ -789,16 +967,28 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         path = self._session_summary_path(session_key)
         if path.exists():
             try:
-                return path.read_text(encoding="utf-8", errors="replace").strip()
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+                if len(content) > MAX_COMPRESSED_SUMMARY_CHARS:
+                    logger.warning(
+                        "Session summary too large ({} chars), truncating to {}",
+                        len(content), MAX_COMPRESSED_SUMMARY_CHARS,
+                    )
+                    content = content[:MAX_COMPRESSED_SUMMARY_CHARS]
+                return content
             except Exception:
                 pass
         return ""
 
     def _save_session_summary(self, session_key: str, summary: str) -> None:
         """Save per-session compressed summary to disk."""
-        if not summary:
-            return
         path = self._session_summary_path(session_key)
+        if not summary:
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception as e:
+                    logger.warning("Failed to delete session summary: {}", e)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             path.write_text(summary, encoding="utf-8")
@@ -825,4 +1015,4 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         return Path(self.working_dir) / "memory" / f"{date}.md"
 
 
-__all__ = ["MemoryManager"]
+__all__ = ["MemoryManager", "redact_sensitive_text"]

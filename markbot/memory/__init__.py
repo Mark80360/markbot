@@ -24,7 +24,7 @@ from .fencing import (
     is_fenced,
     sanitize_context,
 )
-from .manager import MemoryManager
+from .manager import MemoryManager, redact_sensitive_text
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
 from .tool import MEMORY_TOOL_SCHEMA, MemoryStore, memory_tool_handler
@@ -33,6 +33,7 @@ __all__ = [
     "BaseMemoryManager",
     "DailyLogManager",
     "MemoryManager",
+    "redact_sensitive_text",
     "MemoryEncoder",
     "MemorySecurityScanner",
     "MemoryProvider",

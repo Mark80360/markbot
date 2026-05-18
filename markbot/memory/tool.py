@@ -17,16 +17,29 @@ Context fencing: memory context is wrapped in <memory-context> tags.
 
 from __future__ import annotations
 
-import logging
 import os
 import re
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from loguru import logger
 
-from .scanner import MemorySecurityScanner
 from .fencing import fence_context
+from .scanner import MemorySecurityScanner
+
+fcntl = None
+msvcrt = None
+try:
+    import fcntl as _fcntl  # noqa: E402
+    fcntl = _fcntl
+except ImportError:
+    try:
+        import msvcrt as _msvcrt  # noqa: E402
+        msvcrt = _msvcrt
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +94,8 @@ class MemoryStore:
         self._system_prompt_snapshot: str = ""
 
         self._scanner = MemorySecurityScanner()
+
+        self._lock_path = self._working_dir / ".memory.lock"
 
         self._load_all()
 
@@ -282,8 +297,58 @@ class MemoryStore:
 
         self._system_prompt_snapshot = "\n\n".join(parts)
 
+    @contextmanager
+    def _file_lock(self, path: Path):
+        """Context manager for cross-platform file locking."""
+        lock_fd = None
+        try:
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = open(self._lock_path, "w")
+            if fcntl:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            elif msvcrt:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
+            yield
+        except Exception:
+            yield
+        finally:
+            if lock_fd:
+                try:
+                    if fcntl:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    elif msvcrt:
+                        try:
+                            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
+                    lock_fd.close()
+                except Exception:
+                    pass
+
+    def _atomic_write_text(self, path: Path, content: str) -> None:
+        """Write text to a file atomically using temp + rename.
+
+        Prevents readers from seeing partially-written files.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=path.stem + "_",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _persist(self, target: str) -> None:
-        """Write entries to disk."""
+        """Write entries to disk with file lock and atomic write."""
         if target == "memory":
             path = self._memory_path
             entries = self.memory_entries
@@ -294,16 +359,17 @@ class MemoryStore:
             header = "# User Profile\n\n"
 
         if not entries:
-            # Write empty header to keep the file
             try:
-                path.write_text(header, encoding="utf-8")
+                with self._file_lock(path):
+                    self._atomic_write_text(path, header)
             except Exception as e:
                 logger.warning("Failed to write {}: {}", path, e)
             return
 
         content = header + ENTRY_DELIMITER.join(entries) + "\n"
         try:
-            path.write_text(content, encoding="utf-8")
+            with self._file_lock(path):
+                self._atomic_write_text(path, content)
         except Exception as e:
             logger.warning("Failed to write {}: {}", path, e)
 

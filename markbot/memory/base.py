@@ -204,7 +204,7 @@ class BaseMemoryManager(ABC):
                     pass
 
         # 3. Recent memory context from MemoryStore
-        memory_ctx = self.get_memory_context(query=last_user_msg if messages else None)
+        memory_ctx = self.get_memory_context(query=last_user_msg if messages else None, session_key=session_key)
         if memory_ctx:
             parts.append(memory_ctx)
 
@@ -427,7 +427,7 @@ class BaseMemoryManager(ABC):
             child_session_id: The subagent's session_id.
         """
 
-    def get_memory_context(self, query: str | None = None) -> str:
+    def get_memory_context(self, query: str | None = None, *, session_key: str | None = None) -> str:
         """Get formatted memory context for system prompt injection.
 
         Returns a string containing the compressed summary, recent
@@ -436,6 +436,7 @@ class BaseMemoryManager(ABC):
 
         Args:
             query: Optional search query to scope the context.
+            session_key: Optional session key for session-scoped summary.
 
         Returns:
             Formatted memory context string, or empty string.

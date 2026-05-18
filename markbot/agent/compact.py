@@ -957,6 +957,7 @@ class MultiLevelCompactor:
                         {"role": "system", "content": self.COMPACT_PROMPT},
                         {"role": "user", "content": conversation_text},
                     ],
+                    max_tokens=self.config.max_compact_output_tokens,
                 )
                 if response.finish_reason == "error":
                     error_msg = response.content or "Unknown error"
