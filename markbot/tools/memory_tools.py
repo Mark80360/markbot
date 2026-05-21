@@ -1,7 +1,11 @@
 """Memory management tools for AI self-management.
 
 These tools allow the AI to autonomously manage its long-term memory:
-search (existing), save, forget, list, and trigger dream optimisation.
+save, forget, list, and trigger dream optimisation.
+
+Two memory stores:
+- 'memory': agent notes — environment facts, project conventions, tool quirks
+- 'user': user profile — name, role, preferences, communication style
 """
 
 from __future__ import annotations
@@ -30,7 +34,11 @@ class MemorySaveTool(Tool):
         return (
             "Save a key piece of information to your long-term memory. "
             "Use when you learn something important about the user, project, "
-            "or decisions that you want to recall across conversations."
+            "or decisions that you want to recall across conversations.\n\n"
+            "TWO TARGETS:\n"
+            "- 'user': who the user is — name, role, preferences, communication style\n"
+            "- 'memory': your notes — environment facts, project conventions, tool quirks\n\n"
+            "Do NOT save task progress, session outcomes, or temporary TODO state."
         )
 
     @property
@@ -41,6 +49,14 @@ class MemorySaveTool(Tool):
                 "content": {
                     "type": "string",
                     "description": "The information to remember. Be specific and include context.",
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": (
+                        "Which store to save to: 'memory' for agent notes, "
+                        "'user' for user profile. Default: 'memory'."
+                    ),
                 },
                 "tags": {
                     "type": "array",
@@ -54,6 +70,7 @@ class MemorySaveTool(Tool):
     async def _legacy_execute(
         self,
         content: str = "",
+        target: str = "memory",
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
@@ -61,9 +78,16 @@ class MemorySaveTool(Tool):
             return "Error: content is required."
         if not self._memory_manager:
             return "Error: Memory manager is not available."
+        if target not in ("memory", "user"):
+            return "Error: target must be 'memory' or 'user'."
         try:
-            await self._memory_manager.add_memory(content=content, tags=tags or [])
-            return f"Saved to memory: {content[:80]}..."
+            result = await self._memory_manager.add_memory(
+                content=content, tags=tags or [], target=target,
+            )
+            if not result:
+                return "Error: Failed to save — character limit may have been reached."
+            store_label = "user profile" if target == "user" else "memory"
+            return f"Saved to {store_label}: {content[:80]}..."
         except Exception as e:
             return f"Error saving memory: {e}"
 
@@ -81,7 +105,12 @@ class MemoryForgetTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Remove specific entries from your long-term memory by memory ID."
+        return (
+            "Remove specific entries from your long-term memory by substring match.\n\n"
+            "TWO TARGETS:\n"
+            "- 'user': remove from user profile\n"
+            "- 'memory': remove from agent notes"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -90,20 +119,36 @@ class MemoryForgetTool(Tool):
             "properties": {
                 "memory_id": {
                     "type": "string",
-                    "description": "The ID of the memory entry to forget",
+                    "description": "Short unique substring identifying the entry to forget.",
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": "Which store to remove from. Default: 'memory'.",
                 },
             },
             "required": ["memory_id"],
         }
 
-    async def _legacy_execute(self, memory_id: str = "", **kwargs: Any) -> str:
+    async def _legacy_execute(
+        self,
+        memory_id: str = "",
+        target: str = "memory",
+        **kwargs: Any,
+    ) -> str:
         if not memory_id:
             return "Error: memory_id is required."
         if not self._memory_manager:
             return "Error: Memory manager is not available."
+        if target not in ("memory", "user"):
+            return "Error: target must be 'memory' or 'user'."
         try:
-            await self._memory_manager.delete_memory(memory_id=memory_id)
-            return f"Memory entry '{memory_id}' has been forgotten."
+            result = await self._memory_manager.delete_memory(
+                memory_id=memory_id, target=target,
+            )
+            if not result:
+                return f"No entry containing '{memory_id[:40]}' found in {target}."
+            return f"Memory entry '{memory_id[:40]}' has been forgotten from {target}."
         except Exception as e:
             return f"Error forgetting memory: {e}"
 
@@ -121,7 +166,12 @@ class MemoryListTool(Tool):
 
     @property
     def description(self) -> str:
-        return "List your recent long-term memory entries with their IDs and summaries."
+        return (
+            "List your recent long-term memory entries with their IDs and summaries.\n\n"
+            "TWO TARGETS:\n"
+            "- 'user': list user profile entries\n"
+            "- 'memory': list agent note entries (default)"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -132,17 +182,32 @@ class MemoryListTool(Tool):
                     "type": "integer",
                     "description": "Maximum number of entries to return (default 20)",
                 },
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": "Which store to list. Default: 'memory'.",
+                },
             },
         }
 
-    async def _legacy_execute(self, limit: int = 20, **kwargs: Any) -> str:
+    async def _legacy_execute(
+        self,
+        limit: int = 20,
+        target: str = "memory",
+        **kwargs: Any,
+    ) -> str:
         if not self._memory_manager:
             return "Error: Memory manager is not available."
+        if target not in ("memory", "user"):
+            return "Error: target must be 'memory' or 'user'."
         try:
-            memories = await self._memory_manager.list_memories(limit=limit)
+            memories = await self._memory_manager.list_memories(
+                limit=limit, target=target,
+            )
             if not memories:
-                return "No memories found."
-            lines = [f"## Memories ({len(memories)} entries)\n"]
+                return f"No {target} entries found."
+            store_label = "User Profile" if target == "user" else "Agent Memory"
+            lines = [f"## {store_label} ({len(memories)} entries)\n"]
             for m in memories:
                 mid = m.get("id", "?")
                 content = m.get("content", "")[:120]

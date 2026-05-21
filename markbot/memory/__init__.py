@@ -27,7 +27,7 @@ from .fencing import (
 from .manager import MemoryManager, redact_sensitive_text
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
-from .tool import MEMORY_TOOL_SCHEMA, MemoryStore, memory_tool_handler
+from .tool import MemoryStore
 
 __all__ = [
     "BaseMemoryManager",
@@ -40,8 +40,6 @@ __all__ = [
     "MemoryStore",
     "BootstrapHook",
     "MemoryCompactionHook",
-    "MEMORY_TOOL_SCHEMA",
-    "memory_tool_handler",
     "fence_context",
     "sanitize_context",
     "is_fenced",

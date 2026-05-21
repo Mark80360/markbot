@@ -4,12 +4,12 @@ import json
 from pathlib import Path
 
 import pydantic
-from loguru import logger
 
 from markbot.config.schema import Config
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+_current_config: Config | None = None
 
 
 class ConfigValidationError(Exception):
@@ -22,8 +22,9 @@ class ConfigValidationError(Exception):
 
 def set_config_path(path: Path) -> None:
     """Set the current config path (used to derive data directory)."""
-    global _current_config_path
+    global _current_config_path, _current_config
     _current_config_path = path
+    _current_config = None
 
 
 def get_config_path() -> Path:
@@ -31,6 +32,14 @@ def get_config_path() -> Path:
     if _current_config_path:
         return _current_config_path
     return Path.home() / ".markbot" / "config.json"
+
+
+def get_config() -> Config:
+    """Get the current cached config, loading from default path if needed."""
+    global _current_config
+    if _current_config is None:
+        _current_config = load_config()
+    return _current_config
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -47,6 +56,7 @@ def load_config(config_path: Path | None = None) -> Config:
         Loaded configuration object.
     """
     path = config_path or get_config_path()
+    global _current_config
 
     if path.exists():
         try:
@@ -55,13 +65,14 @@ def load_config(config_path: Path | None = None) -> Config:
 
             config = Config.model_validate(data)
 
-            # Validate model_chain references
             errors = config.validate_model_chain()
             if errors:
                 raise ConfigValidationError(
                     "Configuration validation failed",
                     details=errors
                 )
+
+            _current_config = config
 
             return config
 
@@ -70,7 +81,9 @@ def load_config(config_path: Path | None = None) -> Config:
         except pydantic.ValidationError as e:
             raise ConfigValidationError(f"Schema validation failed: {e}")
 
-    return Config()
+    config = Config()
+    _current_config = config
+    return config
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:

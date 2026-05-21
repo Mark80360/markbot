@@ -40,11 +40,6 @@ from markbot.config.schema import Base
 from markbot.utils.network import validate_url_target
 
 try:
-    from markbot.config.paths import get_media_dir
-except Exception:  # pragma: no cover
-    get_media_dir = None  # type: ignore
-
-try:
     import botpy
     from botpy.http import Route
 
@@ -176,13 +171,9 @@ class QQChannel(BaseChannel):
         """Choose a directory for saving inbound attachments."""
         if self.config.media_dir:
             root = Path(self.config.media_dir).expanduser()
-        elif get_media_dir:
-            try:
-                root = Path(get_media_dir("qq"))
-            except Exception:
-                root = Path.home() / ".markbot" / "media" / "qq"
         else:
-            root = Path.home() / ".markbot" / "media" / "qq"
+            from markbot.config.paths import get_media_dir
+            root = get_media_dir("qq")
 
         root.mkdir(parents=True, exist_ok=True)
         logger.info("QQ media directory: {}", str(root))

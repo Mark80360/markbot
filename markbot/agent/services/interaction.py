@@ -40,7 +40,8 @@ class InteractionLogger:
 
     def __init__(self, log_dir: Path | None = None):
         if log_dir is None:
-            log_dir = Path.home() / ".markbot" / "logs"
+            from markbot.config.paths import get_logs_dir
+            log_dir = get_logs_dir()
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._logged_msg_counts: dict[str, int] = {}

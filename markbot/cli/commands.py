@@ -34,7 +34,7 @@ from rich.text import Text
 from markbot import __logo__, __version__
 from markbot.cli.skills import app as skills_app
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
-from markbot.config.paths import get_cron_dir, get_workspace_path
+from markbot.config.paths import get_cron_dir, get_gateway_dir, get_logs_dir, get_workspace_path
 from markbot.config.schema import Config
 from markbot.utils.helpers import sync_workspace_templates
 
@@ -516,11 +516,11 @@ gateway_app = typer.Typer(
 app.add_typer(gateway_app, name="gateway")
 
 # Gateway PID file management
-GATEWAY_PID_DIR = Path.home() / ".markbot" / "gateway"
+GATEWAY_PID_DIR = get_gateway_dir()
 GATEWAY_PID_FILE = GATEWAY_PID_DIR / "gateway.pid"
 GATEWAY_LOG_FILE = GATEWAY_PID_DIR / "gateway.log"
 
-AGENT_LOG_DIR = Path.home() / ".markbot" / "logs"
+AGENT_LOG_DIR = get_logs_dir()
 AGENT_LOG_FILE = AGENT_LOG_DIR / "agent.log"
 
 

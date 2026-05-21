@@ -7,7 +7,7 @@ Monitors conversation patterns to detect:
 
 When a pattern is detected, the encoder:
 1. Checks if the preference already exists in PROFILE.md or MEMORY.md
-2. If not, appends it as a structured entry
+2. If not, appends it as a structured entry via MemoryStore
 3. Marks it as auto-detected so the user can review/edit
 
 This makes the assistant progressively learn user preferences without
@@ -20,8 +20,12 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from markbot.memory.tool import MemoryStore
 
 
 @dataclass
@@ -29,7 +33,7 @@ class PreferenceEntry:
     content: str
     source: str = "auto_detected"
     detected_at: float = 0.0
-    confidence: int = 1  # number of times this pattern was seen
+    confidence: int = 1
 
     def to_line(self) -> str:
         return f"- {self.content}  [source: {self.source}, confidence: {self.confidence}]"
@@ -37,7 +41,7 @@ class PreferenceEntry:
 
 @dataclass
 class PatternMatch:
-    pattern_type: str  # "preference", "correction", "workflow"
+    pattern_type: str
     content: str
     raw_text: str
     confidence: int = 1
@@ -68,8 +72,6 @@ _CORRECTION_PATTERNS = [
     ),
 ]
 
-_MAX_PROFILE_ENTRIES = 50
-_MAX_MEMORY_ENTRIES = 100
 _DETECTION_COOLDOWN_SECONDS = 300
 
 
@@ -78,18 +80,26 @@ class MemoryEncoder:
 
     Usage::
 
-        encoder = MemoryEncoder(workspace)
+        encoder = MemoryEncoder(workspace, memory_store=store)
         matches = encoder.scan_message(user_text)
         if matches:
             encoder.encode_preferences(matches)
     """
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        memory_store: Optional[MemoryStore] = None,
+    ) -> None:
         self.workspace = workspace
+        self._memory_store = memory_store
         self._profile_path = workspace / "PROFILE.md"
         self._memory_path = workspace / "MEMORY.md"
         self._detection_log_path = workspace / "memory" / "encoder_log.json"
         self._recent_detections: dict[str, float] = {}
+
+    def set_memory_store(self, store: MemoryStore) -> None:
+        self._memory_store = store
 
     def scan_message(self, text: str) -> list[PatternMatch]:
         if not text or not isinstance(text, str):
@@ -157,10 +167,10 @@ class MemoryEncoder:
                 continue
 
             if match.pattern_type == "preference":
-                if self._append_to_profile(match):
+                if self._append_to_store("user", match):
                     encoded += 1
             elif match.pattern_type == "correction":
-                if self._append_to_memory(match):
+                if self._append_to_store("memory", match):
                     encoded += 1
 
             self._recent_detections[key] = now
@@ -187,6 +197,14 @@ class MemoryEncoder:
 
     def _read_existing_preferences(self) -> list[str]:
         entries: list[str] = []
+
+        if self._memory_store:
+            for target in ("user", "memory"):
+                result = self._memory_store.read(target)
+                for entry in result.get("entries", []):
+                    entries.append(entry)
+            return entries
+
         for path in (self._profile_path, self._memory_path):
             if path.exists():
                 try:
@@ -198,29 +216,31 @@ class MemoryEncoder:
                     pass
         return entries
 
-    def _append_to_profile(self, match: PatternMatch) -> bool:
-        return self._append_entry(
-            self._profile_path,
-            "User Preferences",
-            match,
-            max_entries=_MAX_PROFILE_ENTRIES,
-        )
+    def _append_to_store(self, target: str, match: PatternMatch) -> bool:
+        if self._memory_store:
+            entry = PreferenceEntry(
+                content=match.content,
+                source="auto_detected",
+                detected_at=time.time(),
+                confidence=match.confidence,
+            )
+            result = self._memory_store.add(target, entry.to_line())
+            if result.get("success", False):
+                logger.info("Appended to {} via MemoryStore: {}", target, match.content[:60])
+                return True
+            logger.debug("MemoryStore.add failed for {}: {}", target, result.get("message", ""))
+            return False
 
-    def _append_to_memory(self, match: PatternMatch) -> bool:
-        return self._append_entry(
-            self._memory_path,
-            "Auto-Detected Patterns",
-            match,
-            max_entries=_MAX_MEMORY_ENTRIES,
-        )
+        return self._append_to_file(target, match)
 
-    def _append_entry(
-        self,
-        path: Path,
-        section_title: str,
-        match: PatternMatch,
-        max_entries: int = 50,
-    ) -> bool:
+    def _append_to_file(self, target: str, match: PatternMatch) -> bool:
+        if target == "user":
+            path = self._profile_path
+            section_title = "User Preferences"
+        else:
+            path = self._memory_path
+            section_title = "Auto-Detected Patterns"
+
         entry = PreferenceEntry(
             content=match.content,
             source="auto_detected",
@@ -256,10 +276,6 @@ class MemoryEncoder:
                 if lines[i].strip().startswith("- ") or lines[i].strip().startswith("* "):
                     section_entries += 1
 
-            if section_entries >= max_entries:
-                logger.debug("Section {} full ({} entries)", section_title, max_entries)
-                return False
-
             lines.insert(insert_pos, entry.to_line())
 
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -271,6 +287,23 @@ class MemoryEncoder:
             return False
 
     def _increment_confidence(self, content: str) -> None:
+        if self._memory_store:
+            for target in ("user", "memory"):
+                result = self._memory_store.read(target)
+                for entry in result.get("entries", []):
+                    if content.lower().strip() in entry.lower():
+                        m = re.search(r"confidence:\s*(\d+)", entry)
+                        if m:
+                            old_conf = int(m.group(1))
+                            new_conf = old_conf + 1
+                            new_entry = entry.replace(
+                                f"confidence: {old_conf}",
+                                f"confidence: {new_conf}",
+                            )
+                            self._memory_store.replace(target, entry, new_entry)
+                            return
+            return
+
         for path in (self._profile_path, self._memory_path):
             if not path.exists():
                 continue
@@ -279,8 +312,7 @@ class MemoryEncoder:
                 modified = False
                 for i, line in enumerate(lines):
                     if content.lower().strip() in line.lower():
-                        import re as _re
-                        m = _re.search(r"confidence:\s*(\d+)", line)
+                        m = re.search(r"confidence:\s*(\d+)", line)
                         if m:
                             old_conf = int(m.group(1))
                             new_conf = old_conf + 1

@@ -170,7 +170,8 @@ def offload_tool_output(
         return output, None
 
     if artifact_dir is None:
-        artifact_dir = Path(os.environ.get("MARKBOT_ARTIFACT_DIR", ".markbot_artifacts"))
+        from markbot.config.paths import get_artifacts_dir
+        artifact_dir = Path(os.environ.get("MARKBOT_ARTIFACT_DIR", str(get_artifacts_dir())))
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name.strip())[:80] or "tool"

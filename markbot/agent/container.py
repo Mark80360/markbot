@@ -517,7 +517,7 @@ class AgentContext:
         _t0 = time.time()
         handoff_manager = _HM(workspace)
         task_tracker = _TT(workspace)
-        memory_encoder = _ME(workspace)
+        memory_encoder = _ME(workspace, memory_store=getattr(memory_manager, "_memory_store", None))
         session_bootstrap = _SB(
             workspace,
             handoff_manager=handoff_manager,

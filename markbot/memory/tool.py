@@ -22,7 +22,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
 
@@ -77,6 +77,7 @@ class MemoryStore:
         working_dir: str | Path,
         memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
+        on_write: Optional[Callable[[str, str, str], None]] = None,
     ):
         self._working_dir = Path(working_dir)
         self._memory_path = self._working_dir / MEMORY_FILENAME
@@ -97,6 +98,8 @@ class MemoryStore:
 
         self._lock_path = self._working_dir / ".memory.lock"
 
+        self._on_write = on_write
+
         self._load_all()
 
     # -- Public API ----------------------------------------------------------
@@ -109,6 +112,13 @@ class MemoryStore:
         wrapped in memory-context fence tags.
         """
         return self._system_prompt_snapshot
+
+    def _notify_write(self, action: str, target: str, content: str) -> None:
+        if self._on_write:
+            try:
+                self._on_write(action, target, content)
+            except Exception:
+                pass
 
     def refresh_snapshot(self) -> None:
         """Refresh the frozen snapshot from current entries.
@@ -156,6 +166,7 @@ class MemoryStore:
 
         entries.append(content)
         self._persist(target)
+        self._notify_write("add", target, content)
         logger.info("Added entry to {}: {}...", target, content[:60])
         return {"success": True, "message": "Entry added.", "entries": list(entries)}
 
@@ -186,6 +197,7 @@ class MemoryStore:
             if old_text in entry:
                 entries[i] = new_content
                 self._persist(target)
+                self._notify_write("replace", target, new_content)
                 logger.info("Replaced entry in {}: {}...", target, old_text[:40])
                 return {"success": True, "message": "Entry replaced.", "entries": list(entries)}
 
@@ -210,6 +222,7 @@ class MemoryStore:
             if old_text in entry:
                 removed = entries.pop(i)
                 self._persist(target)
+                self._notify_write("remove", target, removed)
                 logger.info("Removed entry from {}: {}...", target, removed[:40])
                 return {"success": True, "message": "Entry removed.", "entries": list(entries)}
 
@@ -374,107 +387,8 @@ class MemoryStore:
             logger.warning("Failed to write {}: {}", path, e)
 
 
-# ---------------------------------------------------------------------------
-# Tool schema and handler
-# ---------------------------------------------------------------------------
-
-MEMORY_TOOL_SCHEMA = {
-    "name": "memory",
-    "description": (
-        "Save durable information to persistent memory that survives across sessions. "
-        "Memory is injected into future turns, so keep it compact and focused on facts "
-        "that will still matter later.\n\n"
-        "WHEN TO SAVE (proactive 鈥?don't wait to be asked):\n"
-        "- User corrects you or says 'remember this' / 'don't do that again'\n"
-        "- User shares a preference, habit, or personal detail\n"
-        "- You discover something about the environment (OS, installed tools, project structure)\n"
-        "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
-        "- You identify a stable fact that will be useful again in future sessions\n\n"
-        "TWO TARGETS:\n"
-        "- 'user': who the user is 鈥?name, role, preferences, communication style\n"
-        "- 'memory': your notes 鈥?environment facts, project conventions, tool quirks\n\n"
-        "ACTIONS:\n"
-        "- add: Add a new entry\n"
-        "- replace: Update an existing entry (old_text identifies it)\n"
-        "- remove: Delete an entry (old_text identifies it)\n"
-        "- read: List all entries\n"
-        "\n"
-        "Do NOT save task progress, session outcomes, or temporary TODO state.\n"
-        "If you've discovered a reusable solution, save it as a skill instead."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["add", "replace", "remove", "read"],
-                "description": "The action to perform.",
-            },
-            "target": {
-                "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for agent notes, 'user' for user profile.",
-            },
-            "content": {
-                "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace'.",
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Short unique substring identifying the entry to replace or remove.",
-            },
-        },
-        "required": ["action", "target"],
-    },
-}
-
-
-def memory_tool_handler(
-    action: str,
-    target: str = "memory",
-    content: str | None = None,
-    old_text: str | None = None,
-    store: MemoryStore | None = None,
-) -> str:
-    """Dispatch to MemoryStore methods and return JSON result."""
-    import json
-
-    if store is None:
-        return json.dumps({"success": False, "message": "Memory store is not available."}, ensure_ascii=False)
-
-    if target not in {"memory", "user"}:
-        return json.dumps({"success": False, "message": f"Invalid target '{target}'. Use 'memory' or 'user'."}, ensure_ascii=False)
-
-    if action == "add":
-        if not content:
-            return json.dumps({"success": False, "message": "Content is required for 'add' action."}, ensure_ascii=False)
-        result = store.add(target, content)
-
-    elif action == "replace":
-        if not old_text:
-            return json.dumps({"success": False, "message": "old_text is required for 'replace' action."}, ensure_ascii=False)
-        if not content:
-            return json.dumps({"success": False, "message": "content is required for 'replace' action."}, ensure_ascii=False)
-        result = store.replace(target, old_text, content)
-
-    elif action == "remove":
-        if not old_text:
-            return json.dumps({"success": False, "message": "old_text is required for 'remove' action."}, ensure_ascii=False)
-        result = store.remove(target, old_text)
-
-    elif action == "read":
-        result = store.read(target)
-
-    else:
-        return json.dumps({"success": False, "message": f"Unknown action '{action}'."}, ensure_ascii=False)
-
-    return json.dumps(result, ensure_ascii=False)
-
-
 __all__ = [
     "MemoryStore",
-    "MEMORY_TOOL_SCHEMA",
-    "memory_tool_handler",
     "MEMORY_FILENAME",
     "USER_FILENAME",
 ]

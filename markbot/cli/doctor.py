@@ -27,7 +27,7 @@ from rich.text import Text
 
 from markbot import __logo__, __version__
 from markbot.config.loader import get_config_path, load_config
-from markbot.config.paths import get_cron_dir
+from markbot.config.paths import get_cron_dir, get_data_dir, get_gateway_dir
 from markbot.config.schema import Config, ProviderConfig
 
 console = Console()
@@ -386,7 +386,7 @@ def check_cron_jobs(cfg: Config) -> tuple[bool, str]:
 
 
 def check_gateway_pid() -> tuple[bool, str]:
-    pid_file = Path.home() / ".markbot" / "gateway" / "gateway.pid"
+    pid_file = get_gateway_dir() / "gateway.pid"
 
     if not pid_file.exists():
         return True, "not running (no PID file)"
@@ -419,7 +419,7 @@ def check_gateway_pid() -> tuple[bool, str]:
 
 
 def check_gateway_log() -> tuple[bool, str]:
-    log_file = Path.home() / ".markbot" / "gateway" / "gateway.log"
+    log_file = get_gateway_dir() / "gateway.log"
 
     if not log_file.exists():
         return True, "no log file (gateway not started yet)"
@@ -513,7 +513,7 @@ def check_optional_dependencies() -> list[str]:
 # Section 2 Fix runner
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path.home() / ".markbot"
+DATA_DIR = get_data_dir()
 BACKUP_SUBDIR = "doctor-fix-backups"
 
 SAFE_FIX_IDS = frozenset(

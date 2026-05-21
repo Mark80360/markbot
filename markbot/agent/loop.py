@@ -325,6 +325,8 @@ class AgentLoop:
             logger.info("Starting memory manager...")
             await self.memory_manager.start()
             logger.info("Memory manager started, took {:.3f}s", time.time() - _t0)
+            if self.memory_encoder and hasattr(self.memory_manager, "_memory_store") and self.memory_manager._memory_store:
+                self.memory_encoder.set_memory_store(self.memory_manager._memory_store)
         except Exception as e:
             logger.warning("Memory manager start failed: {}", e)
         logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
@@ -689,6 +691,8 @@ class AgentLoop:
                 logger.info("Starting memory manager in process_direct...")
                 await self.memory_manager.start()
                 logger.info("Memory manager started in process_direct, took {:.3f}s", time.time() - _t0)
+                if self.memory_encoder and hasattr(self.memory_manager, "_memory_store") and self.memory_manager._memory_store:
+                    self.memory_encoder.set_memory_store(self.memory_manager._memory_store)
             except Exception as e:
                 logger.warning("Memory manager start failed in process_direct: {}", e)
         logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)

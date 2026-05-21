@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from markbot.config.loader import get_config_path
+from markbot.config.loader import get_config, get_config_path
 from markbot.utils.helpers import ensure_dir
+
+_DEFAULT_WORKSPACE = "~/.markbot/workspace"
 
 
 def get_data_dir() -> Path:
@@ -36,31 +38,57 @@ def get_logs_dir() -> Path:
 
 def get_code_run_dir() -> Path:
     """Return the directory for ephemeral code execution scripts."""
-    return ensure_dir(Path.home() / ".markbot" / ".run")
+    return get_runtime_subdir(".run")
+
+
+def get_artifacts_dir() -> Path:
+    """Return the directory for offloaded tool output artifacts."""
+    return get_runtime_subdir(".artifacts")
+
+
+def get_gateway_dir() -> Path:
+    """Return the gateway runtime directory (pid, log)."""
+    return get_runtime_subdir("gateway")
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
-    """Resolve and ensure the agent workspace path."""
-    path = Path(workspace).expanduser() if workspace else Path.home() / ".markbot" / "workspace"
-    return ensure_dir(path)
+    """Resolve and ensure the agent workspace path.
+
+    When *workspace* is omitted the value is read from the active
+    configuration (``agents.defaults.workspace``).  Falls back to the
+    schema default ``~/.markbot/workspace`` when no config is loaded.
+    """
+    if workspace:
+        return ensure_dir(Path(workspace).expanduser())
+    try:
+        return ensure_dir(get_config().workspace_path)
+    except Exception:
+        return ensure_dir(Path(_DEFAULT_WORKSPACE).expanduser())
 
 
 def is_default_workspace(workspace: str | Path | None) -> bool:
     """Return whether a workspace resolves to markbot's default workspace path."""
-    current = Path(workspace).expanduser() if workspace is not None else Path.home() / ".markbot" / "workspace"
-    default = Path.home() / ".markbot" / "workspace"
+    if workspace is not None:
+        current = Path(workspace).expanduser()
+    else:
+        try:
+            current = get_config().workspace_path
+        except Exception:
+            current = Path(_DEFAULT_WORKSPACE).expanduser()
+    default = Path(_DEFAULT_WORKSPACE).expanduser()
     return current.resolve(strict=False) == default.resolve(strict=False)
 
 
 def get_cli_history_path() -> Path:
     """Return the shared CLI history file path."""
-    return Path.home() / ".markbot" / "history" / "cli_history"
+    return get_data_dir() / "history" / "cli_history"
 
 
 def get_bridge_install_dir() -> Path:
-    return Path.home() / ".markbot" / "bridge"
+    """Return the bridge installation directory."""
+    return get_runtime_subdir("bridge")
 
 
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
-    return Path.home() / ".markbot" / "sessions"
+    return get_runtime_subdir("sessions")

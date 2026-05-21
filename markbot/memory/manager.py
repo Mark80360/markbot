@@ -215,7 +215,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize for a session."""
         working_dir = kwargs.get("working_dir", self.working_dir)
-        self._memory_store = MemoryStore(working_dir=working_dir)
+        self._memory_store = MemoryStore(working_dir=working_dir, on_write=self._on_store_write)
         self._daily_log = DailyLogManager(workspace=Path(working_dir))
         self._compressed_summary = self._load_compressed_summary()
         logger.info("Initialized for session: {}", session_id)
@@ -336,6 +336,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 chat_id=action,
             )
 
+    def _on_store_write(self, action: str, target: str, content: str) -> None:
+        """Callback from MemoryStore to trigger on_memory_write."""
+        self.on_memory_write(action=action, target=target, content=content)
+
     def on_delegation(
         self,
         task: str,
@@ -360,7 +364,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         """Start the memory manager."""
         if self._started:
             return
-        self._memory_store = MemoryStore(working_dir=self.working_dir)
+        self._memory_store = MemoryStore(working_dir=self.working_dir, on_write=self._on_store_write)
         self._daily_log = DailyLogManager(workspace=Path(self.working_dir))
         self._compressed_summary = self._load_compressed_summary()
         self._started = True
@@ -542,10 +546,15 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 )
                 summary = response.content or ""
 
-                # Write to MEMORY.md via MemoryStore
                 if summary and self._memory_store:
                     try:
-                        self._memory_store.add("memory", summary)
+                        truncated = summary[:self._memory_store.memory_char_limit - 100] if len(summary) > self._memory_store.memory_char_limit else summary
+                        result = self._memory_store.add("memory", truncated)
+                        if not result.get("success", False):
+                            logger.warning(
+                                "Failed to write summary to MemoryStore: {}",
+                                result.get("message", "unknown"),
+                            )
                     except Exception as e:
                         logger.warning("Failed to write summary to MemoryStore: {}", e)
 
@@ -665,47 +674,56 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
     # -- Extra methods for tool compatibility --------------------------------
 
-    async def add_memory(self, content: str, tags: list[str] | None = None) -> bool:
+    async def add_memory(self, content: str, tags: list[str] | None = None, target: str = "memory") -> bool:
         """Add a memory entry (for MemorySaveTool compatibility).
 
         Args:
             content: The memory content to save.
             tags: Optional categorization tags.
+            target: 'memory' or 'user'.
 
         Returns:
             True if successful.
         """
         if not self._memory_store:
             return False
-        result = self._memory_store.add("memory", content)
+        if target not in ("memory", "user"):
+            target = "memory"
+        result = self._memory_store.add(target, content)
         return result.get("success", False)
 
-    async def delete_memory(self, memory_id: str) -> bool:
+    async def delete_memory(self, memory_id: str, target: str = "memory") -> bool:
         """Delete a memory entry (for MemoryForgetTool compatibility).
 
         Args:
             memory_id: ID or text identifying the entry to delete.
+            target: 'memory' or 'user'.
 
         Returns:
             True if successful.
         """
         if not self._memory_store:
             return False
-        result = self._memory_store.remove("memory", memory_id)
+        if target not in ("memory", "user"):
+            target = "memory"
+        result = self._memory_store.remove(target, memory_id)
         return result.get("success", False)
 
-    async def list_memories(self, limit: int = 20) -> list[dict]:
+    async def list_memories(self, limit: int = 20, target: str = "memory") -> list[dict]:
         """List recent memory entries (for MemoryListTool compatibility).
 
         Args:
             limit: Maximum number of entries.
+            target: 'memory' or 'user'.
 
         Returns:
             List of dicts with id, content, tags keys.
         """
         if not self._memory_store:
             return []
-        result = self._memory_store.read("memory")
+        if target not in ("memory", "user"):
+            target = "memory"
+        result = self._memory_store.read(target)
         entries = result.get("entries", [])
         return [
             {
@@ -766,7 +784,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             if optimized:
                 memory_path.write_text(optimized, encoding="utf-8")
                 # Reload MemoryStore
-                self._memory_store = MemoryStore(working_dir=self.working_dir)
+                self._memory_store = MemoryStore(working_dir=self.working_dir, on_write=self._on_store_write)
                 return f"Dream optimization completed. Backup at {backup_path}"
             return "Dream produced empty result"
         except Exception as e:
@@ -999,7 +1017,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             existing = path.read_text(encoding="utf-8") if path.exists() else ""
-            path.write_text(existing + "\n\n----------\n\n" + summary, encoding="utf-8")
+            new_content = existing + "\n\n----------\n\n" + summary
+            if len(new_content) > MAX_COMPRESSED_SUMMARY_CHARS:
+                keep = new_content[-MAX_COMPRESSED_SUMMARY_CHARS:]
+                cutoff = keep.find("\n")
+                if cutoff > 0:
+                    keep = keep[cutoff + 1:]
+                new_content = keep
+            path.write_text(new_content, encoding="utf-8")
         except Exception as e:
             logger.warning("Failed to save daily session summary: {}", e)
         
