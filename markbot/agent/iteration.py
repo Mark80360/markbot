@@ -30,6 +30,10 @@ from markbot.utils.helpers import strip_think
 if TYPE_CHECKING:
     from markbot.agent.loop import AgentLoop
 
+# Tag for internal context messages injected after system prompt.
+# These are per-turn and should not be persisted to session history.
+_INTERNAL_CONTEXT_TAG = "[Agent Internal Context"
+
 
 @dataclass
 class LoopState:
@@ -214,15 +218,15 @@ class IterationRunner:
         if sys_idx is None:
             return
 
+        context_parts: list[str] = []
+
         if memory_manager and hasattr(memory_manager, "prefetch"):
             try:
                 session_id = self.session_key or ""
                 prefetch_ctx = memory_manager.prefetch(user_text, session_id=session_id)
                 if prefetch_ctx and prefetch_ctx.strip():
-                    state.messages[sys_idx]["content"] = (
-                        state.messages[sys_idx]["content"] + "\n\n" + prefetch_ctx
-                    )
-                    logger.info("Memory prefetch context injected")
+                    context_parts.append(prefetch_ctx)
+                    logger.info("Memory prefetch context assembled")
             except Exception as e:
                 logger.warning("Memory prefetch failed: {}", e)
 
@@ -233,25 +237,29 @@ class IterationRunner:
                     session_key=self.session_key,
                 )
                 if memory_ctx and memory_ctx.strip():
-                    state.messages[sys_idx]["content"] = (
-                        state.messages[sys_idx]["content"] + "\n\n" + memory_ctx
-                    )
-                    logger.info("Memory context injected (summary + store)")
+                    context_parts.append(memory_ctx)
+                    logger.info("Memory context assembled (summary + store)")
             except Exception as e:
                 logger.warning("Memory context injection failed: {}", e)
 
-        if not mem_tool:
+        if mem_tool:
+            try:
+                if user_text:
+                    forced_ctx = await mem_tool.get_forced_context(user_text)
+                    if forced_ctx:
+                        context_parts.append(forced_ctx)
+                        logger.info("Forced memory search context assembled")
+            except Exception as e:
+                logger.warning("Forced memory search failed: {}", e)
+
+        if not context_parts:
             return
-        try:
-            if user_text:
-                forced_ctx = await mem_tool.get_forced_context(user_text)
-                if forced_ctx:
-                    state.messages[sys_idx]["content"] = (
-                        state.messages[sys_idx]["content"] + "\n\n" + forced_ctx
-                    )
-                    logger.info("Forced memory search context injected")
-        except Exception as e:
-            logger.warning("Forced memory search failed: {}", e)
+
+        # Inject as a standalone user message after system to preserve
+        # system prompt immutability for Anthropic prompt caching.
+        context_block = "\n\n".join(context_parts)
+        self._inject_internal_context(state, sys_idx, context_block)
+        logger.info("Memory context injected as standalone message")
 
     async def _phase_memory_compaction_hook(self, state: LoopState) -> None:
         if state.current_tokens <= self.loop.context_window_tokens * 0.6:
@@ -288,9 +296,11 @@ class IterationRunner:
                         None,
                     )
                     if sys_idx is not None:
-                        state.messages[sys_idx]["content"] = (
-                            state.messages[sys_idx]["content"] + "\n\n" + context_block
-                        )
+                        # Append to existing internal context message (from memory
+                        # injection) or create a new one. This keeps all per-turn
+                        # runtime context in a single user message after system,
+                        # preserving system prompt immutability for prompt caching.
+                        self._inject_internal_context(state, sys_idx, context_block)
                         logger.info(
                             "Session bootstrap context injected "
                             "(handoff={}, warnings={}, features={}, init_sh={})",
@@ -317,6 +327,46 @@ class IterationRunner:
                     )
         except Exception as e:
             logger.debug("Active memory encoding failed: {}", e)
+
+    @staticmethod
+    def _inject_internal_context(
+        state: LoopState, sys_idx: int, context_block: str,
+    ) -> None:
+        """Append *context_block* into the internal-context user message after system.
+
+        If an internal-context message already exists (from a prior injection this
+        turn), the block is appended to it.  Otherwise a new user message is
+        inserted at ``sys_idx + 1`` and ``new_msg_start`` is incremented.
+
+        Keeping all per-turn runtime context in a **single** user message:
+        * avoids consecutive same-role messages that some providers reject,
+        * minimises message-list growth, and
+        * preserves the system prompt verbatim for Anthropic prompt caching.
+        """
+        # Check if an internal-context message already exists right after system.
+        if sys_idx + 1 < len(state.messages):
+            next_msg = state.messages[sys_idx + 1]
+            content = next_msg.get("content")
+            if (
+                isinstance(content, str)
+                and content.startswith(_INTERNAL_CONTEXT_TAG)
+            ):
+                state.messages[sys_idx + 1]["content"] = (
+                    content + "\n\n" + context_block
+                )
+                return
+
+        # No existing internal-context message — create one.
+        runtime_msg = {
+            "role": "user",
+            "content": (
+                _INTERNAL_CONTEXT_TAG
+                + " — informational only, do not acknowledge]\n"
+                + context_block
+            ),
+        }
+        state.messages.insert(sys_idx + 1, runtime_msg)
+        state.new_msg_start += 1
 
     def _phase_memory_sync(self, state: LoopState) -> None:
         memory_manager = getattr(self.loop, "memory_manager", None)

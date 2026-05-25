@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from markbot.agent.context import ContextBuilder
+from markbot.agent.iteration import _INTERNAL_CONTEXT_TAG
 from markbot.tools.registry import ToolRegistry
 from markbot.session.session import Session
 from markbot.utils.helpers import strip_ansi
@@ -124,6 +125,12 @@ class ToolExecutor:
                     entry["content"] = filtered
 
             elif role == "user":
+                # Skip per-turn internal context messages (memory prefetch,
+                # session bootstrap, etc.) — they must not leak into history.
+                if isinstance(content, str) and content.startswith(
+                    _INTERNAL_CONTEXT_TAG
+                ):
+                    continue
                 if isinstance(content, str) and content.startswith(
                     ContextBuilder._RUNTIME_CONTEXT_TAG
                 ):
