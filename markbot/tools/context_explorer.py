@@ -18,7 +18,7 @@ from typing import Any, TYPE_CHECKING
 from loguru import logger
 
 from markbot.tools.base import Tool
-from markbot.utils.constants import BOOTSTRAP_FILES
+from markbot.utils.constants import BOOTSTRAP_FILES, MEMORY_FILENAME, USER_FILENAME
 from markbot.utils.helpers import format_time
 
 if TYPE_CHECKING:
@@ -176,12 +176,12 @@ class ExploreContextCatalogTool(Tool):
                 else:
                     lines.append("*No memory entries found*")
             else:
-                memory_file = self.workspace / "MEMORY.md"
+                memory_file = self.workspace / MEMORY_FILENAME
                 if memory_file.exists():
                     stat = memory_file.stat()
                     size_kb = stat.st_size / 1024
-                    lines.append(f"- MEMORY.md ({size_kb:.1f} KB)")
-                    lines.append("- Contains: User preferences, project notes, learned facts")
+                    lines.append(f"- {MEMORY_FILENAME} ({size_kb:.1f} KB)")
+                    lines.append("- Contains: Agent notes, conversation summaries, learned facts")
                     lines.append("")
                 else:
                     lines.append("*No memory storage found*")
@@ -374,7 +374,7 @@ class SearchContextTool(Tool):
                         'full_content': r.get('content', ''),
                     })
             else:
-                memory_file = self.workspace / "MEMORY.md"
+                memory_file = self.workspace / MEMORY_FILENAME
                 if memory_file.exists():
                     content = memory_file.read_text(encoding='utf-8')
                     if query.lower() in content.lower():
@@ -386,7 +386,7 @@ class SearchContextTool(Tool):
                         results.append({
                             'id': 'mem_0',
                             'source': 'memory',
-                            'title': 'MEMORY.md',
+                            'title': MEMORY_FILENAME,
                             'preview': preview,
                             'score': None,
                             'full_content': content,
@@ -546,7 +546,7 @@ class LoadContextTool(Tool):
         except Exception as e:
             logger.warning("Failed to load memory {}: {}", context_id, e)
 
-        memory_file = self.workspace / "MEMORY.md"
+        memory_file = self.workspace / MEMORY_FILENAME
         if memory_file.exists():
             return memory_file.read_text(encoding='utf-8'), 'memory'
 
@@ -566,15 +566,15 @@ class LoadContextTool(Tool):
             'SOUL_md': 'SOUL.md',
             'USER_md': 'USER.md',
             'TOOLS_md': 'TOOLS.md',
-            'MEMORY_md': 'MEMORY.md',
-            'PROFILE_md': 'PROFILE.md',
+            'MEMORY_md': MEMORY_FILENAME,
+            'PROFILE_md': USER_FILENAME,
         }
 
         filename = filename_map.get(context_id, context_id.replace('_', '.'))
 
-        if filename == 'MEMORY.md':
+        if filename == MEMORY_FILENAME:
             hint = (
-                "*Note: MEMORY.md content is already included in the system prompt above. "
+                f"*Note: {MEMORY_FILENAME} content is already included in the system prompt above. "
                 "Reloading it here would be redundant. "
                 "If you need more details, consider using `search_context` to find specific sections.*"
             )

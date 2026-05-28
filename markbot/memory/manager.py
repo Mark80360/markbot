@@ -41,7 +41,8 @@ from .daily_log import DailyLogManager
 from .fencing import fence_context, sanitize_context, StreamingContextScrubber
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
-from .tool import MemoryStore, MEMORY_FILENAME, USER_FILENAME
+from .tool import MemoryStore
+from markbot.utils.constants import MEMORY_FILENAME, USER_FILENAME
 
 if TYPE_CHECKING:
     pass
@@ -742,7 +743,8 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     async def dream(self, **kwargs) -> str:
         """Run dream-based memory optimization.
 
-        Uses LLM to consolidate MEMORY.md entries.
+        Uses LLM to consolidate MEMORY.md entries. Writes back through
+        MemoryStore to ensure security scanning and character limits.
 
         Returns:
             Status message.
@@ -752,9 +754,8 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         memory_path = Path(self.working_dir) / MEMORY_FILENAME
         if not memory_path.exists():
-            return "No MEMORY.md to optimize"
+            return f"No {MEMORY_FILENAME} to optimize"
 
-        # Create backup
         backup_dir = Path(self.working_dir) / "backup"
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -776,22 +777,58 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                     {
                         "role": "system",
                         "content": (
-                            "You are a Dream Memory Organizer. Read the MEMORY.md content, "
+                            "You are a Dream Memory Organizer. Read the memory content, "
                             "deduplicate entries, merge related items, remove outdated info, "
                             "and reorganize into a clean markdown format. "
-                            "Return ONLY the optimized markdown content."
+                            "Output each distinct entry separated by a line containing only '---'. "
+                            "Do NOT include headers like '# Agent Memory'. "
+                            "Return ONLY the optimized entries."
                         ),
                     },
                     {"role": "user", "content": content},
                 ],
             )
             optimized = response.content or ""
-            if optimized:
-                memory_path.write_text(optimized, encoding="utf-8")
-                # Reload MemoryStore
-                self._memory_store = MemoryStore(working_dir=self.working_dir, on_write=self._on_store_write)
-                return f"Dream optimization completed. Backup at {backup_path}"
-            return "Dream produced empty result"
+            if not optimized:
+                return "Dream produced empty result"
+
+            new_entries = [
+                e.strip()
+                for e in re.split(r"\n---\n", optimized)
+                if e.strip() and not e.strip().startswith("#")
+            ]
+
+            if not new_entries:
+                return "Dream produced no valid entries"
+
+            old_entries = list(self._memory_store.memory_entries)
+            self._memory_store.memory_entries.clear()
+
+            added, skipped = 0, 0
+            for entry in new_entries:
+                error = self._memory_store._scanner.scan(entry)
+                if error:
+                    skipped += 1
+                    continue
+                sanitized = self._memory_store._scanner.sanitize(entry)
+                current_total = sum(len(e) for e in self._memory_store.memory_entries)
+                if current_total + len(sanitized) > self._memory_store.memory_char_limit:
+                    skipped += 1
+                    continue
+                self._memory_store.memory_entries.append(sanitized)
+                added += 1
+
+            if added == 0:
+                self._memory_store.memory_entries = old_entries
+                return "Dream produced no safe entries; original memory preserved"
+
+            self._memory_store._persist("memory")
+            self._memory_store.refresh_snapshot()
+
+            return (
+                f"Dream optimization completed: {added} entries kept, "
+                f"{skipped} skipped (limit/security). Backup at {backup_path}"
+            )
         except Exception as e:
             return f"Dream optimization failed: {e}"
 

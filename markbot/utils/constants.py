@@ -4,6 +4,14 @@ This module provides unified constants to ensure consistency across
 search, filesystem, explore, and other tools.
 """
 
+# ---------------------------------------------------------------------------
+# Memory file constants (canonical definitions — import from here)
+# ---------------------------------------------------------------------------
+MEMORY_FILENAME: str = "MEMORY.md"
+USER_FILENAME: str = "PROFILE.md"
+DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
+DEFAULT_USER_CHAR_LIMIT: int = 2000
+
 # Standard directories to ignore in file operations (comprehensive list)
 IGNORE_DIRS = frozenset({
     # Version Control
@@ -102,11 +110,11 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\b/dev/tcp/",
 ]
 
-BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md", "ARCHITECTURE.md"]
+BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", MEMORY_FILENAME, USER_FILENAME, "ARCHITECTURE.md"]
 
 _TEMPLATE_DIR_NAMES: frozenset[str] = frozenset({
-    "AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md",
-    "PROFILE.md", "ARCHITECTURE.md", "HEARTBEAT.md", "BOOTSTRAP.md",
+    "AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", MEMORY_FILENAME,
+    USER_FILENAME, "ARCHITECTURE.md", "HEARTBEAT.md", "BOOTSTRAP.md",
 })
 
 
@@ -169,7 +177,8 @@ MAX_GIT_STATUS_CHARS: int = 2000
 MAX_COMPRESSED_SUMMARY_CHARS: int = 200_000
 
 # Maximum characters for MEMORY.md before section-based truncation
-MAX_MEMORY_MD_CHARS: int = 8_000
+# Should be >= DEFAULT_MEMORY_CHAR_LIMIT from memory.tool (the write limit)
+MAX_MEMORY_MD_CHARS: int = max(8_000, DEFAULT_MEMORY_CHAR_LIMIT * 2)
 
 # Maximum characters for daily log search results
 MAX_DAILY_LOG_RESULT_CHARS: int = 2000

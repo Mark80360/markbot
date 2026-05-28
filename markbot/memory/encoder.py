@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
+from markbot.utils.constants import MEMORY_FILENAME, USER_FILENAME
+
 if TYPE_CHECKING:
     from markbot.memory.tool import MemoryStore
 
@@ -93,8 +95,8 @@ class MemoryEncoder:
     ) -> None:
         self.workspace = workspace
         self._memory_store = memory_store
-        self._profile_path = workspace / "PROFILE.md"
-        self._memory_path = workspace / "MEMORY.md"
+        self._profile_path = workspace / USER_FILENAME
+        self._memory_path = workspace / MEMORY_FILENAME
         self._detection_log_path = workspace / "memory" / "encoder_log.json"
         self._recent_detections: dict[str, float] = {}
 

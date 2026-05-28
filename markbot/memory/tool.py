@@ -2,7 +2,7 @@
 
 Provides bounded, file-backed memory that persists across sessions. Two stores:
 
-- MEMORY.md: agent's personal notes and observations
+- MEMORY.md: agent's persistent memory (notes, conversation summaries, learned facts)
 - PROFILE.md (or USER.md): what the agent knows about the user
 
 Uses frozen snapshot pattern:
@@ -26,6 +26,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
 
+from markbot.utils.constants import (
+    MEMORY_FILENAME,
+    USER_FILENAME,
+    DEFAULT_MEMORY_CHAR_LIMIT,
+    DEFAULT_USER_CHAR_LIMIT,
+)
 from .fencing import fence_context
 from .scanner import MemorySecurityScanner
 
@@ -47,14 +53,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 ENTRY_DELIMITER = "\n\n---\n\n"
-
-# Default character limits (not tokens 鈥?char counts are model-independent)
-DEFAULT_MEMORY_CHAR_LIMIT = 4000
-DEFAULT_USER_CHAR_LIMIT = 2000
-
-# Files
-MEMORY_FILENAME = "MEMORY.md"
-USER_FILENAME = "PROFILE.md"  # Also checks USER.md as fallback
 
 
 # ---------------------------------------------------------------------------

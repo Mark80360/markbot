@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 class MemorySearchTool(Tool):
-    """Search MEMORY.md and memory/*.md files semantically.
+    """Search agent memory (MEMORY.md, PROFILE.md, daily logs) semantically.
 
     Use this tool before answering questions about prior work, decisions,
     dates, people, preferences, or todos. Returns top relevant snippets.
@@ -48,7 +48,7 @@ class MemorySearchTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Search MEMORY.md and memory/*.md files semantically. "
+            "Search agent memory (MEMORY.md, PROFILE.md, daily logs) semantically. "
             "Use when uncertain about previous decisions, user preferences, "
             "past conversations, or when the user refers to something mentioned earlier."
         )

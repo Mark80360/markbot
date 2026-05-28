@@ -20,6 +20,7 @@ from typing import Any
 
 from loguru import logger
 
+from markbot.utils.constants import USER_FILENAME
 from markbot.utils.helpers import ensure_dir
 
 
@@ -295,7 +296,11 @@ def _extract_decisions(messages: list[dict]) -> list[HandoffDecision]:
 def _extract_preferences_from_memory(memory_manager: Any) -> list[str]:
     prefs: list[str] = []
     try:
-        profile_path = Path(memory_manager.working_dir) / "PROFILE.md"
+        profile_path = Path(memory_manager.working_dir) / USER_FILENAME
+        if not profile_path.exists():
+            fallback_path = Path(memory_manager.working_dir) / "USER.md"
+            if fallback_path.exists():
+                profile_path = fallback_path
         if profile_path.exists():
             content = profile_path.read_text(encoding="utf-8").strip()
             if content:

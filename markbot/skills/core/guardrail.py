@@ -14,6 +14,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from markbot.types.skill import SkillDefinition
+from markbot.utils.constants import MEMORY_FILENAME, USER_FILENAME
 
 
 @dataclass
@@ -219,7 +220,8 @@ class SkillGuardrail:
             ("SOUL.md", "Modifying SOUL.md during skill execution"),
             ("AGENTS.md", "Modifying AGENTS.md during skill execution"),
             ("USER.md", "Modifying USER.md during skill execution"),
-            ("MEMORY.md", "Directly modifying MEMORY.md"),
+            (USER_FILENAME, f"Modifying {USER_FILENAME} during skill execution"),
+            (MEMORY_FILENAME, f"Directly modifying {MEMORY_FILENAME}"),
         ]
 
         if tool_name in ("write_file", "edit_file"):
