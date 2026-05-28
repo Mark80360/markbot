@@ -1,6 +1,6 @@
 # MarkBot 🦞
 
-> Version 2.2.11
+> Version 2.2.13
 
 A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
 
@@ -9,7 +9,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 - **Multi-Model Support with Auto-Failover**: Configure multiple LLM providers in a priority chain. When the primary model fails or is overloaded, MarkBot automatically falls back to the next model.
 - **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
 - **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
-- **ReMeLight Memory System**: Advanced memory management powered by [reme-ai](https://github.com/remember-ai/reme-ai), with compaction, summarization, and semantic search for context-aware responses
+- **Memory System**: Advanced memory management with compaction, summarization, and semantic search for context-aware responses
 - **Extensible Architecture**: Customize and extend capabilities through a powerful skills system with security scanning and guardrails
 - **Autopilot Pipeline**: Automated task execution with scoring, acceptance, verification, and self-repair capabilities
 
@@ -25,7 +25,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 ### Memory & Context
 
-- **ReMeLight Memory**: Advanced memory management with compaction, summarization, semantic search, and Dream optimization
+- **Memory System**: Advanced memory management with compaction, summarization, semantic search, and Dream optimization
 - **4-Tier Progressive Compaction**: Context Collapse → Micro-Compact → Auto-Compaction → History Snip, escalating only when needed
 - **Dream Service**: Periodic AI-driven memory optimization on a cron schedule for intelligent context management
 
@@ -97,7 +97,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 │  │  Think, etc.)   │  │                 │  │                │       │
 │  └─────────────────┘  └─────────────────┘  └────────────────┘       │
 │  ┌─────────────────────────────────────────────────────────────┐    │
-│  │           ReMeLight Memory System                           │    │
+│  │           Memory System                           │    │
 │  │  ┌──────────────┐  ┌────────────┐  ┌────────────────┐       │    │
 │  │  │  Compressed  │  │  Summary   │  │    Search      │       │    │
 │  │  │   Summary    │  │   Task     │  │  (Embedding)   │       │    │
@@ -157,6 +157,10 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 │  │    SessionManager     │  │  InteractionLogger           │        │
 │  │    (Session State)    │  │  (Audit Trail)               │        │
 │  └───────────────────────┘  └──────────────────────────────┘        │
+│  ┌───────────────────────┐  ┌──────────────────────────────┐        │
+│  │   CuratorService      │  │  SkillImprover               │        │
+│  │   (Skill Maintenance) │  │  (Quality Evaluation)        │        │
+│  └───────────────────────┘  └──────────────────────────────┘        │
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │                    Autopilot Service                        │    │
 │  │  Intake → Score → Accept → Execute → Verify → Repair        │    │
@@ -190,6 +194,7 @@ pip install -e ".[dev]"
 ```bash
 pip install -e ".[weixin]"     # WeChat integration (qrcode, pycryptodome)
 pip install -e ".[langsmith]"  # LangSmith tracing
+pip install -e ".[chroma]"     # ChromaDB vector memory provider
 ```
 
 ## Quick Start
@@ -484,6 +489,10 @@ MarkBot features a modular skill framework that allows you to extend functionali
 - **Sandboxed Execution**: Isolated execution environment
 - **Conditional Activation**: Load skills based on requirements and configuration
 - **Config Resolution**: Per-skill configuration with inheritance
+- **Usage Tracking**: View/use counters and last activity timestamps per skill, persisted to `.skill_usage.json`
+- **Lifecycle Management**: Automatic state transitions — `active` → `stale` (30 days inactive) → `archived` (90 days)
+- **Curator Service**: Background maintenance agent that auto-archives stale skills and evaluates quality
+- **Self-Improvement**: SkillImprover runs heuristic quality evaluations and generates improvement suggestions via LLM
 
 ## Autopilot System
 
@@ -525,9 +534,9 @@ Granular control over agent actions through configurable permission modes:
 
 Each tool can have individual allow/deny/ask policies for fine-grained control.
 
-## Memory System (ReMeLight)
+## Memory System
 
-Advanced memory management powered by reme-ai:
+Advanced built-in memory management:
 
 ### Features
 
@@ -542,6 +551,29 @@ Advanced memory management powered by reme-ai:
 - **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
 - **Security Scanner**: Injection and exfiltration detection for memory content
 - **Context Fencing**: `<memory-context>` tags with streaming scrubber
+- **Plugin Discovery**: External memory providers via entry points, naming convention (`markbot_memory_*`), or manual registration
+- **ChromaDB Provider**: Reference implementation for vector-based semantic memory with ChromaDB
+
+### Memory Provider Plugins
+
+MarkBot supports pluggable memory providers through the `MemoryProvider` ABC. External providers are discovered automatically:
+
+1. **Entry Points**: Packages declaring `markbot.memory_providers` in their `pyproject.toml`
+2. **Naming Convention**: Installed packages matching `markbot_memory_*` or `markbot-memory-*`
+3. **Manual Registration**: Via `MemoryPluginDiscovery.register()`
+
+Configuration in `config.yaml`:
+
+```yaml
+tools:
+  memory:
+    provider: chroma          # External provider name
+    provider_config:          # Provider-specific configuration
+      host: localhost
+      port: 8000
+```
+
+The built-in ChromaDB provider (`markbot.memory.providers.chroma`) supports both local persistent and remote HTTP modes. Install with `pip install -e ".[chroma]"`.
 
 ### Configuration
 
@@ -679,6 +711,10 @@ markbot/
 │   │   ├── manage.py   # Skill management tool
 │   │   ├── tool.py     # Skill tools (list/view)
 │   │   └── helpers.py  # Skill helpers
+│   ├── usage.py        # Skill usage tracking (SkillUsageStore)
+│   ├── lifecycle.py    # Lifecycle state machine (active→stale→archived)
+│   ├── curator.py      # Background maintenance service
+│   ├── improve.py      # Self-improvement evaluations
 │   └── builtin/        # Built-in skills
 │       ├── weather/    # Weather lookup
 │       ├── summarize/  # Text summarization
@@ -703,7 +739,7 @@ markbot/
 │   ├── loader.py       # Config loading/saving
 │   ├── paths.py        # Path resolution
 │   └── validator.py    # Config validation
-├── memory/             # ReMeLight memory system
+├── memory/             # Memory system
 │   ├── base.py         # BaseMemoryManager ABC
 │   ├── manager.py      # File-based memory manager
 │   ├── provider.py     # MemoryProvider ABC
@@ -712,9 +748,13 @@ markbot/
 │   ├── scanner.py      # Security scanner
 │   ├── fencing.py      # Context fencing
 │   ├── tool.py         # MemoryStore
-│   └── manager.py      # Main MemoryManager
+│   ├── manager.py      # Main MemoryManager
+│   ├── plugins/        # Memory plugin discovery
+│   │   └── discovery.py # MemoryPluginDiscovery (entry points, naming, manual)
+│   └── providers/      # Memory provider implementations
+│       └── chroma.py   # ChromaDB vector memory provider
 ├── bus/                # Event bus infrastructure
-│   ├── events.py       # Event types (25+ event types)
+│   ├── events.py       # Event types (28 event types)
 │   ├── queue.py        # MessageBus (inbound/outbound)
 │   └── emitter.py      # Event emitter
 ├── session/            # Session management

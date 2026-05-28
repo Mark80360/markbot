@@ -16,6 +16,7 @@ from markbot.skills.core.helpers import build_constraint_block, load_skill_body
 from markbot.skills.core.loader import SkillLoader
 from markbot.skills.core.scanner import Finding, ScanResult, SecurityScanner, should_allow
 from markbot.skills.core.tool import SkillTool
+from markbot.skills.usage import SkillUsageStore
 from markbot.types.skill import SkillDefinition
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ class SkillRegistry:
         self._available_tool_names = set(available_tool_names or [])
         self._loader = SkillLoader(workspace)
         self._config_resolver = SkillConfigResolver(workspace)
+        self._usage_store = SkillUsageStore(workspace)
         self._skills: dict[str, SkillDefinition] = {}
         self._config_cache: dict[str, dict[str, str]] = {}
 
@@ -65,6 +67,12 @@ class SkillRegistry:
                 if reason:
                     logger.info("Skill '{}' scan note: {}", skill.name, reason)
 
+            # Populate usage data from store
+            usage = self._usage_store.get(skill.name)
+            skill.view_count = usage.view_count
+            skill.use_count = usage.use_count
+            skill.last_activity_at = usage.last_activity_at
+
             self._skills[skill.name] = skill
 
             if skill.config_vars:
@@ -85,7 +93,7 @@ class SkillRegistry:
             return
         for skill in self._skills.values():
             for script in skill.scripts:
-                tool = SkillTool(skill.name, script, self.workspace)
+                tool = SkillTool(skill.name, script, self.workspace, self._usage_store)
                 self.tool_registry.register(tool)
                 logger.debug("Registered skill tool: {}", tool.definition.name)
 
@@ -318,3 +326,26 @@ class SkillRegistry:
     def set_available_tools(self, tool_names: list[str]) -> None:
         """Update the set of available tool names for conditional activation."""
         self._available_tool_names = set(tool_names)
+
+    @property
+    def usage_store(self) -> SkillUsageStore:
+        """Access the skill usage store."""
+        return self._usage_store
+
+    def bump_view(self, skill_name: str) -> None:
+        """Record a skill view event."""
+        self._usage_store.bump_view(skill_name)
+        skill = self._skills.get(skill_name)
+        if skill:
+            entry = self._usage_store.get(skill_name)
+            skill.view_count = entry.view_count
+            skill.last_activity_at = entry.last_activity_at
+
+    def bump_use(self, skill_name: str) -> None:
+        """Record a skill use (execution) event."""
+        self._usage_store.bump_use(skill_name)
+        skill = self._skills.get(skill_name)
+        if skill:
+            entry = self._usage_store.get(skill_name)
+            skill.use_count = entry.use_count
+            skill.last_activity_at = entry.last_activity_at

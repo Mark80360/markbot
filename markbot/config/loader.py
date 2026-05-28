@@ -10,6 +10,7 @@ from markbot.config.schema import Config
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
 _current_config: Config | None = None
+_last_validation_warnings: list[str] = []
 
 
 class ConfigValidationError(Exception):
@@ -42,6 +43,14 @@ def get_config() -> Config:
     return _current_config
 
 
+def get_validation_warnings() -> list[str]:
+    """Return warnings from the most recent config validation.
+
+    Empty if config has not been loaded yet or if there were no warnings.
+    """
+    return list(_last_validation_warnings)
+
+
 def load_config(config_path: Path | None = None) -> Config:
     """
     Load configuration from file with validation.
@@ -66,6 +75,19 @@ def load_config(config_path: Path | None = None) -> Config:
             config = Config.model_validate(data)
 
             errors = config.validate_model_chain()
+            warnings: list[str] = []
+
+            from markbot.config.validator import validate_config as _validate_config, Severity
+            vr = _validate_config(config)
+            for issue in vr.issues:
+                if issue.severity == Severity.ERROR:
+                    errors.append(f"{issue.field}: {issue.message}")
+                elif issue.severity == Severity.WARNING:
+                    warnings.append(f"{issue.field}: {issue.message}")
+
+            global _last_validation_warnings
+            _last_validation_warnings = warnings
+
             if errors:
                 raise ConfigValidationError(
                     "Configuration validation failed",

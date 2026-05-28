@@ -388,6 +388,10 @@ Result:
 
 Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
 
+        # Publish result as a system message so AgentLoop._handle_message()
+        # rewrites channel="system" → origin_channel via the explicit
+        # origin_channel/origin_chat_id fields. This ensures the subagent
+        # result is routed back to the correct channel/chat.
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",

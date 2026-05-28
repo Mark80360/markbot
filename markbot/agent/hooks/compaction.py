@@ -1,4 +1,4 @@
-﻿"""Memory compaction hook for long-term memory archival.
+"""Memory compaction hook for long-term memory archival.
 
 Responsible for archiving older conversation messages into long-term
 memory (compressed_summary + async summary tasks) when the context
@@ -40,7 +40,7 @@ class MemoryCompactionHook:
     This hook persists conversation knowledge into MEMORY.md (via async
     summary tasks) and compresses older messages into ``compressed_summary``
     (via ``memory_manager.compact_memory()``).  It does NOT truncate
-    tool results or drop messages 鈥?that is MultiLevelCompactor's job.
+    tool results or drop messages — that is MultiLevelCompactor's job.
 
     **Coordination with MultiLevelCompactor**:
     Both systems may run in the same iteration.  When MultiLevelCompactor
@@ -48,6 +48,15 @@ class MemoryCompactionHook:
     the iteration runner passes ``skip_context_compact=True`` so this hook
     only runs Phase 1 (async summary archival) and skips Phase 2 (context
     compaction), avoiding redundant LLM summarization.
+
+    **Intentional dual summarization**:
+    Phase 1 (async summary archival) and MultiLevelCompactor's auto-compact
+    serve different purposes and write to different stores:
+    - MultiLevelCompactor → replaces in-flight messages with a system-prompt
+      summary (immediate context relief, not persisted to MEMORY.md)
+    - Phase 1 → writes to MEMORY.md via add_async_summary_task (long-term
+      memory archival, survives across sessions)
+    Both may process the same messages, but their outputs are independent.
 
     Two-phase operation:
     1. **Async summary archival** (always runs when messages need archiving):

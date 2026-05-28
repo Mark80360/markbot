@@ -29,6 +29,8 @@ def _get_store(workspace: Path) -> AutopilotStore:
     from markbot.autopilot.store import AutopilotStore
 
     resolved = workspace.resolve()
+    if not str(resolved) or str(resolved) == ".":
+        raise ValueError("Autopilot requires a valid workspace path")
     if resolved not in _store_cache:
         _store_cache[resolved] = AutopilotStore(resolved)
     return _store_cache[resolved]

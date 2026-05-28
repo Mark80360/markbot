@@ -127,9 +127,10 @@ class FallbackManager:
                 provider_name, circuit.failure_count,
             )
 
-    def _is_model_unavailable_error(self, error: Exception | str) -> bool:
+    @staticmethod
+    def _is_model_unavailable_error(error: Exception | str) -> bool:
         err_str = str(error).lower()
-        return any(marker in err_str for marker in self.MODEL_UNAVAILABLE_ERRORS)
+        return any(marker in err_str for marker in FallbackManager.MODEL_UNAVAILABLE_ERRORS)
 
     def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
         cache_key = provider_name

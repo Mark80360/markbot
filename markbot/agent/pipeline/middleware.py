@@ -78,6 +78,11 @@ class MemoryLifecycleMiddleware(Middleware):
 
     Note: Daily log writing is handled by MemoryManager.sync_turn()
     in IterationRunner._phase_memory_sync(), not here.
+
+    Note: Session persistence is handled by ToolExecutor.save_turn()
+    in AgentLoop._handle_message(). This middleware only saves on
+    error (to preserve partial progress) and skips the normal-path
+    save to avoid redundant disk I/O.
     """
 
     def __init__(
@@ -102,14 +107,9 @@ class MemoryLifecycleMiddleware(Middleware):
         ctx: ProcessContext,
         response: OutboundMessage | None,
     ) -> OutboundMessage | None:
-        if ctx.session:
-            try:
-                if self._session_manager and hasattr(self._session_manager, 'save'):
-                    self._session_manager.save(ctx.session)
-                elif hasattr(ctx.session, 'save'):
-                    ctx.session.save()
-            except Exception as e:
-                logger.warning("Session save failed: {}", e)
+        # Skip normal-path session save — ToolExecutor.save_turn() already
+        # persists the session in AgentLoop._handle_message(). Saving here
+        # too would cause redundant disk I/O on every turn.
 
         session_key = ctx.session_key or "_default"
         count = self._session_message_counts.get(session_key, 0) + 1

@@ -84,10 +84,7 @@ class BaseTool(ABC):
         Returns ALLOW for read-only tools, ASK for others.
         Override for custom permission logic.
         """
-        if self.is_read_only(params):
-            return PermissionDecision(behavior="allow")
-
-        # Check permission context rules
+        # Explicit deny/allow lists take priority over read-only shortcut
         tool_name = self.definition.name
         ctx = context.tool_permission_context
 
@@ -96,6 +93,10 @@ class BaseTool(ABC):
 
         if tool_name in ctx.always_allow:
             return PermissionDecision(behavior="allow", reason="Tool in always-allow list")
+
+        # Read-only tools are allowed by default
+        if self.is_read_only(params):
+            return PermissionDecision(behavior="allow")
 
         if tool_name in ctx.always_ask:
             return PermissionDecision(behavior="ask")

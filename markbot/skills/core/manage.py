@@ -19,12 +19,13 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from loguru import logger
 
 from markbot.skills.core.loader import SkillLoader
 from markbot.skills.core.scanner import SecurityScanner
+from markbot.skills.usage import SkillUsageStore
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
@@ -41,6 +42,7 @@ class SkillManageTool(BaseTool):
     def __init__(self, workspace: Path):
         self._workspace = workspace
         self._workspace_skills = workspace / "skills"
+        self._usage_store = SkillUsageStore(workspace)
 
     @property
     def definition(self) -> ToolDefinition:
@@ -207,6 +209,9 @@ class SkillManageTool(BaseTool):
             shutil.rmtree(skill_dir, ignore_errors=True)
             return f"Error: Security scan blocked this skill: {scan_error}"
 
+        # Record creation timestamp in usage store
+        self._usage_store.set_created_at(name)
+
         return (
             f"Skill '{name}' created at {skill_dir}.\n"
             f"To add supporting files, use skill_manage(action='write_file', "
@@ -330,6 +335,7 @@ class SkillManageTool(BaseTool):
             return f"Error: Cannot delete built-in skill '{name}'."
 
         shutil.rmtree(skill_dir)
+        self._usage_store.remove(name)
         return f"Skill '{name}' deleted."
 
     def _write_file(self, params: dict[str, Any]) -> str:

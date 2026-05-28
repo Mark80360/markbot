@@ -23,10 +23,17 @@ class SkillTool(BaseTool):
     as mandatory constraints to prevent the agent from improvising.
     """
 
-    def __init__(self, skill_name: str, script: SkillScriptDef, workspace: Path):
+    def __init__(
+        self,
+        skill_name: str,
+        script: SkillScriptDef,
+        workspace: Path,
+        usage_store: Any = None,
+    ):
         self._skill_name = skill_name
         self._script = script
         self._workspace = workspace
+        self._usage_store = usage_store
 
     @property
     def definition(self) -> ToolDefinition:
@@ -63,6 +70,10 @@ class SkillTool(BaseTool):
         """Execute the skill script via Sandbox, with constraint injection."""
         from markbot.skills.core.sandbox import Sandbox
         from markbot.skills.core.scanner import SecurityScanner
+
+        # Record skill usage
+        if self._usage_store:
+            self._usage_store.bump_use(self._skill_name)
 
         skill_path = self._resolve_skill_path()
         entry_path = skill_path / self._script.entry
@@ -166,6 +177,9 @@ class SkillViewTool(BaseTool):
         if not name:
             return "Error: 'name' parameter is required."
 
+        # Record view event
+        self._registry.bump_view(name)
+
         content = self._registry.load_skill_content(name)
         if content is None:
             available = ", ".join(s.name for s in self._registry.list_all())
@@ -219,7 +233,8 @@ class SkillsListTool(BaseTool):
             tag = "📦 builtin" if skill.is_builtin else "📁 workspace"
             desc = skill.description[:100] + "..." if len(skill.description) > 100 else skill.description
             has_scripts = " (has scripts)" if skill.scripts else ""
-            lines.append(f"- **{skill.name}** `[{tag}]`: {desc}{has_scripts}")
+            usage = f" [views:{skill.view_count} uses:{skill.use_count}]" if skill.view_count or skill.use_count else ""
+            lines.append(f"- **{skill.name}** `[{tag}]`: {desc}{has_scripts}{usage}")
 
         lines.append("\nUse `skill_view(name)` to load a skill's full instructions.")
         return "\n".join(lines)

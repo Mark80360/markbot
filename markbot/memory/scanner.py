@@ -31,8 +31,10 @@ _THREAT_PATTERNS: list[tuple[str, str]] = [
     (r"disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", "disregard_rules"),
     (r"act\s+as\s+(if|though)\s+you\s+(have\s+no|don\\?t\s+have)\s+(restrictions|limits|rules)", "bypass_restrictions"),
     # Exfiltration via curl/wget with secrets
-    (r"curl\s+[^\n]*\$\\{?\\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)", "exfil_curl"),
-    (r"wget\s+[^\n]*\$\\{?\\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)", "exfil_wget"),
+    (r"curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*", "exfil_curl"),
+    (r"curl\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)\b", "exfil_curl"),
+    (r"wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*", "exfil_wget"),
+    (r"wget\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)\b", "exfil_wget"),
     (r"cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)", "read_secrets"),
     # Persistence via shell rc
     (r"authorized_keys", "ssh_backdoor"),

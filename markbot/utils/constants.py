@@ -104,6 +104,58 @@ DANGEROUS_COMMAND_PATTERNS = [
 
 BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "PROFILE.md", "ARCHITECTURE.md"]
 
+_TEMPLATE_DIR_NAMES: frozenset[str] = frozenset({
+    "AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md",
+    "PROFILE.md", "ARCHITECTURE.md", "HEARTBEAT.md", "BOOTSTRAP.md",
+})
+
+
+def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
+    """Cross-check BOOTSTRAP_FILES constant against the templates directory.
+
+    Returns a list of warning messages for any discrepancies found:
+    - Template files in the directory that are not in BOOTSTRAP_FILES
+    - Entries in BOOTSTRAP_FILES that have no corresponding template file
+
+    This function is called at startup to catch drift between the
+    hardcoded constant and the actual template files on disk.
+    """
+    from pathlib import Path
+
+    warnings: list[str] = []
+
+    if templates_dir is None:
+        templates_dir = Path(__file__).resolve().parent.parent / "templates"
+
+    if not templates_dir.is_dir():
+        return warnings
+
+    disk_files: set[str] = set()
+    for p in templates_dir.iterdir():
+        if p.is_file() and p.suffix == ".md":
+            disk_files.add(p.name)
+
+    known = set(BOOTSTRAP_FILES)
+    in_template_dir = disk_files & _TEMPLATE_DIR_NAMES
+
+    missing_from_constant = in_template_dir - known
+    if missing_from_constant:
+        warnings.append(
+            f"Template file(s) on disk but not in BOOTSTRAP_FILES: "
+            f"{sorted(missing_from_constant)}. "
+            f"Consider adding them if they should be loaded at startup."
+        )
+
+    missing_from_disk = known - disk_files
+    if missing_from_disk:
+        warnings.append(
+            f"BOOTSTRAP_FILES entry(s) with no template on disk: "
+            f"{sorted(missing_from_disk)}. "
+            f"Consider removing them or creating the template files."
+        )
+
+    return warnings
+
 # Context builder cache TTL (seconds)
 CONTEXT_CACHE_TTL: float = 300.0
 

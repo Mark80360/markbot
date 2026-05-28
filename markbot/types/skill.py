@@ -32,6 +32,14 @@ class SkillScriptDef:
     sandbox_config: Optional[dict[str, Any]] = None
 
 
+class SkillState:
+    """Skill lifecycle states."""
+
+    ACTIVE = "active"
+    STALE = "stale"
+    ARCHIVED = "archived"
+
+
 @dataclass
 class SkillDefinition:
     name: str
@@ -42,3 +50,8 @@ class SkillDefinition:
     is_always_active: bool = False
     config_vars: list[SkillConfigVar] = field(default_factory=list)
     conditions: SkillConditions = field(default_factory=SkillConditions)
+    # Usage tracking (populated from SkillUsageStore at load time)
+    view_count: int = 0
+    use_count: int = 0
+    last_activity_at: float | None = None
+    state: str = SkillState.ACTIVE

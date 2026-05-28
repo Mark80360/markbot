@@ -1,7 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
@@ -24,7 +24,7 @@ class ChannelsConfig(Base):
     model_config = ConfigDict(extra="allow")
 
     send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("鈥?))
+    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("�?))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
 
 
@@ -126,7 +126,8 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)
 
-    _dynamic_providers: dict[str, ProviderConfig] = {}
+    def model_post_init(self, __context) -> None:
+        self._dynamic_providers: dict[str, ProviderConfig] = {}
 
     def get_provider(self, provider_id: str) -> ProviderConfig | None:
         """Get a provider by ID, checking both named fields and dynamic providers."""
@@ -150,7 +151,7 @@ class ProvidersConfig(Base):
     def list_provider_ids(self) -> list[str]:
         """List all available provider IDs (named + dynamic)."""
         ids = []
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             val = getattr(self, field_name, None)
             if isinstance(val, ProviderConfig) and val.is_configured:
                 ids.append(field_name)
@@ -277,6 +278,15 @@ class MemoryToolsConfig(Base):
     dream_cron: str = Field(
         default="0 23 * * *",
         description="Cron expression for dream-based memory optimization job (empty string to disable)"
+    )
+    # External memory plugin configuration
+    provider: str | None = Field(
+        default=None,
+        description="External memory provider name (e.g. 'chroma'). None = use built-in file-based memory."
+    )
+    provider_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Configuration dict passed to the external memory provider"
     )
 
 

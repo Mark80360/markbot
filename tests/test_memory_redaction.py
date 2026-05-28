@@ -1,5 +1,5 @@
 import pytest
-from markbot.memory.redaction import redact_sensitive_text, _SENSITIVE_PATTERNS
+from markbot.memory.manager import redact_sensitive_text, _SENSITIVE_PATTERNS
 
 
 class TestRedactSensitiveText:
@@ -18,7 +18,7 @@ class TestRedactSensitiveText:
         assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in result
 
     def test_redact_github_pat(self):
-        text = "github_pat_11ABCDEF1234567890abcdef"
+        text = "github_pat_11ABCDEF1234567890abcdefghijklmnopqrstuvwxABCDEFGHIJ"
         result = redact_sensitive_text(text)
         assert "[REDACTED]" in result
 

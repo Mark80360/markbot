@@ -22,6 +22,7 @@ from markbot.utils.constants import (
     CONTEXT_CACHE_TTL,
     GUIDANCE_INJECTION_TTL,
     MAX_GIT_STATUS_CHARS,
+    check_template_sync,
 )
 from markbot.utils.helpers import (
     build_assistant_message,
@@ -68,6 +69,10 @@ class ContextBuilder:
         self._cache_ttl: float = CONTEXT_CACHE_TTL
         self._guidance_injected_sessions: dict[str, float] = {}
         self._guidance_ttl: float = GUIDANCE_INJECTION_TTL
+
+        sync_warnings = check_template_sync()
+        for w in sync_warnings:
+            logger.warning("Template sync: {}", w)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, and skills.
@@ -214,13 +219,14 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
     def get_system_context(self) -> dict[str, str]:
         """
         Get system-level context (git status, environment info).
-        This context is cached for the duration of the conversation.
+        This context is cached with TTL to allow periodic refresh.
 
         Reference: getSystemContext()
         """
         cache_key = "system_context"
-        if cache_key in self._context_cache:
-            return self._context_cache[cache_key]
+        cached = self._context_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < self._cache_ttl:
+            return cached[1]
 
         context = {}
 
@@ -228,7 +234,7 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
         if git_status:
             context["gitStatus"] = git_status
 
-        self._context_cache[cache_key] = context
+        self._context_cache[cache_key] = (time.monotonic(), context)
         return context
 
     def _get_git_status(self) -> str | None:

@@ -311,8 +311,12 @@ class MemoryStore:
         self._system_prompt_snapshot = "\n\n".join(parts)
 
     @contextmanager
-    def _file_lock(self, path: Path):
-        """Context manager for cross-platform file locking."""
+    def _file_lock(self):
+        """Context manager for cross-platform file locking.
+
+        Uses a single shared lock file (self._lock_path) to serialize
+        all memory write operations, regardless of target file.
+        """
         lock_fd = None
         try:
             self._lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,8 +325,6 @@ class MemoryStore:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             elif msvcrt:
                 msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
-            yield
-        except Exception:
             yield
         finally:
             if lock_fd:
@@ -373,7 +375,7 @@ class MemoryStore:
 
         if not entries:
             try:
-                with self._file_lock(path):
+                with self._file_lock():
                     self._atomic_write_text(path, header)
             except Exception as e:
                 logger.warning("Failed to write {}: {}", path, e)
@@ -381,7 +383,7 @@ class MemoryStore:
 
         content = header + ENTRY_DELIMITER.join(entries) + "\n"
         try:
-            with self._file_lock(path):
+            with self._file_lock():
                 self._atomic_write_text(path, content)
         except Exception as e:
             logger.warning("Failed to write {}: {}", path, e)

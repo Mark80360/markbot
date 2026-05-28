@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from markbot.bus.queue import MessageBus
     from markbot.cli.slash_commands import CommandRouter
     from markbot.config.schema import (
+        BudgetConfig,
         ChannelsConfig,
         CodeExecutionConfig,
         CompactionConfig as SchemaCompactionConfig,
@@ -49,9 +50,13 @@ if TYPE_CHECKING:
     )
     from markbot.memory.base import BaseMemoryManager
     from markbot.memory.daily_log import DailyLogManager
+    from markbot.memory.encoder import MemoryEncoder
     from markbot.providers.fallback import FallbackManager
     from markbot.schedule.cron import CronService
+    from markbot.session.bootstrap import SessionBootstrap
+    from markbot.session.handoff import HandoffManager
     from markbot.session.session import SessionManager
+    from markbot.session.task_tracker import TaskTracker
     from markbot.skills import SkillRegistry
     from markbot.skills.core.guardrail import SkillGuardrailManager
     from markbot.tools.memory_tools import MemorySearchTool
@@ -102,7 +107,7 @@ class AgentContext:
     compaction_config: "CompactionConfig | None" = None
     max_budget_usd: float | None = None
     warn_threshold_usd: float = 0.5
-    budget_config: Any = None
+    budget_config: "BudgetConfig | None" = None
     mcp_servers: dict | None = None
 
     tools: "ToolRegistry | None" = None
@@ -125,10 +130,10 @@ class AgentContext:
     memory_search_tool: "MemorySearchTool | None" = None
     question_tool: "AskUserQuestionTool | None" = None
     message_tool: "MessageTool | None" = None
-    handoff_manager: Any = None
-    session_bootstrap: Any = None
-    task_tracker: Any = None
-    memory_encoder: Any = None
+    handoff_manager: "HandoffManager | None" = None
+    session_bootstrap: "SessionBootstrap | None" = None
+    task_tracker: "TaskTracker | None" = None
+    memory_encoder: "MemoryEncoder | None" = None
 
     _init_timings: dict[str, float] = field(default_factory=dict)
 
@@ -210,7 +215,7 @@ class AgentContext:
             self._params["compaction_config"] = cfg
             return self
 
-        def with_budget(self, max_usd: float | None, warn_usd: float = 0.5, budget_config: Any = None) -> "AgentContext.Builder":
+        def with_budget(self, max_usd: float | None, warn_usd: float = 0.5, budget_config: "BudgetConfig | None" = None) -> "AgentContext.Builder":
             self._params["max_budget_usd"] = max_usd
             self._params["warn_threshold_usd"] = warn_usd
             self._params["budget_config"] = budget_config
@@ -299,7 +304,7 @@ class AgentContext:
         compaction_config: "CompactionConfig | None" = None,
         max_budget_usd: float | None = None,
         warn_threshold_usd: float = 0.5,
-        budget_config: Any = None,
+        budget_config: "BudgetConfig | None" = None,
     ) -> "AgentContext":
         """Create a fully initialized AgentContext from the legacy parameter list.
 
@@ -319,7 +324,6 @@ class AgentContext:
         )
         from markbot.agent.services.executor import ToolExecutor as _TE
         from markbot.agent.services.interaction import InteractionLogger as _IL
-        from markbot.agent.stream import StreamFilter
         from markbot.agent.subagent import SubagentManager as _SM
         from markbot.agent.tool_binder import ToolBinder as _TB
         from markbot.config.schema import (
@@ -356,7 +360,7 @@ class AgentContext:
         _web_search_config = web_search_config or _WSC()
         _exec_config = exec_config or _ETC()
         _filesystem_config = filesystem_config or _FTC()
-        _memory_config = memory_config or _MTC()
+        _resolved_memory_config = memory_config or _MTC()
         _code_execution_config = getattr(
             config.tools if config else None, "code_execution", None
         ) or _CEC()
@@ -406,7 +410,7 @@ class AgentContext:
 
         mcp = _MM(mcp_servers)
 
-        memory_cfg = _memory_config
+        memory_cfg = _resolved_memory_config
         embedding_config: dict[str, Any] = {}
         if memory_cfg:
             embedding_config = {
@@ -543,7 +547,7 @@ class AgentContext:
             web_proxy=web_proxy,
             exec_config=_exec_config,
             filesystem_config=_filesystem_config,
-            memory_config=_memory_config,
+            memory_config=_resolved_memory_config,
             code_execution_config=_code_execution_config,
             cron_service=cron_service,
             restrict_to_workspace=restrict_to_workspace,

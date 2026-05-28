@@ -64,7 +64,7 @@ _SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     (r'(sk_test_[\w]{10,})', r'sk_test_[REDACTED]'),
     (r'(ghp_[\w]{30,})', r'ghp_[REDACTED]'),
     (r'(gho_[\w]{30,})', r'gho_[REDACTED]'),
-    (r'(github_pat_[\w_]{50,})', r'github_pat_[REDACTED]'),
+    (r'(github_pat_[\w_]{20,})', r'github_pat_[REDACTED]'),
     (r'(AKIA[\w]{16})', r'AKIA[REDACTED]'),
     (r'(xox[bpas]-[\w\-]{20,})', r'\1[REDACTED]'),
     (r'(AIza[\w_-]{30,})', r'AIza[REDACTED]'),
@@ -365,7 +365,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if self._started:
             return
         self._memory_store = MemoryStore(working_dir=self.working_dir, on_write=self._on_store_write)
-        self._daily_log = DailyLogManager(workspace=Path(self.working_dir))
+        # Preserve externally-set daily_log (e.g. from AgentContext.from_legacy_params)
+        # instead of overwriting it with a new instance.
+        if self._daily_log is None:
+            self._daily_log = DailyLogManager(workspace=Path(self.working_dir))
         self._compressed_summary = self._load_compressed_summary()
         self._started = True
         logger.info("Started")
@@ -530,6 +533,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             return ""
 
         conversation_text = self._format_messages_for_summary(messages)
+        conversation_text = redact_sensitive_text(conversation_text)
 
         if self._fallback_manager:
             try:
@@ -545,6 +549,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                     ],
                 )
                 summary = response.content or ""
+                summary = redact_sensitive_text(summary)
 
                 if summary and self._memory_store:
                     try:
@@ -1020,9 +1025,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             new_content = existing + "\n\n----------\n\n" + summary
             if len(new_content) > MAX_COMPRESSED_SUMMARY_CHARS:
                 keep = new_content[-MAX_COMPRESSED_SUMMARY_CHARS:]
-                cutoff = keep.find("\n")
-                if cutoff > 0:
-                    keep = keep[cutoff + 1:]
+                # Cut at the nearest delimiter boundary to avoid splitting mid-summary
+                delimiter = "\n\n----------\n\n"
+                cutoff = keep.find(delimiter)
+                if cutoff >= 0:
+                    keep = keep[cutoff + len(delimiter):]
                 new_content = keep
             path.write_text(new_content, encoding="utf-8")
         except Exception as e:

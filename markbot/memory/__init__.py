@@ -9,6 +9,7 @@ Provides file-based memory management with:
 - MemoryProvider ABC for pluggable memory backends
 - DailyLogManager for lightweight interaction logging
 - MemoryEncoder for active preference detection and encoding
+- MemoryPluginDiscovery for external memory provider discovery
 """
 
 from markbot.agent.hooks import BootstrapHook, MemoryCompactionHook
@@ -25,6 +26,7 @@ from .fencing import (
     sanitize_context,
 )
 from .manager import MemoryManager, redact_sensitive_text
+from .plugins.discovery import MemoryPluginDiscovery, MemoryProviderInfo
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
 from .tool import MemoryStore
@@ -37,6 +39,8 @@ __all__ = [
     "MemoryEncoder",
     "MemorySecurityScanner",
     "MemoryProvider",
+    "MemoryPluginDiscovery",
+    "MemoryProviderInfo",
     "MemoryStore",
     "BootstrapHook",
     "MemoryCompactionHook",
