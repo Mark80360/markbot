@@ -9,7 +9,19 @@ from markbot.providers.fallback import (
     FallbackManager,
     AllModelsFailedError,
 )
-from markbot.providers.registry import ProviderSpec, PROVIDERS, find_by_name
+from markbot.providers.registry import (
+    ProviderSpec,
+    DeepSeekSpec,
+    MoonshotSpec,
+    OpenRouterSpec,
+    GeminiSpec,
+    CustomSpec,
+    DashScopeSpec,
+    AnthropicSpec,
+    PROVIDERS,
+    _OMIT_TEMPERATURE,
+    find_by_name,
+)
 
 
 class TestToolCallRequest:
@@ -129,6 +141,252 @@ class TestProviderSpec:
         )
         assert spec.is_gateway is True
 
+    def test_get_hostname_from_base_url(self):
+        spec = ProviderSpec(
+            name="test", keywords=("test",), env_key="TEST_KEY",
+            default_api_base="https://api.example.com/v1",
+        )
+        assert spec.get_hostname() == "api.example.com"
+
+    def test_get_hostname_explicit(self):
+        spec = ProviderSpec(
+            name="test", keywords=("test",), env_key="TEST_KEY",
+            hostname="custom.host.com",
+            default_api_base="https://api.example.com/v1",
+        )
+        assert spec.get_hostname() == "custom.host.com"
+
+    def test_get_hostname_empty(self):
+        spec = ProviderSpec(name="test", keywords=("test",), env_key="TEST_KEY")
+        assert spec.get_hostname() == ""
+
+    def test_default_hooks(self):
+        spec = ProviderSpec(name="test", keywords=("test",), env_key="TEST_KEY")
+        msgs = [{"role": "user", "content": "hi"}]
+        assert spec.prepare_messages(msgs) is msgs
+        assert spec.build_extra_body() == {}
+        assert spec.build_api_kwargs_extras() == ({}, {})
+
+    def test_new_metadata_fields(self):
+        spec = ProviderSpec(
+            name="test", keywords=("test",), env_key="TEST_KEY",
+            aliases=("t1", "t2"),
+            description="Test provider",
+            signup_url="https://example.com/",
+            fallback_models=("model-a", "model-b"),
+            default_aux_model="model-cheap",
+            auth_type="api_key",
+            supports_health_check=True,
+        )
+        assert spec.aliases == ("t1", "t2")
+        assert spec.description == "Test provider"
+        assert spec.signup_url == "https://example.com/"
+        assert spec.fallback_models == ("model-a", "model-b")
+        assert spec.default_aux_model == "model-cheap"
+        assert spec.auth_type == "api_key"
+        assert spec.supports_health_check is True
+
+    def test_fixed_temperature_omit(self):
+        spec = ProviderSpec(
+            name="test", keywords=("test",), env_key="TEST_KEY",
+            fixed_temperature=_OMIT_TEMPERATURE,
+        )
+        assert spec.fixed_temperature is _OMIT_TEMPERATURE
+
+    def test_fixed_temperature_value(self):
+        spec = ProviderSpec(
+            name="test", keywords=("test",), env_key="TEST_KEY",
+            fixed_temperature=1.0,
+        )
+        assert spec.fixed_temperature == 1.0
+
+
+class TestDeepSeekSpec:
+    def test_thinking_model_v4(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        assert spec._model_supports_thinking("deepseek-v4-pro") is True
+        assert spec._model_supports_thinking("deepseek-v4-flash") is True
+
+    def test_non_thinking_model_v3(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        assert spec._model_supports_thinking("deepseek-chat") is False
+        assert spec._model_supports_thinking("deepseek-v3") is False
+
+    def test_reasoner_model(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        assert spec._model_supports_thinking("deepseek-reasoner") is True
+
+    def test_build_api_kwargs_extras_thinking_enabled(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="deepseek-v4-pro",
+        )
+        assert eb["thinking"] == {"type": "enabled"}
+        assert tl["reasoning_effort"] == "high"
+
+    def test_build_api_kwargs_extras_thinking_disabled(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="deepseek-v4-pro",
+        )
+        assert eb["thinking"] == {"type": "disabled"}
+        assert tl == {}
+
+    def test_build_api_kwargs_extras_non_thinking_model(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="deepseek-chat",
+        )
+        assert eb == {}
+        assert tl == {}
+
+    def test_effort_xhigh_maps_to_max(self):
+        spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            model="deepseek-v4-pro",
+        )
+        assert tl["reasoning_effort"] == "max"
+
+
+class TestMoonshotSpec:
+    def test_default_thinking_enabled(self):
+        spec = MoonshotSpec(name="moonshot", keywords=("moonshot",), env_key="MOONSHOT_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras()
+        assert eb["thinking"] == {"type": "enabled"}
+        assert tl["reasoning_effort"] == "medium"
+
+    def test_thinking_disabled(self):
+        spec = MoonshotSpec(name="moonshot", keywords=("moonshot",), env_key="MOONSHOT_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+        )
+        assert eb["thinking"] == {"type": "disabled"}
+        assert tl == {}
+
+    def test_custom_effort(self):
+        spec = MoonshotSpec(name="moonshot", keywords=("moonshot",), env_key="MOONSHOT_API_KEY")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        assert tl["reasoning_effort"] == "low"
+
+    def test_omit_temperature(self):
+        spec = MoonshotSpec(
+            name="moonshot", keywords=("moonshot",), env_key="MOONSHOT_API_KEY",
+            fixed_temperature=_OMIT_TEMPERATURE,
+        )
+        assert spec.fixed_temperature is _OMIT_TEMPERATURE
+
+
+class TestOpenRouterSpec:
+    def test_build_extra_body_with_preferences(self):
+        spec = OpenRouterSpec(
+            name="openrouter", keywords=("openrouter",), env_key="OPENROUTER_API_KEY",
+        )
+        body = spec.build_extra_body(provider_preferences={"allow_fallback": True})
+        assert body["provider"] == {"allow_fallback": True}
+
+    def test_build_extra_body_without_preferences(self):
+        spec = OpenRouterSpec(
+            name="openrouter", keywords=("openrouter",), env_key="OPENROUTER_API_KEY",
+        )
+        body = spec.build_extra_body()
+        assert body == {}
+
+    def test_reasoning_passthrough(self):
+        spec = OpenRouterSpec(
+            name="openrouter", keywords=("openrouter",), env_key="OPENROUTER_API_KEY",
+        )
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            supports_reasoning=True,
+        )
+        assert eb["reasoning"]["effort"] == "high"
+
+    def test_xai_session_affinity(self):
+        spec = OpenRouterSpec(
+            name="openrouter", keywords=("openrouter",), env_key="OPENROUTER_API_KEY",
+        )
+        eb, tl = spec.build_api_kwargs_extras(
+            model="x-ai/grok-3",
+            session_id="sess-123",
+        )
+        assert "extra_headers" in tl
+        assert tl["extra_headers"]["x-grok-conv-id"] == "sess-123"
+
+
+class TestGeminiSpec:
+    def test_thinking_config_enabled(self):
+        spec = GeminiSpec(name="gemini", keywords=("gemini",), env_key="GEMINI_API_KEY")
+        body = spec.build_extra_body(
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "google" in body
+        assert body["google"]["thinking_config"]["thinking_budget"] == 65536
+
+    def test_thinking_config_disabled(self):
+        spec = GeminiSpec(name="gemini", keywords=("gemini",), env_key="GEMINI_API_KEY")
+        body = spec.build_extra_body(
+            reasoning_config={"enabled": False},
+        )
+        assert body == {}
+
+    def test_no_reasoning_config(self):
+        spec = GeminiSpec(name="gemini", keywords=("gemini",), env_key="GEMINI_API_KEY")
+        body = spec.build_extra_body()
+        assert body == {}
+
+
+class TestCustomSpec:
+    def test_think_false_on_disabled(self):
+        spec = CustomSpec(name="custom", keywords=(), env_key="")
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "none"},
+        )
+        assert eb["think"] is False
+
+    def test_ollama_num_ctx(self):
+        spec = CustomSpec(name="custom", keywords=(), env_key="")
+        eb, tl = spec.build_api_kwargs_extras(ollama_num_ctx=32768)
+        assert eb["options"]["num_ctx"] == 32768
+
+
+class TestDashScopeSpec:
+    def test_prepare_messages_normalizes_string_content(self):
+        spec = DashScopeSpec(name="dashscope", keywords=("qwen",), env_key="DASHSCOPE_API_KEY")
+        msgs = [{"role": "user", "content": "hello"}]
+        result = spec.prepare_messages(msgs)
+        assert result[0]["content"] == [{"type": "text", "text": "hello"}]
+
+    def test_prepare_messages_injects_cache_control(self):
+        spec = DashScopeSpec(name="dashscope", keywords=("qwen",), env_key="DASHSCOPE_API_KEY")
+        msgs = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "hi"},
+        ]
+        result = spec.prepare_messages(msgs)
+        system_content = result[0]["content"]
+        assert isinstance(system_content, list)
+        assert system_content[-1].get("cache_control") == {"type": "ephemeral"}
+
+    def test_build_extra_body(self):
+        spec = DashScopeSpec(name="dashscope", keywords=("qwen",), env_key="DASHSCOPE_API_KEY")
+        body = spec.build_extra_body()
+        assert body["vl_high_resolution_images"] is True
+
+
+class TestAnthropicSpec:
+    def test_fetch_models_requires_api_key(self):
+        spec = AnthropicSpec(
+            name="anthropic", keywords=("anthropic",), env_key="ANTHROPIC_API_KEY",
+        )
+        result = spec.fetch_models(api_key=None)
+        assert result is None
+
 
 class TestProviderRegistry:
     def test_providers_not_empty(self):
@@ -156,3 +414,81 @@ class TestProviderRegistry:
     def test_openai_provider(self):
         result = find_by_name("openai")
         assert result is not None
+
+    def test_find_by_alias(self):
+        result = find_by_name("claude")
+        assert result is not None
+        assert result.name == "anthropic"
+
+    def test_find_by_alias_kimi(self):
+        result = find_by_name("kimi")
+        assert result is not None
+        assert result.name == "moonshot"
+
+    def test_find_by_alias_or(self):
+        result = find_by_name("or")
+        assert result is not None
+        assert result.name == "openrouter"
+
+    def test_find_by_alias_grok(self):
+        result = find_by_name("grok")
+        assert result is not None
+        assert result.name == "xai"
+
+    def test_find_by_alias_hf(self):
+        result = find_by_name("hf")
+        assert result is not None
+        assert result.name == "huggingface"
+
+    def test_deepseek_is_subclass(self):
+        result = find_by_name("deepseek")
+        assert isinstance(result, DeepSeekSpec)
+
+    def test_moonshot_is_subclass(self):
+        result = find_by_name("moonshot")
+        assert isinstance(result, MoonshotSpec)
+
+    def test_openrouter_is_subclass(self):
+        result = find_by_name("openrouter")
+        assert isinstance(result, OpenRouterSpec)
+
+    def test_gemini_is_subclass(self):
+        result = find_by_name("gemini")
+        assert isinstance(result, GeminiSpec)
+
+    def test_custom_is_subclass(self):
+        result = find_by_name("custom")
+        assert isinstance(result, CustomSpec)
+
+    def test_dashscope_is_subclass(self):
+        result = find_by_name("dashscope")
+        assert isinstance(result, DashScopeSpec)
+
+    def test_anthropic_is_subclass(self):
+        result = find_by_name("anthropic")
+        assert isinstance(result, AnthropicSpec)
+
+    def test_new_providers_exist(self):
+        for name in ("xai", "nvidia", "huggingface"):
+            result = find_by_name(name)
+            assert result is not None, f"Provider '{name}' not found"
+
+    def test_all_providers_have_description(self):
+        for spec in PROVIDERS:
+            if spec.name in ("custom", "azure_openai") or spec.is_local:
+                continue
+            assert spec.description, f"Provider '{spec.name}' missing description"
+
+    def test_all_providers_have_signup_url_or_no_key(self):
+        for spec in PROVIDERS:
+            if not spec.env_key or spec.is_local or spec.is_direct or spec.is_oauth:
+                continue
+            assert spec.signup_url, f"Provider '{spec.name}' with env_key missing signup_url"
+
+    def test_moonshot_omits_temperature(self):
+        result = find_by_name("moonshot")
+        assert result.fixed_temperature is _OMIT_TEMPERATURE
+
+    def test_deepseek_has_fallback_models(self):
+        result = find_by_name("deepseek")
+        assert len(result.fallback_models) > 0

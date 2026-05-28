@@ -6,6 +6,20 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from markbot.providers.base import LLMProvider, LLMResponse
+from markbot.providers.registry import (
+    ProviderSpec,
+    DeepSeekSpec,
+    MoonshotSpec,
+    OpenRouterSpec,
+    GeminiSpec,
+    CustomSpec,
+    DashScopeSpec,
+    AnthropicSpec,
+    PROVIDERS,
+    _OMIT_TEMPERATURE,
+    find_by_name,
+    create_provider,
+)
 
 __all__ = [
     "LLMProvider",
@@ -17,6 +31,18 @@ __all__ = [
     "FallbackManager",
     "AllModelsFailedError",
     "FallbackAttempt",
+    "ProviderSpec",
+    "DeepSeekSpec",
+    "MoonshotSpec",
+    "OpenRouterSpec",
+    "GeminiSpec",
+    "CustomSpec",
+    "DashScopeSpec",
+    "AnthropicSpec",
+    "PROVIDERS",
+    "_OMIT_TEMPERATURE",
+    "find_by_name",
+    "create_provider",
 ]
 
 _LAZY_IMPORTS = {

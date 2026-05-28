@@ -220,6 +220,8 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
     ) -> dict[str, Any]:
+        from markbot.providers.registry import _OMIT_TEMPERATURE
+
         model_name = model or self.default_model
         spec = self._spec
 
@@ -229,13 +231,24 @@ class OpenAICompatProvider(LLMProvider):
         if spec and spec.strip_model_prefix:
             model_name = model_name.split("/")[-1]
 
+        if spec:
+            messages = spec.prepare_messages(messages)
+
+        sanitized = self._sanitize_messages(self._sanitize_empty_content(messages))
+
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": sanitized,
             "max_tokens": max(1, max_tokens),
             "max_completion_tokens": max(1, max_tokens),
-            "temperature": temperature,
         }
+
+        if spec and spec.fixed_temperature is _OMIT_TEMPERATURE:
+            pass
+        elif spec and spec.fixed_temperature is not None:
+            kwargs["temperature"] = spec.fixed_temperature
+        else:
+            kwargs["temperature"] = temperature
 
         if spec:
             model_lower = model_name.lower()
@@ -250,6 +263,41 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        if spec:
+            reasoning_config = None
+            if reasoning_effort:
+                reasoning_config = {"enabled": True, "effort": reasoning_effort}
+
+            extra_body_from_spec = spec.build_extra_body(
+                model=model_name,
+                reasoning_config=reasoning_config,
+            )
+            if extra_body_from_spec:
+                existing = kwargs.get("extra_body", {})
+                if isinstance(existing, dict):
+                    existing.update(extra_body_from_spec)
+                else:
+                    existing = extra_body_from_spec
+                kwargs["extra_body"] = existing
+
+            eb_additions, top_level = spec.build_api_kwargs_extras(
+                reasoning_config=reasoning_config,
+                model=model_name,
+            )
+            if eb_additions:
+                existing = kwargs.get("extra_body", {})
+                if isinstance(existing, dict):
+                    existing.update(eb_additions)
+                else:
+                    existing = eb_additions
+                kwargs["extra_body"] = existing
+            if top_level:
+                kwargs.update(top_level)
+
+            if spec.default_max_tokens and "max_tokens" not in kwargs:
+                kwargs["max_tokens"] = spec.default_max_tokens
+                kwargs["max_completion_tokens"] = spec.default_max_tokens
 
         return kwargs
 
