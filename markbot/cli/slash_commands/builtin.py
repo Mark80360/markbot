@@ -16,6 +16,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
+    loop.clear_steer(msg.session_key)
     tasks = loop._active_tasks.pop(msg.session_key, [])
     cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
     for t in tasks:
@@ -176,10 +177,35 @@ async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
+    """Inject a mid-task instruction into the running agent loop."""
+    loop = ctx.loop
+    msg = ctx.msg
+    steer_text = (ctx.args or "").strip()
+    if not steer_text:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Usage: /steer <instruction>\nExample: /steer focus on error handling",
+        )
+    session_key = msg.session_key
+    accepted = loop.steer(session_key, steer_text)
+    if accepted:
+        preview = steer_text[:80] + "..." if len(steer_text) > 80 else steer_text
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Steer queued: {preview}",
+        )
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content="No agent loop is currently running for this session.",
+    )
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     lines = [
         "🦞 MarkBot commands:",
+        "/steer <text> — Inject mid-task instruction into running agent",
         "/new — Start a new conversation (saves summary first)",
         "/compact — Manually compact conversation into summary",
         "/compact_str — View current compressed summary",
@@ -200,6 +226,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
+    router.priority("/steer", cmd_steer)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)

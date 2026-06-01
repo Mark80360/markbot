@@ -148,8 +148,13 @@ class ToolRegistry:
         """
         tool = self.get(name)
         if not tool:
-            available = ", ".join(self.tool_names[:10])
-            return f"Error: Tool '{name}' not found. Available: {available}..."
+            available = ", ".join(sorted(self.tool_names))
+            return (
+                f"Error: Tool '{name}' does not exist. "
+                f"This may be a hallucinated tool name. "
+                f"Available tools: {available}. "
+                f"Use only the tools listed above."
+            )
 
         # Create default context if not provided
         if context is None:

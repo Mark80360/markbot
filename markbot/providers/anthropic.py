@@ -101,14 +101,27 @@ class AnthropicProvider(LLMProvider):
 
         return system, self._merge_consecutive(raw)
 
-    @staticmethod
-    def _tool_result_block(msg: dict[str, Any]) -> dict[str, Any]:
+    def _tool_result_block(self, msg: dict[str, Any]) -> dict[str, Any]:
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": msg.get("tool_call_id", ""),
         }
-        if isinstance(content, (str, list)):
+        if isinstance(content, list):
+            converted: list[dict[str, Any]] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    converted_block = self._convert_image_block(item)
+                    if converted_block:
+                        converted.append(converted_block)
+                    else:
+                        converted.append({"type": "text", "text": "(image unavailable)"})
+                elif isinstance(item, dict):
+                    converted.append(item)
+                else:
+                    converted.append({"type": "text", "text": str(item)})
+            block["content"] = converted
+        elif isinstance(content, str):
             block["content"] = content
         else:
             block["content"] = str(content) if content else ""

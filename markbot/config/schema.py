@@ -305,6 +305,104 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
+class ComputerUseConfig(Base):
+    """Computer use (desktop control) tool configuration."""
+
+    enable: bool = Field(
+        default=True,
+        description="Enable the computer_use tool for desktop control",
+    )
+    backend: str = Field(
+        default="cua",
+        description="Backend to use: 'cua' (cua-driver via MCP) or 'noop' (testing stub)",
+    )
+    capture_after_actions: bool = Field(
+        default=True,
+        description="Automatically capture a screenshot after each action",
+    )
+    max_elements: int = Field(
+        default=200,
+        ge=10,
+        le=1000,
+        description="Max AX elements returned in som/vision capture mode",
+    )
+    blocked_key_combos: list[str] = Field(
+        default_factory=lambda: [
+            "cmd+shift+backspace",
+            "cmd+option+escape",
+        ],
+        description="Key combinations that are always blocked for safety",
+    )
+    blocked_type_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "sudo rm -rf /",
+            "sudo rm -rf ~",
+            "rm -rf /",
+            "rm -rf ~",
+            ":(){ :|:& };:",
+        ],
+        description="Type patterns that are always blocked for safety",
+    )
+
+
+class BrowserConfig(Base):
+    """Browser automation tool configuration."""
+
+    enable: bool = Field(
+        default=True,
+        description="Enable browser automation tools",
+    )
+    backend: str = Field(
+        default="playwright",
+        description="Browser backend: 'playwright' (local) or 'browserbase' (cloud)",
+    )
+    headless: bool = Field(
+        default=True,
+        description="Run browser in headless mode",
+    )
+    record_session: bool = Field(
+        default=False,
+        description="Record browser sessions as .webm files",
+    )
+    default_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=120,
+        description="Default navigation/action timeout in seconds",
+    )
+    snapshot_max_chars: int = Field(
+        default=8000,
+        ge=1000,
+        le=50000,
+        description="Max characters for accessibility snapshot before LLM summarization",
+    )
+    blocked_domains: list[str] = Field(
+        default_factory=list,
+        description="Domains blocked from browser access (glob patterns, e.g. '*.internal.com')",
+    )
+    allowed_domains: list[str] = Field(
+        default_factory=list,
+        description="If non-empty, only these domains are allowed (glob patterns); takes precedence over blocked_domains",
+    )
+
+
+class AuxiliaryVisionConfig(Base):
+    """Auxiliary vision model configuration for pre-analyzing screenshots."""
+
+    force_text_only: bool = Field(
+        default=False,
+        description="Force all multimodal tool results to text-only (disable image passing to LLM)",
+    )
+    provider: str = Field(
+        default="",
+        description="Provider for auxiliary vision model (empty = use same provider as main model)",
+    )
+    model: str = Field(
+        default="",
+        description="Model name for auxiliary vision (empty = use main model)",
+    )
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -313,6 +411,8 @@ class ToolsConfig(Base):
     filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
     code_execution: CodeExecutionConfig = Field(default_factory=CodeExecutionConfig)
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
+    computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -430,6 +530,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    auxiliary_vision: AuxiliaryVisionConfig = Field(default_factory=AuxiliaryVisionConfig)
 
     @property
     def workspace_path(self) -> Path:

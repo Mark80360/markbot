@@ -69,7 +69,7 @@ class FallbackManager:
         "temporarily unavailable", "throttle",
     )
 
-    DEFAULT_CIRCUIT_THRESHOLD = 3
+    DEFAULT_CIRCUIT_THRESHOLD = 6
     DEFAULT_CIRCUIT_COOLDOWN = 60.0
 
     def __init__(self, config: Config):

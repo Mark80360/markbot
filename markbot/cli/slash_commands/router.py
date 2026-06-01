@@ -55,13 +55,24 @@ class CommandRouter:
         self._interceptors.append(handler)
 
     def is_priority(self, text: str) -> bool:
-        return text.strip().lower() in self._priority
+        lowered = text.strip().lower()
+        if lowered in self._priority:
+            return True
+        for cmd in self._priority:
+            if lowered.startswith(cmd + " ") or lowered.startswith(cmd + "\t"):
+                return True
+        return False
 
     async def dispatch_priority(self, ctx: CommandContext) -> OutboundMessage | None:
         """Dispatch a priority command. Called from run() without the lock."""
-        handler = self._priority.get(ctx.raw.lower())
+        lowered = ctx.raw.lower()
+        handler = self._priority.get(lowered)
         if handler:
             return await handler(ctx)
+        for cmd, handler in self._priority.items():
+            if lowered.startswith(cmd + " ") or lowered.startswith(cmd + "\t"):
+                ctx.args = ctx.raw[len(cmd):].strip()
+                return await handler(ctx)
         return None
 
     async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:

@@ -1,6 +1,6 @@
 [project]
 name = "markbot"
-version = "2.2.13"
+version = "2.3.0"
 description = "A lightweight personal AI assistant framework"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -56,6 +56,14 @@ langsmith = [
 ]
 chroma = [
     "chromadb>=0.4.0",
+]
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+]
+desktop = [
+    "pyautogui>=0.9.54",
+    "Pillow>=10.0.0",
 ]
 dev = [
     "pytest>=9.0.0,<10.0.0",

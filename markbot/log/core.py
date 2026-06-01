@@ -94,6 +94,7 @@ def setup_logging(
             log_file,
             level="DEBUG",
             format=file_format,
+            colorize=False,
             rotation="10 MB",
             retention="7 days",
             backtrace=True,

@@ -49,6 +49,7 @@ class LoopState:
     last_response: Any = None
     last_attempts: list = field(default_factory=list)
     last_compact_action: CompactAction = CompactAction.NONE
+    steer_continues: int = 0
 
 
 @dataclass
@@ -77,6 +78,8 @@ class IterationRunner:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         session_key: str | None = None,
+        on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
     ) -> None:
         self.loop = loop
         self.channel = channel
@@ -86,6 +89,8 @@ class IterationRunner:
         self.on_stream = on_stream
         self.on_stream_end = on_stream_end
         self.session_key = session_key or f"{channel}:{chat_id}"
+        self.on_tool_start = on_tool_start
+        self.on_tool_complete = on_tool_complete
         self._stream_filter = StreamFilter(on_stream)
         self._bootstrap_report: Any | None = None
 
@@ -141,6 +146,8 @@ class IterationRunner:
         state.messages = self.loop._strip_orphan_tool_results(state.messages)
 
         await self._phase_memory_compaction_hook(state)
+
+        self._inject_pending_steer(state)
 
         llm_result = await self._phase_call_llm(state, tool_defs)
         if llm_result is not None:
@@ -367,6 +374,47 @@ class IterationRunner:
         }
         state.messages.insert(sys_idx + 1, runtime_msg)
         state.new_msg_start += 1
+
+    def _inject_pending_steer(self, state: LoopState) -> None:
+        steer_text = self.loop.drain_steer(self.session_key)
+        if not steer_text:
+            return
+        last_tool_idx = None
+        for i in range(len(state.messages) - 1, -1, -1):
+            if state.messages[i].get("role") == "tool":
+                last_tool_idx = i
+                break
+        steer_content = (
+            "[User mid-task instruction — adjust your approach accordingly]\n"
+            + steer_text
+        )
+        if last_tool_idx is not None:
+            existing = state.messages[last_tool_idx].get("content", "")
+            if isinstance(existing, str):
+                state.messages[last_tool_idx]["content"] = (
+                    existing + "\n\n" + steer_content
+                )
+            elif isinstance(existing, list):
+                state.messages[last_tool_idx]["content"].append(
+                    {"type": "text", "text": steer_content}
+                )
+            logger.info(
+                "Steer injected into last tool result at message {}",
+                last_tool_idx,
+            )
+        else:
+            last_msg = state.messages[-1]
+            existing = last_msg.get("content", "")
+            if isinstance(existing, str):
+                last_msg["content"] = existing + "\n\n" + steer_content
+            elif isinstance(existing, list):
+                last_msg["content"].append(
+                    {"type": "text", "text": steer_content}
+                )
+            logger.info(
+                "Steer appended to last message (role={})",
+                last_msg.get("role"),
+            )
 
     def _phase_memory_sync(self, state: LoopState) -> None:
         memory_manager = getattr(self.loop, "memory_manager", None)
@@ -617,6 +665,54 @@ class IterationRunner:
 
         self.loop._set_tool_context(self.channel, self.chat_id, self.message_id)
 
+        invalid_tool_calls = self._detect_and_repair_hallucinated_tools(response)
+        if invalid_tool_calls:
+            self._invalid_tool_retries = getattr(self, "_invalid_tool_retries", 0) + 1
+            available = ", ".join(sorted(self.loop.tools.tool_names))
+            invalid_name = invalid_tool_calls[0]
+            invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
+            logger.warning(
+                "Unknown tool '{}' — sending error to model for self-correction ({}/3)",
+                invalid_preview, self._invalid_tool_retries,
+            )
+
+            if self._invalid_tool_retries >= 3:
+                logger.error("Max retries (3) for invalid tool calls exceeded. Stopping.")
+                self._invalid_tool_retries = 0
+                state.final_content = (
+                    f"I tried to call a tool that doesn't exist ('{invalid_preview}') "
+                    f"too many times. Available tools: {available}"
+                )
+                return IterationResult(should_break=True)
+
+            error_msg = (
+                f"Tool '{invalid_name}' does not exist. "
+                f"Available tools: {available}. "
+                f"Please use only the tools listed above."
+            )
+            for tc in response.tool_calls:
+                if tc.name not in self.loop.tools.tool_names:
+                    state.messages = self.loop.context.add_tool_result(
+                        state.messages, tc.id, tc.name, error_msg
+                    )
+                else:
+                    result = await self.loop.tools.execute(tc.name, tc.arguments, context=ToolContext(
+                        session_id=f"{self.channel}:{self.chat_id}",
+                        workspace=str(self.loop.workspace),
+                        permission_mode=PermissionMode.AUTO,
+                        tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
+                        is_non_interactive=False,
+                        channel=self.channel,
+                        chat_id=self.chat_id,
+                        message_id=self.message_id,
+                    ))
+                    state.messages = self.loop.context.add_tool_result(
+                        state.messages, tc.id, tc.name, result
+                    )
+            return IterationResult(should_continue=True)
+        else:
+            self._invalid_tool_retries = 0
+
         for tc in response.tool_calls:
             if "." in tc.name:
                 skill_name = tc.name.split(".", 1)[0]
@@ -647,6 +743,18 @@ class IterationRunner:
             chat_id=self.chat_id,
             message_id=self.message_id,
         )
+
+        for tc in response.tool_calls:
+            if self.on_tool_start:
+                context_str = None
+                if isinstance(tc.arguments, dict):
+                    args_preview = json.dumps(tc.arguments, ensure_ascii=False)[:200]
+                    context_str = f"{tc.name}({args_preview})"
+                try:
+                    await self.on_tool_start(tc.id, tc.name, context_str)
+                except Exception:
+                    pass
+
         results = await asyncio.gather(
             *(
                 self.loop.tools.execute(tc.name, tc.arguments, context=_tool_ctx)
@@ -697,10 +805,26 @@ class IterationRunner:
             state.messages = self.loop.context.add_tool_result(
                 state.messages, tool_call.id, tool_call.name, result
             )
+
+            if self.on_tool_complete:
+                error_msg = None
+                summary = None
+                if isinstance(result, str):
+                    if result.startswith("Error:"):
+                        error_msg = result
+                    else:
+                        summary = result[:200] if len(result) > 200 else result
+                try:
+                    await self.on_tool_complete(tool_call.id, tool_call.name, summary, error_msg)
+                except Exception:
+                    pass
         logger.info(
             "Added {} tool results to messages, continue to next iteration",
             len(results),
         )
+
+        self._inject_pending_steer(state)
+
         return IterationResult(should_continue=True)
 
     async def _phase_final_response(
@@ -753,7 +877,100 @@ class IterationRunner:
         )
         state.final_content = clean
         logger.info("Final response captured, length={}", len(clean or ""))
+
+        steer_text = self.loop.drain_steer(self.session_key)
+        if steer_text and state.steer_continues < 3:
+            steer_content = (
+                "[User mid-task instruction — adjust your approach accordingly]\n"
+                + steer_text
+            )
+            state.messages.append({
+                "role": "user",
+                "content": steer_content,
+            })
+            state.new_msg_start += 1
+            state.steer_continues += 1
+            logger.info(
+                "Steer injected after final response, continuing loop ({} chars, attempt {}/3)",
+                len(steer_text),
+                state.steer_continues,
+            )
+            return IterationResult(should_continue=True)
+
         return IterationResult(should_break=True)
+
+    def _detect_and_repair_hallucinated_tools(self, response: Any) -> list[str]:
+        """Detect and attempt to repair hallucinated tool call names.
+
+        Models sometimes invent tool names that don't exist. This method:
+        1. Tries fuzzy matching to auto-repair minor misspellings
+        2. Returns a list of tool names that are still invalid after repair
+
+        Args:
+            response: LLM response with tool_calls.
+
+        Returns:
+            List of tool names that could not be repaired.
+        """
+        valid_names = set(self.loop.tools.tool_names)
+        invalid: list[str] = []
+
+        for tc in response.tool_calls:
+            if tc.name in valid_names:
+                continue
+
+            repaired = self._try_repair_tool_name(tc.name, valid_names)
+            if repaired:
+                logger.info(
+                    "Auto-repaired hallucinated tool name: '{}' -> '{}'",
+                    tc.name, repaired,
+                )
+                tc.name = repaired
+            else:
+                invalid.append(tc.name)
+
+        return invalid
+
+    @staticmethod
+    def _try_repair_tool_name(name: str, valid_names: set[str]) -> str | None:
+        """Try to repair a hallucinated tool name using fuzzy matching.
+
+        Handles common patterns:
+        - Underscore vs hyphen: read_file vs read-file
+        - Missing prefix: search vs grep
+        - Extra words: file_read vs read_file
+        - Case differences: ReadFile vs read_file
+
+        Returns repaired name if a close match is found, None otherwise.
+        """
+        if name in valid_names:
+            return name
+
+        normalized = name.lower().replace("-", "_").replace(" ", "_")
+
+        candidates = []
+        for valid in valid_names:
+            valid_norm = valid.lower().replace("-", "_")
+            if normalized == valid_norm:
+                candidates.append(valid)
+            elif normalized.replace("_", "") == valid_norm.replace("_", ""):
+                candidates.append(valid)
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if "." in name:
+            parts = name.split(".", 1)
+            skill_name = parts[0]
+            script_name = parts[1].lower().replace("-", "_").replace(" ", "_")
+            for valid in valid_names:
+                if "." not in valid:
+                    continue
+                v_parts = valid.split(".", 1)
+                if v_parts[0] == skill_name and v_parts[1].lower().replace("-", "_") == script_name:
+                    return valid
+
+        return None
 
     async def _finalize_loop(self, state: LoopState) -> None:
         if state.final_content is None and state.budget_exceeded:

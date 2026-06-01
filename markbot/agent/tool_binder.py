@@ -32,6 +32,8 @@ class ToolBinder:
         exec_config: Any = None,
         filesystem_config: Any = None,
         code_execution_config: Any = None,
+        computer_use_config: Any = None,
+        browser_config: Any = None,
         cron_service: "CronService | None" = None,
         subagent_manager: "SubagentManager | None" = None,
         memory_manager: "MemoryManager | None" = None,
@@ -47,6 +49,8 @@ class ToolBinder:
         self._exec_config = exec_config
         self._filesystem_config = filesystem_config
         self._code_execution_config = code_execution_config
+        self._computer_use_config = computer_use_config
+        self._browser_config = browser_config
         self._cron_service = cron_service
         self._subagent_manager = subagent_manager
         self._memory_manager = memory_manager
@@ -76,6 +80,7 @@ class ToolBinder:
         self._register_memory_tools()
         self._register_skill_tools()
         self._register_autopilot_tools()
+        self._register_desktop_tools()
 
         if self._cron_service:
             from markbot.tools.cron import CronTool
@@ -234,4 +239,19 @@ class ToolBinder:
 
         for tool_cls in ALL_AUTOPILOT_TOOLS:
             self._tools.register(tool_cls())
+
+    def _register_desktop_tools(self) -> None:
+        """Register computer_use and browser automation tools."""
+        if self._computer_use_config is None or self._computer_use_config.enable:
+            from markbot.tools.computer_use.tool import ComputerUseTool
+
+            tool = ComputerUseTool(config=self._computer_use_config)
+            if tool.is_enabled:
+                self._tools.register(tool)
+
+        if self._browser_config is None or self._browser_config.enable:
+            from markbot.tools.browser import BROWSER_TOOLS
+
+            for browser_tool in BROWSER_TOOLS:
+                self._tools.register(browser_tool)
 

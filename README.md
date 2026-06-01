@@ -1,6 +1,6 @@
 # MarkBot 🦞
 
-> Version 2.2.13
+> Version 2.3.0
 
 A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
 
@@ -17,7 +17,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 ### Core Capabilities
 
-- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, and more (25 providers supported)
+- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, HuggingFace, xAI, NVIDIA NIM, and more (28 providers supported)
 - **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
 - **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, with auto-reconnect and health monitoring
 - **OAuth Authentication**: Native support for OpenAI Codex and GitHub Copilot with OAuth flow
@@ -31,10 +31,12 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 ### Tool System
 
-- **Built-in Tools**: 25+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot
+- **Built-in Tools**: 25+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot, Computer Use, Browser
 - **MCP Support**: Model Context Protocol for seamless tool integration (stdio, SSE, streamable HTTP)
 - **Web Integration**: Built-in web browsing, content extraction, and search (Brave, Tavily, DuckDuckGo, SearXNG, Jina)
 - **Code Execution**: Sandboxed Python code execution with security scanning and resource limits
+- **Computer Use**: Cross-platform desktop control with screenshot capture, mouse/keyboard automation, and element-based interaction (cua-driver on macOS, pyautogui on Linux/Windows)
+- **Browser Automation**: Playwright-based browser control with navigate, snapshot, click, type, scroll, press, back, and vision tools
 - **Voice Transcription**: Audio transcription via Groq Whisper integration
 
 ### Agent Architecture
@@ -195,6 +197,9 @@ pip install -e ".[dev]"
 pip install -e ".[weixin]"     # WeChat integration (qrcode, pycryptodome)
 pip install -e ".[langsmith]"  # LangSmith tracing
 pip install -e ".[chroma]"     # ChromaDB vector memory provider
+pip install -e ".[desktop]"    # Computer Use desktop control (pyautogui, Pillow)
+pip install -e ".[web]"        # Web gateway server (FastAPI, uvicorn)
+pip install playwright && playwright install chromium  # Browser automation
 ```
 
 ## Quick Start
@@ -263,19 +268,22 @@ markbot doctor fix
 | `/compact_str` | View current compressed summary |
 | `/clear` | Clear history and compressed summary |
 | `/stop` | Cancel all active tasks and subagents |
+| `/steer` | Inject mid-task instruction into running agent |
 | `/status` | Show session status, token usage, and statistics |
 | `/restart` | Restart the agent process |
 | `/help` | Show available slash commands |
 
 ## Supported LLM Providers
 
-MarkBot supports 25 LLM providers out of the box:
+MarkBot supports 28 LLM providers out of the box:
 
 ### Direct Providers
 | Provider | Models | Authentication | Prompt Caching |
 |----------|--------|----------------|----------------|
 | **Anthropic** | Claude 3.5/3.7 Sonnet, Claude 3 Opus/Haiku, Claude 4 | API Key | ✅ |
 | **OpenAI** | GPT-4o, GPT-4, GPT-3.5 | API Key | — |
+| **OpenAI Codex** | GPT-5.1 Codex | OAuth | — |
+| **GitHub Copilot** | Copilot models | OAuth | — |
 | **Azure OpenAI** | GPT-4, GPT-3.5 | Azure credentials | — |
 | **DeepSeek** | DeepSeek-V3, DeepSeek-R1, DeepSeek-Coder | API Key | — |
 | **Gemini** | Gemini Pro, Gemini Ultra | API Key | — |
@@ -285,18 +293,21 @@ MarkBot supports 25 LLM providers out of the box:
 | **MiniMax** | MiniMax models | API Key | — |
 | **Mistral** | Mistral Large, Medium, Small | API Key | — |
 | **Step Fun (阶跃星辰)** | Step models | API Key | — |
+| **xAI** | Grok models | API Key | — |
+| **NVIDIA NIM** | Nemotron and other NVIDIA models | API Key | — |
 | **Groq** | Groq models (Whisper, LLM) | API Key | — |
 
 ### Gateway Services
 | Provider | Description | Prompt Caching |
 |----------|-------------|----------------|
-| **OpenRouter** | Universal gateway to 100+ models | ✅ |
+| **OpenRouter** | Universal gateway to 200+ models | ✅ |
 | **AiHubMix** | OpenAI-compatible gateway | — |
 | **SiliconFlow (硅基流动)** | Chinese model gateway | — |
 | **VolcEngine (火山引擎)** | ByteDance cloud models | — |
-| **VolcEngine Coding Plan** | ByteDance coding-specific models | — |
-| **BytePlus** | VolcEngine international | — |
-| **BytePlus Coding Plan** | BytePlus coding-specific models | — |
+| **VolcEngine Coding Plan** | ByteDance coding-enhanced models | — |
+| **BytePlus** | VolcEngine international gateway | — |
+| **BytePlus Coding Plan** | BytePlus coding-enhanced models | — |
+| **HuggingFace** | HuggingFace Inference API | — |
 
 ### OAuth-Based Providers
 | Provider | Description |
@@ -307,14 +318,20 @@ MarkBot supports 25 LLM providers out of the box:
 ### Local Deployment
 | Provider | Description |
 |----------|-------------|
+| **Custom** | Any OpenAI-compatible endpoint (Ollama, vLLM, LLamaCPP, etc.) |
 | **vLLM** | High-throughput LLM serving engine |
 | **Ollama** | Local model runner |
 | **OVMS** | OpenVINO Model Server |
 
-### Custom Endpoint
-| Provider | Description |
-|----------|-------------|
-| **Custom** | Any OpenAI-compatible endpoint |
+### Provider Aliases
+
+Each provider supports alias-based lookup via `find_by_name()`. For example:
+- `anthropic` can also be referenced as `claude`
+- `gemini` accepts `google` or `google-gemini`
+- `custom` covers `ollama`, `local`, `vllm`, `llamacpp`
+- `dashscope` accepts `alibaba`, `alibaba-cloud`, `qwen-dashscope`
+
+Provider metadata includes `description` and `signup_url` for guided setup wizards.
 
 ## Configuration
 
@@ -550,6 +567,7 @@ Advanced built-in memory management:
 - **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule
 - **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
 - **Security Scanner**: Injection and exfiltration detection for memory content
+- **Sensitive Data Redaction**: Automatic scrubbing of API keys, tokens, passwords, JWTs, and connection strings before LLM summarization
 - **Context Fencing**: `<memory-context>` tags with streaming scrubber
 - **Plugin Discovery**: External memory providers via entry points, naming convention (`markbot_memory_*`), or manual registration
 - **ChromaDB Provider**: Reference implementation for vector-based semantic memory with ChromaDB
@@ -602,6 +620,88 @@ compaction:
   tool_output_inline_chars: 16000
   tool_output_preview_chars: 3000
   system_prompt_token_budget: 16000
+```
+
+## Computer Use & Browser Automation
+
+MarkBot includes two powerful automation capabilities for desktop and web interaction.
+
+### Computer Use
+
+Cross-platform desktop control tool that lets the AI agent interact with your computer:
+
+- **Screenshot Capture**: Take screenshots with numbered element overlays (SOM mode) for precise interaction
+- **Mouse Control**: Click, double-click, right-click, middle-click, drag, and scroll by element index or pixel coordinates
+- **Keyboard Input**: Type text, press key combinations, and use keyboard shortcuts
+- **App Management**: List running applications, focus specific apps
+- **Element-Based Interaction**: Click by element index (e.g., `element=14`) for reliability — much more robust than pixel coordinates
+- **Safety Features**: Blocked destructive key combinations and type patterns, permission-based access control
+
+**Backend Selection** (automatic by default):
+- **macOS + cua-driver**: Background operation without stealing the user's cursor or keyboard focus
+- **Linux/Windows + pyautogui**: Foreground operation using the real cursor
+- **Override**: Set `MARKBOT_COMPUTER_USE_BACKEND` environment variable (`cua`, `pyautogui`, or `noop`)
+
+**Installation**:
+
+```bash
+# For Linux/Windows (pyautogui backend)
+pip install -e ".[desktop]"
+
+# For macOS (cua-driver backend — automatic if available)
+# cua-driver is auto-detected; falls back to pyautogui if not installed
+pip install -e ".[desktop]"
+```
+
+**Configuration** in `config.yaml`:
+
+```yaml
+tools:
+  computer_use:
+    enable: true
+    backend: cua                    # 'cua' (macOS), 'pyautogui' (cross-platform), or 'noop' (testing)
+    capture_after_actions: true     # Auto-screenshot after each action
+    max_elements: 200               # Max AX elements in SOM capture (10-1000)
+    blocked_key_combos:             # Always-blocked key combinations
+      - "cmd+shift+backspace"
+      - "cmd+option+escape"
+    blocked_type_patterns:          # Always-blocked type patterns
+      - "sudo rm -rf /"
+      - "rm -rf ~"
+```
+
+### Browser Automation
+
+Playwright-based browser control for web page interaction:
+
+- **Navigate**: Open URLs and initialize browser sessions
+- **Snapshot**: Get accessibility tree with interactive element references
+- **Click/Type**: Interact with elements by their ref IDs (e.g., `element='e5'`)
+- **Scroll/Press**: Scroll pages and press keyboard shortcuts
+- **Vision**: Visual verification with screenshots for CAPTCHAs or visual content
+- **Session Isolation**: Each task gets an isolated browser session with auto-cleanup
+- **Domain Filtering**: Block or allow specific domains via glob patterns
+
+**Installation**:
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+**Configuration** in `config.yaml`:
+
+```yaml
+tools:
+  browser:
+    enable: true
+    backend: playwright             # 'playwright' (local) or 'browserbase' (cloud)
+    headless: true                  # Run browser in headless mode
+    record_session: false           # Record sessions as .webm files
+    default_timeout: 30             # Navigation/action timeout in seconds
+    snapshot_max_chars: 8000        # Max chars for accessibility snapshot
+    blocked_domains: []             # Blocked domains (glob patterns)
+    allowed_domains: []             # If non-empty, only these domains are allowed
 ```
 
 ## Monitoring & Diagnostics
@@ -699,7 +799,16 @@ markbot/
 │   ├── explore.py      # Deep code exploration
 │   ├── context_explorer.py # Context catalog/search/load
 │   ├── cron.py         # Cron scheduling
-│   └── mcp.py          # MCP client tool wrapper
+│   ├── mcp.py          # MCP client tool wrapper
+│   ├── browser.py      # Playwright browser automation
+│   └── computer_use/   # Cross-platform desktop control
+│       ├── tool.py     # ComputerUseTool
+│       ├── backend.py  # Abstract backend interface
+│       ├── cua_backend.py    # macOS cua-driver backend
+│       ├── pyautogui_backend.py # Cross-platform pyautogui backend
+│       ├── noop_backend.py   # Testing stub backend
+│       ├── schema.py   # Tool schema definition
+│       └── vision_routing.py # Vision model routing
 ├── skills/             # Skill system
 │   ├── core/           # Skill framework
 │   │   ├── loader.py   # Skill loading
@@ -727,7 +836,7 @@ markbot/
 │       └── cron/       # Scheduled task management
 ├── providers/          # LLM provider integrations
 │   ├── base.py         # LLMProvider ABC
-│   ├── registry.py     # ProviderSpec registry (25 providers)
+│   ├── registry.py     # ProviderSpec registry (28 providers)
 │   ├── fallback.py     # FallbackManager with circuit breaker
 │   ├── anthropic.py    # Anthropic native SDK
 │   ├── openai_compat.py # OpenAI-compatible provider

@@ -151,6 +151,8 @@ class AgentLoop:
         self.task_tracker = ctx.task_tracker
         self.memory_encoder = ctx.memory_encoder
 
+        self._pending_steer: dict[str, str] = {}
+
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     async def _connect_mcp(self) -> None:
@@ -200,6 +202,8 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
         from markbot.agent.iteration import IterationRunner
 
@@ -212,6 +216,8 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             session_key=f"{channel}:{chat_id}",
+            on_tool_start=on_tool_start,
+            on_tool_complete=on_tool_complete,
         )
         return await runner.run(initial_messages)
 
@@ -464,6 +470,24 @@ class AgentLoop:
         """Return cost tracking summary including per-model breakdown."""
         return self.cost_tracker.get_summary()
 
+    def steer(self, session_key: str, text: str) -> bool:
+        if not text or not text.strip():
+            return False
+        cleaned = text.strip()
+        existing = self._pending_steer.get(session_key, "")
+        self._pending_steer[session_key] = (existing + "\n" + cleaned) if existing else cleaned
+        logger.info("Steer accepted for session {}: {} chars", session_key, len(cleaned))
+        return True
+
+    def drain_steer(self, session_key: str) -> str | None:
+        text = self._pending_steer.pop(session_key, None)
+        if text:
+            logger.debug("Drained steer for session {}: {} chars", session_key, len(text))
+        return text
+
+    def clear_steer(self, session_key: str) -> None:
+        self._pending_steer.pop(session_key, None)
+
     @property
     def total_cost_usd(self) -> float:
         """Total cost in USD for this session."""
@@ -481,6 +505,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         channel = msg.channel
@@ -507,6 +533,8 @@ class AgentLoop:
                 on_progress=on_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
+                on_tool_start=on_tool_start,
+                on_tool_complete=on_tool_complete,
             )
 
         return await self.pipeline.process(pctx, _handler)
@@ -517,6 +545,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Core message handling logic, executed inside the pipeline."""
         await self._connect_mcp()
@@ -548,6 +578,8 @@ class AgentLoop:
                     channel=channel,
                     chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
+                    on_tool_start=on_tool_start,
+                    on_tool_complete=on_tool_complete,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
             except Exception:
@@ -634,6 +666,8 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                on_tool_start=on_tool_start,
+                on_tool_complete=on_tool_complete,
             )
 
             logger.info(
@@ -680,6 +714,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+        on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         _direct_start = time.time()
@@ -703,4 +739,6 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            on_tool_start=on_tool_start,
+            on_tool_complete=on_tool_complete,
         )

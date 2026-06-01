@@ -485,6 +485,8 @@ class AgentContext:
             exec_config=_exec_config,
             filesystem_config=_filesystem_config,
             code_execution_config=_code_execution_config,
+            computer_use_config=getattr(config.tools if config else None, "computer_use", None),
+            browser_config=getattr(config.tools if config else None, "browser", None),
             cron_service=cron_service,
             subagent_manager=subagents,
             memory_manager=memory_manager,

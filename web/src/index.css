@@ -1,0 +1,357 @@
+@import 'tailwindcss';
+
+:root {
+  --foreground: color-mix(in srgb, #ffffff 0%, transparent);
+  --foreground-base: #ffffff;
+  --foreground-alpha: 0;
+  --midground: color-mix(in srgb, #ffe6cb 100%, transparent);
+  --midground-base: #ffe6cb;
+  --midground-alpha: 1;
+  --background: color-mix(in srgb, #041c1c 100%, transparent);
+  --background-base: #041c1c;
+  --background-alpha: 1;
+
+  --warm-glow: rgba(255, 189, 56, 0.35);
+  --noise-opacity-mul: 1;
+
+  --theme-font-sans: system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --theme-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
+    Consolas, monospace;
+  --theme-font-display: var(--theme-font-sans);
+  --theme-base-size: 15px;
+  --theme-line-height: 1.55;
+  --theme-letter-spacing: 0;
+
+  --radius: 0.5rem;
+  --theme-radius: 0.5rem;
+  --theme-spacing-mul: 1;
+  --theme-density: comfortable;
+
+  --accent-teal: #4fd1c5;
+  --accent-teal-hover: #38b2ac;
+  --accent-teal-dim: rgba(79, 209, 197, 0.15);
+  --accent-teal-glow: rgba(79, 209, 197, 0.08);
+  --user-bubble: rgba(79, 209, 197, 0.12);
+  --user-bubble-border: rgba(79, 209, 197, 0.2);
+  --border-accent: rgba(79, 209, 197, 0.3);
+}
+
+[data-theme="light"] {
+  --foreground: color-mix(in srgb, #1a1a2e 100%, transparent);
+  --foreground-base: #1a1a2e;
+  --foreground-alpha: 1;
+  --midground: color-mix(in srgb, #2d3748 100%, transparent);
+  --midground-base: #2d3748;
+  --midground-alpha: 1;
+  --background: color-mix(in srgb, #f7f8fa 100%, transparent);
+  --background-base: #f7f8fa;
+  --background-alpha: 1;
+
+  --warm-glow: rgba(255, 189, 56, 0.12);
+  --noise-opacity-mul: 0.4;
+
+  --accent-teal: #0d9488;
+  --accent-teal-hover: #0f766e;
+  --accent-teal-dim: rgba(13, 148, 136, 0.1);
+  --accent-teal-glow: rgba(13, 148, 136, 0.05);
+  --user-bubble: rgba(13, 148, 136, 0.08);
+  --user-bubble-border: rgba(13, 148, 136, 0.15);
+  --border-accent: rgba(13, 148, 136, 0.25);
+}
+
+html {
+  font-family: var(--theme-font-sans);
+  font-size: var(--theme-base-size);
+  line-height: var(--theme-line-height);
+  letter-spacing: var(--theme-letter-spacing);
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--theme-font-sans);
+  min-height: 0;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--background-base);
+  color: var(--midground);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+code, kbd, pre, samp, .font-mono {
+  font-family: var(--theme-font-mono);
+}
+
+#root {
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  html,
+  body,
+  #root {
+    min-height: 100dvh;
+    height: auto;
+    max-height: none;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+}
+
+small { font-size: 1.0625rem; }
+code { font-size: 0.875rem; }
+
+@theme inline {
+  --spacing: calc(0.25rem * var(--theme-spacing-mul, 1));
+
+  --color-foreground: var(--midground);
+  --color-card: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
+  --color-card-foreground: var(--midground);
+  --color-primary: var(--midground);
+  --color-primary-foreground: var(--background-base);
+  --color-secondary: color-mix(in srgb, var(--midground-base) 6%, var(--background-base));
+  --color-secondary-foreground: var(--midground);
+  --color-muted: color-mix(in srgb, var(--midground-base) 8%, var(--background-base));
+  --color-muted-foreground: var(--color-text-secondary);
+  --color-accent: color-mix(in srgb, var(--midground-base) 10%, var(--background-base));
+  --color-accent-foreground: var(--midground);
+  --color-destructive: #fb2c36;
+  --color-destructive-foreground: #ffffff;
+  --color-success: #4ade80;
+  --color-warning: #ffbd38;
+  --color-border: color-mix(in srgb, var(--midground-base) 15%, transparent);
+  --color-input: color-mix(in srgb, var(--midground-base) 15%, transparent);
+  --color-ring: var(--midground);
+  --color-popover: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
+  --color-popover-foreground: var(--midground);
+
+  --color-background-base: var(--background-base);
+  --color-background-secondary: color-mix(in srgb, var(--midground-base) 3%, var(--background-base));
+  --color-background-tertiary: color-mix(in srgb, var(--midground-base) 6%, var(--background-base));
+  --color-background-hover: color-mix(in srgb, var(--midground-base) 8%, var(--background-base));
+
+  --color-midground: var(--midground);
+  --color-midground-dim: color-mix(in srgb, var(--midground-base) 60%, transparent);
+  --color-midground-faint: color-mix(in srgb, var(--midground-base) 30%, transparent);
+
+  --color-text-primary: var(--midground);
+  --color-text-secondary: color-mix(in srgb, var(--midground-base) 70%, transparent);
+  --color-text-tertiary: color-mix(in srgb, var(--midground-base) 40%, transparent);
+  --color-text-muted: color-mix(in srgb, var(--midground-base) 25%, transparent);
+
+  --color-accent-teal: var(--accent-teal);
+  --color-accent-teal-hover: var(--accent-teal-hover);
+  --color-accent-teal-dim: var(--accent-teal-dim);
+  --color-accent-teal-glow: var(--accent-teal-glow);
+
+  --color-user-bubble: var(--user-bubble);
+  --color-user-bubble-border: var(--user-bubble-border);
+
+  --color-border-accent: var(--border-accent);
+
+  --radius-sm: calc(var(--theme-radius) - 4px);
+  --radius-md: calc(var(--theme-radius) - 2px);
+  --radius-lg: var(--theme-radius);
+  --radius-xl: calc(var(--theme-radius) + 4px);
+}
+
+.prose-chat {
+  line-height: 1.7;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  color: var(--midground);
+}
+
+.prose-chat p {
+  margin: 0.5em 0;
+}
+
+.prose-chat p:first-child {
+  margin-top: 0;
+}
+
+.prose-chat p:last-child {
+  margin-bottom: 0;
+}
+
+.prose-chat h1, .prose-chat h2, .prose-chat h3, .prose-chat h4 {
+  margin: 1em 0 0.5em 0;
+  font-weight: 600;
+  color: var(--midground);
+}
+
+.prose-chat h1 { font-size: 1.25em; }
+.prose-chat h2 { font-size: 1.125em; }
+.prose-chat h3 { font-size: 1em; }
+.prose-chat h4 { font-size: 0.9375em; }
+
+.prose-chat ul, .prose-chat ol {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+
+.prose-chat li {
+  margin: 0.25em 0;
+}
+
+.prose-chat code {
+  background: color-mix(in srgb, var(--midground-base) 8%, transparent);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.875em;
+  font-family: var(--theme-font-mono);
+  color: var(--accent-teal);
+}
+
+.prose-chat pre {
+  background: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
+  border: 1px solid color-mix(in srgb, var(--midground-base) 15%, transparent);
+  border-radius: var(--radius-lg);
+  padding: 12px 16px;
+  overflow-x: auto;
+  font-size: 0.8125em;
+  line-height: 1.5;
+  margin: 0.75em 0;
+}
+
+.prose-chat pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  color: var(--midground);
+}
+
+.prose-chat blockquote {
+  border-left: 3px solid var(--accent-teal);
+  padding-left: 12px;
+  margin: 0.5em 0;
+  color: color-mix(in srgb, var(--midground-base) 70%, transparent);
+}
+
+.prose-chat a {
+  color: var(--accent-teal);
+  text-decoration: none;
+  text-decoration-line: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent-teal) 30%, transparent);
+  text-underline-offset: 2px;
+}
+
+.prose-chat a:hover {
+  text-decoration-color: color-mix(in srgb, var(--accent-teal) 60%, transparent);
+}
+
+.prose-chat hr {
+  border: none;
+  border-top: 1px solid color-mix(in srgb, var(--midground-base) 15%, transparent);
+  margin: 1em 0;
+}
+
+.prose-chat table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.75em 0;
+  font-size: 0.875em;
+}
+
+.prose-chat th, .prose-chat td {
+  border: 1px solid color-mix(in srgb, var(--midground-base) 15%, transparent);
+  padding: 6px 12px;
+  text-align: left;
+}
+
+.prose-chat th {
+  background: color-mix(in srgb, var(--midground-base) 6%, var(--background-base));
+  font-weight: 600;
+}
+
+.prose-chat img {
+  max-width: 100%;
+  border-radius: var(--radius-lg);
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--accent-teal);
+  opacity: 0.5;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.message-enter {
+  animation: fadeIn 0.2s ease-out;
+}
+
+.dialog-enter {
+  animation: fadeInScale 0.15s ease-out;
+}
+
+.blend-lighter {
+  mix-blend-mode: plus-lighter;
+}
+
+[data-theme="light"] .blend-lighter {
+  mix-blend-mode: normal;
+}
+
+.text-display {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--midground-base) 25%, transparent);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--midground-base) 40%, transparent);
+}
