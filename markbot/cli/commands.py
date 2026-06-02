@@ -29,6 +29,15 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from markbot import __logo__, __version__
 from markbot.cli.skills import app as skills_app
+from markbot.cli.daemon import (
+    _gateway_paths,
+    is_process_running,
+    read_pid,
+    remove_pid,
+    start_daemon,
+    terminate_process,
+    write_pid,
+)
 from markbot.cli.runtime import _onboard_plugins, load_runtime_config, make_provider
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.cli.ui import (
@@ -66,14 +75,6 @@ app.add_typer(autopilot_app, name="autopilot")
 # Add doctor diagnostic subcommand
 from markbot.cli.doctor import doctor_app
 app.add_typer(doctor_app, name="doctor")
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-PROCESS_STOP_RETRIES = 10
-PROCESS_STOP_WAIT_INTERVAL = 0.5
-DAEMON_STARTUP_WAIT = 0.5
 
 # ---------------------------------------------------------------------------
 # Interactive-mode helpers (prompt_toolkit-driven) used by the ``agent``
@@ -370,121 +371,6 @@ gateway_app = typer.Typer(
 )
 app.add_typer(gateway_app, name="gateway")
 
-# Gateway PID file management
-GATEWAY_PID_DIR = get_gateway_dir()
-GATEWAY_PID_FILE = GATEWAY_PID_DIR / "gateway.pid"
-GATEWAY_LOG_FILE = GATEWAY_PID_DIR / "gateway.log"
-
-AGENT_LOG_DIR = get_logs_dir()
-AGENT_LOG_FILE = AGENT_LOG_DIR / "agent.log"
-
-
-def _ensure_pid_dir() -> None:
-    GATEWAY_PID_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _read_pid() -> int | None:
-    if not GATEWAY_PID_FILE.exists():
-        return None
-    try:
-        return int(GATEWAY_PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        return None
-
-
-def _write_pid(pid: int) -> None:
-    _ensure_pid_dir()
-    GATEWAY_PID_FILE.write_text(str(pid))
-
-
-def _remove_pid() -> None:
-    if GATEWAY_PID_FILE.exists():
-        GATEWAY_PID_FILE.unlink()
-
-
-def _is_process_running(pid: int) -> bool:
-    """Check if a process is running (cross-platform)."""
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle == 0:
-                return False
-
-            exit_code = wintypes.DWORD()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                kernel32.CloseHandle(handle)
-                return exit_code.value == 259  # STILL_ACTIVE
-
-            kernel32.CloseHandle(handle)
-            return True
-        else:
-            # Unix/Linux: send signal 0 to check if process exists
-            import os
-            os.kill(pid, 0)
-            return True
-    except (OSError, ProcessLookupError):
-        return False
-    except Exception:
-        return False
-
-
-def _terminate_process(pid: int, force: bool = False) -> bool:
-    """Terminate a process by PID (cross-platform).
-
-    Args:
-        pid: Process ID to terminate.
-        force: If True, use SIGKILL (Unix) or force terminate (Windows).
-              If False, use SIGTERM (Unix) or graceful terminate (Windows).
-
-    Returns:
-        True if process was terminated successfully, False otherwise.
-    """
-    import time
-
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_TERMINATE = 0x0001
-            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-
-            if handle == 0:
-                return False
-
-            exit_code = wintypes.DWORD()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                if exit_code.value != 259:  # Not STILL_ACTIVE
-                    kernel32.CloseHandle(handle)
-                    return True
-
-            kernel32.TerminateProcess(handle, 1 if force else 0)
-            kernel32.CloseHandle(handle)
-        else:
-            import os
-            import signal
-
-            if force:
-                os.kill(pid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGTERM)
-
-        for _ in range(PROCESS_STOP_RETRIES):
-            time.sleep(PROCESS_STOP_WAIT_INTERVAL)
-            if not _is_process_running(pid):
-                return True
-
-        return False
-    except Exception:
-        return False
-
 
 @gateway_app.command("start")
 def gateway_start(
@@ -495,116 +381,18 @@ def gateway_start(
     daemon: bool = typer.Option(True, "--daemon/--foreground", "-d", help="Run as daemon (background)"),
 ):
     """Start the Markbot gateway service."""
-    _markbot_banner()
+    markbot_banner()
 
-    existing_pid = _read_pid()
-    if existing_pid and _is_process_running(existing_pid):
+    existing_pid = read_pid()
+    if existing_pid and is_process_running(existing_pid):
         console.print(f"[yellow]Gateway is already running (PID: {existing_pid})[/yellow]")
         console.print("Use [cyan]markbot gateway stop[/cyan] to stop it first.")
         raise typer.Exit(1)
 
     if daemon:
-        _start_daemon(port, workspace, config, verbose)
+        start_daemon(port, workspace, config, verbose)
     else:
         _run_gateway_foreground(port, workspace, config, verbose)
-
-
-def _start_daemon(port: int, workspace: str | None, config_path: str | None, verbose: bool) -> None:
-    """Start the gateway as a daemon process (cross-platform)."""
-    from rich.text import Text
-
-    _ensure_pid_dir()
-
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
-
-    console.print()
-
-    if sys.platform == "win32":
-        # Windows: use subprocess
-        import subprocess
-
-        cmd = [
-            sys.executable, "-m", "markbot",
-            "gateway", "start",
-            "--port", str(port),
-            "--foreground",
-        ]
-
-        if workspace:
-            cmd.extend(["--workspace", workspace])
-        if config_path:
-            cmd.extend(["--config", config_path])
-        if verbose:
-            cmd.append("--verbose")
-
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP |
-            subprocess.CREATE_NO_WINDOW
-        )
-
-        with open(GATEWAY_LOG_FILE, "w") as log_file:
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=creationflags,
-                cwd=str(Path.cwd()),
-            )
-
-        import time
-        time.sleep(DAEMON_STARTUP_WAIT)
-
-        if process.poll() is not None:
-            section("Status", "red")
-            console.print("  [red]✗[/red] Failed to start gateway daemon")
-            console.print()
-            raise typer.Exit(1)
-
-        _write_pid(process.pid)
-        section("Status", "green")
-        kv("State", "[bold green]● RUNNING[/bold green]")
-        kv("PID", str(process.pid))
-        divider()
-        console.print()
-
-    else:
-        # Linux/Unix: use os.fork()
-        pid = os.fork()
-        if pid > 0:
-            _write_pid(pid)
-            section("Status", "green")
-            kv("State", "[bold green]● RUNNING[/bold green]")
-            kv("PID", str(pid))
-            kv("Log File", str(GATEWAY_LOG_FILE))
-            divider()
-            console.print()
-            return
-
-        os.setsid()
-        sys.stdin.close()
-        _ensure_pid_dir()
-        with open(GATEWAY_LOG_FILE, "w") as log_file:
-            os.dup2(log_file.fileno(), sys.stdout.fileno())
-            os.dup2(log_file.fileno(), sys.stderr.fileno())
-        try:
-            _run_gateway_foreground(port, workspace, config_path, verbose)
-        except Exception as e:
-            print(f"Gateway failed: {e}", file=sys.stderr)
-            sys.exit(1)
 
 
 def _run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
@@ -621,7 +409,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
     from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
 
-    setup_logging(verbose=verbose, log_file=GATEWAY_LOG_FILE)
+    setup_logging(verbose=verbose, log_file=_gateway_paths()["log_file"])
 
     config_path = Path(config) if config else None
     config = load_config(config_path)
@@ -860,10 +648,10 @@ def agent(
     from markbot.log.core import setup_logging
     from markbot.schedule.cron import CronService
 
-    AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _gateway_paths()["agent_log_dir"].mkdir(parents=True, exist_ok=True)
     setup_logging(
         console_level="DEBUG" if logs else "ERROR",
-        log_file=AGENT_LOG_FILE,
+        log_file=_gateway_paths()["agent_log_file"],
     )
 
     _cmd_start = time.time()
@@ -1118,7 +906,7 @@ def gateway_stop(
 
     console.print()
 
-    pid = _read_pid()
+    pid = read_pid()
     if not pid:
         section("Status", "yellow")
         console.print("  [yellow]○ Gateway is not running (no PID file found)[/yellow]")
@@ -1126,8 +914,8 @@ def gateway_stop(
         console.print()
         raise typer.Exit(0)
 
-    if not _is_process_running(pid):
-        _remove_pid()
+    if not is_process_running(pid):
+        remove_pid()
         section("Status", "yellow")
         console.print("  [yellow]○ Gateway is not running (stale PID file removed)[/yellow]")
         divider()
@@ -1139,8 +927,8 @@ def gateway_stop(
     kv("Action", "Force kill" if force else "Graceful terminate")
     console.print()
 
-    if _terminate_process(pid, force):
-        _remove_pid()
+    if terminate_process(pid, force):
+        remove_pid()
         section("Status", "green")
         kv("State", "[bold green]● STOPPED[/bold green]")
         divider()
@@ -1186,21 +974,21 @@ def gateway_restart(
 
     console.print()
 
-    pid = _read_pid()
+    pid = read_pid()
 
-    if pid and _is_process_running(pid):
+    if pid and is_process_running(pid):
         section("Stop", "cyan")
         kv("PID", str(pid))
         kv("Action", "Force kill" if force else "Graceful terminate")
         divider()
 
-        if _terminate_process(pid, force):
-            _remove_pid()
+        if terminate_process(pid, force):
+            remove_pid()
             section("Stop", "green")
             kv("State", "[bold green]● STOPPED[/bold green]")
             divider()
         else:
-            _remove_pid()
+            remove_pid()
             section("Stop", "red")
             kv("State", "[bold red]● FAILED[/bold red]")
             console.print("  [red]Gateway did not stop gracefully. Use --force to kill it.[/red]")
@@ -1208,12 +996,12 @@ def gateway_restart(
             raise typer.Exit(1)
     else:
         if pid:
-            _remove_pid()
+            remove_pid()
         section("Stop", "yellow")
         console.print("  [yellow]○ Gateway was not running[/yellow]")
         divider()
 
-    _start_daemon(port, workspace, config, verbose)
+    start_daemon(port, workspace, config, verbose)
 
 
 @gateway_app.command("status")
@@ -1231,11 +1019,11 @@ def gateway_status():
     workspace = config.workspace_path
 
     # ── Gather all data ─────────────────────────────────────────────────────
-    pid = _read_pid()
+    pid = read_pid()
     running = False
     proc = None
     if pid:
-        running = _is_process_running(pid)
+        running = is_process_running(pid)
         if running:
             try:
                 import psutil
@@ -1282,12 +1070,13 @@ def gateway_status():
         except Exception:
             pass
 
-    log_exists = GATEWAY_LOG_FILE.exists()
+    log_exists = _gateway_paths()["log_file"].exists()
     log_size_kb = 0.0
     log_mtime = ""
     if log_exists:
-        log_size_kb = GATEWAY_LOG_FILE.stat().st_size / 1024
-        log_mtime = datetime.fromtimestamp(GATEWAY_LOG_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        _log_file = _gateway_paths()["log_file"]
+        log_size_kb = _log_file.stat().st_size / 1024
+        log_mtime = datetime.fromtimestamp(_log_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     mcp_count = len(config.tools.mcp_servers) if config.tools.mcp_servers else 0
 
@@ -1392,7 +1181,7 @@ def gateway_status():
     # ─ Log File ──────────────────────────────────────────────────────────
     section("Log File", "yellow" if log_exists else "dim")
     if log_exists:
-        kv("Path", str(GATEWAY_LOG_FILE))
+        kv("Path", str(_gateway_paths()["log_file"]))
         kv("Size", f"{log_size_kb:.1f} KB")
         kv("Modified", log_mtime)
     else:
