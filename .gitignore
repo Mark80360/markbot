@@ -1,9 +1,8 @@
 .worktrees/
 .assets
 .docs/
-docs/
+docs/*
 !docs/superpowers/
-!docs/superpowers/specs/
 .env
 *.pyc
 dist/
