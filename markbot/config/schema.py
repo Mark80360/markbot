@@ -520,9 +520,48 @@ class BudgetConfig(Base):
     )
 
 
+class SsrfConfig(Base):
+    """SSRF protection block lists. Configurable per deployment."""
+
+    blocked_hostnames: list[str] = Field(
+        default_factory=lambda: [
+            "metadata.google.internal",
+            "metadata.goog",
+        ],
+        description="Hostnames always blocked (e.g. cloud metadata endpoints)",
+    )
+    always_blocked_ips: list[str] = Field(
+        default_factory=lambda: [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.169.253",
+            "fd00:ec2::254",
+            "100.100.100.200",
+        ],
+        description="IPs always blocked regardless of allow_private",
+    )
+    blocked_networks: list[str] = Field(
+        default_factory=lambda: [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
+        ],
+        description="Private/internal networks blocked when allow_private=False",
+    )
+
+
 class Config(BaseSettings):
     """Root configuration for markbot."""
 
+    ssrf: SsrfConfig = Field(default_factory=SsrfConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
