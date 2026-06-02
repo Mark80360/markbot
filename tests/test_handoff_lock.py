@@ -44,13 +44,13 @@ def test_concurrent_save_same_key_no_corruption(manager: HandoffManager) -> None
     """Parallel writes to the same key: file remains valid JSON,
     one of the writes wins (last-write-wins semantics is fine —
     the requirement is no torn writes or corruption)."""
-    N = 30
+    writes = 30
 
     def save_one(i: int) -> None:
         manager.save(_make_handoff("shared", summary=f"version-{i}"))
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(save_one, range(N)))
+        list(pool.map(save_one, range(writes)))
 
     h = manager.load("shared")
     assert h is not None

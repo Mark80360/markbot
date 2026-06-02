@@ -52,7 +52,8 @@ def test_concurrent_transition_one_succeeds(tracker: TaskTracker) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(start) for _ in range(2)]
-        results = [f.result() for f in as_completed(futures)]
+        for f in as_completed(futures):
+            f.result()
 
     final = tracker.list_all()
     assert len(final) == 1
@@ -92,7 +93,9 @@ def test_concurrent_cleanup_completed_idempotent(tracker: TaskTracker) -> None:
         return tracker.cleanup_completed(max_age_days=0)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [pool.submit(cleanup).result() for _ in range(2)]
+        futures = [pool.submit(cleanup) for _ in range(2)]
+        for f in as_completed(futures):
+            f.result()
 
     assert tracker.list_completed() == []
 
@@ -100,7 +103,7 @@ def test_concurrent_cleanup_completed_idempotent(tracker: TaskTracker) -> None:
 def test_lock_creation_no_existing_registry(tmp_path: Path) -> None:
     """The lock file is created on first construction, even before
     the data file exists."""
-    t = TaskTracker(tmp_path)
+    TaskTracker(tmp_path)
     assert (tmp_path / "tasks" / "registry.json.lock").exists()
     assert not (tmp_path / "tasks" / "registry.json").exists()
 
