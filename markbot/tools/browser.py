@@ -160,10 +160,10 @@ class BrowserNavigateTool(BaseTool):
         if not url:
             return "Error: 'url' parameter is required"
 
-        from markbot.utils.url_safety import check_url_safety
-        safety_error = check_url_safety(url)
-        if safety_error:
-            return f"Error: {safety_error}"
+        from markbot.utils.ssrf import validate_resolved_url, validate_url_target
+        ok, err = validate_url_target(url)
+        if not ok:
+            return f"Error: {err}"
 
         from markbot.utils.website_policy import check_website_policy
         policy_error = check_website_policy(url)
@@ -175,6 +175,10 @@ class BrowserNavigateTool(BaseTool):
 
         try:
             response = await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            if response and response.url and response.url != url:
+                ok, err = validate_resolved_url(response.url)
+                if not ok:
+                    return f"Error: redirect blocked - {err}"
             status = response.status if response else "unknown"
             title = await page.title()
             return f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
