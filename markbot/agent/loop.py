@@ -17,6 +17,7 @@ from loguru import logger
 from markbot.agent.compact import CompactionConfig
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
+from markbot.agent.stream_scrubber import ScrubberPool
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
@@ -152,6 +153,7 @@ class AgentLoop:
         self.memory_encoder = ctx.memory_encoder
 
         self._pending_steer: dict[str, str] = {}
+        self._scrubber_pool = ScrubberPool()
 
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
@@ -387,16 +389,32 @@ class AgentLoop:
                 if msg.metadata.get("_wants_stream"):
 
                     async def on_stream(delta: str) -> None:
+                        visible = self._scrubber_pool.feed(msg.session_key, delta)
+                        if not visible:
+                            return
                         await self.bus.publish_outbound(
                             OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
-                                content=delta,
+                                content=visible,
                                 metadata={"_stream_delta": True},
                             )
                         )
 
                     async def on_stream_end(*, resuming: bool = False, discard: bool = False) -> None:
+                        # Flush any held-back text in the scrubber before signalling end.
+                        if not discard:
+                            trailing = self._scrubber_pool.flush(msg.session_key)
+                            if trailing:
+                                await self.bus.publish_outbound(
+                                    OutboundMessage(
+                                        channel=msg.channel,
+                                        chat_id=msg.chat_id,
+                                        content=trailing,
+                                        metadata={"_stream_delta": True},
+                                    )
+                                )
+                            self._scrubber_pool.reset(msg.session_key)
                         meta: dict[str, Any] = {
                             "_resuming": resuming,
                             "message_id": msg.metadata.get("message_id")
@@ -458,6 +476,7 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        self._scrubber_pool.clear()
         try:
             worker = getattr(self.memory_manager, "_worker_task", None)
             if worker and not worker.done():

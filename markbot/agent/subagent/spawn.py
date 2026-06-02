@@ -2,6 +2,8 @@
 
 from typing import TYPE_CHECKING, Any, Optional
 
+from loguru import logger
+
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
@@ -33,7 +35,11 @@ class SpawnTool(BaseTool):
                 "Use this for complex or time-consuming tasks that can run independently. "
                 "The subagent will complete the task and report back when done. "
                 "For deliverables or existing projects, inspect the workspace first "
-                "and use a dedicated subdirectory when helpful."
+                "and use a dedicated subdirectory when helpful. "
+                "By default the subagent is read-only. To grant extra tools or "
+                "relax the budget/timeout, pass a `capability` object; the subagent "
+                "will be limited to `allowed_tools` and cannot call any tool in "
+                "`forbidden_tools`."
             ),
             parameters=[
                 ToolParameter(
@@ -46,6 +52,19 @@ class SpawnTool(BaseTool):
                     name="label",
                     type="string",
                     description="Optional short label for the task (for display)",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="capability",
+                    type="object",
+                    description=(
+                        "Optional capability object declaring what the subagent "
+                        "may do. Keys (snake_case or camelCase): "
+                        "allowed_tools (list[str]), forbidden_tools (list[str]), "
+                        "max_iterations (int, default 15), max_budget_usd "
+                        "(number), timeout_seconds (number), description (str). "
+                        "Omit or pass null to use the default read-only profile."
+                    ),
                     required=False,
                 ),
             ],
@@ -61,10 +80,21 @@ class SpawnTool(BaseTool):
     async def execute(self, params: dict[str, Any], context: ToolContext) -> str:
         task = params["task"]
         label = params.get("label")
+        capability_param = params.get("capability")
 
         channel = context.channel or self._origin_channel
         chat_id = context.chat_id or self._origin_chat_id
         session_key = f"{channel}:{chat_id}" if channel and chat_id else self._session_key
+
+        from markbot.agent.subagent.capability import CapabilityToken
+
+        try:
+            capability = CapabilityToken.from_dict(capability_param)
+        except (TypeError, ValueError) as e:
+            logger.warning("SpawnTool: invalid capability payload, falling back to read-only: {}", e)
+            capability = CapabilityToken.read_only(
+                description="Invalid capability payload — read-only fallback"
+            )
 
         return await self._manager.spawn(
             task=task,
@@ -72,4 +102,5 @@ class SpawnTool(BaseTool):
             origin_channel=channel,
             origin_chat_id=chat_id,
             session_key=session_key,
+            capability=capability,
         )

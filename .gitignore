@@ -2,6 +2,8 @@
 .assets
 .docs/
 docs/
+!docs/superpowers/
+!docs/superpowers/specs/
 .env
 *.pyc
 dist/
@@ -37,3 +39,4 @@ run_debug.py
 test/
 node_modules/
 web/node_modules/
+.markbot/

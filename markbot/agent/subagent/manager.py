@@ -270,8 +270,31 @@ class SubagentManager:
                     tool_permission_context=_TPC(mode=_PM.AUTO),
                     is_non_interactive=True,
                 )
+
+                # Defence-in-depth: the LLM only sees tools that pass
+                # ``capability.allows()`` in ``_register_subagent_tools``,
+                # but a hallucinated tool name or a direct call could
+                # still slip through. Re-check at execution time and
+                # replace any violation with a structured denial result
+                # so the LLM can recover and stay inside the sandbox.
+                async def _guarded_execute(tc) -> Any:
+                    if not capability.allows(tc.name):
+                        logger.warning(
+                            "Subagent [{}] attempted to call forbidden tool '{}' "
+                            "(allowed={}, forbidden={}) — denied by capability token",
+                            task_id, tc.name,
+                            list(capability.allowed_tools) or "<inherit>",
+                            list(capability.forbidden_tools),
+                        )
+                        return (
+                            f"Error: tool '{tc.name}' is not permitted by this "
+                            "subagent's capability token. Pick a tool from the "
+                            "available set and try again."
+                        )
+                    return await tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx)
+
                 results = await asyncio.gather(
-                    *(tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx) for tc in response.tool_calls),
+                    *(_guarded_execute(tc) for tc in response.tool_calls),
                     return_exceptions=True,
                 )
 
