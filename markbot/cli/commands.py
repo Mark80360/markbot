@@ -22,18 +22,28 @@ if sys.platform == "win32":
             pass
 
 import typer
-from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit import print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.text import Text
 
 from markbot import __logo__, __version__
 from markbot.cli.skills import app as skills_app
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
+from markbot.cli.ui import (
+    PROMPT_SESSION,
+    console,
+    flush_pending_tty_input,
+    init_prompt_session,
+    is_exit_command,
+    make_console,
+    markbot_banner,
+    print_agent_response,
+    print_cli_progress_line,
+    render_interactive_ansi,
+    response_renderable,
+    restore_terminal,
+)
 from markbot.config.paths import get_cron_dir, get_gateway_dir, get_logs_dir, get_workspace_path
 from markbot.config.schema import Config
 from markbot.utils.helpers import sync_workspace_templates
@@ -56,9 +66,6 @@ app.add_typer(autopilot_app, name="autopilot")
 from markbot.cli.doctor import doctor_app
 app.add_typer(doctor_app, name="doctor")
 
-console = Console()
-EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -68,120 +75,67 @@ PROCESS_STOP_WAIT_INTERVAL = 0.5
 DAEMON_STARTUP_WAIT = 0.5
 
 # ---------------------------------------------------------------------------
-# CLI input: prompt_toolkit for editing, paste, history, and display
+# Interactive-mode helpers (prompt_toolkit-driven) used by the ``agent``
+# command. These stay in commands.py for now; they will move with the
+# agent group in the next refactor pass.
 # ---------------------------------------------------------------------------
 
-_PROMPT_SESSION: PromptSession | None = None
-_SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
-def _markbot_banner():
-    console.print()
-    console.print("  ███╗░░░███╗░█████╗░██████╗░██╗░░██╗██████╗░░█████╗░████████╗")
-    console.print("  ████╗░████║██╔══██╗██╔══██╗██║░██╔╝██╔══██╗██╔══██╗╚══██╔══╝")
-    console.print("  ██╔████╔██║███████║██████╔╝█████═╝░██████╦╝██║░░██║░░░██║░░░")
-    console.print("  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗░██╔══██╗██║░░██║░░░██║░░░")
-    console.print("  ██║░╚═╝░██║██║░░██║██║░░██║██║░╚██╗██████╦╝╚█████╔╝░░░██║░░░")
-    console.print("  ╚═╝░░░░░╚═╝╚═╝░░╚═╝╚═╝░░╚═╝╚═╝░░╚═╝╚═════╝░░╚════╝░░░░╚═╝░░░")
+async def _print_interactive_line(text: str) -> None:
+    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        ansi = render_interactive_ansi(
+            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
+        )
+        print_formatted_text(ANSI(ansi), end="")
 
-def _flush_pending_tty_input() -> None:
-    """Drop unread keypresses typed while the model was generating output."""
-    try:
-        fd = sys.stdin.fileno()
-        if not os.isatty(fd):
-            return
-    except Exception:
-        return
-
-    try:
-        import termios
-        termios.tcflush(fd, termios.TCIFLUSH)
-        return
-    except Exception:
-        pass
-
-    try:
-        while True:
-            ready, _, _ = select.select([fd], [], [], 0)
-            if not ready:
-                break
-            if not os.read(fd, 4096):
-                break
-    except Exception:
-        return
+    await run_in_terminal(_write)
 
 
-def _restore_terminal() -> None:
-    """Restore terminal to its original state (echo, line buffering, etc.)."""
-    if _SAVED_TERM_ATTRS is None:
-        return
-    try:
-        import termios
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
-    except Exception:
-        pass
-
-
-def _init_prompt_session() -> None:
-    """Create the prompt_toolkit session with persistent file history."""
-    global _PROMPT_SESSION, _SAVED_TERM_ATTRS
-
-    # Save terminal state so we can restore it on exit
-    try:
-        import termios
-        _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
-    except Exception:
-        pass
-
-    from markbot.config.paths import get_cli_history_path
-
-    history_file = get_cli_history_path()
-    history_file.parent.mkdir(parents=True, exist_ok=True)
-
-    _PROMPT_SESSION = PromptSession(
-        history=FileHistory(str(history_file)),
-        enable_open_in_editor=False,
-        multiline=False,   # Enter submits (single line mode)
-    )
-
-
-def _make_console() -> Console:
-    return Console(file=sys.stdout)
-
-
-def _render_interactive_ansi(render_fn) -> str:
-    """Render Rich output to ANSI so prompt_toolkit can print it safely."""
-    ansi_console = Console(
-        force_terminal=True,
-        color_system=console.color_system or "standard",
-        width=console.width,
-    )
-    with ansi_console.capture() as capture:
-        render_fn(ansi_console)
-    return capture.get()
-
-
-def _print_agent_response(
+async def _print_interactive_response(
     response: str,
     render_markdown: bool,
     metadata: dict | None = None,
 ) -> None:
-    """Render assistant response with consistent terminal styling."""
-    console = _make_console()
-    content = response or ""
-    body = _response_renderable(content, render_markdown, metadata)
-    console.print()
-    console.print(f"[cyan]{__logo__} MarkBot[/cyan]")
-    console.print(body)
-    console.print()
+    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+    def _write() -> None:
+        content = response or ""
+        ansi = render_interactive_ansi(
+            lambda c: (
+                c.print(),
+                c.print(f"[cyan]{__logo__} MarkBot[/cyan]"),
+                c.print(response_renderable(content, render_markdown, metadata)),
+                c.print(),
+            )
+        )
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
 
 
-def _response_renderable(content: str, render_markdown: bool, metadata: dict | None = None):
-    """Render plain-text command output without markdown collapsing newlines."""
-    if not render_markdown:
-        return Text(content)
-    if (metadata or {}).get("render_as") == "text":
-        return Text(content)
-    return Markdown(content)
+async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
+    """Print an interactive progress line, pausing the spinner if needed."""
+    with thinking.pause() if thinking else nullcontext():
+        await _print_interactive_line(text)
+
+
+async def _read_interactive_input_async() -> str:
+    """Read user input using prompt_toolkit (handles paste, history, display).
+
+    prompt_toolkit natively handles:
+    - Multiline paste (bracketed paste mode)
+    - History navigation (up/down arrows)
+    - Clean display (no ghost characters or artifacts)
+    """
+    if PROMPT_SESSION is None:
+        raise RuntimeError("Call init_prompt_session() first")
+    try:
+        with patch_stdout():
+            return await PROMPT_SESSION.prompt_async(
+                HTML("<b fg='ansiblue'>❯</b> "),
+            )
+    except EOFError as exc:
+        raise KeyboardInterrupt from exc
 
 
 async def _print_interactive_line(text: str) -> None:
