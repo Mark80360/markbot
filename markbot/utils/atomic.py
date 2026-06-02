@@ -56,10 +56,10 @@ class FileLock:
         self._timeout = timeout
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._fh: object | None = None
-
-    def __enter__(self) -> None:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_path.touch(exist_ok=True)
+
+    def __enter__(self) -> None:
         try:
             lock = portalocker.Lock(
                 str(self._lock_path),
