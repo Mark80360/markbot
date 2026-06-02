@@ -87,7 +87,7 @@ def _validate_url_safe(url: str) -> tuple[bool, str]:
 
     Lazy import to avoid circular dependency with markbot.security.network.
     """
-    from markbot.utils.network import validate_url_target
+    from markbot.utils.ssrf import validate_url_target
     return validate_url_target(url)
 
 
@@ -354,7 +354,7 @@ class WebFetchTool(Tool):
         try:
             async with httpx.AsyncClient(proxy=self.proxy, follow_redirects=True, max_redirects=MAX_REDIRECTS, timeout=15.0) as client:
                 async with client.stream("GET", url, headers={"User-Agent": USER_AGENT}) as r:
-                    from markbot.utils.network import validate_resolved_url
+                    from markbot.utils.ssrf import validate_resolved_url
 
                     redir_ok, redir_err = validate_resolved_url(str(r.url))
                     if not redir_ok:

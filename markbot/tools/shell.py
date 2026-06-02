@@ -221,7 +221,7 @@ class ExecTool(Tool):
 
     def _validate_curl_wget_urls(self, command: str) -> str | None:
         """Validate URLs in curl/wget commands target only external hosts."""
-        from markbot.utils.network import contains_internal_url
+        from markbot.utils.ssrf import contains_internal_url
 
         lower = command.lower()
         if not (lower.startswith("curl") or lower.startswith("wget")):
