@@ -20,6 +20,7 @@ from typing import Any
 
 from loguru import logger
 
+from markbot.utils.atomic import FileLock, atomic_write_json
 from markbot.utils.constants import USER_FILENAME
 from markbot.utils.helpers import ensure_dir
 
@@ -147,26 +148,35 @@ class HandoffManager:
     def _handoff_path(self, session_key: str) -> Path:
         return self._handoff_dir / self._session_key_to_filename(session_key)
 
+    def _lock_for(self, session_key: str) -> FileLock:
+        """Return a per-session-key file lock.
+
+        Different session keys get independent locks, so parallel
+        saves to distinct sessions do not contend. The lock is
+        re-created cheaply on each call (it only opens a file
+        handle on ``__enter__``).
+        """
+        return FileLock(self._handoff_path(session_key))
+
     def save(self, handoff: SessionHandoff) -> Path:
         path = self._handoff_path(handoff.session_key)
-        path.write_text(
-            json.dumps(handoff.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with self._lock_for(handoff.session_key):
+            atomic_write_json(path, handoff.to_dict())
         logger.info("Saved handoff for session {}", handoff.session_key)
         return path
 
     def load(self, session_key: str) -> SessionHandoff | None:
         path = self._handoff_path(session_key)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            handoff = SessionHandoff.from_dict(data)
-            return handoff
-        except Exception as e:
-            logger.warning("Failed to load handoff for {}: {}", session_key, e)
-            return None
+        with self._lock_for(session_key):
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                handoff = SessionHandoff.from_dict(data)
+                return handoff
+            except Exception as e:
+                logger.warning("Failed to load handoff for {}: {}", session_key, e)
+                return None
 
     def load_markdown(self, session_key: str) -> str | None:
         handoff = self.load(session_key)
@@ -176,9 +186,10 @@ class HandoffManager:
 
     def delete(self, session_key: str) -> None:
         path = self._handoff_path(session_key)
-        if path.exists():
-            path.unlink()
-            logger.debug("Deleted handoff for {}", session_key)
+        with self._lock_for(session_key):
+            if path.exists():
+                path.unlink()
+                logger.debug("Deleted handoff for {}", session_key)
 
     def cleanup_stale(self) -> int:
         now = time.time()
