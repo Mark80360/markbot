@@ -11,7 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.providers.errors import ErrorType
+from markbot.providers.errors import ErrorType, classify_error
 
 
 @dataclass
@@ -84,21 +84,6 @@ class LLMProvider(ABC):
     """
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _TRANSIENT_ERROR_MARKERS = (
-        "429",
-        "529",
-        "rate limit",
-        "500",
-        "502",
-        "503",
-        "504",
-        "overloaded",
-        "timeout",
-        "timed out",
-        "connection",
-        "server error",
-        "temporarily unavailable",
-    )
 
     _SENTINEL = object()
 
@@ -197,11 +182,6 @@ class LLMProvider(ABC):
         """
         pass
 
-    @classmethod
-    def _is_transient_error(cls, content: str | None) -> bool:
-        err = (content or "").lower()
-        return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
-
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
@@ -231,7 +211,11 @@ class LLMProvider(ABC):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            return LLMResponse(
+                content=f"Error calling LLM: {exc}",
+                finish_reason="error",
+                error_type=classify_error(None, repr(exc)),
+            )
 
     async def chat_stream(
         self,
@@ -267,7 +251,11 @@ class LLMProvider(ABC):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            return LLMResponse(
+                content=f"Error calling LLM: {exc}",
+                finish_reason="error",
+                error_type=classify_error(None, repr(exc)),
+            )
 
     async def chat_stream_with_retry(
         self,
@@ -301,7 +289,7 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
 
-            if not self._is_transient_error(response.content):
+            if response.error_type != ErrorType.TRANSIENT:
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
@@ -352,7 +340,7 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
 
-            if not self._is_transient_error(response.content):
+            if response.error_type != ErrorType.TRANSIENT:
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
