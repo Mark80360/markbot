@@ -9,11 +9,10 @@ per deployment.
 from __future__ import annotations
 
 import ipaddress
-import socket
-from urllib.parse import urlparse
+import socket  # noqa: F401  (reserved for _resolve_hostname, Task 3)
+from urllib.parse import urlparse  # noqa: F401  (reserved for validate_url_target, Task 3)
 
 from markbot.config.schema import Config
-
 
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset()
 _ALWAYS_BLOCKED_IPS: tuple[ipaddress._BaseAddress, ...] = ()
