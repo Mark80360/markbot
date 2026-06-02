@@ -169,7 +169,7 @@ def start_daemon(port: int, workspace: str | None, config_path: str | None, verb
     """Start the gateway as a daemon process (cross-platform)."""
     from rich.text import Text
 
-    from markbot.cli.commands import _run_gateway_foreground
+    from markbot.cli.groups.gateway import run_gateway_foreground
 
     ensure_pid_dir()
     paths = _gateway_paths()
@@ -258,7 +258,7 @@ def start_daemon(port: int, workspace: str | None, config_path: str | None, verb
             os.dup2(log_file.fileno(), sys.stdout.fileno())
             os.dup2(log_file.fileno(), sys.stderr.fileno())
         try:
-            _run_gateway_foreground(port, workspace, config_path, verbose)
+            run_gateway_foreground(port, workspace, config_path, verbose)
         except Exception as e:
             print(f"Gateway failed: {e}", file=sys.stderr)
             sys.exit(1)
