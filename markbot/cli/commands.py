@@ -2,13 +2,9 @@
 
 import asyncio
 import os
-import select
-import signal
 import sys
-from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -22,13 +18,8 @@ if sys.platform == "win32":
             pass
 
 import typer
-from prompt_toolkit import print_formatted_text
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from markbot import __logo__, __version__
-from markbot.cli.skills import app as skills_app
 from markbot.cli.daemon import (
     _gateway_paths,
     is_process_running,
@@ -36,25 +27,14 @@ from markbot.cli.daemon import (
     remove_pid,
     start_daemon,
     terminate_process,
-    write_pid,
 )
-from markbot.cli.runtime import _onboard_plugins, load_runtime_config, make_provider
-from markbot.cli.stream import StreamRenderer, ThinkingSpinner
-from markbot.cli.ui import (
-    PROMPT_SESSION,
-    console,
-    flush_pending_tty_input,
-    init_prompt_session,
-    is_exit_command,
-    make_console,
-    markbot_banner,
-    print_agent_response,
-    print_cli_progress_line,
-    render_interactive_ansi,
-    response_renderable,
-    restore_terminal,
-)
-from markbot.config.paths import get_cron_dir, get_gateway_dir, get_logs_dir, get_workspace_path
+from markbot.cli.doctor import doctor_app
+from markbot.cli.groups import agent, onboard
+from markbot.cli.runtime import make_provider
+from markbot.cli.ui import console, markbot_banner
+from markbot.cli.autopilot import app as autopilot_app
+from markbot.cli.skills import app as skills_app
+from markbot.config.paths import get_cron_dir
 from markbot.config.schema import Config
 from markbot.utils.helpers import sync_workspace_templates
 
@@ -69,144 +49,18 @@ app = typer.Typer(
 app.add_typer(skills_app, name="skills")
 
 # Add autopilot pipeline subcommands
-from markbot.cli.autopilot import app as autopilot_app
 app.add_typer(autopilot_app, name="autopilot")
 
 # Add doctor diagnostic subcommand
-from markbot.cli.doctor import doctor_app
 app.add_typer(doctor_app, name="doctor")
 
+# Add agent + onboard subcommands (moved from this file in P1-1)
+app.add_typer(agent.app, name="agent")
+app.add_typer(onboard.app, name="onboard")
+
 # ---------------------------------------------------------------------------
-# Interactive-mode helpers (prompt_toolkit-driven) used by the ``agent``
-# command. These stay in commands.py for now; they will move with the
-# agent group in the next refactor pass.
+# version_callback + main callback
 # ---------------------------------------------------------------------------
-
-
-async def _print_interactive_line(text: str) -> None:
-    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        ansi = render_interactive_ansi(
-            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-async def _print_interactive_response(
-    response: str,
-    render_markdown: bool,
-    metadata: dict | None = None,
-) -> None:
-    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        content = response or ""
-        ansi = render_interactive_ansi(
-            lambda c: (
-                c.print(),
-                c.print(f"[cyan]{__logo__} MarkBot[/cyan]"),
-                c.print(response_renderable(content, render_markdown, metadata)),
-                c.print(),
-            )
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print an interactive progress line, pausing the spinner if needed."""
-    with thinking.pause() if thinking else nullcontext():
-        await _print_interactive_line(text)
-
-
-async def _read_interactive_input_async() -> str:
-    """Read user input using prompt_toolkit (handles paste, history, display).
-
-    prompt_toolkit natively handles:
-    - Multiline paste (bracketed paste mode)
-    - History navigation (up/down arrows)
-    - Clean display (no ghost characters or artifacts)
-    """
-    if PROMPT_SESSION is None:
-        raise RuntimeError("Call init_prompt_session() first")
-    try:
-        with patch_stdout():
-            return await PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblue'>❯</b> "),
-            )
-    except EOFError as exc:
-        raise KeyboardInterrupt from exc
-
-
-async def _print_interactive_line(text: str) -> None:
-    """Print async interactive updates with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        ansi = _render_interactive_ansi(
-            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-async def _print_interactive_response(
-    response: str,
-    render_markdown: bool,
-    metadata: dict | None = None,
-) -> None:
-    """Print async interactive replies with prompt_toolkit-safe Rich styling."""
-    def _write() -> None:
-        content = response or ""
-        ansi = _render_interactive_ansi(
-            lambda c: (
-                c.print(),
-                c.print(f"[cyan]{__logo__} MarkBot[/cyan]"),
-                c.print(_response_renderable(content, render_markdown, metadata)),
-                c.print(),
-            )
-        )
-        print_formatted_text(ANSI(ansi), end="")
-
-    await run_in_terminal(_write)
-
-
-def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print a CLI progress line, pausing the spinner if needed."""
-    with thinking.pause() if thinking else nullcontext():
-        console.print(f"  [dim]↳ {text}[/dim]")
-
-
-async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
-    """Print an interactive progress line, pausing the spinner if needed."""
-    with thinking.pause() if thinking else nullcontext():
-        await _print_interactive_line(text)
-
-
-def _is_exit_command(command: str) -> bool:
-    """Return True when input should end interactive chat."""
-    return command.lower() in EXIT_COMMANDS
-
-
-async def _read_interactive_input_async() -> str:
-    """Read user input using prompt_toolkit (handles paste, history, display).
-
-    prompt_toolkit natively handles:
-    - Multiline paste (bracketed paste mode)
-    - History navigation (up/down arrows)
-    - Clean display (no ghost characters or artifacts)
-    """
-    if _PROMPT_SESSION is None:
-        raise RuntimeError("Call _init_prompt_session() first")
-    try:
-        with patch_stdout():
-            return await _PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblue'>❯</b> "),
-            )
-    except EOFError as exc:
-        raise KeyboardInterrupt from exc
-
 
 
 def version_callback(value: bool):
@@ -223,141 +77,6 @@ def main(
 ):
     """MarkBot - Personal AI Assistant."""
     pass
-
-
-# ============================================================================
-# Onboard / Setup
-# ============================================================================
-
-
-@app.command()
-def onboard(
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-    wizard: bool = typer.Option(False, "--wizard", help="Use interactive menu-driven wizard"),
-    guided: bool = typer.Option(False, "--guided", help="Use linear step-by-step guided setup (recommended for first-time users)"),
-    defaults: bool = typer.Option(False, "--defaults", help="Use all default values (non-interactive, for scripts/Docker)"),
-):
-    """Initialize MarkBot configuration and workspace."""
-    from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
-    from markbot.config.schema import Config
-
-    _markbot_banner()
-    console.print()
-
-    if config:
-        config_path = Path(config).expanduser().resolve()
-        set_config_path(config_path)
-        console.print(f"[dim]Using config: {config_path}[/dim]")
-    else:
-        config_path = get_config_path()
-
-    def _apply_workspace_override(loaded: Config) -> Config:
-        if workspace:
-            loaded.agents.defaults.workspace = workspace
-        return loaded
-
-    # --defaults mode: create config with all defaults, no interaction
-    if defaults:
-        config_obj = _apply_workspace_override(Config())
-        save_config(config_obj, config_path)
-        console.print(f"[green]✓[/green] Created default config at {config_path}")
-        _onboard_plugins(config_path)
-
-        workspace_path = get_workspace_path(config_obj.workspace_path)
-        if not workspace_path.exists():
-            workspace_path.mkdir(parents=True, exist_ok=True)
-            console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
-        sync_workspace_templates(workspace_path)
-
-        console.print(f"\n{__logo__} Default configuration created!")
-        console.print(f"  Edit config: [cyan]{config_path}[/cyan]")
-        console.print(f"  Run guided setup: [cyan]markbot onboard --guided[/cyan]")
-        return
-
-    # Create or update config
-    is_interactive = wizard or guided
-    if config_path.exists():
-        if is_interactive:
-            config_obj = _apply_workspace_override(load_config(config_path))
-        else:
-            console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-            console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-            console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
-            if typer.confirm("Overwrite?"):
-                config_obj = _apply_workspace_override(Config())
-                save_config(config_obj, config_path)
-                console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
-            else:
-                config_obj = _apply_workspace_override(load_config(config_path))
-                save_config(config_obj, config_path)
-                console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
-    else:
-        config_obj = _apply_workspace_override(Config())
-        if not is_interactive:
-            save_config(config_obj, config_path)
-            console.print(f"[green]✓[/green] Created config at {config_path}")
-
-    # Run interactive wizard if enabled
-    if wizard:
-        from markbot.cli.onboard import run_onboard
-
-        try:
-            result = run_onboard(initial_config=config_obj)
-            if not result.should_save:
-                console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
-                return
-
-            config_obj = result.config
-            save_config(config_obj, config_path)
-            console.print(f"[green]✓[/green] Config saved at {config_path}")
-        except Exception as e:
-            console.print(f"[red]✗[/red] Error during configuration: {e}")
-            console.print("[yellow]Please run 'markbot onboard' again to complete setup.[/yellow]")
-            raise typer.Exit(1)
-
-    # Run guided onboarding if enabled
-    if guided:
-        from markbot.cli.onboard import run_guided_onboard
-
-        try:
-            result = run_guided_onboard(initial_config=config_obj)
-            if not result.should_save:
-                console.print("[yellow]Configuration discarded. No changes were saved.[/yellow]")
-                return
-
-            config_obj = result.config
-            save_config(config_obj, config_path)
-            console.print(f"[green]✓[/green] Config saved at {config_path}")
-        except Exception as e:
-            console.print(f"[red]✗[/red] Error during configuration: {e}")
-            console.print("[yellow]Please run 'markbot onboard --guided' again to complete setup.[/yellow]")
-            raise typer.Exit(1)
-
-    _onboard_plugins(config_path)
-
-    # Create workspace, preferring the configured workspace path.
-    workspace_path = get_workspace_path(config_obj.workspace_path)
-    if not workspace_path.exists():
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
-
-    sync_workspace_templates(workspace_path)
-
-    agent_cmd = 'markbot agent -m "Hello!"'
-    gateway_cmd = "markbot gateway"
-    if config:
-        agent_cmd += f" --config {config_path}"
-        gateway_cmd += f" --config {config_path}"
-
-    console.print(f"\n{__logo__} I'm ready!")
-    console.print("\nNext steps:")
-    if is_interactive:
-        console.print(f"  1. Chat: [cyan]{agent_cmd}[/cyan]")
-        console.print(f"  2. Start gateway: [cyan]{gateway_cmd}[/cyan]")
-    else:
-        console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
-        console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
 
 
 # ============================================================================
@@ -628,255 +347,6 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
 # ============================================================================
 # Agent Commands
 # ============================================================================
-
-
-@app.command()
-def agent(
-    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show MarkBot runtime logs during chat"),
-):
-    """Interact with the agent directly."""
-    import time
-    from loguru import logger
-
-    from markbot.agent.loop import AgentLoop
-    from markbot.bus.queue import MessageBus
-    from markbot.log.core import setup_logging
-    from markbot.schedule.cron import CronService
-
-    _gateway_paths()["agent_log_dir"].mkdir(parents=True, exist_ok=True)
-    setup_logging(
-        console_level="DEBUG" if logs else "ERROR",
-        log_file=_gateway_paths()["agent_log_file"],
-    )
-
-    _cmd_start = time.time()
-    logger.info("agent command starting...")
-
-    _t0 = time.time()
-    config = load_runtime_config(config, workspace)
-    logger.debug("Config loaded, took {:.3f}s", time.time() - _t0)
-
-    _t0 = time.time()
-    sync_workspace_templates(config.workspace_path)
-    logger.debug("Workspace templates synced, took {:.3f}s", time.time() - _t0)
-
-    _t0 = time.time()
-    bus = MessageBus()
-    logger.debug("MessageBus created, took {:.3f}s", time.time() - _t0)
-
-    _t0 = time.time()
-    provider = make_provider(config)
-    logger.debug("Provider created, took {:.3f}s", time.time() - _t0)
-
-    cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-    cron = CronService(cron_store_path)
-
-    _t0 = time.time()
-    logger.info("Creating AgentLoop...")
-    import time as _cli_time
-    _cli_t0 = _cli_time.time()
-    agent_loop = AgentLoop(
-        ctx_or_bus=bus,
-        fallback_manager=provider,
-        config=config,
-        workspace=config.workspace_path,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        filesystem_config=config.tools.filesystem,
-        memory_config=config.tools.memory,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-        compaction_config=config.compaction,
-        max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
-        warn_threshold_usd=config.budget.warn_threshold_usd,
-        budget_config=config.budget if config.budget.enabled else None,
-    )
-    _cli_elapsed = _cli_time.time() - _cli_t0
-    logger.info("AgentLoop created, took {:.3f}s", time.time() - _t0)
-    if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
-        logger.info("AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
-    else:
-        logger.warning("No timing data available from AgentContext")
-
-    # Shared reference for progress callbacks
-    _thinking: ThinkingSpinner | None = None
-
-    async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
-        ch = agent_loop.channels_config
-        if ch and tool_hint and not ch.send_tool_hints:
-            return
-        if ch and not tool_hint and not ch.send_progress:
-            return
-        _print_cli_progress_line(content, _thinking)
-
-    if message:
-        # Single message mode — direct call, no bus needed
-        async def run_once():
-            renderer = StreamRenderer(render_markdown=markdown)
-            response = await agent_loop.process_direct(
-                message, session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
-            if not renderer.streamed:
-                await renderer.close()
-                _print_agent_response(
-                    response.content if response else "",
-                    render_markdown=markdown,
-                    metadata=response.metadata if response else None,
-                )
-            await agent_loop.close_mcp()
-
-        asyncio.run(run_once())
-    else:
-        # Interactive mode — route through bus like other channels
-        from markbot.bus.events import InboundMessage
-        _init_prompt_session()
-
-        _markbot_banner()
-        console.print(f"{__logo__} MarkBot v{__version__} (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
-
-        if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
-        else:
-            cli_channel, cli_chat_id = "cli", session_id
-
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
-            _restore_terminal()
-            # console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-
-        async def run_interactive():
-            bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            turn_response: list[tuple[str, dict]] = []
-            renderer: StreamRenderer | None = None
-
-            async def _consume_outbound():
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-
-                        if msg.metadata.get("_stream_delta"):
-                            if renderer:
-                                await renderer.on_delta(msg.content)
-                            continue
-                        if msg.metadata.get("_stream_end"):
-                            if renderer:
-                                await renderer.on_end(
-                                    resuming=msg.metadata.get("_resuming", False),
-                                )
-                            continue
-                        if msg.metadata.get("_streamed"):
-                            turn_done.set()
-                            continue
-
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
-                            continue
-
-                        if not turn_done.is_set():
-                            if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
-                            turn_done.set()
-                        elif msg.content:
-                            await _print_interactive_response(
-                                msg.content,
-                                render_markdown=markdown,
-                                metadata=msg.metadata,
-                            )
-
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
-
-            outbound_task = asyncio.create_task(_consume_outbound())
-
-            try:
-                while True:
-                    try:
-                        _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
-                        command = user_input.strip()
-                        if not command:
-                            continue
-
-                        if _is_exit_command(command):
-                            _restore_terminal()
-                            console.print("\nGoodbye!")
-                            break
-
-                        turn_done.clear()
-                        turn_response.clear()
-                        renderer = StreamRenderer(render_markdown=markdown)
-
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_wants_stream": True},
-                        ))
-
-                        await turn_done.wait()
-
-                        if turn_response:
-                            content, meta = turn_response[0]
-                            if content and not meta.get("_streamed"):
-                                if renderer:
-                                    await renderer.close()
-                                _print_agent_response(
-                                    content, render_markdown=markdown, metadata=meta,
-                                )
-                        elif renderer and not renderer.streamed:
-                            await renderer.close()
-                    except KeyboardInterrupt:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-                    except EOFError:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-            finally:
-                agent_loop.stop()
-                outbound_task.cancel()
-                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
-
-        asyncio.run(run_interactive())
 
 
 @gateway_app.command("stop")
