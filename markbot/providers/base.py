@@ -1,5 +1,7 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from abc import ABC, abstractmethod
@@ -8,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+
+from markbot.providers.errors import ErrorType
 
 
 @dataclass
@@ -48,7 +52,8 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+    error_type: ErrorType | None = None
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
