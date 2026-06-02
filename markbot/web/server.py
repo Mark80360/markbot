@@ -58,8 +58,8 @@ def _build_app():
         config = load_config()
         bus = MessageBus()
 
-        from markbot.cli.commands import _make_provider
-        provider = _make_provider(config)
+        from markbot.cli.runtime import make_provider
+        provider = make_provider(config)
 
         cron_store_path = Path(config.workspace_path) / ".cron" / "jobs.json"
         cron = CronService(cron_store_path)

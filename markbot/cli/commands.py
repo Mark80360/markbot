@@ -29,6 +29,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from markbot import __logo__, __version__
 from markbot.cli.skills import app as skills_app
+from markbot.cli.runtime import _onboard_plugins, load_runtime_config, make_provider
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.cli.ui import (
     PROMPT_SESSION,
@@ -358,106 +359,6 @@ def onboard(
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
 
 
-def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
-    """Recursively fill in missing values from defaults without overwriting user config."""
-    if not isinstance(existing, dict) or not isinstance(defaults, dict):
-        return existing
-
-    merged = dict(existing)
-    for key, value in defaults.items():
-        if key not in merged:
-            merged[key] = value
-        else:
-            merged[key] = _merge_missing_defaults(merged[key], value)
-    return merged
-
-
-def _onboard_plugins(config_path: Path) -> None:
-    """Inject default config for all discovered channels (built-in + plugins)."""
-    import json
-
-    from markbot.channels.discovery import discover_all
-
-    all_channels = discover_all()
-    if not all_channels:
-        return
-
-    with open(config_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    channels = data.setdefault("channels", {})
-    for name, cls in all_channels.items():
-        if name not in channels:
-            channels[name] = cls.default_config()
-        else:
-            channels[name] = _merge_missing_defaults(channels[name], cls.default_config())
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def _make_provider(config: Config):
-    """
-    Create fallback manager from config (V2).
-
-    Returns:
-        FallbackManager instance (replaces old single LLMProvider)
-    """
-    from markbot.providers import FallbackManager
-
-    if not config.agents.defaults.model_chain:
-        console.print("[red]Error: No models configured in modelChain.[/red]")
-        console.print("Run 'markbot onboard' to configure models.")
-        raise typer.Exit(1)
-
-    errors = config.validate_model_chain()
-    if errors:
-        console.print("[red]Configuration errors:[/red]")
-        for error in errors:
-            console.print(f"  • {error}")
-        raise typer.Exit(1)
-
-    return FallbackManager(config)
-
-
-def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
-    """Load config and optionally override the active workspace."""
-    from markbot.config.loader import load_config, set_config_path
-
-    config_path = None
-    if config:
-        config_path = Path(config).expanduser().resolve()
-        if not config_path.exists():
-            console.print(f"[red]Error: Config file not found: {config_path}[/red]")
-            raise typer.Exit(1)
-        set_config_path(config_path)
-        console.print(f"[dim]Using config: {config_path}[/dim]")
-
-    loaded = load_config(config_path)
-    _warn_deprecated_config_keys(config_path)
-    if workspace:
-        loaded.agents.defaults.workspace = workspace
-    return loaded
-
-
-def _warn_deprecated_config_keys(config_path: Path | None) -> None:
-    """Hint users to remove obsolete keys from their config file."""
-    import json
-
-    from markbot.config.loader import get_config_path
-
-    path = config_path or get_config_path()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if "memoryWindow" in raw.get("agents", {}).get("defaults", {}):
-        console.print(
-            "[dim]Hint: `memoryWindow` in your config is no longer used "
-            "and can be safely removed.[/dim]"
-        )
-
-
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -731,7 +632,7 @@ def _run_gateway_foreground(port: int, workspace: str | None, config: str | None
 
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
+    provider = make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
@@ -969,7 +870,7 @@ def agent(
     logger.info("agent command starting...")
 
     _t0 = time.time()
-    config = _load_runtime_config(config, workspace)
+    config = load_runtime_config(config, workspace)
     logger.debug("Config loaded, took {:.3f}s", time.time() - _t0)
 
     _t0 = time.time()
@@ -981,7 +882,7 @@ def agent(
     logger.debug("MessageBus created, took {:.3f}s", time.time() - _t0)
 
     _t0 = time.time()
-    provider = _make_provider(config)
+    provider = make_provider(config)
     logger.debug("Provider created, took {:.3f}s", time.time() - _t0)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"

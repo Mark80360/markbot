@@ -151,7 +151,7 @@ def tick(
     max_turns: Optional[int] = typer.Option(None, "--max-turns", help="Override max turns"),
 ):
     """Run the next queued autopilot task."""
-    from markbot.cli.commands import _load_runtime_config, _make_provider
+    from markbot.cli.runtime import load_runtime_config, make_provider
 
     ws = _resolve_workspace(workspace)
 
@@ -161,8 +161,8 @@ def tick(
     store = AutopilotStore(ws)
     service = AutopilotService(store)
 
-    runtime_config = _load_runtime_config(config, str(ws))
-    provider = _make_provider(runtime_config)
+    runtime_config = load_runtime_config(config, str(ws))
+    provider = make_provider(runtime_config)
 
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
