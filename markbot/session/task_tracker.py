@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from loguru import logger
 
+from markbot.utils.atomic import FileLock, atomic_write_json
 from markbot.utils.helpers import ensure_dir
 
 TaskStatus = Literal[
@@ -97,6 +98,7 @@ class TaskTracker:
         self._max_active_tasks = max(1, max_active_tasks)
         ensure_dir(self._tasks_dir)
         self._registry_path = self._tasks_dir / self._REGISTRY_FILE
+        self._lock = FileLock(self._registry_path)
         self._cache: dict[str, Task] | None = None
 
     def _load_registry(self) -> TaskRegistry:
@@ -122,47 +124,46 @@ class TaskTracker:
             "tasks": registry.tasks,
             "updated_at": registry.updated_at,
         }
-        self._registry_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(self._registry_path, data)
         self._cache = None
 
     def _invalidate_cache(self) -> None:
         self._cache = None
 
     def _get_task(self, task_id: str) -> Task | None:
-        if self._cache is not None and task_id in self._cache:
-            return self._cache[task_id]
-        registry = self._load_registry()
-        for t_dict in registry.tasks:
-            if t_dict.get("id") == task_id:
-                return Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
-        return None
+        with self._lock:
+            if self._cache is not None and task_id in self._cache:
+                return self._cache[task_id]
+            registry = self._load_registry()
+            for t_dict in registry.tasks:
+                if t_dict.get("id") == task_id:
+                    return Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+            return None
 
     def _save_task(self, task: Task) -> None:
-        registry = self._load_registry()
-        task.updated_at = time.time()
-        task_dict = asdict(task)
+        with self._lock:
+            registry = self._load_registry()
+            task.updated_at = time.time()
+            task_dict = asdict(task)
 
-        found = False
-        for i, t in enumerate(registry.tasks):
-            if t.get("id") == task.id:
-                registry.tasks[i] = task_dict
-                found = True
-                break
-        if not found:
-            registry.tasks.append(task_dict)
+            found = False
+            for i, t in enumerate(registry.tasks):
+                if t.get("id") == task.id:
+                    registry.tasks[i] = task_dict
+                    found = True
+                    break
+            if not found:
+                registry.tasks.append(task_dict)
 
-        if task.status == "in_progress":
-            registry.active_task_id = task.id
-        elif registry.active_task_id == task.id and task.status != "in_progress":
-            registry.active_task_id = None
+            if task.status == "in_progress":
+                registry.active_task_id = task.id
+            elif registry.active_task_id == task.id and task.status != "in_progress":
+                registry.active_task_id = None
 
-        self._save_registry(registry)
-        if self._cache is None:
-            self._cache = {}
-        self._cache[task.id] = task
+            self._save_registry(registry)
+            if self._cache is None:
+                self._cache = {}
+            self._cache[task.id] = task
 
     def create_task(
         self,
@@ -261,14 +262,15 @@ class TaskTracker:
         return self.transition(task_id, "cancelled", **kwargs)
 
     def list_all(self) -> list[Task]:
-        registry = self._load_registry()
-        tasks: list[Task] = []
-        for t_dict in registry.tasks:
-            try:
-                tasks.append(Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__}))
-            except Exception:
-                pass
-        return sorted(tasks, key=lambda t: (-t.priority, -t.updated_at))
+        with self._lock:
+            registry = self._load_registry()
+            tasks: list[Task] = []
+            for t_dict in registry.tasks:
+                try:
+                    tasks.append(Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__}))
+                except Exception:
+                    pass
+            return sorted(tasks, key=lambda t: (-t.priority, -t.updated_at))
 
     def list_active(self) -> list[Task]:
         return [t for t in self.list_all() if t.status in ("in_progress", "verifying")]
@@ -301,15 +303,16 @@ class TaskTracker:
     def cleanup_completed(self, max_age_days: int = 30) -> int:
         now = time.time()
         cutoff = now - max_age_days * 86400
-        registry = self._load_registry()
-        before = len(registry.tasks)
-        registry.tasks = [
-            t for t in registry.tasks
-            if t.get("status") not in ("done", "cancelled")
-            or (t.get("completed_at") or t.get("updated_at", 0)) > cutoff
-        ]
-        removed = before - len(registry.tasks)
-        if removed > 0:
-            self._save_registry(registry)
-            logger.info("Cleaned up {} completed tasks", removed)
-        return removed
+        with self._lock:
+            registry = self._load_registry()
+            before = len(registry.tasks)
+            registry.tasks = [
+                t for t in registry.tasks
+                if t.get("status") not in ("done", "cancelled")
+                or (t.get("completed_at") or t.get("updated_at", 0)) > cutoff
+            ]
+            removed = before - len(registry.tasks)
+            if removed > 0:
+                self._save_registry(registry)
+                logger.info("Cleaned up {} completed tasks", removed)
+            return removed
