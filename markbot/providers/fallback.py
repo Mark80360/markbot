@@ -8,6 +8,7 @@ from loguru import logger
 
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.providers.base import LLMProvider, LLMResponse
+from markbot.providers.errors import ErrorType, classify_error
 
 
 @dataclass
@@ -53,22 +54,6 @@ class FallbackManager:
         response = await manager.chat_with_fallback(messages, tools)
     """
 
-    MODEL_UNAVAILABLE_ERRORS = (
-        "402", "insufficient balance", "insufficient_quota", "quota exceeded",
-        "401", "unauthorized", "invalid api key", "authentication",
-        "403", "forbidden", "access denied",
-        "model not found", "model_not_found",
-        "invalid function arguments", "invalid params",
-    )
-
-    _TRANSIENT_ERROR_MARKERS = (
-        "timeout", "timed out", "connection", "rate limit", "rate_limit",
-        "too many requests", "server error", "internal server error",
-        "service unavailable", "overloaded", "capacity", "busy",
-        "try again", "retry", "503", "502", "504", "529",
-        "temporarily unavailable", "throttle",
-    )
-
     DEFAULT_CIRCUIT_THRESHOLD = 6
     DEFAULT_CIRCUIT_COOLDOWN = 60.0
 
@@ -78,13 +63,6 @@ class FallbackManager:
         self._circuits: dict[str, CircuitState] = {}
         self._circuit_threshold = self.DEFAULT_CIRCUIT_THRESHOLD
         self._circuit_cooldown = self.DEFAULT_CIRCUIT_COOLDOWN
-
-    @staticmethod
-    def _is_retryable_error(error: Exception | str) -> bool:
-        err_str = str(error).lower()
-        if not err_str or err_str.isspace():
-            return True
-        return any(marker in err_str for marker in FallbackManager._TRANSIENT_ERROR_MARKERS)
 
     def _get_circuit(self, provider_name: str) -> CircuitState:
         if provider_name not in self._circuits:
@@ -126,11 +104,6 @@ class FallbackManager:
                 "{} circuit OPEN ({} consecutive failures)",
                 provider_name, circuit.failure_count,
             )
-
-    @staticmethod
-    def _is_model_unavailable_error(error: Exception | str) -> bool:
-        err_str = str(error).lower()
-        return any(marker in err_str for marker in FallbackManager.MODEL_UNAVAILABLE_ERRORS)
 
     def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
         cache_key = provider_name
@@ -219,12 +192,12 @@ class FallbackManager:
                     )
                     attempts.append(attempt)
 
-                    if self._is_retryable_error(error_msg):
+                    if response.error_type == ErrorType.TRANSIENT:
                         logger.warning(
                             "Model {} returned error (retryable): {}. Trying next...",
                             model_ref, error_msg,
                         )
-                    elif self._is_model_unavailable_error(error_msg):
+                    elif response.error_type == ErrorType.UNAVAILABLE:
                         logger.warning(
                             "Model {} unavailable: {}. Trying next...",
                             model_ref, error_msg,
@@ -277,12 +250,13 @@ class FallbackManager:
                 )
                 attempts.append(attempt)
 
-                if self._is_retryable_error(e):
+                err_type = classify_error(None, str(e))
+                if err_type == ErrorType.TRANSIENT:
                     logger.warning(
                         "Model {} failed (retryable): {}. Trying next...",
                         model_ref, e,
                     )
-                elif self._is_model_unavailable_error(e):
+                elif err_type == ErrorType.UNAVAILABLE:
                     logger.warning(
                         "Model {} unavailable: {}. Trying next...", model_ref, e,
                     )
