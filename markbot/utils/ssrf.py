@@ -104,4 +104,45 @@ def validate_url_target(url: str, allow_private: bool = False) -> tuple[bool, st
     return True, ""
 
 
-__all__ = ["init_from_config", "validate_url_target"]
+def validate_resolved_url(url: str, allow_private: bool = False) -> tuple[bool, str]:
+    """Validate an already-fetched URL (e.g. after a redirect).
+
+    Skips DNS resolution for IP literal URLs. For domain hostnames,
+    resolves and checks. Used for post-redirect SSRF protection in
+    browser.py.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return True, ""
+
+    hostname = parsed.hostname
+    if not hostname:
+        return True, ""
+
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        ips = _resolve_hostname(hostname)
+        if not ips:
+            return True, ""
+        for ip in ips:
+            if ip in _ALWAYS_BLOCKED_IPS:
+                return False, f"Blocked: redirect target {hostname} resolves to cloud metadata IP {ip}"
+        if not allow_private:
+            for ip in ips:
+                for network in _PRIVATE_NETWORKS:
+                    if ip in network:
+                        return False, f"Blocked: redirect target {hostname} resolves to private address {ip}"
+        return True, ""
+
+    if addr in _ALWAYS_BLOCKED_IPS:
+        return False, f"Blocked: redirect target is cloud metadata IP {addr}"
+    if not allow_private:
+        for network in _PRIVATE_NETWORKS:
+            if addr in network:
+                return False, f"Blocked: redirect target is private address {addr}"
+    return True, ""
+
+
+__all__ = ["init_from_config", "validate_url_target", "validate_resolved_url"]

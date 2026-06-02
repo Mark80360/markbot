@@ -129,3 +129,38 @@ class TestValidateUrlTargetAllowPrivate:
             "http://metadata.google.internal/foo", allow_private=True
         )
         assert ok is False
+
+
+class TestValidateResolvedUrl:
+    def test_public_ip_ok(self):
+        ok, err = ssrf.validate_resolved_url("https://93.184.216.34/page")
+        assert ok is True
+
+    def test_private_ip_blocked(self):
+        ok, err = ssrf.validate_resolved_url("http://127.0.0.1/page")
+        assert ok is False
+        assert "private" in err.lower() or "blocked" in err.lower()
+
+    def test_no_hostname_passes(self):
+        ok, err = ssrf.validate_resolved_url("https:///path")
+        assert ok is True
+
+    def test_metadata_ip_blocked_post_redirect(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))],
+        )
+        ok, err = ssrf.validate_resolved_url("https://example.com/redirect")
+        assert ok is False
+
+    def test_allow_private_bypasses_private_network(self):
+        ok, err = ssrf.validate_resolved_url("http://10.0.0.1/page", allow_private=True)
+        assert ok is True
+
+    def test_always_blocked_not_bypassed_by_allow_private(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("100.100.100.200", 0))],
+        )
+        ok, err = ssrf.validate_resolved_url("http://100.100.100.200/page", allow_private=True)
+        assert ok is False
