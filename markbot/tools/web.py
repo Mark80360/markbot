@@ -431,7 +431,7 @@ class WebFetchTool(Tool):
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
 
-            from markbot.utils.network import validate_resolved_url
+            from markbot.utils.ssrf import validate_resolved_url
             redir_ok, redir_err = validate_resolved_url(str(r.url))
             if not redir_ok:
                 return json.dumps({"error": f"Redirect blocked: {redir_err}", "url": url}, ensure_ascii=False)
