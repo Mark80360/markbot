@@ -3,6 +3,7 @@
 import pytest
 
 from markbot.providers.base import LLMResponse, ToolCallRequest
+from markbot.providers.errors import ErrorType, classify_error
 from markbot.providers.fallback import (
     CircuitState,
     FallbackAttempt,
@@ -86,24 +87,29 @@ class TestFallbackAttempt:
 
 
 class TestFallbackManager:
-    def test_is_retryable_error_timeout(self):
-        assert FallbackManager._is_retryable_error("connection timeout") is True
+    def test_classify_timeout_is_transient(self):
+        assert classify_error(None, "connection timeout") == ErrorType.TRANSIENT
 
-    def test_is_retryable_error_rate_limit(self):
-        assert FallbackManager._is_retryable_error("rate limit exceeded") is True
+    def test_classify_rate_limit_is_transient(self):
+        assert classify_error(None, "rate limit exceeded") == ErrorType.TRANSIENT
 
-    def test_is_retryable_error_503(self):
-        assert FallbackManager._is_retryable_error("503 service unavailable") is True
+    def test_classify_503_is_transient(self):
+        assert classify_error(503, "service unavailable") == ErrorType.TRANSIENT
 
-    def test_is_not_retryable_error(self):
-        assert FallbackManager._is_retryable_error("invalid api key") is False
+    def test_classify_invalid_api_key_is_unavailable(self):
+        assert classify_error(None, "invalid api key") == ErrorType.UNAVAILABLE
 
-    def test_is_model_unavailable_error(self):
-        mgr = FallbackManager.__new__(FallbackManager)
-        assert mgr._is_model_unavailable_error("402 insufficient balance") is True
-        assert mgr._is_model_unavailable_error("401 unauthorized") is True
-        assert mgr._is_model_unavailable_error("model not found") is True
-        assert mgr._is_model_unavailable_error("timeout") is False
+    def test_classify_402_is_unavailable(self):
+        assert classify_error(402, "insufficient balance") == ErrorType.UNAVAILABLE
+
+    def test_classify_401_is_unavailable(self):
+        assert classify_error(401, "unauthorized") == ErrorType.UNAVAILABLE
+
+    def test_classify_model_not_found_is_unavailable(self):
+        assert classify_error(None, "model not found") == ErrorType.UNAVAILABLE
+
+    def test_classify_unknown_message_is_unknown(self):
+        assert classify_error(None, "totally unrecognised error") == ErrorType.UNKNOWN
 
     def test_circuit_breaker_flow(self):
         mgr = FallbackManager.__new__(FallbackManager)
