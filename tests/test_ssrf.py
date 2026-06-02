@@ -164,3 +164,55 @@ class TestValidateResolvedUrl:
         )
         ok, err = ssrf.validate_resolved_url("http://100.100.100.200/page", allow_private=True)
         assert ok is False
+
+
+class TestContainsInternalUrl:
+    def test_no_urls_returns_false(self):
+        assert ssrf.contains_internal_url("echo hello") is False
+
+    def test_public_url_returns_false(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))],
+        )
+        assert ssrf.contains_internal_url("curl https://example.com") is False
+
+    def test_internal_url_returns_true(self):
+        assert ssrf.contains_internal_url("curl http://127.0.0.1/admin") is True
+
+    def test_multiple_urls_one_internal(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))],
+        )
+        result = ssrf.contains_internal_url("curl https://example.com http://10.0.0.1")
+        assert result is True
+
+    def test_allowed_ip_whitelist(self):
+        result = ssrf.contains_internal_url(
+            "curl http://10.0.0.1/api",
+            allowed_ips=["10.0.0.1"],
+        )
+        assert result is False
+
+    def test_allowed_network_whitelist(self):
+        result = ssrf.contains_internal_url(
+            "curl http://10.0.0.5/api",
+            allowed_ips=["10.0.0.0/24"],
+        )
+        assert result is False
+
+    def test_ip_not_in_whitelist(self):
+        result = ssrf.contains_internal_url(
+            "curl http://10.0.0.1/api",
+            allowed_ips=["192.168.1.0/24"],
+        )
+        assert result is True
+
+    def test_allow_private_bypasses_private_check(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))],
+        )
+        result = ssrf.contains_internal_url("curl http://10.0.0.1/api", allow_private=True)
+        assert result is False

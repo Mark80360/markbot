@@ -9,6 +9,7 @@ per deployment.
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -87,9 +88,12 @@ def validate_url_target(url: str, allow_private: bool = False) -> tuple[bool, st
     if hostname_lower in _BLOCKED_HOSTNAMES:
         return False, f"Blocked: hostname {hostname} is a cloud metadata endpoint"
 
-    ips = _resolve_hostname(hostname)
-    if not ips:
-        return False, f"Cannot resolve hostname: {hostname}"
+    try:
+        ips: list[ipaddress._BaseAddress] = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        ips = _resolve_hostname(hostname)
+        if not ips:
+            return False, f"Cannot resolve hostname: {hostname}"
 
     for ip in ips:
         if ip in _ALWAYS_BLOCKED_IPS:
@@ -145,4 +149,48 @@ def validate_resolved_url(url: str, allow_private: bool = False) -> tuple[bool, 
     return True, ""
 
 
-__all__ = ["init_from_config", "validate_url_target", "validate_resolved_url"]
+_URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
+
+
+def contains_internal_url(
+    command: str,
+    allowed_ips: list[str] | None = None,
+    allow_private: bool = False,
+) -> bool:
+    """Return True if *command* contains a URL targeting a private/internal address.
+
+    Args:
+        command: The command string to scan.
+        allowed_ips: Optional whitelist of IPs/CIDRs that bypass blocking.
+        allow_private: If True, private network URLs are not flagged.
+    """
+    allowed_networks: list[ipaddress._BaseNetwork] = []
+    if allowed_ips:
+        for s in allowed_ips:
+            try:
+                allowed_networks.append(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                try:
+                    addr = ipaddress.ip_address(s)
+                    allowed_networks.append(ipaddress.ip_network(str(addr), strict=False))
+                except ValueError:
+                    pass
+
+    for match in _URL_RE.finditer(command):
+        url = match.group(0)
+        ok, _ = validate_url_target(url, allow_private=allow_private)
+        if not ok:
+            try:
+                parsed = urlparse(url)
+                hostname = parsed.hostname
+                if hostname:
+                    addr = ipaddress.ip_address(hostname)
+                    if any(addr in net for net in allowed_networks):
+                        continue
+            except ValueError:
+                pass
+            return True
+    return False
+
+
+__all__ = ["init_from_config", "validate_url_target", "validate_resolved_url", "contains_internal_url"]
