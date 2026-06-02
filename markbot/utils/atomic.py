@@ -65,8 +65,9 @@ class FileLock:
                 str(self._lock_path),
                 mode="a",
                 timeout=self._timeout,
+                check_interval=0.1,
                 fail_when_locked=False,
-                flags=portalocker.LOCK_EX,
+                flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
             )
             lock.__enter__()
             self._fh = lock
