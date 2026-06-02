@@ -108,3 +108,24 @@ class TestValidateUrlTargetCloudMetadata:
         ok, err = ssrf.validate_url_target("http://100.100.100.200/latest/meta-data/")
         assert ok is False
         assert "metadata" in err.lower() or "blocked" in err.lower()
+
+
+class TestValidateUrlTargetAllowPrivate:
+    def test_allow_private_bypasses_private_network(self):
+        ok, err = ssrf.validate_url_target("http://10.0.0.1/api", allow_private=True)
+        assert ok is True
+        assert err == ""
+
+    def test_allow_private_does_not_bypass_always_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            "socket.getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))],
+        )
+        ok, err = ssrf.validate_url_target("http://169.254.169.254/foo", allow_private=True)
+        assert ok is False
+
+    def test_allow_private_does_not_bypass_blocked_hostname(self):
+        ok, err = ssrf.validate_url_target(
+            "http://metadata.google.internal/foo", allow_private=True
+        )
+        assert ok is False
