@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,12 +55,15 @@ class SkillTool(BaseTool):
     async def check_permission(
         self, params: dict[str, Any], context: ToolContext
     ) -> PermissionDecision:
+        base = await super().check_permission(params, context)
+        if base.behavior != "ask":
+            return base
         if context.is_non_interactive:
             return PermissionDecision(
                 behavior="allow",
                 reason="Skill script executed via tool in non-interactive mode"
             )
-        return PermissionDecision(behavior="ask")
+        return base
 
     def _resolve_skill_path(self) -> Path:
         if self._loader:
@@ -80,6 +84,12 @@ class SkillTool(BaseTool):
         from markbot.skills.core.sandbox import Sandbox
         from markbot.skills.core.scanner import SecurityScanner
 
+        # Cast and validate params per script definition
+        casted = self.cast_params(params)
+        errors = self.validate_params(casted)
+        if errors:
+            return f"Error: {'; '.join(errors)}"
+
         # Record skill usage
         if self._usage_store:
             self._usage_store.bump_use(self._skill_name)
@@ -99,7 +109,7 @@ class SkillTool(BaseTool):
             )
             return f"Error: Script failed security check\n{findings_str}"
 
-        sandbox_config = self._script.sandbox_config or {}
+        sandbox_config = copy.deepcopy(self._script.sandbox_config) if self._script.sandbox_config else {}
         sandbox_config.setdefault("environment", {})
         sandbox_config["environment"]["SKILL_NAME"] = self._skill_name
         sandbox_config["environment"]["SCRIPT_NAME"] = self._script.name
@@ -117,7 +127,7 @@ class SkillTool(BaseTool):
             result = await sandbox.run(
                 script=entry_path.resolve(),
                 language=self._script.language,
-                args=params,
+                args=casted,
                 cwd=skill_path,
             )
             if result.success:
@@ -179,7 +189,7 @@ class SkillViewTool(BaseTool):
         return True
 
     async def check_permission(self, params: dict[str, Any], context: ToolContext) -> PermissionDecision:
-        return PermissionDecision(behavior="allow")
+        return await super().check_permission(params, context)
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         name = params.get("name", "")
@@ -232,7 +242,7 @@ class SkillsListTool(BaseTool):
         return True
 
     async def check_permission(self, params: dict[str, Any], context: ToolContext) -> PermissionDecision:
-        return PermissionDecision(behavior="allow")
+        return await super().check_permission(params, context)
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
         skills = self._registry.list_all()
@@ -241,7 +251,7 @@ class SkillsListTool(BaseTool):
 
         lines = [f"**{len(skills)} skills available:**\n"]
         for skill in sorted(skills, key=lambda s: s.name):
-            tag = "📦 builtin" if skill.is_builtin else "📁 workspace"
+            tag = "builtin" if skill.is_builtin else "workspace"
             desc = skill.description[:100] + "..." if len(skill.description) > 100 else skill.description
             has_scripts = " (has scripts)" if skill.scripts else ""
             usage = f" [views:{skill.view_count} uses:{skill.use_count}]" if skill.view_count or skill.use_count else ""
