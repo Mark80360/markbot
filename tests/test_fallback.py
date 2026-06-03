@@ -45,18 +45,6 @@ class TestFallbackManager:
             ),
         )
 
-    def test_transient_error_markers(self):
-        markers = FallbackManager._TRANSIENT_ERROR_MARKERS
-        assert "timeout" in markers
-        assert "rate limit" in markers
-        assert "503" in markers
-
-    def test_unavailable_error_markers(self):
-        markers = FallbackManager.MODEL_UNAVAILABLE_ERRORS
-        assert "401" in markers
-        assert "402" in markers
-        assert "unauthorized" in markers
-
     def test_circuit_threshold_default(self):
         assert FallbackManager.DEFAULT_CIRCUIT_THRESHOLD == 3
 

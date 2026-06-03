@@ -12,6 +12,7 @@ import httpx
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.errors import classify_error
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -152,6 +153,7 @@ class AzureOpenAIProvider(LLMProvider):
                     return LLMResponse(
                         content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
                         finish_reason="error",
+                        error_type=classify_error(response.status_code, response.text),
                     )
                 
                 response_data = response.json()
@@ -161,6 +163,7 @@ class AzureOpenAIProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error calling Azure OpenAI: {repr(e)}",
                 finish_reason="error",
+                error_type=classify_error(None, repr(e)),
             )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
@@ -243,10 +246,15 @@ class AzureOpenAIProvider(LLMProvider):
                         return LLMResponse(
                             content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
                             finish_reason="error",
+                            error_type=classify_error(response.status_code, text.decode("utf-8", "ignore")),
                         )
                     return await self._consume_stream(response, on_content_delta)
         except Exception as e:
-            return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
+            return LLMResponse(
+                content=f"Error calling Azure OpenAI: {repr(e)}",
+                finish_reason="error",
+                error_type=classify_error(None, repr(e)),
+            )
 
     async def _consume_stream(
         self,

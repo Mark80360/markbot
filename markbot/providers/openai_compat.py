@@ -16,6 +16,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.errors import ErrorType, classify_error  # noqa: F401  (imported per Task 3 spec)
 
 if TYPE_CHECKING:
     from markbot.providers.registry import ProviderSpec
@@ -398,7 +399,11 @@ class OpenAICompatProvider(LLMProvider):
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_map),
                     )
-                return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+                return LLMResponse(
+                    content="Error: API returned empty choices.",
+                    finish_reason="error",
+                    error_type=ErrorType.UNKNOWN,
+                )
 
             choice0 = self._maybe_mapping(choices[0]) or {}
             msg0 = self._maybe_mapping(choice0.get("message")) or {}
@@ -446,7 +451,11 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         if not response.choices:
-            return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+            return LLMResponse(
+                content="Error: API returned empty choices.",
+                finish_reason="error",
+                error_type=ErrorType.UNKNOWN,
+            )
 
         choice = response.choices[0]
         msg = choice.message
@@ -577,6 +586,7 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            error_type=ErrorType.CONTENT if finish_reason == "content_filter" else None,
         )
 
     @staticmethod
@@ -588,7 +598,11 @@ class OpenAICompatProvider(LLMProvider):
             msg = f"Error calling LLM: {e}"
         else:
             msg = "Error calling LLM: connection failed or timed out (empty error from provider)"
-        return LLMResponse(content=msg, finish_reason="error")
+        return LLMResponse(
+            content=msg,
+            finish_reason="error",
+            error_type=ErrorType.UNKNOWN,
+        )
 
     # ------------------------------------------------------------------
     # Public API

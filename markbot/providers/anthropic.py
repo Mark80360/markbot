@@ -12,6 +12,7 @@ import json_repair
 from loguru import logger
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.errors import classify_error
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -425,7 +426,11 @@ class AnthropicProvider(LLMProvider):
             response = await self._client.messages.create(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+            return LLMResponse(
+                content=f"Error calling LLM: {e}",
+                finish_reason="error",
+                error_type=classify_error(None, repr(e)),
+            )
 
     async def chat_stream(
         self,
@@ -450,7 +455,11 @@ class AnthropicProvider(LLMProvider):
                 response = await stream.get_final_message()
             return self._parse_response(response)
         except Exception as e:
-            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+            return LLMResponse(
+                content=f"Error calling LLM: {e}",
+                finish_reason="error",
+                error_type=classify_error(None, repr(e)),
+            )
 
     def get_default_model(self) -> str:
         return self.default_model
