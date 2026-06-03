@@ -21,7 +21,7 @@ def load_skill_body(skill_path: Path) -> str | None:
 
     content = skill_file.read_text(encoding="utf-8")
     if content.startswith("---"):
-        match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
+        match = re.match(r"^---[\r\n].*?[\r\n]---[\r\n]", content, re.DOTALL)
         if match:
             return content[match.end():].strip()
     return content.strip() if content else None

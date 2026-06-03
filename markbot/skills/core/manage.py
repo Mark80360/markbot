@@ -333,7 +333,7 @@ class SkillManageTool(BaseTool):
         if not self._is_workspace_skill(skill_dir):
             return f"Error: Cannot delete built-in skill '{name}'."
 
-        shutil.rmtree(skill_dir)
+        shutil.rmtree(skill_dir, ignore_errors=True)
         self._usage_store.remove(name)
         return f"Skill '{name}' deleted."
 

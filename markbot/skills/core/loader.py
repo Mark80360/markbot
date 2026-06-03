@@ -1,4 +1,8 @@
-"""Skill loader for markbot."""
+"""Skill loader for markbot.
+
+Requires PyYAML (the fallback manual parser only handles flat key-value
+pairs and simple lists; nested structures require PyYAML).
+"""
 
 from __future__ import annotations
 

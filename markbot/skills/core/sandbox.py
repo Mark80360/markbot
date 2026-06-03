@@ -98,7 +98,16 @@ class Sandbox:
         if lang == "python":
             return sys.executable
         elif lang == "bash":
-            return "bash" if os.name != "nt" else "cmd"
+            if os.name == "nt":
+                import shutil
+                bash_path = shutil.which("bash")
+                if bash_path:
+                    return bash_path
+                raise ValueError(
+                    "Shell scripts are not supported on Windows without Git Bash or WSL. "
+                    "Install Git for Windows (git-scm.com) to enable bash script execution."
+                )
+            return "bash"
         elif lang == "node":
             return "node"
         else:
@@ -170,22 +179,20 @@ class Sandbox:
 
         # Apply PATH restrictions if no network
         if not self.config.network:
-            # Keep only essential paths
-            essential_paths = [
-                "/usr/bin",
-                "/usr/local/bin",
-                "/bin",
-                "/sbin",
-            ]
+            # Keep only essential paths plus the interpreter's directory
+            import shutil
+            interpreter_dir = str(Path(cmd[0]).parent.resolve()) if os.path.isfile(cmd[0]) else ""
+
             if os.name == "nt":
-                process_env["PATH"] = ";".join(
-                    [
-                        r"C:\Windows\System32",
-                        r"C:\Windows",
-                    ]
-                )
+                sys_dir = r"C:\Windows\System32"
+                win_dir = r"C:\Windows"
+                paths = [p for p in [sys_dir, win_dir, interpreter_dir] if p]
+                process_env["PATH"] = ";".join(paths)
             else:
-                process_env["PATH"] = ":".join(essential_paths)
+                essential = ["/usr/bin", "/usr/local/bin", "/bin", "/sbin"]
+                if interpreter_dir:
+                    essential.insert(0, interpreter_dir)
+                process_env["PATH"] = ":".join(essential)
 
         try:
             def _set_child_limits() -> None:

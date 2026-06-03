@@ -164,8 +164,10 @@ Do NOT suggest adding dangerous scripts or external API calls."""
             score += 0.3
         if hasattr(skill_def, 'config_vars') and skill_def.config_vars:
             score += 0.1
-        if hasattr(skill_def, 'conditions') and skill_def.conditions:
-            if skill_def.conditions.requires_tools or skill_def.conditions.fallback_for_tools:
+        if hasattr(skill_def, 'conditions'):
+            cond = skill_def.conditions
+            if (hasattr(cond, 'requires_tools') and cond.requires_tools) or \
+               (hasattr(cond, 'fallback_for_tools') and cond.fallback_for_tools):
                 score += 0.1
         return min(score, 1.0)
 

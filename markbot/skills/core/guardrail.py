@@ -135,14 +135,22 @@ class SkillGuardrail:
         "message": "Subagents cannot send messages to users",
     }
 
-    def __init__(self, skill: SkillDefinition, context: str = "main"):
+    def __init__(
+        self,
+        skill: SkillDefinition,
+        context: str = "main",
+        available_tools: set[str] | None = None,
+    ):
         self.skill = skill
         self._context = context
         self._completed_steps: set[str] = set()
         self._called_tools: list[tuple[str, dict]] = []
+        self._violations: list[GuardrailViolation] = []
         self._active = False
 
-        if context == "subagent":
+        if available_tools is not None:
+            self._allowed_tools = available_tools
+        elif context == "subagent":
             self._allowed_tools = self.SUBAGENT_ALLOWED_TOOLS
         else:
             self._allowed_tools = self.MAIN_AGENT_ALLOWED_TOOLS
@@ -152,6 +160,7 @@ class SkillGuardrail:
         self._active = True
         self._completed_steps.clear()
         self._called_tools.clear()
+        self._violations.clear()
 
     def deactivate(self) -> None:
         """Deactivate the guardrail."""
@@ -234,10 +243,15 @@ class SkillGuardrail:
                         tool_name=tool_name,
                     ))
 
+        self._violations.extend(violations)
+
         return GuardrailResult(
             passed=not any(v.severity in ("error", "critical") for v in violations),
             violations=violations,
         )
+
+    def get_violations(self) -> list[GuardrailViolation]:
+        return list(self._violations)
 
     def get_execution_summary(self) -> dict[str, Any]:
         """Get a summary of the guarded execution.
@@ -261,12 +275,16 @@ class SkillGuardrailManager:
     and validates tool calls against all active guardrails.
     """
 
-    def __init__(self, context: str = "main"):
+    def __init__(self, context: str = "main", available_tools: set[str] | None = None):
         self._guardrails: dict[str, SkillGuardrail] = {}
         self._context = context
+        self._available_tools = available_tools
+
+    def set_available_tools(self, tool_names: set[str]) -> None:
+        self._available_tools = tool_names
 
     def start_guarding(self, skill: SkillDefinition) -> SkillGuardrail:
-        guardrail = SkillGuardrail(skill, context=self._context)
+        guardrail = SkillGuardrail(skill, context=self._context, available_tools=self._available_tools)
         guardrail.activate()
         self._guardrails[skill.name] = guardrail
         logger.info("Skill guardrail activated for: {} (context={})", skill.name, self._context)
@@ -284,7 +302,9 @@ class SkillGuardrailManager:
         guardrail = self._guardrails.pop(skill_name, None)
         if guardrail:
             guardrail.deactivate()
-            return GuardrailResult(passed=True)
+            violations = guardrail.get_violations()
+            passed = not any(v.severity in ("error", "critical") for v in violations)
+            return GuardrailResult(passed=passed, violations=violations)
         return None
 
     def check_all(self, tool_name: str, params: dict[str, Any]) -> list[GuardrailResult]:

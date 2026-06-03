@@ -72,7 +72,9 @@ class SkillConfigResolver:
         if env_value is not None:
             return env_value
 
-        file_value = file_config.get(var.key) or file_config.get(f"{skill_name}.{var.key}")
+        file_value = file_config.get(var.key)
+        if file_value is None:
+            file_value = file_config.get(f"{skill_name}.{var.key}")
         if file_value is not None:
             return str(file_value)
 

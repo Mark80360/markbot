@@ -29,11 +29,13 @@ class SkillTool(BaseTool):
         script: SkillScriptDef,
         workspace: Path,
         usage_store: Any = None,
+        loader: Any = None,
     ):
         self._skill_name = skill_name
         self._script = script
         self._workspace = workspace
         self._usage_store = usage_store
+        self._loader = loader
 
     @property
     def definition(self) -> ToolDefinition:
@@ -53,10 +55,17 @@ class SkillTool(BaseTool):
         self, params: dict[str, Any], context: ToolContext
     ) -> PermissionDecision:
         if context.is_non_interactive:
-            return PermissionDecision(behavior="allow", reason="Non-interactive mode")
+            return PermissionDecision(
+                behavior="allow",
+                reason="Skill script executed via tool in non-interactive mode"
+            )
         return PermissionDecision(behavior="ask")
 
     def _resolve_skill_path(self) -> Path:
+        if self._loader:
+            path = self._loader.get_skill_path(self._skill_name)
+            if path:
+                return path
         skill_path = self._workspace / "skills" / self._skill_name
         if skill_path.exists():
             return skill_path
@@ -193,10 +202,12 @@ class SkillViewTool(BaseTool):
             if skill.scripts:
                 header += "**Scripts**:\n"
                 for script in skill.scripts:
-                    header += f"- {skill.name}.{script.name}: {script.description}\n"
+                    header += f"- `{skill.name}.{script.name}`: {script.description}\n"
             header += "\n---\n\n"
 
-        return header + content
+        body = header + content
+        constraint_block = build_constraint_block(name, body)
+        return constraint_block
 
 
 class SkillsListTool(BaseTool):

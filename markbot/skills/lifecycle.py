@@ -126,7 +126,8 @@ class SkillLifecycle:
         Returns:
             TransitionReport with applied=True if successful.
         """
-        current_state = self.evaluate(skill_name)
+        entry = self._usage_store.get(skill_name)
+        current_state = getattr(entry, 'state', SkillState.ACTIVE)
         if current_state == target_state:
             return TransitionReport(
                 skill_name=skill_name,

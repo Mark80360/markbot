@@ -533,7 +533,7 @@ class SecurityScanner:
                 ))
 
         verdict = self._compute_verdict(findings)
-        is_safe = not any(f.severity in BLOCKING_SEVERITIES for f in findings)
+        is_safe = self._is_safe_from_findings(findings)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -575,7 +575,7 @@ class SecurityScanner:
             all_findings.extend(result.findings)
 
         verdict = self._compute_verdict(all_findings)
-        is_safe = not any(f.severity in BLOCKING_SEVERITIES for f in all_findings)
+        is_safe = self._is_safe_from_findings(all_findings)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -585,6 +585,10 @@ class SecurityScanner:
             scan_duration_ms=scan_duration,
             verdict=verdict,
         )
+
+    @staticmethod
+    def _is_safe_from_findings(findings: list[Finding]) -> bool:
+        return not any(f.severity in BLOCKING_SEVERITIES for f in findings)
 
     @staticmethod
     def _compute_verdict(findings: list[Finding]) -> str:

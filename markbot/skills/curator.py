@@ -13,6 +13,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -39,7 +40,11 @@ class CuratorService:
     """Background service for skill health maintenance.
 
     Usage:
-        curator = CuratorService(workspace, skill_registry)
+        curator = CuratorService(workspace, skill_registry, interval_hours=6)
+        await curator.start()
+        ...
+        await curator.stop()
+        # Or run once:
         report = curator.run_maintenance()
     """
 
@@ -48,11 +53,15 @@ class CuratorService:
         workspace: Path,
         skill_registry: Any = None,
         auto_archive: bool = True,
+        interval_hours: int = 6,
     ):
         self._workspace = workspace
         self._registry = skill_registry
         self._auto_archive = auto_archive
+        self._interval_hours = interval_hours
         self._reports_dir = workspace / ".markbot" / "curator_reports"
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
 
     def run_maintenance(self) -> CuratorReport:
         """Execute a full maintenance cycle.
@@ -145,6 +154,45 @@ class CuratorService:
 
         except Exception as e:
             logger.debug("Skill improvement evaluation failed: {}", e)
+
+    async def start(self) -> None:
+        """Start the curator background loop."""
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._run())
+        logger.info(
+            "Curator background service started (interval={}h)", self._interval_hours,
+        )
+
+    async def stop(self) -> None:
+        """Stop the curator background loop."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
+            logger.info("Curator background service stopped")
+
+    async def _run(self) -> None:
+        """Run maintenance on an interval."""
+        interval_s = self._interval_hours * 3600
+        while self._running:
+            try:
+                report = self.run_maintenance()
+                if report.transitions:
+                    logger.info(
+                        "Curator: {} transitions applied",
+                        sum(1 for t in report.transitions if t.get("applied")),
+                    )
+                if report.errors:
+                    logger.warning("Curator: {} errors during maintenance", len(report.errors))
+            except Exception as e:
+                logger.error("Curator background maintenance failed: {}", e)
+            await asyncio.sleep(interval_s)
 
     def get_recent_reports(self, limit: int = 5) -> list[dict[str, Any]]:
         """Load recent curator reports from disk."""

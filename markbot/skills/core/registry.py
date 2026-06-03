@@ -93,7 +93,7 @@ class SkillRegistry:
             return
         for skill in self._skills.values():
             for script in skill.scripts:
-                tool = SkillTool(skill.name, script, self.workspace, self._usage_store)
+                tool = SkillTool(skill.name, script, self.workspace, self._usage_store, loader=self._loader)
                 self.tool_registry.register(tool)
                 logger.debug("Registered skill tool: {}", tool.definition.name)
 
@@ -124,6 +124,12 @@ class SkillRegistry:
 
         for skill in self._skills.values():
             if skill.is_always_active:
+                if skill.conditions.requires_tools or skill.conditions.fallback_for_tools:
+                    logger.debug(
+                        "Skill '{}' is always-active; conditions ({}) are ignored",
+                        skill.name,
+                        self._format_conditions(skill.conditions),
+                    )
                 active.append(skill)
                 continue
 
@@ -147,7 +153,6 @@ class SkillRegistry:
                         skill.name, ", ".join(missing_fallback),
                     )
                     fallback.append(skill)
-                    continue
 
             active.append(skill)
 
@@ -220,13 +225,13 @@ class SkillRegistry:
         return content
 
     def load_skills_for_context(self, skill_names: list[str]) -> str:
-        """Load specific skills for inclusion in agent context."""
+        """Load specific skills for inclusion in agent context, wrapped in constraints."""
         parts = []
 
         for name in skill_names:
-            content = self.load_skill_content(name)
-            if content:
-                parts.append(f"### Skill: {name}\n\n{content}")
+            constraint = self.build_skill_constraint_block(name)
+            if constraint:
+                parts.append(constraint)
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
@@ -322,6 +327,15 @@ class SkillRegistry:
         entry_path = skill_path / script.entry
         scanner = SecurityScanner()
         return scanner.scan(entry_path, script.language)
+
+    @staticmethod
+    def _format_conditions(conditions) -> str:
+        parts = []
+        if conditions.requires_tools:
+            parts.append(f"requires: {','.join(conditions.requires_tools)}")
+        if conditions.fallback_for_tools:
+            parts.append(f"fallback: {','.join(conditions.fallback_for_tools)}")
+        return "; ".join(parts)
 
     def set_available_tools(self, tool_names: list[str]) -> None:
         """Update the set of available tool names for conditional activation."""
