@@ -7,8 +7,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from markbot.skills.core.helpers import build_constraint_block, load_skill_body
 from markbot.tools.base import BaseTool
-from markbot.skills.core.helpers import load_skill_body, build_constraint_block
 from markbot.types.permission import PermissionDecision
 from markbot.types.skill import SkillScriptDef
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter

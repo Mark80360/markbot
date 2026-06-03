@@ -2,16 +2,16 @@
 
 import pytest
 
-from markbot.memory.scanner import MemorySecurityScanner
 from markbot.memory.fencing import (
-    fence_context,
-    sanitize_context,
-    is_fenced,
-    StreamingContextScrubber,
-    MEMORY_CONTEXT_OPEN,
     MEMORY_CONTEXT_CLOSE,
+    MEMORY_CONTEXT_OPEN,
+    StreamingContextScrubber,
+    fence_context,
+    is_fenced,
+    sanitize_context,
 )
 from markbot.memory.manager import redact_sensitive_text
+from markbot.memory.scanner import MemorySecurityScanner
 
 
 class TestMemorySecurityScanner:

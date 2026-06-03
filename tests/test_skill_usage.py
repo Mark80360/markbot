@@ -2,13 +2,16 @@
 
 import time
 
-import pytest
-
-from markbot.skills.usage import SkillUsageStore, SkillUsageEntry
-from markbot.skills.lifecycle import SkillLifecycle, TransitionReport, STALE_THRESHOLD, ARCHIVE_THRESHOLD, NEW_SKILL_GRACE_PERIOD
-from markbot.skills.curator import CuratorService, CuratorReport
-from markbot.skills.improve import SkillImprover, EvalResult
-from markbot.types.skill import SkillState, SkillDefinition
+from markbot.skills.curator import CuratorReport, CuratorService
+from markbot.skills.improve import EvalResult, SkillImprover
+from markbot.skills.lifecycle import (
+    ARCHIVE_THRESHOLD,
+    NEW_SKILL_GRACE_PERIOD,
+    STALE_THRESHOLD,
+    SkillLifecycle,
+)
+from markbot.skills.usage import SkillUsageStore
+from markbot.types.skill import SkillDefinition, SkillState
 
 
 class TestSkillUsageStore:

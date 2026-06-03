@@ -2,8 +2,8 @@
 
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from markbot.tools.base import Tool
 from markbot.bus.events import OutboundMessage
+from markbot.tools.base import Tool
 
 if TYPE_CHECKING:
     from markbot.types.tool import ToolContext

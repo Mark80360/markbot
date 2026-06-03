@@ -6,15 +6,10 @@ file access control, and timeout management.
 
 import asyncio
 import os
-import signal
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
-
-from loguru import logger
 
 # Resource module is Unix-only
 try:

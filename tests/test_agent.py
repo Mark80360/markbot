@@ -4,22 +4,21 @@ import time
 
 import pytest
 
-from markbot.agent.tokens import TokenUsage, estimate_tokens
-from markbot.agent.cost import (
-    ModelUsage,
-    CostState,
-    ModelPricing,
-    PricingTable,
-    CostTracker,
-    _match_pricing_key,
-    DEFAULT_PRICING,
-)
-from markbot.agent.stream import StreamFilter
 from markbot.agent.compact import (
     CompactAction,
-    CompactResult,
     CompactionConfig,
+    CompactResult,
 )
+from markbot.agent.cost import (
+    CostState,
+    CostTracker,
+    ModelPricing,
+    ModelUsage,
+    PricingTable,
+    _match_pricing_key,
+)
+from markbot.agent.stream import StreamFilter
+from markbot.agent.tokens import TokenUsage, estimate_tokens
 from markbot.types.exceptions import BudgetExceededError
 
 
@@ -270,8 +269,8 @@ class TestCompactionConfig:
 
 class TestContextBuilderCache:
     def test_system_context_caches_with_ttl(self, tmp_path):
+
         from markbot.agent.context import ContextBuilder
-        import time
 
         cb = ContextBuilder(workspace=tmp_path)
         ctx1 = cb.get_system_context()
@@ -291,3 +290,75 @@ class TestContextBuilderCache:
         # Both should return valid results (cache expired, rebuilt)
         assert isinstance(result1, str)
         assert isinstance(result2, str)
+
+
+class TestIdleTimeout:
+    """Tests for agent session idle timeout detection and cleanup."""
+
+    def test_check_idle_sessions_detects_timeout(self):
+        from markbot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._session_last_active = {"test:ses1": time.time() - 60 * 31}  # 31 min ago
+        loop._active_tasks = {}
+        loop._session_locks = {}
+        loop._pending_steer = {}
+        loop._scrubber_pool = type("FakeScrubberPool", (), {
+            "reset": lambda self, _: None,
+        })()
+
+        # Mock bus to capture the notification
+        notifications: list[str] = []
+
+        async def fake_publish(msg):
+            notifications.append(msg)
+
+        loop.bus = type("FakeBus", (), {"publish_outbound": fake_publish})()
+
+        # _check_idle_sessions uses ensure_future, which won't run inline.
+        # Instead, verify the cleanup path directly.
+        loop._cleanup_session_state("test:ses1")
+
+        assert "test:ses1" not in loop._session_last_active
+        assert "test:ses1" not in loop._active_tasks
+
+    def test_cleanup_cancels_active_tasks(self):
+        import asyncio
+
+        from markbot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._session_last_active = {"ses:1": 0}
+        loop._active_tasks = {"ses:1": [asyncio.Future()]}
+        loop._session_locks = {"ses:1": asyncio.Lock()}
+        loop._pending_steer = {"ses:1": "pending"}
+        loop._scrubber_pool = type("Fake", (), {
+            "reset": lambda self, _: None,
+        })()
+
+        loop._cleanup_session_state("ses:1")
+
+        assert "ses:1" not in loop._active_tasks
+        assert "ses:1" not in loop._session_locks
+        assert "ses:1" not in loop._pending_steer
+        assert "ses:1" not in loop._session_last_active
+
+    def test_idle_disabled_when_zero(self, monkeypatch):
+        from markbot.agent.loop import AgentLoop
+        import markbot.agent.loop as agent_loop
+
+        monkeypatch.setattr(agent_loop, "AGENT_IDLE_TIMEOUT_MINUTES", 0)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._session_last_active = {"x:y": time.time() - 3600}  # 1h ago
+        loop._active_tasks = {}
+        loop._session_locks = {}
+        loop._pending_steer = {}
+        loop._scrubber_pool = type("Fake", (), {
+            "reset": lambda self, _: None,
+        })()
+
+        # _check_idle_sessions returns immediately when idle_seconds <= 0
+        loop._check_idle_sessions(time.time())
+        # The session should still be tracked (no cleanup happened)
+        assert "x:y" in loop._session_last_active

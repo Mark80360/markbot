@@ -1,8 +1,8 @@
 """Tests for markbot.agent.services.executor — Tool result handling."""
 
-import pytest
 from unittest.mock import MagicMock
-from datetime import datetime
+
+import pytest
 
 from markbot.agent.services.executor import ToolExecutor
 from markbot.tools.registry import ToolRegistry
@@ -24,8 +24,9 @@ class TestToolExecutor:
         assert executor.get_truncation_limit("unknown_tool") == 16_000
 
     def test_heavy_tool_truncation_limit(self, tool_registry):
-        from markbot.tools.base import Tool
         from typing import Any
+
+        from markbot.tools.base import Tool
 
         class HeavyTool(Tool):
             _is_heavy_tool = True

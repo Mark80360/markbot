@@ -1,15 +1,17 @@
 """Tests for fallback manager and circuit breaker."""
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from markbot.agent.cost import CostTracker
-from markbot.config.schema import Config, ModelConfig, ProviderConfig, ProvidersConfig, AgentsConfig, AgentDefaults
+from markbot.config.schema import (
+    AgentDefaults,
+    AgentsConfig,
+    Config,
+    ModelConfig,
+    ProviderConfig,
+    ProvidersConfig,
+)
 from markbot.providers.base import LLMResponse, ToolCallRequest
 from markbot.providers.fallback import (
-    AllModelsFailedError,
     CircuitState,
-    FallbackAttempt,
     FallbackManager,
 )
 
@@ -46,7 +48,7 @@ class TestFallbackManager:
         )
 
     def test_circuit_threshold_default(self):
-        assert FallbackManager.DEFAULT_CIRCUIT_THRESHOLD == 3
+        assert FallbackManager.DEFAULT_CIRCUIT_THRESHOLD == 6
 
     def test_circuit_cooldown_default(self):
         assert FallbackManager.DEFAULT_CIRCUIT_COOLDOWN == 60.0

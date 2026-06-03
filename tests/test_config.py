@@ -1,25 +1,21 @@
 """Tests for markbot.config module (schema, validator)."""
 
-import pytest
 
 from markbot.config.schema import (
     AgentDefaults,
-    AgentsConfig,
+    ChannelsConfig,
+    CodeExecutionConfig,
+    CompactionConfig,
+    ExecToolConfig,
+    FilesystemToolConfig,
+    GatewayConfig,
+    MCPServerConfig,
+    MemoryToolsConfig,
     ModelConfig,
     ProviderConfig,
     ProvidersConfig,
-    ChannelsConfig,
-    HeartbeatConfig,
-    GatewayConfig,
-    WebSearchConfig,
-    WebToolsConfig,
-    ExecToolConfig,
-    FilesystemToolConfig,
-    CodeExecutionConfig,
-    MemoryToolsConfig,
-    MCPServerConfig,
     ToolsConfig,
-    CompactionConfig,
+    WebToolsConfig,
 )
 from markbot.config.validator import (
     Severity,

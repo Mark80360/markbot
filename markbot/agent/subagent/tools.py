@@ -1,6 +1,6 @@
 """Tool for checking subagent progress and output."""
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision

@@ -11,17 +11,20 @@ Enhanced with:
 """
 
 import fnmatch
-import os
 import re
 from pathlib import Path
 from typing import Any
 
 from markbot.tools.base import Tool, _resolve_path
 from markbot.utils.constants import (
-    IGNORE_DIRS as _DEFAULT_IGNORE_DIRS,
     BINARY_EXTENSIONS as _BINARY_EXTENSIONS,
-    MAX_SEARCH_RESULTS,
+)
+from markbot.utils.constants import (
+    IGNORE_DIRS as _DEFAULT_IGNORE_DIRS,
+)
+from markbot.utils.constants import (
     MAX_CONTEXT_LINES,
+    MAX_SEARCH_RESULTS,
 )
 from markbot.utils.helpers import format_time
 

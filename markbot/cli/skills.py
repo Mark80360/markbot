@@ -7,17 +7,13 @@ Provides commands to:
 - Execute scripts directly
 """
 
-import json
-from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
-from markbot.skills import SkillRegistry
 from markbot.config.paths import get_workspace_path
+from markbot.skills import SkillRegistry
 
 app = typer.Typer(
     name="skills",
@@ -183,7 +179,7 @@ def skill_info(
             console.print(f"    Language: {script.language}")
             console.print(f"    Entry: {script.entry}")
             if script.parameters:
-                console.print(f"    Parameters:")
+                console.print("    Parameters:")
                 for param in script.parameters:
                     req_mark = "*" if param.required else ""
                     console.print(f"      - {param.name}{req_mark}: {param.type}")

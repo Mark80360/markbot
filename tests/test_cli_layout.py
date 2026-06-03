@@ -15,9 +15,9 @@ import sys
 import pytest
 import typer
 
-import markbot.cli.ui as ui
-import markbot.cli.runtime as runtime
 import markbot.cli.daemon as daemon
+import markbot.cli.runtime as runtime
+import markbot.cli.ui as ui
 from markbot.cli.commands import app as top_app
 from markbot.cli.groups import (
     agent,

@@ -8,6 +8,7 @@ Merges the former separate tools:
 """
 
 from typing import Any
+
 from markbot.tools.base import Tool
 
 

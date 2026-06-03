@@ -13,8 +13,6 @@ import enum
 from collections import defaultdict
 from typing import Any
 
-from loguru import logger
-
 from markbot.bus.events import InboundMessage, OutboundMessage
 
 

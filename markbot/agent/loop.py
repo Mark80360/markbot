@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.agent.compact import CompactionConfig
+from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
 from markbot.agent.stream_scrubber import ScrubberPool
@@ -22,8 +23,6 @@ from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
-from markbot.types.permission import PermissionMode, ToolPermissionContext
-from markbot.types.tool import ToolContext
 
 
 class AgentLoop:
@@ -154,6 +153,12 @@ class AgentLoop:
 
         self._pending_steer: dict[str, str] = {}
         self._scrubber_pool = ScrubberPool()
+
+        # Per-session last-active timestamps for idle timeout detection.
+        # Updated on every inbound message and checked during the 1s poll
+        # gap in ``run()``. A session that has been silent longer than
+        # ``AGENT_IDLE_TIMEOUT_MINUTES`` gets a notification + cleanup.
+        self._session_last_active: dict[str, float] = {}
 
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
@@ -340,9 +345,12 @@ class AgentLoop:
         logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
         while self._running:
+            now = time.time()
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
+                # No message in this 1s poll — check for idle sessions.
+                self._check_idle_sessions(now)
                 continue
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
@@ -353,6 +361,9 @@ class AgentLoop:
             except Exception as e:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
+
+            # Mark the session as active.
+            self._session_last_active[msg.session_key] = time.time()
 
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
@@ -378,6 +389,83 @@ class AgentLoop:
                     self._session_locks.pop(k, None)
 
             task.add_done_callback(_cleanup_task)
+
+    # ------------------------------------------------------------------
+    # Idle session management
+    # ------------------------------------------------------------------
+
+    def _check_idle_sessions(self, now: float) -> None:
+        """Check and clean up sessions that have exceeded the idle timeout.
+
+        Called on each 1-second poll gap. Iterates a snapshot of the
+        session keys so we don't mutate the dict while iterating it.
+        """
+        idle_seconds = AGENT_IDLE_TIMEOUT_MINUTES * 60
+        if idle_seconds <= 0:
+            return  # disabled
+
+        for session_key in list(self._session_last_active.keys()):
+            last_active = self._session_last_active.get(session_key)
+            if last_active is None:
+                continue
+            elapsed = now - last_active
+            if elapsed >= idle_seconds:
+                logger.info(
+                    "Session {} idle for {:.0f}s (>{:.0f}s), timing out",
+                    session_key, elapsed, idle_seconds,
+                )
+                asyncio.ensure_future(self._notify_idle_timeout(session_key))
+
+    async def _notify_idle_timeout(self, session_key: str) -> None:
+        """Send an idle-timeout notification for *session_key*.
+
+        The session_key format is ``channel:chat_id``. We parse it to
+        route the notification back through the correct channel.
+        """
+        channel = chat_id = session_key
+        if ":" in session_key:
+            channel, chat_id = session_key.split(":", 1)
+
+        # 暂时取消，不要删除
+        # try:
+        #     await self.bus.publish_outbound(
+        #         OutboundMessage(
+        #             channel=channel,
+        #             chat_id=chat_id,
+        #             content=f"⏰ 会话已闲置 {AGENT_IDLE_TIMEOUT_MINUTES} 分钟，自动关闭。",
+        #             metadata={"_idle_timeout": True},
+        #         )
+        #     )
+        # except Exception as e:
+        #     logger.warning("Failed to publish idle timeout notification: {}", e)
+
+        self._cleanup_session_state(session_key)
+
+    def _cleanup_session_state(self, session_key: str) -> None:
+        """Release resources held by *session_key* after idle timeout.
+
+        Cancels any in-flight tasks, removes session locks, resets the
+        streaming scrubber, and cleans up steer / last-active tracking
+        so the next message from this session starts fresh.
+        """
+        # Cancel active tasks for this session.
+        tasks = self._active_tasks.pop(session_key, None)
+        if tasks:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        # Release session-level lock.
+        self._session_locks.pop(session_key, None)
+
+        # Reset streaming scrubber state for this session.
+        self._scrubber_pool.reset(session_key)
+
+        # Clear steer and idle tracking.
+        self._pending_steer.pop(session_key, None)
+        self._session_last_active.pop(session_key, None)
+
+        logger.info("Cleaned up state for idle session {}", session_key)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -477,6 +565,10 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         self._scrubber_pool.clear()
+        try:
+            self.sessions.close()
+        except Exception:
+            pass
         try:
             worker = getattr(self.memory_manager, "_worker_task", None)
             if worker and not worker.done():
@@ -601,6 +693,7 @@ class AgentLoop:
                     on_tool_complete=on_tool_complete,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
+                self.sessions.save(session)
             except Exception:
                 raise
 
@@ -700,6 +793,7 @@ class AgentLoop:
 
             logger.info("Saving session with {} messages (new_msg_start={})", len(all_msgs), _new_start)
             self.tool_executor.save_turn(session, all_msgs, _new_start)
+            self.sessions.save(session)
         except Exception as e:
             logger.error("_run_agent_loop failed with exception: {}", e)
             raise

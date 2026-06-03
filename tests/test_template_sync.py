@@ -1,7 +1,7 @@
 """Tests for template-code synchronization mechanism."""
 
-import pytest
 from pathlib import Path
+
 from markbot.utils.constants import BOOTSTRAP_FILES, check_template_sync
 
 

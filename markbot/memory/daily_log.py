@@ -24,6 +24,35 @@ from markbot.utils.constants import MAX_DAILY_LOG_RESULT_CHARS
 
 _DEFAULT_MAX_CONTENT_LENGTH = 2000
 
+# CJK Unified Ideographs — basic block (U+4E00..U+9FFF).
+# Single-char matches miss most search queries like "用户喜欢Python" (the
+# token "用户" only matches if the haystack contains the exact same two
+# chars in the same order). Bigrams of consecutive CJK chars plus the
+# single chars give both prefix and substring recall.
+_CJK_BASIC_RANGE = r"\u4e00-\u9fff"
+_TOKEN_RE = re.compile(rf"[a-zA-Z0-9]+|[{_CJK_BASIC_RANGE}]")
+
+
+def tokenize_for_search(text: str) -> list[str]:
+    """Split text into lowercase tokens with CJK bigram support.
+
+    Used by daily log and memory entry search so both surfaces produce
+    consistent recall. Returns a list containing:
+      - every ASCII alnum run (lowercased)
+      - every CJK character
+      - every bigram where at least one side is CJK (covers "用户" /
+        "用p" overlap so Latin neighbors don't form dead tokens)
+    """
+    if not text:
+        return []
+    tokens = _TOKEN_RE.findall(text.lower())
+    bigrams: list[str] = []
+    for i in range(len(tokens) - 1):
+        if tokens[i][0] >= "\u4e00" or tokens[i + 1][0] >= "\u4e00":
+            bigrams.append(tokens[i] + tokens[i + 1])
+    return tokens + bigrams
+
+
 _SECTION_HEADER_RE = re.compile(
     r"^## \[(?P<time>[^\]]+)\]"
     r"(?:\s+`(?P<chat_id>[^`]+)`)?"
@@ -133,7 +162,7 @@ class DailyLogManager:
         if not self._daily_dir.is_dir():
             return []
 
-        query_tokens = set(self._tokenize_for_search(query))
+        query_tokens = set(tokenize_for_search(query))
         if not query_tokens:
             return []
 
@@ -164,7 +193,7 @@ class DailyLogManager:
                         continue
 
                 section_text = section.lower()
-                section_tokens = set(self._tokenize_for_search(section_text))
+                section_tokens = set(tokenize_for_search(section_text))
                 hits = sum(1 for t in query_tokens if t in section_tokens)
                 if hits == 0:
                     continue
@@ -269,15 +298,6 @@ class DailyLogManager:
                     return results
 
         return results
-
-    @staticmethod
-    def _tokenize_for_search(text: str) -> list[str]:
-        tokens = re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", text.lower())
-        bigrams = []
-        for i in range(len(tokens) - 1):
-            if tokens[i][0] >= '\u4e00' or tokens[i + 1][0] >= '\u4e00':
-                bigrams.append(tokens[i] + tokens[i + 1])
-        return tokens + bigrams
 
     def _truncate(self, text: str) -> str:
         if len(text) <= self._max_content_length:

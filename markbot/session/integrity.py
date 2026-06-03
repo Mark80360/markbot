@@ -6,11 +6,9 @@ Layered on top of the existing SessionManager to avoid breaking changes.
 from __future__ import annotations
 
 import hashlib
-import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from loguru import logger
 

@@ -706,8 +706,6 @@ def _get_provider_names() -> dict[str, str]:
 
 def _configure_provider(config: Config, provider_name: str) -> None:
     """Configure a single LLM provider (V2: with models)."""
-    from markbot.config.schema import ModelConfig
-    from markbot.cli.models import get_provider_models
 
     provider_config = getattr(config.providers, provider_name, None)
     if provider_config is None:
@@ -797,8 +795,7 @@ def _prompt_update_model_chain(config: Config, provider_name: str, display_name:
 
 def _configure_models_for_provider(config: Config, provider_name: str, display_name: str) -> None:
     """Configure models for a specific provider."""
-    from markbot.config.schema import ModelConfig
-    from markbot.cli.models import get_provider_models, get_model_info, format_token_count
+    from markbot.cli.models import format_token_count, get_model_info, get_provider_models
 
     provider_config = getattr(config.providers, provider_name, None)
     if not provider_config:
@@ -869,8 +866,8 @@ def _add_model_to_provider(
     available_models: list,
 ) -> None:
     """Add a model to a provider configuration."""
+    from markbot.cli.models import format_token_count
     from markbot.config.schema import ModelConfig
-    from markbot.cli.models import get_model_info, format_token_count
 
     provider_config = getattr(config.providers, provider_name, None)
     if not provider_config:
@@ -989,7 +986,7 @@ def _remove_model_from_provider(config: Config, provider_name: str, display_name
 
 def _configure_model_chain(config: Config) -> None:
     """Configure the model fallback chain (V2 core feature)."""
-    from markbot.cli.models import find_model_info, get_all_models, format_token_count
+    from markbot.cli.models import find_model_info, format_token_count
 
     while True:
         try:

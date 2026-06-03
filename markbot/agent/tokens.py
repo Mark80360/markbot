@@ -18,6 +18,15 @@ from typing import Any, Optional
 
 from loguru import logger
 
+# The single source of truth for token estimation lives in markbot.utils
+# so both the agent loop and the memory manager can use it without a
+# cross-module dependency. Re-export here for backward compatibility
+# with existing ``from markbot.agent.tokens import estimate_tokens`` calls.
+from markbot.utils.tokens import (  # noqa: F401
+    estimate_messages_tokens as _estimate_messages_tokens,
+    estimate_tokens,
+)
+
 try:
     import tiktoken
 
@@ -73,18 +82,6 @@ class TokenUsage:
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "total_tokens": self.total_tokens,
         }
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count for text using tiktoken, with char/4 fallback."""
-    if not text:
-        return 0
-    if _ENC is not None:
-        try:
-            return len(_ENC.encode(text))
-        except Exception:
-            pass
-    return len(text) // 4
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:

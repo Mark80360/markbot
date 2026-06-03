@@ -2,9 +2,9 @@
 
 import pytest
 
-from markbot.tools.base import BaseTool, _resolve_path, _is_under
+from markbot.tools.base import BaseTool, _is_under, _resolve_path
 from markbot.tools.registry import ToolRegistry
-from markbot.types.permission import PermissionMode, PermissionDecision, ToolPermissionContext
+from markbot.types.permission import PermissionDecision, PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
 
 

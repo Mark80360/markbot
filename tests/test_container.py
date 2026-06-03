@@ -1,7 +1,5 @@
 """Tests for markbot.agent.container — AgentContext builder pattern."""
 
-import pytest
-from pathlib import Path
 
 from markbot.agent.container import AgentContext
 

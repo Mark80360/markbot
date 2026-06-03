@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from loguru import logger
 
-from markbot.bus.events import OutboundMessage
 from markbot.agent.pipeline.engine import Middleware, ProcessContext
+from markbot.bus.events import OutboundMessage
 
 if TYPE_CHECKING:
     from markbot.memory.daily_log import DailyLogManager
@@ -107,9 +107,8 @@ class MemoryLifecycleMiddleware(Middleware):
         ctx: ProcessContext,
         response: OutboundMessage | None,
     ) -> OutboundMessage | None:
-        # Skip normal-path session save — ToolExecutor.save_turn() already
-        # persists the session in AgentLoop._handle_message(). Saving here
-        # too would cause redundant disk I/O on every turn.
+        # Session persistence is handled by sessions.save() in
+        # AgentLoop._handle_message() after save_turn().
 
         session_key = ctx.session_key or "_default"
         count = self._session_message_counts.get(session_key, 0) + 1
@@ -145,7 +144,5 @@ class MemoryLifecycleMiddleware(Middleware):
             try:
                 if self._session_manager and hasattr(self._session_manager, 'save'):
                     self._session_manager.save(ctx.session)
-                elif hasattr(ctx.session, 'save'):
-                    ctx.session.save()
             except Exception as e:
                 logger.warning("Session save on error failed: {}", e)

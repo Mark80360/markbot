@@ -65,8 +65,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     from markbot.channels.manager import ChannelManager
     from markbot.config.loader import load_config
     from markbot.log.core import setup_logging
-    from markbot.schedule.cron import CronService
-    from markbot.schedule.cron import CronJob
+    from markbot.schedule.cron import CronJob, CronService
     from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
 
@@ -112,9 +111,9 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:
+        from markbot.schedule.evaluator import evaluate_response
         from markbot.tools.cron import CronTool
         from markbot.tools.message import MessageTool
-        from markbot.schedule.evaluator import evaluate_response
 
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
@@ -136,10 +135,9 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
-
-        cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
-        cron_session.retain_recent_legal_suffix(8)
-        agent.sessions.save(cron_session)
+            cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
+            cron_session.retain_recent_legal_suffix(8)
+            agent.sessions.save(cron_session)
 
         response = resp.content if resp else ""
 
@@ -234,8 +232,9 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             dream_cron = config.tools.memory.dream_cron
             dream_task: asyncio.Task | None = None
             if dream_cron:
-                from croniter import croniter
                 from zoneinfo import ZoneInfo
+
+                from croniter import croniter
 
                 async def _dream_loop():
                     tz = ZoneInfo(config.agents.defaults.timezone)

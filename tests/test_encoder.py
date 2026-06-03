@@ -1,15 +1,15 @@
 """Tests for markbot.memory.encoder — Active preference detection."""
 
-import pytest
-from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from markbot.memory.encoder import (
-    MemoryEncoder,
-    PreferenceEntry,
-    PatternMatch,
-    _PREFERENCE_PATTERNS,
     _CORRECTION_PATTERNS,
+    _PREFERENCE_PATTERNS,
+    MemoryEncoder,
+    PatternMatch,
+    PreferenceEntry,
 )
 
 

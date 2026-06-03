@@ -21,15 +21,14 @@ import html
 import json
 import os
 import re
-import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urlparse
 
 import httpx
 from loguru import logger
 
-from markbot.tools.base import Tool
 from markbot.config.schema import WebSearchConfig
+from markbot.tools.base import Tool
 from markbot.utils.helpers import build_image_content_blocks
 
 # Shared constants
@@ -196,7 +195,7 @@ class WebSearchTool(Tool):
                 items = await self._search_brave_items(query, n)
             else:
                 return json.dumps({"success": False, "error": f"Unknown search provider '{provider}'"}, ensure_ascii=False)
-            
+
             # Return structured JSON
             return json.dumps({
                 "success": True,
@@ -223,7 +222,7 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("BRAVE_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo_items(query, n)
-        
+
         async with httpx.AsyncClient(proxy=self.proxy) as client:
             r = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
@@ -232,7 +231,7 @@ class WebSearchTool(Tool):
                 timeout=_SEARCH_TIMEOUT,
             )
             r.raise_for_status()
-        
+
         return [
             {"title": x.get("title", ""), "url": x.get("url", ""), "content": x.get("description", "")}
             for x in r.json().get("web", {}).get("results", [])
@@ -244,7 +243,7 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("TAVILY_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo_items(query, n)
-        
+
         async with httpx.AsyncClient(proxy=self.proxy) as client:
             r = await client.post(
                 "https://api.tavily.com/search",
@@ -253,7 +252,7 @@ class WebSearchTool(Tool):
                 timeout=_SEARCH_TIMEOUT,
             )
             r.raise_for_status()
-        
+
         return r.json().get("results", [])
 
     async def _search_searxng_items(self, query: str, n: int) -> list[dict]:
@@ -262,12 +261,12 @@ class WebSearchTool(Tool):
         if not base_url:
             logger.warning("SEARXNG_BASE_URL not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo_items(query, n)
-        
+
         endpoint = f"{base_url.rstrip('/')}/search"
         is_valid, error_msg = _validate_url(endpoint)
         if not is_valid:
             raise ValueError(f"Invalid SearXNG URL: {error_msg}")
-        
+
         async with httpx.AsyncClient(proxy=self.proxy) as client:
             r = await client.get(
                 endpoint,
@@ -276,7 +275,7 @@ class WebSearchTool(Tool):
                 timeout=_SEARCH_TIMEOUT,
             )
             r.raise_for_status()
-        
+
         return r.json().get("results", [])
 
     async def _search_jina_items(self, query: str, n: int) -> list[dict]:
@@ -285,7 +284,7 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("JINA_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo_items(query, n)
-        
+
         headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
         async with httpx.AsyncClient(proxy=self.proxy) as client:
             r = await client.get(
@@ -295,7 +294,7 @@ class WebSearchTool(Tool):
                 timeout=_SEARCH_TIMEOUT,
             )
             r.raise_for_status()
-        
+
         data = r.json().get("data", [])[:n]
         return [
             {"title": d.get("title", ""), "url": d.get("url", ""), "content": d.get("content", "")[:500]}
@@ -318,7 +317,7 @@ class WebSearchTool(Tool):
 
         if not raw:
             return []
-        
+
         return [
             {"title": r.get("title", ""), "url": r.get("href", ""), "content": r.get("body", "")}
             for r in raw
@@ -497,17 +496,17 @@ async def _process_content_with_llm(
     """
     try:
         content_len = len(content)
-        
+
         # Refuse if content is absurdly large
         if content_len > MAX_CONTENT_SIZE:
             size_mb = content_len / 1_000_000
             logger.warning("Content too large (%.1fMB > 2MB limit). Refusing.", size_mb)
             return f"[Content too large to process: {size_mb:.1f}MB. Try a more focused source.]"
-        
+
         # Skip if too short
         if content_len < min_length:
             return None
-        
+
         # Build context
         context_info = []
         if title:
@@ -515,15 +514,15 @@ async def _process_content_with_llm(
         if url:
             context_info.append(f"Source: {url}")
         context_str = "\n".join(context_info) + "\n\n" if context_info else ""
-        
+
         # Check if chunked processing needed
         if content_len > CHUNK_THRESHOLD:
             logger.info("Content large ({} chars). Using chunked processing...", content_len)
             return await _process_large_content_chunked(content, context_str, CHUNK_SIZE, MAX_OUTPUT_SIZE)
-        
+
         # Standard single-pass processing
         logger.info("Processing content with LLM ({} characters)", content_len)
-        
+
         system_prompt = """You are an expert content analyst. Create a comprehensive yet concise markdown summary preserving all important information.
 
 Include:
@@ -542,16 +541,16 @@ Create a markdown summary that captures all key information in a well-organized,
 
         # Try to call LLM - will gracefully fail if no auxiliary configured
         processed_content = await _call_llm_summarizer(system_prompt, user_prompt)
-        
+
         if processed_content:
             if len(processed_content) > MAX_OUTPUT_SIZE:
                 processed_content = processed_content[:MAX_OUTPUT_SIZE] + "\n\n[... summary truncated ...]"
-            
+
             compression_ratio = len(processed_content) / content_len if content_len > 0 else 1.0
             logger.info("Content processed: {} -> {} chars ({:.1f}%)", content_len, len(processed_content), compression_ratio * 100)
-        
+
         return processed_content
-        
+
     except Exception as e:
         logger.warning("LLM summarization failed: {}. Falling back to truncated content.", str(e)[:120])
         truncated = content[:MAX_OUTPUT_SIZE]
@@ -565,12 +564,12 @@ async def _call_llm_summarizer(system_prompt: str, user_prompt: str) -> Optional
     try:
         # Try to use auxiliary model if available
         from markbot.agent.auxiliary import get_async_text_auxiliary_client
-        
+
         client, default_model = get_async_text_auxiliary_client("web_extract")
         if client is None or not default_model:
             logger.debug("No auxiliary model available for web_extract LLM processing")
             return None
-        
+
         # Make LLM call with retry
         max_retries = 2
         for attempt in range(max_retries):
@@ -608,31 +607,31 @@ async def _process_large_content_chunked(
     """Process large content using chunked approach."""
     chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
     total_chunks = len(chunks)
-    
+
     logger.info("Processing {} chunks in parallel...", total_chunks)
-    
+
     # Process chunks in parallel
     async def process_chunk(idx: int, chunk: str) -> str:
         chunk_context = f"{context_str}Chunk {idx+1}/{total_chunks}"
         system_prompt = """You are processing a SECTION of a larger document. Extract ALL key facts, figures, and insights from this section only. Use bullet points. No introductions or conclusions."""
         user_prompt = f"""Extract key information from this section:\n\n{chunk_context}\n\nSECTION CONTENT:\n{chunk}"""
-        
+
         result = await _call_llm_summarizer(system_prompt, user_prompt)
         return result or f"[Chunk {idx+1} processing failed]"
-    
+
     tasks = [process_chunk(i, chunk) for i, chunk in enumerate(chunks)]
     chunk_results = await asyncio.gather(*tasks)
-    
+
     # Synthesize final summary
     combined = "\n\n---\n\n".join(chunk_results)
     synthesis_prompt = """Synthesize these chunk summaries into a single comprehensive markdown summary. Preserve all key information. Use proper markdown formatting."""
     synthesis_user = f"""Combine these section summaries into one coherent summary:\n\n{combined}"""
-    
+
     final_result = await _call_llm_summarizer(synthesis_prompt, synthesis_user)
-    
+
     if final_result and len(final_result) > max_output:
         final_result = final_result[:max_output] + "\n\n[... synthesized summary truncated ...]"
-    
+
     return final_result or combined[:max_output]
 
 
@@ -688,20 +687,26 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
         urls = urls[:5] if isinstance(urls, list) else []
         if not urls:
             return json.dumps({"success": False, "error": "No URLs provided"}, ensure_ascii=False)
-        
+
         # Block URLs containing embedded secrets (exfiltration prevention)
         try:
-            from markbot.agent.redact import _PREFIX_RE
             from urllib.parse import unquote
+
+            from markbot.log.redact import redact_sensitive
+
             for _url in urls:
-                if _PREFIX_RE.search(_url) or _PREFIX_RE.search(unquote(_url)):
+                decoded = unquote(_url)
+                # If redaction would mask anything in either the raw or
+                # percent-decoded URL, the URL carries a secret-shaped
+                # value and must not be fetched.
+                if redact_sensitive(_url) != _url or redact_sensitive(decoded) != decoded:
                     return json.dumps({
                         "success": False,
                         "error": "Blocked: URL contains what appears to be an API key or token. Secrets must not be sent in URLs.",
                     }, ensure_ascii=False)
         except ImportError:
             pass  # Gracefully handle missing module
-        
+
         # SSRF protection
         safe_urls = []
         ssrf_blocked = []
@@ -724,13 +729,13 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
                     "content": "",
                     "error": f"URL validation failed: {str(e)}"
                 })
-        
+
         # Extract content from safe URLs
         results = []
         if safe_urls:
             extract_tasks = [self._extract_single_url(url, format) for url in safe_urls]
             extract_results = await asyncio.gather(*extract_tasks, return_exceptions=True)
-            
+
             for url, result in zip(safe_urls, extract_results):
                 if isinstance(result, Exception):
                     logger.warning("Extract failed for {}: {}", url, result)
@@ -742,11 +747,11 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
                     })
                 else:
                     results.append(result)
-        
+
         # Merge SSRF-blocked results
         if ssrf_blocked:
             results = ssrf_blocked + results
-        
+
         # Apply LLM processing if enabled
         if use_llm_processing:
             llm_tasks = []
@@ -755,7 +760,7 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
                     llm_tasks.append(self._process_result_with_llm(result))
                 else:
                     llm_tasks.append(asyncio.ensure_future(asyncio.sleep(0, result)))
-            
+
             processed_results = await asyncio.gather(*llm_tasks, return_exceptions=True)
             results = []
             for r in processed_results:
@@ -764,12 +769,12 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
                     results.append(r.args[0] if r.args else {"error": "LLM processing failed"})
                 else:
                     results.append(r)
-        
+
         # Clean base64 images from all results
         for result in results:
             if result.get("content"):
                 result["content"] = _clean_base64_images(result["content"])
-        
+
         # Trim to minimal fields
         trimmed_results = [
             {
@@ -780,18 +785,18 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
             }
             for r in results
         ]
-        
+
         return json.dumps({"results": trimmed_results}, indent=2, ensure_ascii=False)
 
     async def _extract_single_url(self, url: str, format: str) -> dict:
         """Extract content from a single URL."""
         max_chars = self.max_chars
-        
+
         # Try Jina Reader API first
         result = await self._fetch_jina(url, max_chars)
         if result is not None:
             return result
-        
+
         # Fallback to local readability
         return await self._fetch_readability(url, format, max_chars)
 
@@ -800,10 +805,10 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
         url = result.get("url", "")
         title = result.get("title", "")
         content = result.get("content", "")
-        
+
         if not content or len(content) < DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION:
             return result
-        
+
         processed = await _process_content_with_llm(content, url, title)
         if processed:
             result["raw_content"] = content  # Keep original
@@ -817,27 +822,27 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
             jina_key = os.environ.get("JINA_API_KEY", "")
             if jina_key:
                 headers["Authorization"] = f"Bearer {jina_key}"
-            
+
             async with httpx.AsyncClient(proxy=self.proxy, timeout=_JINA_TIMEOUT) as client:
                 r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
                 if r.status_code in (429, 500, 502, 503):
                     return None
                 r.raise_for_status()
                 data = r.json().get("data", {})
-            
+
             text = data.get("content", "")
             if not text:
                 return None
-            
+
             title = data.get("title", "")
             if title:
                 text = f"# {title}\n\n{text}"
-            
+
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
             text = f"{_UNTRUSTED_BANNER}\n\n{text}"
-            
+
             return {
                 "url": url,
                 "finalUrl": data.get("url", url),
@@ -853,7 +858,7 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
     async def _fetch_readability(self, url: str, extract_mode: str, max_chars: int) -> dict:
         """Local fallback using readability-lxml."""
         from readability import Document
-        
+
         try:
             async with httpx.AsyncClient(
                 follow_redirects=True,
@@ -863,11 +868,11 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
-            
+
             ctype = r.headers.get("content-type", "")
             if ctype.startswith("image/"):
                 return build_image_content_blocks(r.content, ctype, url, f"(Image fetched from: {url})")
-            
+
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
@@ -877,12 +882,12 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
                 extractor = "readability"
             else:
                 text, extractor = r.text, "raw"
-            
+
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
             text = f"{_UNTRUSTED_BANNER}\n\n{text}"
-            
+
             return {
                 "url": url,
                 "finalUrl": str(r.url),

@@ -1,6 +1,7 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -9,22 +10,17 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any, Literal
 
+from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
 from loguru import logger
+from pydantic import Field
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.channels.base import BaseChannel
 from markbot.config.paths import get_media_dir
 from markbot.config.schema import Base
-from pydantic import Field
-
-import importlib.util
-
-from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
@@ -390,6 +386,7 @@ class FeishuChannel(BaseChannel):
         # "This event loop is already running" errors.
         def run_ws():
             import time as _time
+
             import lark_oapi.ws.client as _lark_ws_client
 
             ws_loop = asyncio.new_event_loop()

@@ -158,6 +158,8 @@ class SessionManager:
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._max_cache_size = max_cache_size
         self._ttl_days = ttl_days if ttl_days is not None else self._DEFAULT_TTL_DAYS
+        self._save_count = 0
+        self._CLEANUP_INTERVAL = 100
         self._cleanup_expired()
 
     def _cleanup_expired(self) -> None:
@@ -285,6 +287,19 @@ class SessionManager:
         self._save_to_disk(session)
         self._cache[session.key] = session
         self._cache.move_to_end(session.key)
+        self._evict_if_needed()
+        self._save_count += 1
+        if self._save_count % self._CLEANUP_INTERVAL == 0:
+            self._cleanup_expired()
+
+    def close(self) -> None:
+        """Persist all cached sessions to disk (best-effort)."""
+        for key in list(self._cache):
+            session = self._cache[key]
+            try:
+                self._save_to_disk(session)
+            except Exception as e:
+                logger.warning("Failed to save session {} on close: {}", key, e)
 
     def _evict_if_needed(self) -> None:
         """Evict oldest cached sessions when cache exceeds max size."""
@@ -361,7 +376,6 @@ class SessionManager:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         except Exception:
             self._full_write(session, path)
-            raise
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""

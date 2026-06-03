@@ -1,6 +1,5 @@
 """Tests for markbot.session.store — StateStore with subscriptions."""
 
-import pytest
 
 from markbot.session.store import StateStore, StateSubscription
 from markbot.session.types import AppState

@@ -1,9 +1,9 @@
 """Tests for markbot.session.task_tracker — Task lifecycle state machine."""
 
-import pytest
-from pathlib import Path
 
-from markbot.session.task_tracker import Task, TaskTracker, TaskRegistry, VALID_TRANSITIONS
+import pytest
+
+from markbot.session.task_tracker import VALID_TRANSITIONS, Task, TaskRegistry, TaskTracker
 
 
 class TestTaskDataclass:

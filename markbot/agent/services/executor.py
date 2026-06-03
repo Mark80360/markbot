@@ -6,12 +6,10 @@ Extracted from AgentLoop to decouple tool execution concerns.
 from datetime import datetime
 from typing import Any
 
-from loguru import logger
-
 from markbot.agent.context import ContextBuilder
 from markbot.agent.iteration import _INTERNAL_CONTEXT_TAG
-from markbot.tools.registry import ToolRegistry
 from markbot.session.session import Session
+from markbot.tools.registry import ToolRegistry
 from markbot.utils.helpers import strip_ansi
 
 

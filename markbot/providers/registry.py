@@ -17,7 +17,6 @@ Every entry writes out all fields so you can copy-paste as a template.
 from __future__ import annotations
 
 import json
-import logging
 import urllib.request
 from dataclasses import dataclass
 from typing import Any

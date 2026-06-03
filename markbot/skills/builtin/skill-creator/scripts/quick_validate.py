@@ -191,7 +191,7 @@ def validate_skill(skill_path):
     # Allow standard resource dirs plus skill-creator specific dirs
     ALLOWED_EXTRA_DIRS = {"agents", "eval-viewer"}
     ALLOWED_FILES_IN_ROOT = {"LICENSE.txt", "LICENSE", "LICENSE.md"}
-    
+
     for child in skill_path.iterdir():
         if child.name == "SKILL.md":
             continue

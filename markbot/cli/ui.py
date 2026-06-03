@@ -31,6 +31,7 @@ from markbot.cli.stream import ThinkingSpinner
 __all__ = [
     "markbot_banner",
     "flush_pending_tty_input",
+    "get_prompt_session",
     "restore_terminal",
     "init_prompt_session",
     "make_console",
@@ -188,6 +189,11 @@ def print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None
     """Print a CLI progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
         console.print(f"  [dim]↳ {text}[/dim]")
+
+
+def get_prompt_session() -> PromptSession | None:
+    """Return the current prompt_toolkit session singleton."""
+    return PROMPT_SESSION
 
 
 def is_exit_command(command: str) -> bool:

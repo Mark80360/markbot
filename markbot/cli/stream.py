@@ -14,8 +14,6 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
-from markbot import __logo__
-
 STREAM_REFRESH_INTERVAL = 0.05
 
 
@@ -100,7 +98,7 @@ class StreamRenderer:
             self._stop_spinner()
             c = _make_console()
             c.print()
-            c.print(f"[cyan]MarkBot:\n[/cyan]")
+            c.print("[cyan]MarkBot:\n[/cyan]")
             self._live = Live(self._render(), console=c, auto_refresh=False)
             self._live.start()
         now = time.monotonic()

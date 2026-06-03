@@ -42,8 +42,8 @@ class TestScrubberPoolScrubs:
     def test_split_across_chunks_still_scrubbed(self):
         pool = ScrubberPool()
         # Chunk 1 ends mid-tag, chunk 2 completes the open tag and payload.
-        out1 = pool.feed("cli:direct", f"pre<mem")
-        out2 = pool.feed("cli:direct", f"ory-context>secret")
+        out1 = pool.feed("cli:direct", "pre<mem")
+        out2 = pool.feed("cli:direct", "ory-context>secret")
         out3 = pool.feed("cli:direct", f"{MEMORY_CONTEXT_CLOSE}post")
         assert out1 + out2 + out3 == "prepost"
         assert pool.flush("cli:direct") == ""

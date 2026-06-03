@@ -1,6 +1,8 @@
 """``markbot config`` group: read/write configuration values."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from markbot.cli.ui import console, markbot_banner
@@ -302,7 +304,7 @@ def channel(
     config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Interactively configure chat channels."""
-    from markbot.cli.onboard import _configure_channels, run_onboard
+    from markbot.cli.onboard import _configure_channels
     from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
 
     if config_path:

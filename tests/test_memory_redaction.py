@@ -1,5 +1,4 @@
-import pytest
-from markbot.memory.manager import redact_sensitive_text, _SENSITIVE_PATTERNS
+from markbot.memory.manager import _SENSITIVE_PATTERNS, redact_sensitive_text
 
 
 class TestRedactSensitiveText:

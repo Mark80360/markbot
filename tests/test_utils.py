@@ -1,23 +1,21 @@
 """Tests for markbot.utils module (helpers, constants, network)."""
 
-import pytest
-from pathlib import Path
 
+from markbot.utils.constants import (
+    BINARY_EXTENSIONS,
+    DANGEROUS_COMMAND_PATTERNS,
+    IGNORE_DIRS,
+    MAX_SEARCH_RESULTS,
+)
 from markbot.utils.helpers import (
-    shorten,
-    strip_think,
-    strip_ansi,
+    current_time_str,
     detect_image_mime,
     ensure_dir,
-    safe_filename,
     normalize_timezone,
-    current_time_str,
-)
-from markbot.utils.constants import (
-    IGNORE_DIRS,
-    BINARY_EXTENSIONS,
-    MAX_SEARCH_RESULTS,
-    DANGEROUS_COMMAND_PATTERNS,
+    safe_filename,
+    shorten,
+    strip_ansi,
+    strip_think,
 )
 
 

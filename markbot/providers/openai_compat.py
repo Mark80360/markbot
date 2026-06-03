@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import secrets
 import string
 import uuid
-import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-import json_repair
 import httpx
+import json_repair
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from markbot.providers.errors import ErrorType, classify_error  # noqa: F401  (imported per Task 3 spec)
+from markbot.providers.errors import (  # noqa: F401  (imported per Task 3 spec)
+    ErrorType,
+    classify_error,
+)
 
 if TYPE_CHECKING:
     from markbot.providers.registry import ProviderSpec

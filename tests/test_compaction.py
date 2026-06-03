@@ -1,12 +1,8 @@
 """Tests for compaction service."""
 
-import pytest
 from markbot.agent.compact import (
     CompactAction,
     CompactResult,
-    CONTEXT_COLLAPSE_HEAD_CHARS,
-    CONTEXT_COLLAPSE_TAIL_CHARS,
-    _PTL_ERROR_PATTERNS,
     is_prompt_too_long_error,
 )
 

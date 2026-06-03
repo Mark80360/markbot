@@ -13,7 +13,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import mimetypes
 import os
 import re
 import time

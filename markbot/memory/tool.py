@@ -27,11 +27,12 @@ from typing import Any, Callable, Dict, List, Optional
 from loguru import logger
 
 from markbot.utils.constants import (
-    MEMORY_FILENAME,
-    USER_FILENAME,
     DEFAULT_MEMORY_CHAR_LIMIT,
     DEFAULT_USER_CHAR_LIMIT,
+    MEMORY_FILENAME,
+    USER_FILENAME,
 )
+
 from .fencing import fence_context
 from .scanner import MemorySecurityScanner
 
@@ -152,9 +153,12 @@ class MemoryStore:
             entries = self.user_entries
             char_limit = self.user_char_limit
 
-        # Check total char limit
-        current_total = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries), 1)
-        if current_total + len(content) > char_limit:
+        # Check total char limit.
+        # N entries are joined by N-1 delimiters (no leading/trailing delimiter).
+        # The on-disk layout also adds a header and trailing newline, but those
+        # are constant overhead and not counted against the entry budget here.
+        current_total = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries) - 1, 0)
+        if current_total + len(content) + len(ENTRY_DELIMITER) > char_limit:
             return {
                 "success": False,
                 "message": f"Character limit reached ({char_limit}). "

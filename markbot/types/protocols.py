@@ -7,7 +7,6 @@ between modules, replacing raw ``Any`` types with explicit contracts.
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 

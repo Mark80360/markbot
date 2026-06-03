@@ -10,7 +10,6 @@ hallucinates a tool name.
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -128,8 +127,6 @@ class TestSubagentToolGuard:
         )
         tools = ToolRegistry()
         # Forbid every tool we register below; the registry must be empty.
-        from markbot.tools.filesystem import ReadFileTool
-        from markbot.tools.search import GlobTool
 
         cap = CapabilityToken(
             allowed_tools=("read_file", "glob"),

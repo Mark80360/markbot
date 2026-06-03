@@ -1,6 +1,5 @@
 """Tests for markbot.providers module (base, registry, fallback)."""
 
-import pytest
 
 from markbot.providers.base import LLMResponse, ToolCallRequest
 from markbot.providers.errors import ErrorType, classify_error
@@ -8,19 +7,18 @@ from markbot.providers.fallback import (
     CircuitState,
     FallbackAttempt,
     FallbackManager,
-    AllModelsFailedError,
 )
 from markbot.providers.registry import (
-    ProviderSpec,
-    DeepSeekSpec,
-    MoonshotSpec,
-    OpenRouterSpec,
-    GeminiSpec,
+    _OMIT_TEMPERATURE,
+    PROVIDERS,
+    AnthropicSpec,
     CustomSpec,
     DashScopeSpec,
-    AnthropicSpec,
-    PROVIDERS,
-    _OMIT_TEMPERATURE,
+    DeepSeekSpec,
+    GeminiSpec,
+    MoonshotSpec,
+    OpenRouterSpec,
+    ProviderSpec,
     find_by_name,
 )
 

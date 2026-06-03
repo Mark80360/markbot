@@ -1,18 +1,14 @@
 """Tests for markbot.session module (session, handoff)."""
 
-import json
-import pytest
-from pathlib import Path
-from datetime import datetime
 
-from markbot.session.session import Session
 from markbot.session.handoff import (
-    HandoffTask,
-    HandoffDecision,
     HandoffBlocker,
-    SessionHandoff,
+    HandoffDecision,
     HandoffManager,
+    HandoffTask,
+    SessionHandoff,
 )
+from markbot.session.session import Session
 
 
 class TestSession:
@@ -239,7 +235,6 @@ class TestHandoffManager:
         path = mgr.save(h)
 
         import os
-        import time
         old_time = os.path.getmtime(path) - 31 * 86400
         os.utime(path, (old_time, old_time))
 

@@ -1,15 +1,14 @@
 """Tests for markbot.skills.core.scanner — Security scanner."""
 
-import pytest
 from pathlib import Path
 
+import pytest
+
 from markbot.skills.core.scanner import (
-    SecurityScanner,
-    ScanResult,
     Finding,
+    ScanResult,
+    SecurityScanner,
     should_allow,
-    TRUST_POLICY,
-    BLOCKING_SEVERITIES,
 )
 
 

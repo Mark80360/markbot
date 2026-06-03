@@ -4,6 +4,8 @@ This module provides unified constants to ensure consistency across
 search, filesystem, explore, and other tools.
 """
 
+from pathlib import Path
+
 # ---------------------------------------------------------------------------
 # Memory file constants (canonical definitions — import from here)
 # ---------------------------------------------------------------------------
@@ -214,3 +216,18 @@ MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 10
 # Context fencing tags
 MEMORY_CONTEXT_TAG_OPEN: str = "<memory-context>"
 MEMORY_CONTEXT_TAG_CLOSE: str = "</memory-context>"
+
+# Maximum number of MEMORY.md backups to retain from dream() runs.
+# Older backups are pruned to keep the workspace from growing without bound.
+DREAM_BACKUP_KEEP: int = 5
+
+# Soft per-entry cap (chars) used by summary_memory() and dream() when
+# staging entries, to keep a single bloated entry from monopolizing the
+# entire MemoryStore budget.
+SINGLE_ENTRY_SOFT_LIMIT: int = 1500
+
+# Agent idle timeout in minutes. When no inbound message is received for
+# any session within this window, a timeout notification is sent back and
+# the session's resources (active tasks, locks, scrubber state) are
+# cleaned up. Set to 0 to disable idle timeout.
+AGENT_IDLE_TIMEOUT_MINUTES: int = 30

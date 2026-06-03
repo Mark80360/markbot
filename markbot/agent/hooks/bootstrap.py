@@ -8,12 +8,12 @@ Ported from bootstrap hook.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 if TYPE_CHECKING:
-    from markbot.memory.base import BaseMemoryManager
+    pass
 
 
 class BootstrapHook:

@@ -38,12 +38,9 @@ import os
 import re
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from markbot.tools.base import BaseTool
-from markbot.types.permission import PermissionDecision
-from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
-
 from markbot.tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
@@ -51,6 +48,8 @@ from markbot.tools.computer_use.backend import (
     UIElement,
 )
 from markbot.tools.computer_use.schema import get_computer_use_schema
+from markbot.types.permission import PermissionDecision
+from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +121,10 @@ def _get_backend() -> ComputerUseBackend:
                 _backend = PyAutoGUIBackend()
             elif backend_name in {"cua", "cua-driver", ""}:
                 if sys.platform == "darwin":
-                    from markbot.tools.computer_use.cua_backend import CuaDriverBackend, cua_driver_binary_available
+                    from markbot.tools.computer_use.cua_backend import (
+                        CuaDriverBackend,
+                        cua_driver_binary_available,
+                    )
                     if cua_driver_binary_available():
                         _backend = CuaDriverBackend()
                     else:

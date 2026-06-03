@@ -34,14 +34,12 @@ if TYPE_CHECKING:
     from markbot.agent.services.executor import ToolExecutor
     from markbot.agent.services.interaction import InteractionLogger
     from markbot.agent.subagent import SubagentManager
-    from markbot.agent.tool_binder import ToolBinder
     from markbot.bus.queue import MessageBus
     from markbot.cli.slash_commands import CommandRouter
     from markbot.config.schema import (
         BudgetConfig,
         ChannelsConfig,
         CodeExecutionConfig,
-        CompactionConfig as SchemaCompactionConfig,
         Config,
         ExecToolConfig,
         FilesystemToolConfig,
@@ -311,39 +309,53 @@ class AgentContext:
         This encapsulates all the component creation that was previously
         inlined in ``AgentLoop.__init__``.
         """
-        from markbot.agent.compact import CompactionConfig as _CC, MultiLevelCompactor as _MLC
-        from markbot.agent.cost import CostTracker as _CT, PricingTable as _PT, ModelPricing as _MP
+        from markbot.agent.compact import CompactionConfig as _CC
+        from markbot.agent.compact import MultiLevelCompactor as _MLC
         from markbot.agent.context import ContextBuilder as _CB
+        from markbot.agent.cost import CostTracker as _CT
+        from markbot.agent.cost import ModelPricing as _MP
+        from markbot.agent.cost import PricingTable as _PT
         from markbot.agent.hooks.bootstrap import BootstrapHook as _BH
         from markbot.agent.hooks.compaction import MemoryCompactionHook as _MCH
         from markbot.agent.mcp.manager import McpManager as _MM
         from markbot.agent.pipeline.engine import MessagePipeline as _MP2
         from markbot.agent.pipeline.middleware import (
             MemoryLifecycleMiddleware as _MLM,
+        )
+        from markbot.agent.pipeline.middleware import (
             QuestionResponseMiddleware as _QRM,
         )
         from markbot.agent.services.executor import ToolExecutor as _TE
         from markbot.agent.services.interaction import InteractionLogger as _IL
         from markbot.agent.subagent import SubagentManager as _SM
         from markbot.agent.tool_binder import ToolBinder as _TB
+        from markbot.cli.slash_commands import CommandRouter as _CR
+        from markbot.cli.slash_commands import register_builtin_commands as _rbc
         from markbot.config.schema import (
-            MemoryToolsConfig as _MTC,
             CodeExecutionConfig as _CEC,
-            WebSearchConfig as _WSC,
+        )
+        from markbot.config.schema import (
             ExecToolConfig as _ETC,
+        )
+        from markbot.config.schema import (
             FilesystemToolConfig as _FTC,
         )
+        from markbot.config.schema import (
+            MemoryToolsConfig as _MTC,
+        )
+        from markbot.config.schema import (
+            WebSearchConfig as _WSC,
+        )
         from markbot.memory.daily_log import DailyLogManager as _DLM
-        from markbot.memory.manager import MemoryManager as _HMM
         from markbot.memory.encoder import MemoryEncoder as _ME
-        from markbot.session.session import SessionManager as _SM2
-        from markbot.session.handoff import HandoffManager as _HM
+        from markbot.memory.manager import MemoryManager as _HMM
         from markbot.session.bootstrap import SessionBootstrap as _SB
+        from markbot.session.handoff import HandoffManager as _HM
+        from markbot.session.session import SessionManager as _SM2
         from markbot.session.task_tracker import TaskTracker as _TT
         from markbot.skills import SkillRegistry as _SR
         from markbot.skills.core.guardrail import SkillGuardrailManager as _SGM
         from markbot.tools.registry import ToolRegistry as _TR
-        from markbot.cli.slash_commands import CommandRouter as _CR, register_builtin_commands as _rbc
 
         _init_start = time.time()
         logger.info("Starting initialization...")

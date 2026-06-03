@@ -16,12 +16,8 @@ Provides a file-based memory system with:
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
-import platform
 import re
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -30,19 +26,18 @@ from loguru import logger
 
 from markbot.utils.constants import (
     MAX_COMPRESSED_SUMMARY_CHARS,
-    MAX_DAILY_LOG_RESULT_CHARS,
-    MAX_MEMORY_MD_CHARS,
     MAX_PREFETCH_RESULTS,
+    MEMORY_FILENAME,
     MIN_PREFETCH_SCORE,
+    USER_FILENAME,
 )
 
 from .base import BaseMemoryManager
-from .daily_log import DailyLogManager
-from .fencing import fence_context, sanitize_context, StreamingContextScrubber
+from .daily_log import DailyLogManager, tokenize_for_search
+from .fencing import fence_context
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
 from .tool import MemoryStore
-from markbot.utils.constants import MEMORY_FILENAME, USER_FILENAME
 
 if TYPE_CHECKING:
     pass
@@ -194,7 +189,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self._memory_store: MemoryStore | None = None
         self._daily_log: DailyLogManager | None = None
         self._scanner = MemorySecurityScanner()
-        self._scrubber = StreamingContextScrubber()
+        # Note: streaming scrubbers live in markbot.agent.stream_scrubber
+        # (ScrubberPool) and are reset per turn by the agent loop. This
+        # module has no scrubber state of its own.
 
         self._prefetch_query: str = ""
         self._prefetch_session_key: str | None = None
@@ -217,7 +214,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         """Initialize for a session."""
         working_dir = kwargs.get("working_dir", self.working_dir)
         self._memory_store = MemoryStore(working_dir=working_dir, on_write=self._on_store_write)
-        self._daily_log = DailyLogManager(workspace=Path(working_dir))
+        # Preserve externally-injected _memory_store and _daily_log (e.g. from
+        # AgentContext.from_legacy_params or tests) — only construct a default
+        # DailyLogManager when one was not provided. Mirrors start() behavior.
+        if self._daily_log is None:
+            self._daily_log = DailyLogManager(workspace=Path(working_dir))
         self._compressed_summary = self._load_compressed_summary()
         logger.info("Initialized for session: {}", session_id)
 
@@ -422,32 +423,52 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         Returns:
             Tuple of (messages_to_compact, remaining_messages, is_valid).
         """
+        from markbot.utils.tokens import (
+            estimate_messages_tokens,
+            estimate_tokens,
+        )
+
         messages = kwargs.get("messages", [])
         if not messages:
             return [], [], True
 
-        # Calculate total context size
-        total_chars = sum(
-            len(m.get("content", "")) if isinstance(m.get("content", ""), str) else 0
-            for m in messages
-        )
-
-        # Add system prompt size
+        # Token-based accounting: the model context window is denominated
+        # in tokens, so char counts are only a rough proxy. Estimate the
+        # message block and the system prompt separately, then compare
+        # against the configured max_input_length (which callers pass as
+        # the model's context window in tokens).
+        total_tokens = estimate_messages_tokens(messages)
         system_prompt = kwargs.get("system_prompt", "")
-        total_chars += len(system_prompt)
+        if isinstance(system_prompt, str) and system_prompt:
+            total_tokens += estimate_tokens(system_prompt)
 
-        threshold = self.max_input_length * self.memory_compact_ratio
-        reserve = int(self.max_input_length * self.memory_reserve_ratio)
+        threshold = int(self.max_input_length * self.memory_compact_ratio)
+        reserve_ratio = max(0.0, min(self.memory_reserve_ratio, 0.9))
 
-        if total_chars <= threshold:
+        if total_tokens <= threshold:
             return [], messages, True
 
-        # Determine how many messages to compact
-        compact_count = int(len(messages) * (1 - self.memory_reserve_ratio))
-        messages_to_compact = messages[:compact_count]
-        remaining = messages[compact_count:]
+        # Pick the prefix length that, when compacted, brings us back
+        # under the threshold. We walk oldest-first and stop as soon as
+        # compacting the prefix is sufficient — that preserves as much
+        # recent context as possible.
+        cumulative = 0
+        compact_count = 0
+        for i in range(len(messages) - 1, -1, -1):
+            cumulative += estimate_messages_tokens([messages[i]])
+            compact_count = len(messages) - i
+            if total_tokens - cumulative <= threshold:
+                break
+        else:
+            # Every message needed compaction; leave the very last one
+            # untouched so the model has at least one fresh turn to read.
+            compact_count = max(len(messages) - 1, 0)
 
-        return messages_to_compact, remaining, False
+        compact_count = min(compact_count, int(len(messages) * (1 - reserve_ratio)))
+        if compact_count <= 0:
+            return [], messages, True
+
+        return messages[:compact_count], messages[compact_count:], False
 
     async def compact_memory(
         self,
@@ -554,12 +575,25 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
                 if summary and self._memory_store:
                     try:
-                        truncated = summary[:self._memory_store.memory_char_limit - 100] if len(summary) > self._memory_store.memory_char_limit else summary
-                        result = self._memory_store.add("memory", truncated)
-                        if not result.get("success", False):
+                        from markbot.utils.constants import SINGLE_ENTRY_SOFT_LIMIT
+
+                        # Split the summary into reasonably-sized chunks
+                        # so a single LLM response cannot fill the entire
+                        # MEMORY.md budget in one entry.
+                        chunks = self._split_oversized_entry(
+                            summary, SINGLE_ENTRY_SOFT_LIMIT,
+                        )
+                        failures: list[str] = []
+                        for chunk in chunks:
+                            result = self._memory_store.add("memory", chunk)
+                            if not result.get("success", False):
+                                failures.append(result.get("message", "unknown"))
+                                if "limit" in (failures[-1] or "").lower():
+                                    break
+                        if failures:
                             logger.warning(
-                                "Failed to write summary to MemoryStore: {}",
-                                result.get("message", "unknown"),
+                                "Some summary chunks failed to write: {}",
+                                failures,
                             )
                     except Exception as e:
                         logger.warning("Failed to write summary to MemoryStore: {}", e)
@@ -612,16 +646,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # 2. Search MemoryStore entries
         if self._memory_store:
             try:
-                query_lower = query.lower()
-                query_tokens = set(re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", query_lower))
+                query_tokens = set(tokenize_for_search(query))
 
                 for target, entries in [
                     ("memory", self._memory_store.memory_entries),
                     ("user", self._memory_store.user_entries),
                 ]:
                     for entry in entries:
-                        entry_lower = entry.lower()
-                        entry_tokens = set(re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", entry_lower))
+                        entry_tokens = set(tokenize_for_search(entry))
                         hits = sum(1 for t in query_tokens if t in entry_tokens)
                         if hits > 0 and query_tokens:
                             score = hits / len(query_tokens)
@@ -637,9 +669,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # 3. Search compressed summary (global)
         if self._compressed_summary:
             try:
-                summary_lower = self._compressed_summary.lower()
-                query_lower = query.lower()
-                if any(token in summary_lower for token in re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", query_lower)):
+                query_tokens = set(tokenize_for_search(query))
+                summary_tokens = set(tokenize_for_search(self._compressed_summary))
+                if query_tokens & summary_tokens:
                     results.append({
                         "content": self._compressed_summary[:500],
                         "source": "compressed_summary",
@@ -654,9 +686,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             session_summary = self.get_compressed_summary(session_key=session_key)
             if session_summary and session_summary != self._compressed_summary:
                 try:
-                    summary_lower = session_summary.lower()
-                    query_lower = query.lower()
-                    if any(token in summary_lower for token in re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]", query_lower)):
+                    query_tokens = set(tokenize_for_search(query))
+                    summary_tokens = set(tokenize_for_search(session_summary))
+                    if query_tokens & summary_tokens:
                         results.append({
                             "content": session_summary[:500],
                             "source": f"session_summary/{session_key}",
@@ -665,16 +697,19 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 except Exception:
                     pass
 
-        # Deduplicate by content and sort by score descending
-        seen_contents: set[str] = set()
+        # Deduplicate by (source, content) so the same text from two
+        # sources (e.g. daily log vs. memory entry) is preserved, while
+        # truly duplicate rows are dropped. Sort by score descending.
+        seen_keys: set[tuple[str, str]] = set()
         unique_results: list[dict] = []
         for r in sorted(results, key=lambda x: -x.get("score", 0)):
-            content = r.get("content", "")
-            if content not in seen_contents:
-                seen_contents.add(content)
-                unique_results.append(r)
-                if len(unique_results) >= max_results:
-                    break
+            key = (r.get("source", ""), r.get("content", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_results.append(r)
+            if len(unique_results) >= max_results:
+                break
 
         return unique_results
 
@@ -745,10 +780,17 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         Uses LLM to consolidate MEMORY.md entries. Writes back through
         MemoryStore to ensure security scanning and character limits.
+        Old entries are kept in memory until the new entries pass both
+        the security scan and the size limit, so a mid-flight failure
+        never destroys existing memory.
 
         Returns:
             Status message.
         """
+        # Local copies let us restore the in-memory list (and on-disk
+        # file) verbatim if anything goes wrong below.
+        from markbot.utils.constants import DREAM_BACKUP_KEEP
+
         if not self._memory_store:
             return "Memory store not available"
 
@@ -761,15 +803,30 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = backup_dir / f"memory_backup_{timestamp}.md"
 
+        # Snapshot the current entries so we can restore them if any
+        # step below fails. ``list(...)`` copies the live list; we also
+        # keep the on-disk bytes to allow restore on _persist failure.
+        old_entries = list(self._memory_store.memory_entries)
+        old_disk_bytes: bytes | None = None
+        try:
+            old_disk_bytes = memory_path.read_bytes()
+        except Exception:
+            pass
+
         try:
             import shutil
             shutil.copyfile(memory_path, backup_path)
+            self._cleanup_dream_backups(backup_dir, keep=DREAM_BACKUP_KEEP)
         except Exception as e:
             return f"Failed to create backup: {e}"
 
         if not self._fallback_manager:
             return "No LLM available for dream optimization"
 
+        # Stage new entries on a local list and only commit to
+        # ``memory_entries`` once we know they all pass the scan and
+        # fit the budget. That way an exception from the LLM call or
+        # the scanner never wipes the live store.
         try:
             content = memory_path.read_text(encoding="utf-8", errors="replace")
             response, _ = await self._fallback_manager.chat_with_fallback(
@@ -790,39 +847,55 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             )
             optimized = response.content or ""
             if not optimized:
-                return "Dream produced empty result"
+                self._restore_entries(old_entries, old_disk_bytes, memory_path)
+                return "Dream produced empty result; original memory preserved"
 
-            new_entries = [
+            raw_entries = [
                 e.strip()
                 for e in re.split(r"\n---\n", optimized)
                 if e.strip() and not e.strip().startswith("#")
             ]
 
-            if not new_entries:
-                return "Dream produced no valid entries"
+            if not raw_entries:
+                self._restore_entries(old_entries, old_disk_bytes, memory_path)
+                return "Dream produced no valid entries; original memory preserved"
 
-            old_entries = list(self._memory_store.memory_entries)
-            self._memory_store.memory_entries.clear()
+            # Split oversized entries so a single LLM blob cannot fill
+            # the entire char limit and starve future writes.
+            candidate_entries: list[str] = []
+            for raw in raw_entries:
+                candidate_entries.extend(self._split_oversized_entry(raw, self._memory_store.memory_char_limit))
 
+            staged: list[str] = []
             added, skipped = 0, 0
-            for entry in new_entries:
+            for entry in candidate_entries:
                 error = self._memory_store._scanner.scan(entry)
                 if error:
                     skipped += 1
                     continue
                 sanitized = self._memory_store._scanner.sanitize(entry)
-                current_total = sum(len(e) for e in self._memory_store.memory_entries)
+                current_total = sum(len(e) for e in staged)
                 if current_total + len(sanitized) > self._memory_store.memory_char_limit:
                     skipped += 1
                     continue
-                self._memory_store.memory_entries.append(sanitized)
+                staged.append(sanitized)
                 added += 1
 
             if added == 0:
-                self._memory_store.memory_entries = old_entries
+                self._restore_entries(old_entries, old_disk_bytes, memory_path)
                 return "Dream produced no safe entries; original memory preserved"
 
-            self._memory_store._persist("memory")
+            # Commit. From here on, a _persist failure means the on-disk
+            # file might be stale relative to the in-memory list, so we
+            # also restore from the disk snapshot we took above.
+            self._memory_store.memory_entries = staged
+            try:
+                self._memory_store._persist("memory")
+            except Exception as persist_err:
+                logger.error("Dream _persist failed, restoring from snapshot: {}", persist_err)
+                self._restore_entries(old_entries, old_disk_bytes, memory_path)
+                return f"Dream optimization failed during persist: {persist_err}"
+
             self._memory_store.refresh_snapshot()
 
             return (
@@ -830,7 +903,82 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 f"{skipped} skipped (limit/security). Backup at {backup_path}"
             )
         except Exception as e:
+            # Any unexpected failure (LLM timeout, scanner bug, etc.)
+            # must NOT leave the live store empty. The snapshot above
+            # is the source of truth.
+            self._restore_entries(old_entries, old_disk_bytes, memory_path)
             return f"Dream optimization failed: {e}"
+
+    @staticmethod
+    def _split_oversized_entry(entry: str, char_limit: int) -> list[str]:
+        """Split an entry that would overflow the store budget on its own.
+
+        Prefers breaking on sentence/line boundaries, falls back to hard
+        cuts. The per-line cap leaves headroom for surrounding delimiters
+        and the per-entry overhead assumed by ``MemoryStore.add``.
+        """
+        if char_limit <= 0 or len(entry) <= char_limit:
+            return [entry]
+
+        per_chunk = max(char_limit - 200, 500)
+        chunks: list[str] = []
+        remaining = entry
+        while len(remaining) > per_chunk:
+            cut = per_chunk
+            for sep in ("\n\n", "\n", ". ", "。", " "):
+                idx = remaining.rfind(sep, 0, per_chunk)
+                if idx > per_chunk // 2:
+                    cut = idx + len(sep)
+                    break
+            chunks.append(remaining[:cut].strip())
+            remaining = remaining[cut:].strip()
+        if remaining:
+            chunks.append(remaining)
+        return [c for c in chunks if c]
+
+    @staticmethod
+    def _cleanup_dream_backups(backup_dir: Path, keep: int) -> None:
+        """Keep only the most recent ``keep`` dream backups on disk.
+
+        Old runs left hundreds of timestamped files in ``backup/`` which
+        eventually bloat the workspace. We sort by filename (which is
+        sortable via the embedded ``%Y%m%d_%H%M%S`` prefix) and delete
+        the oldest ones beyond the keep window.
+        """
+        if keep <= 0:
+            return
+        try:
+            backups = sorted(backup_dir.glob("memory_backup_*.md"))
+        except Exception:
+            return
+        for stale in backups[:-keep] if len(backups) > keep else []:
+            try:
+                stale.unlink()
+            except Exception:
+                pass
+
+    def _restore_entries(
+        self,
+        entries: list[str],
+        disk_bytes: bytes | None,
+        memory_path: Path,
+    ) -> None:
+        """Best-effort restore of MEMORY.md state after a dream failure.
+
+        Restores both the in-memory list and the on-disk file (if we
+        captured its bytes before the failed write). If we never had a
+        disk snapshot, fall back to just restoring the live list and
+        letting the next ``_persist`` re-serialize it.
+        """
+        self._memory_store.memory_entries = list(entries)
+        if disk_bytes is not None:
+            try:
+                memory_path.write_bytes(disk_bytes)
+                self._memory_store.refresh_snapshot()
+            except Exception as e:
+                logger.error("Failed to restore MEMORY.md from snapshot: {}", e)
+        else:
+            self._memory_store.refresh_snapshot()
 
     def get_in_memory_memory(self, **kwargs) -> Any:
         """Retrieve the in-memory memory object (stub for compatibility)."""
@@ -1071,7 +1219,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             path.write_text(new_content, encoding="utf-8")
         except Exception as e:
             logger.warning("Failed to save daily session summary: {}", e)
-        
+
 
     def _session_summary_path(self, session_key: str) -> Path:
         """Get path for per-session summary file."""
@@ -1079,9 +1227,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         return Path(self.working_dir) / "memory" / f".summary_{safe_key}"
 
     def _session_summary_path_daily(self, session_key: str) -> Path:
-        """Get path for daily-session summary file."""
+        """Get path for daily-session summary file.
+
+        Sits under ``memory/daily/`` so it lives next to the per-day
+        interaction logs written by ``DailyLogManager`` and stays out of
+        the curated ``memory/`` namespace used by ``MemoryStore``.
+        """
         date = datetime.now().strftime("%Y-%m-%d")
-        return Path(self.working_dir) / "memory" / f"{date}.md"
+        return Path(self.working_dir) / "memory" / "daily" / f"{date}.md"
 
 
 __all__ = ["MemoryManager", "redact_sensitive_text"]

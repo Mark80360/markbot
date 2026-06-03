@@ -1,12 +1,11 @@
 """Tests for specific tool implementations — think, question, todo."""
 
-import pytest
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
-from markbot.tools.think import ThinkTool
+import pytest
+
 from markbot.tools.question import AskUserQuestionTool
-from markbot.tools.todo import TodoTool, _TodoStore, _short_id
+from markbot.tools.think import ThinkTool
+from markbot.tools.todo import TodoTool, _short_id, _TodoStore
 
 
 class TestThinkTool:

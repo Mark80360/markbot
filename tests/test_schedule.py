@@ -1,19 +1,17 @@
 """Tests for markbot.schedule module (cron, job management)."""
 
-import json
+
 import pytest
-from pathlib import Path
-from datetime import datetime
 
 from markbot.schedule.cron import (
-    CronSchedule,
-    CronPayload,
     CronJob,
     CronJobState,
+    CronPayload,
+    CronSchedule,
     CronService,
     _compute_next_run,
-    _validate_schedule_for_add,
     _now_ms,
+    _validate_schedule_for_add,
 )
 
 

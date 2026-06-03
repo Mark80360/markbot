@@ -7,18 +7,18 @@ from typing import TYPE_CHECKING
 
 from markbot.providers.base import LLMProvider, LLMResponse
 from markbot.providers.registry import (
-    ProviderSpec,
-    DeepSeekSpec,
-    MoonshotSpec,
-    OpenRouterSpec,
-    GeminiSpec,
+    _OMIT_TEMPERATURE,
+    PROVIDERS,
+    AnthropicSpec,
     CustomSpec,
     DashScopeSpec,
-    AnthropicSpec,
-    PROVIDERS,
-    _OMIT_TEMPERATURE,
-    find_by_name,
+    DeepSeekSpec,
+    GeminiSpec,
+    MoonshotSpec,
+    OpenRouterSpec,
+    ProviderSpec,
     create_provider,
+    find_by_name,
 )
 
 __all__ = [
@@ -58,9 +58,9 @@ _LAZY_IMPORTS = {
 if TYPE_CHECKING:
     from markbot.providers.anthropic import AnthropicProvider
     from markbot.providers.azure_openai import AzureOpenAIProvider
-    from markbot.providers.openai_compat import OpenAICompatProvider
+    from markbot.providers.fallback import AllModelsFailedError, FallbackAttempt, FallbackManager
     from markbot.providers.openai_codex import OpenAICodexProvider
-    from markbot.providers.fallback import FallbackManager, AllModelsFailedError, FallbackAttempt
+    from markbot.providers.openai_compat import OpenAICompatProvider
 
 
 def __getattr__(name: str):

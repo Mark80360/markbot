@@ -2,7 +2,6 @@
 
 import os
 import sys
-from pathlib import Path
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -20,10 +19,19 @@ import typer
 from markbot import __logo__, __version__
 from markbot.cli.autopilot import app as autopilot_app
 from markbot.cli.doctor import doctor_app
-from markbot.cli.groups import agent, channels, config, gateway, onboard, plugins, provider, status, web
+from markbot.cli.groups import (
+    agent,
+    channels,
+    config,
+    gateway,
+    onboard,
+    plugins,
+    provider,
+    status,
+    web,
+)
 from markbot.cli.skills import app as skills_app
 from markbot.cli.ui import console
-from markbot.config.schema import Config
 
 app = typer.Typer(
     name="markbot",

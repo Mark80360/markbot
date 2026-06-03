@@ -4,9 +4,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
+from markbot.schedule.cron import CronJobState, CronSchedule, CronService
 from markbot.tools.base import Tool
-from markbot.schedule.cron import CronService
-from markbot.schedule.cron import CronJobState, CronSchedule
 
 
 class CronTool(Tool):

@@ -208,7 +208,7 @@ class SkillLifecycle:
                 skill_name=skill_name,
                 current_state=current_state,
                 target_state=SkillState.ACTIVE,
-                reason=f"Skill not found in archived or active directories",
+                reason="Skill not found in archived or active directories",
                 applied=False,
             )
 

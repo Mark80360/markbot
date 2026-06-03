@@ -22,17 +22,14 @@ import base64
 import io
 import logging
 import os
-import re
 import subprocess
 import sys
-import time as _time
 from typing import Any, Dict, List, Optional, Tuple
 
 from markbot.tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
     ComputerUseBackend,
-    UIElement,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +57,6 @@ def _check_pyautogui(force: bool = False) -> bool:
     if _PYAUTOGUI_AVAILABLE is not None and not force:
         return _PYAUTOGUI_AVAILABLE
     try:
-        import pyautogui
         _PYAUTOGUI_AVAILABLE = True
     except Exception:
         _PYAUTOGUI_AVAILABLE = False
@@ -286,7 +282,7 @@ class PyAutoGUIBackend(ComputerUseBackend):
 
         try:
             screenshot = pyautogui.screenshot()
-        except Exception as e:
+        except Exception:
             return CaptureResult(mode=mode, width=0, height=0)
 
         buf = io.BytesIO()

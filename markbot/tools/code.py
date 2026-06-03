@@ -10,11 +10,7 @@ Security is enforced by:
 
 from __future__ import annotations
 
-import json
-import os
 import sys
-import tempfile
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,8 +18,8 @@ from uuid import uuid4
 
 from loguru import logger
 
-from markbot.tools.base import Tool
 from markbot.config.paths import get_code_run_dir
+from markbot.tools.base import Tool
 
 
 def _make_temp_script(purpose: str, suffix: str = ".py") -> Path:
@@ -171,7 +167,7 @@ class CodeExecutionTool(Tool):
 
     def _scan_code(self, code: str) -> str | None:
         try:
-            from markbot.skills.core.scanner import SecurityScanner, BLOCKING_SEVERITIES
+            from markbot.skills.core.scanner import BLOCKING_SEVERITIES, SecurityScanner
 
             scanner = SecurityScanner()
             scan_result = scanner.scan_code(code, language="python", trust_level="agent-created")

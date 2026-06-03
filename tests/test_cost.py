@@ -1,7 +1,8 @@
 """Tests for cost tracking and budget control."""
 
 import pytest
-from markbot.agent.cost import CostTracker, ModelPricing, ModelUsage, CostState, PricingTable
+
+from markbot.agent.cost import CostTracker, ModelPricing, ModelUsage, PricingTable
 from markbot.types.exceptions import BudgetExceededError
 
 

@@ -72,7 +72,7 @@ def onboard(
 
         console.print(f"\n{__logo__} Default configuration created!")
         console.print(f"  Edit config: [cyan]{config_path}[/cyan]")
-        console.print(f"  Run guided setup: [cyan]markbot onboard --guided[/cyan]")
+        console.print("  Run guided setup: [cyan]markbot onboard --guided[/cyan]")
         return
 
     # Create or update config

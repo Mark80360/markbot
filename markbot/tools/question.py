@@ -4,8 +4,8 @@ import asyncio
 import uuid
 from typing import Any, Awaitable, Callable
 
-from markbot.tools.base import Tool
 from markbot.bus.events import OutboundMessage
+from markbot.tools.base import Tool
 
 
 class AskUserQuestionTool(Tool):
@@ -87,7 +87,7 @@ class AskUserQuestionTool(Tool):
     async def _legacy_execute(self, **kwargs: Any) -> str:
         question = kwargs.get("question", "")
         options = kwargs.get("options", [])
-        
+
         if not self._send_callback:
             return "Error: Message sending not configured"
 

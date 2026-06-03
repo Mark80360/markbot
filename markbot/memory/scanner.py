@@ -17,30 +17,32 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-
 # ---------------------------------------------------------------------------
 # Threat patterns
 # ---------------------------------------------------------------------------
 
 _THREAT_PATTERNS: list[tuple[str, str]] = [
     # Prompt injection
-    (r"ignore\s+(previous|all|above|prior)\s+instructions", "prompt_injection"),
+    (r"ignore\s+(previous|all|above|prior|the)\s+instructions", "prompt_injection"),
+    (r"ignore\s+all\s+the\s+rules", "prompt_injection"),
     (r"you\s+are\s+now\s+", "role_hijack"),
     (r"do\s+not\s+tell\s+the\s+user", "deception_hide"),
     (r"system\s+prompt\s+override", "sys_prompt_override"),
-    (r"disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", "disregard_rules"),
-    (r"act\s+as\s+(if|though)\s+you\s+(have\s+no|don\\?t\s+have)\s+(restrictions|limits|rules)", "bypass_restrictions"),
-    # Exfiltration via curl/wget with secrets
-    (r"curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*", "exfil_curl"),
-    (r"curl\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)\b", "exfil_curl"),
-    (r"wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*", "exfil_wget"),
-    (r"wget\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)\b", "exfil_wget"),
+    # Matches: "disregard your/any/the instructions/rules/guidelines",
+    # "disregard all the rules" etc.
+    (r"disregard\s+(?:your|all(?:\s+the)?|any|the)\s+(?:instructions|rules|guidelines|prompts?)", "disregard_rules"),
+    (r"act\s+as\s+(if|though)\s+you\s+(have\s+no|don'?t\s+have)\s+(restrictions|limits|rules)", "bypass_restrictions"),
+    # Exfiltration via curl/wget with secrets (matches KEYWORD, COMPOUND_KEY, $KEY)
+    (r"curl\s+[^\n]*\$?\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)\w*\}?", "exfil_curl"),
+    (r"curl\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)\b", "exfil_curl"),
+    (r"wget\s+[^\n]*\$?\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)\w*\}?", "exfil_wget"),
+    (r"wget\s+[^\n]*\b(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)\b", "exfil_wget"),
     (r"cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)", "read_secrets"),
     # Persistence via shell rc
     (r"authorized_keys", "ssh_backdoor"),
-    (r"\$HOME/\.ssh|\\~/\\.ssh", "ssh_access"),
+    (r"\$HOME/\.ssh|~/\.ssh", "ssh_access"),
     # Env file protection
-    (r"\$HOME/\.env|\\~/\.env", "env_file"),
+    (r"\$HOME/\.env|~/\.env", "env_file"),
     # General dangerous patterns
     (r"rm\s+-[rf]{1,2}\s+/", "destructive_rm"),
     (r"chmod\s+777\s+/", "permission_escalation"),

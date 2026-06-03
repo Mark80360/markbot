@@ -23,9 +23,9 @@ from markbot.cli.daemon import _gateway_paths
 from markbot.cli.runtime import load_runtime_config, make_provider
 from markbot.cli.stream import StreamRenderer, ThinkingSpinner
 from markbot.cli.ui import (
-    PROMPT_SESSION,
     console,
     flush_pending_tty_input,
+    get_prompt_session,
     init_prompt_session,
     is_exit_command,
     markbot_banner,
@@ -89,11 +89,12 @@ async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner 
 
 async def _read_interactive_input_async() -> str:
     """Read user input using prompt_toolkit (handles paste, history, display)."""
-    if PROMPT_SESSION is None:
+    session = get_prompt_session()
+    if session is None:
         raise RuntimeError("Call init_prompt_session() first")
     try:
         with patch_stdout():
-            return await PROMPT_SESSION.prompt_async(
+            return await session.prompt_async(
                 HTML("<b fg='ansiblue'>❯</b> "),
             )
     except EOFError as exc:
@@ -221,6 +222,12 @@ def agent(
     else:
         # Interactive mode — route through bus like other channels
         from markbot.bus.events import InboundMessage
+
+        if not sys.stdin.isatty():
+            console.print("[red]Error:[/red] Interactive mode requires a terminal (stdin is not a TTY).")
+            console.print("Use [bold]markbot agent --message <text>[/bold] for non-interactive mode.")
+            raise typer.Exit(1)
+
         init_prompt_session()
 
         markbot_banner()
@@ -350,6 +357,7 @@ def agent(
             finally:
                 agent_loop.stop()
                 outbound_task.cancel()
+                bus_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
 

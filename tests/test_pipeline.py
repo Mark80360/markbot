@@ -1,8 +1,8 @@
 """Tests for markbot.agent.pipeline — Message processing pipeline."""
 
-import pytest
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from markbot.agent.pipeline.engine import MessagePipeline, ProcessContext
 from markbot.bus.events import InboundMessage, OutboundMessage

@@ -98,7 +98,49 @@ class MemoryEncoder:
         self._profile_path = workspace / USER_FILENAME
         self._memory_path = workspace / MEMORY_FILENAME
         self._detection_log_path = workspace / "memory" / "encoder_log.json"
-        self._recent_detections: dict[str, float] = {}
+        # Detection timestamps are persisted so the same preference is
+        # not re-encoded after a process restart. We keep the on-disk
+        # copy in sync best-effort: writes happen after every successful
+        # encode, reads happen on construction.
+        self._recent_detections: dict[str, float] = self._load_detection_log()
+
+    def _load_detection_log(self) -> dict[str, float]:
+        """Load the detection log from disk (best-effort).
+
+        Returns an empty dict if the file is missing or malformed so a
+        single corrupt log never wedges the encoder.
+        """
+        if not self._detection_log_path.exists():
+            return {}
+        try:
+            import json
+
+            raw = self._detection_log_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {}
+            return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
+        except Exception as e:
+            logger.warning("Failed to load encoder detection log: {}", e)
+            return {}
+
+    def _save_detection_log(self) -> None:
+        """Persist the detection log to disk (best-effort).
+
+        Silently swallows write errors — losing the log only means the
+        encoder might re-fire on the same preference after a restart,
+        which is harmless because the existing-entry check will skip it.
+        """
+        import json
+
+        try:
+            self._detection_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._detection_log_path.write_text(
+                json.dumps(self._recent_detections, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug("Failed to persist encoder detection log: {}", e)
 
     def set_memory_store(self, store: MemoryStore) -> None:
         self._memory_store = store
@@ -176,6 +218,9 @@ class MemoryEncoder:
                     encoded += 1
 
             self._recent_detections[key] = now
+
+        if encoded > 0 or self._recent_detections:
+            self._save_detection_log()
 
         if encoded > 0:
             logger.info("Encoded {} new preferences", encoded)
@@ -269,14 +314,11 @@ class MemoryEncoder:
                 lines.append(f"## {section_title}")
                 section_start = len(lines) - 1
 
-            section_entries = 0
             insert_pos = len(lines)
             for i in range(section_start + 1, len(lines)):
                 if lines[i].startswith("## "):
                     insert_pos = i
                     break
-                if lines[i].strip().startswith("- ") or lines[i].strip().startswith("* "):
-                    section_entries += 1
 
             lines.insert(insert_pos, entry.to_line())
 

@@ -9,7 +9,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import json_repair
-from loguru import logger
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from markbot.providers.errors import classify_error

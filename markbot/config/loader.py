@@ -77,7 +77,8 @@ def load_config(config_path: Path | None = None) -> Config:
             errors = config.validate_model_chain()
             warnings: list[str] = []
 
-            from markbot.config.validator import validate_config as _validate_config, Severity
+            from markbot.config.validator import Severity
+            from markbot.config.validator import validate_config as _validate_config
             vr = _validate_config(config)
             for issue in vr.issues:
                 if issue.severity == Severity.ERROR:

@@ -8,13 +8,13 @@ Enhanced with:
 
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import re
 from pathlib import Path
 from typing import Any
 
-from markbot.tools.base import Tool, _resolve_path, _is_under
+from markbot.tools.base import Tool, _is_under
 from markbot.utils.constants import IGNORE_DIRS as _IGNORE_DIRS
 
 _LANG_EXTENSIONS = {
@@ -279,7 +279,7 @@ class ExploreTool(Tool):
                 lines.append(f"- **`{sym}`**: {info}")
             sections.append("\n".join(lines))
 
-        sections.append(f"\n---\n**Tip**: Use `explore` with `analyze` mode on any of the files above for deeper context.")
+        sections.append("\n---\n**Tip**: Use `explore` with `analyze` mode on any of the files above for deeper context.")
         return "\n".join(sections)
 
     def _explore_analyze(self, target_path, depth, focus, include_patterns, exclude_patterns, base_path, symbol=None):

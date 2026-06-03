@@ -348,8 +348,8 @@ def start_server(host: str = "127.0.0.1", port: int = 9120):
 
     app = _build_app()
 
-    print(f"\n  Markbot Web UI")
+    print("\n  Markbot Web UI")
     print(f"  Listening on http://{host}:{port}")
-    print(f"  Press Ctrl+C to stop\n")
+    print("  Press Ctrl+C to stop\n")
 
     uvicorn.run(app, host=host, port=port, log_level="info")

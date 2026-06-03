@@ -1,8 +1,8 @@
 """Tests for markbot.session.integrity — WAL, checksums, and archiving."""
 
-import pytest
-from pathlib import Path
 from datetime import datetime, timedelta
+
+import pytest
 
 from markbot.session.integrity import SessionIntegrity
 
