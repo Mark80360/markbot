@@ -618,6 +618,7 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         channel = msg.channel
@@ -646,6 +647,7 @@ class AgentLoop:
                 on_stream_end=on_stream_end,
                 on_tool_start=on_tool_start,
                 on_tool_complete=on_tool_complete,
+                on_outbound_message=on_outbound_message,
             )
 
         return await self.pipeline.process(pctx, _handler)
@@ -658,6 +660,7 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Core message handling logic, executed inside the pipeline."""
         await self._connect_mcp()
@@ -800,6 +803,8 @@ class AgentLoop:
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             logger.info("MessageTool sent in turn, returning None")
+            if on_outbound_message and mt.last_message:
+                await on_outbound_message(mt.last_message)
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -824,11 +829,13 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        media: list[str] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         _direct_start = time.time()
@@ -845,7 +852,7 @@ class AgentLoop:
             except Exception as e:
                 logger.warning("Memory manager start failed in process_direct: {}", e)
         logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content, media=media or [])
         return await self._process_message(
             msg,
             session_key=session_key,
@@ -854,4 +861,5 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
+            on_outbound_message=on_outbound_message,
         )

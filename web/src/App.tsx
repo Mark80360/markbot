@@ -1,75 +1,53 @@
-import { useState } from "react";
-import { ChatArea } from "@/components/ChatArea";
-import { ChatInput } from "@/components/ChatInput";
-import { Sidebar } from "@/components/Sidebar";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "@/contexts/ThemeContext";
-import { useChat } from "@/hooks/useChat";
+import { ChatProvider } from "@/contexts/ChatContext";
+import { SidebarProvider } from "@/contexts/SidebarContext";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { Sidebar } from "@/components/Sidebar";
+import ChatPage from "@/pages/ChatPage";
+import SessionsPage from "@/pages/SessionsPage";
+import ConfigPage from "@/pages/ConfigPage";
+import EnvPage from "@/pages/EnvPage";
+import ModelsPage from "@/pages/ModelsPage";
+import LogsPage from "@/pages/LogsPage";
+import SkillsPage from "@/pages/SkillsPage";
+import CronPage from "@/pages/CronPage";
+import ChannelsPage from "@/pages/ChannelsPage";
+import McpPage from "@/pages/McpPage";
+import SystemPage from "@/pages/SystemPage";
 
-export interface ToolCallInfo {
-  toolId: string;
-  name: string;
-  context?: string;
-  status: "running" | "completed" | "error";
-  summary?: string;
-  error?: string;
-}
-
-export interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp: number;
-  streaming?: boolean;
-  toolCalls?: ToolCallInfo[];
-}
-
-export interface SessionInfo {
-  id: string;
-  title: string;
-  messageCount: number;
-  lastActive: number;
-}
-
-function AppContent() {
-  const {
-    messages,
-    sendMessage,
-    isStreaming,
-    clearMessages,
-    currentSessionId,
-    sessions,
-    switchSession,
-    deleteSession,
-  } = useChat();
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-
+function AppLayout() {
   return (
     <div className="flex h-full bg-background-base text-text-primary antialiased">
-      <Sidebar
-        open={sidebarOpen}
-        onToggle={() => setSidebarOpen(!sidebarOpen)}
-        onClear={clearMessages}
-        sessions={sessions}
-        currentSessionId={currentSessionId}
-        onSwitchSession={switchSession}
-        onDeleteSession={deleteSession}
-      />
-      <main className="flex-1 flex flex-col min-w-0">
-        <ChatArea
-          messages={messages}
-          isStreaming={isStreaming}
-          onSuggestionClick={sendMessage}
-        />
-        <ChatInput onSend={sendMessage} disabled={isStreaming} />
-      </main>
+      <Sidebar />
+      <Routes>
+        <Route path="/" element={<Navigate to="/chat" replace />} />
+        <Route path="/chat" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
+        <Route path="/sessions" element={<ErrorBoundary><SessionsPage /></ErrorBoundary>} />
+        <Route path="/config" element={<ErrorBoundary><ConfigPage /></ErrorBoundary>} />
+        <Route path="/env" element={<ErrorBoundary><EnvPage /></ErrorBoundary>} />
+        <Route path="/models" element={<ErrorBoundary><ModelsPage /></ErrorBoundary>} />
+        <Route path="/logs" element={<ErrorBoundary><LogsPage /></ErrorBoundary>} />
+        <Route path="/skills" element={<ErrorBoundary><SkillsPage /></ErrorBoundary>} />
+        <Route path="/cron" element={<ErrorBoundary><CronPage /></ErrorBoundary>} />
+        <Route path="/channels" element={<ErrorBoundary><ChannelsPage /></ErrorBoundary>} />
+        <Route path="/mcp" element={<ErrorBoundary><McpPage /></ErrorBoundary>} />
+        <Route path="/system" element={<ErrorBoundary><SystemPage /></ErrorBoundary>} />
+      </Routes>
     </div>
   );
 }
 
 export default function App() {
   return (
-    <ThemeProvider>
-      <AppContent />
-    </ThemeProvider>
+    <BrowserRouter>
+      <ThemeProvider>
+        <SidebarProvider>
+          <ChatProvider>
+            <AppLayout />
+          </ChatProvider>
+        </SidebarProvider>
+      </ThemeProvider>
+    </BrowserRouter>
   );
 }

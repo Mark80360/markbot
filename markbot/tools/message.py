@@ -24,6 +24,7 @@ class MessageTool(Tool):
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self.last_message: OutboundMessage | None = None
         self._last_routed_channel: str = ""
         self._last_routed_chat_id: str = ""
 
@@ -121,6 +122,8 @@ class MessageTool(Tool):
                 "message_id": message_id,
             },
         )
+
+        self.last_message = msg
 
         try:
             await self._send_callback(msg)

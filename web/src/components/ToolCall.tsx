@@ -1,7 +1,7 @@
 import { ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle, Wrench } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
-import type { ToolCallInfo } from "@/App";
+import type { ToolCallInfo } from "@/types/chat";
 
 interface ToolCallProps {
   toolCall: ToolCallInfo;

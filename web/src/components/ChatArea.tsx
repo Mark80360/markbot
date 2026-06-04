@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { ChatMessage } from "@/components/ChatMessage";
 import { WelcomeScreen } from "@/components/WelcomeScreen";
-import type { Message } from "@/App";
+import type { Message } from "@/types/chat";
 
 interface ChatAreaProps {
   messages: Message[];

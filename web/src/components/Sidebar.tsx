@@ -1,17 +1,27 @@
-import { Bot, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Plus, Sun, Trash2 } from "lucide-react";
+import {
+  Bot, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen,
+  Plus, Sun, Trash2, Sparkles, Settings, Key, Brain,
+  FileText, Package, Clock, Radio, Cable, Monitor,
+} from "lucide-react";
+import { NavLink, useNavigate } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/contexts/ThemeContext";
-import type { SessionInfo } from "@/App";
+import { useSidebar } from "@/contexts/SidebarContext";
+import { useChatContext } from "@/contexts/ChatContext";
 
-interface SidebarProps {
-  open: boolean;
-  onToggle: () => void;
-  onClear: () => void;
-  sessions: SessionInfo[];
-  currentSessionId: string | null;
-  onSwitchSession: (id: string) => void;
-  onDeleteSession: (id: string) => void;
-}
+const NAV_ITEMS = [
+  { path: "/chat", label: "Chat", icon: Sparkles },
+  { path: "/sessions", label: "Sessions", icon: MessageSquare },
+  { path: "/config", label: "Config", icon: Settings },
+  { path: "/env", label: "Keys", icon: Key },
+  { path: "/models", label: "Models", icon: Brain },
+  { path: "/logs", label: "Logs", icon: FileText },
+  { path: "/skills", label: "Skills", icon: Package },
+  { path: "/cron", label: "Cron", icon: Clock },
+  { path: "/channels", label: "Channels", icon: Radio },
+  { path: "/mcp", label: "MCP", icon: Cable },
+  { path: "/system", label: "System", icon: Monitor },
+];
 
 function formatTime(ts: number): string {
   if (!ts) return "";
@@ -28,22 +38,18 @@ function formatTime(ts: number): string {
   return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 
-export function Sidebar({
-  open,
-  onToggle,
-  onClear,
-  sessions,
-  currentSessionId,
-  onSwitchSession,
-  onDeleteSession,
-}: SidebarProps) {
+export function Sidebar() {
   const { theme, toggleTheme } = useTheme();
+  const { collapsed, toggle } = useSidebar();
+  const navigate = useNavigate();
+  const { clearMessages, sessions, currentSessionId, switchSession, deleteSession } = useChatContext();
+  const open = !collapsed;
 
   return (
     <>
       {!open && (
         <button
-          onClick={onToggle}
+          onClick={toggle}
           className="fixed top-3 left-3 z-50 p-2 rounded-lg border border-border hover:border-border-accent hover:bg-background-hover text-text-tertiary hover:text-midground transition-all"
           title="展开侧边栏"
         >
@@ -68,7 +74,7 @@ export function Sidebar({
             </h1>
           </div>
           <button
-            onClick={onToggle}
+            onClick={toggle}
             className="p-1.5 rounded-lg hover:bg-background-hover text-text-tertiary hover:text-midground transition-colors"
             title="收起侧边栏"
           >
@@ -78,12 +84,35 @@ export function Sidebar({
 
         <div className="p-3">
           <button
-            onClick={onClear}
+            onClick={() => { clearMessages(); navigate("/chat") }}
             className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm border border-dashed border-border hover:border-border-accent text-text-tertiary hover:text-accent-teal hover:bg-accent-teal-glow transition-all"
           >
             <Plus size={14} />
             新对话
           </button>
+        </div>
+
+        <div className="px-3 py-1">
+          <div className="text-xs text-display text-text-tertiary mb-2 px-2">导航</div>
+          <nav className="space-y-0.5">
+            {NAV_ITEMS.map((item) => (
+              <NavLink
+                key={item.path}
+                to={item.path}
+                className={({ isActive }) =>
+                  cn(
+                    "flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-all",
+                    isActive
+                      ? "bg-accent-teal-dim text-text-primary"
+                      : "text-text-secondary hover:bg-background-hover hover:text-text-primary",
+                  )
+                }
+              >
+                <item.icon size={14} className="flex-shrink-0" />
+                <span>{item.label}</span>
+              </NavLink>
+            ))}
+          </nav>
         </div>
 
         <div className="flex-1 overflow-y-auto scrollbar-none px-3 py-2">
@@ -111,7 +140,7 @@ export function Sidebar({
                       ? "bg-accent-teal-dim text-text-primary"
                       : "text-text-secondary hover:bg-background-hover hover:text-text-primary",
                   )}
-                  onClick={() => onSwitchSession(session.id)}
+                  onClick={() => { switchSession(session.id); navigate("/chat") }}
                 >
                   <MessageSquare
                     size={14}
@@ -129,7 +158,7 @@ export function Sidebar({
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      onDeleteSession(session.id);
+                      deleteSession(session.id);
                     }}
                     className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-background-hover text-text-muted hover:text-destructive transition-all"
                     title="删除对话"

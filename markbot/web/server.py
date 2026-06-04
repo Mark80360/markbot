@@ -1,48 +1,59 @@
-"""Markbot Web UI server.
-
-Provides a FastAPI backend serving the React frontend and WebSocket
-endpoint for real-time chat with the Markbot agent.
-
-Usage:
-    markbot web                  # Start on http://127.0.0.1:9120
-    markbot web --port 8080
-"""
+"""Markbot Web UI server — app factory."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Any
 
+from starlette.routing import WebSocketRoute
+
 _log = logging.getLogger(__name__)
 
 WEB_DIST = Path(__file__).parent / "static"
-
-_session_token = secrets.token_urlsafe(32)
-
 _chat_sessions: dict[str, dict[str, Any]] = {}
 
 
 def _build_app():
     from fastapi import FastAPI
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, Response as FastResponse
     from fastapi.staticfiles import StaticFiles
-    from starlette.routing import WebSocketRoute
     from starlette.websockets import WebSocket
 
+    from markbot.web.auth import TokenAuthMiddleware, get_token, regenerate_token, verify_ws_token
+    from markbot.web.store import WebSessionStore
+    from markbot.web.routers.status import router as status_router
+    from markbot.web.routers.config import router as config_router
+    from markbot.web.routers.env import router as env_router
+    from markbot.web.routers.sessions import router as sessions_router
+    from markbot.web.routers.models import router as models_router
+    from markbot.web.routers.logs import router as logs_router
+    from markbot.web.routers.skills import router as skills_router
+    from markbot.web.routers.cron import router as cron_router
+    from markbot.web.routers.channels import router as channels_router
+    from markbot.web.routers.system import router as system_router
+    from markbot.web.routers.mcp import router as mcp_router
+
     app = FastAPI(title="Markbot", version="1.0")
+    app.add_middleware(TokenAuthMiddleware)
+
+    store = WebSessionStore()
 
     _agent_loop = None
-    _agent_lock = asyncio.Lock()
+    _agent_lock = None
+    _upload_dir: Path | None = None
 
     async def _get_agent():
-        nonlocal _agent_loop
+        nonlocal _agent_loop, _agent_lock
         if _agent_loop is not None:
             return _agent_loop
+        if _agent_lock is None:
+            from asyncio import Lock
+            _agent_lock = Lock()
         async with _agent_lock:
             if _agent_loop is not None:
                 return _agent_loop
@@ -88,58 +99,21 @@ def _build_app():
         )
         return loop
 
-    @app.get("/api/status")
-    async def get_status():
-        from markbot import __version__
-        return JSONResponse({
-            "version": __version__,
-            "token": _session_token,
-        })
-
-    @app.get("/api/sessions")
-    async def list_sessions():
-        sessions = []
-        for sid, data in sorted(
-            _chat_sessions.items(), key=lambda x: x[1].get("last_active", 0), reverse=True
-        ):
-            msgs = data.get("messages", [])
-            if not msgs:
-                continue
-            preview = ""
-            for m in reversed(msgs):
-                if m.get("role") == "user" and m.get("content"):
-                    preview = m["content"][:80]
-                    break
-            sessions.append({
-                "id": sid,
-                "title": data.get("title", preview or "新对话"),
-                "message_count": len(msgs),
-                "created_at": data.get("created_at", 0),
-                "last_active": data.get("last_active", 0),
-            })
-        return JSONResponse({"sessions": sessions})
-
-    @app.get("/api/sessions/{session_id}")
-    async def get_session(session_id: str):
-        data = _chat_sessions.get(session_id)
-        if not data:
-            return JSONResponse({"error": "Session not found"}, status_code=404)
-        return JSONResponse({
-            "id": session_id,
-            "title": data.get("title", "新对话"),
-            "messages": data.get("messages", []),
-            "created_at": data.get("created_at", 0),
-            "last_active": data.get("last_active", 0),
-        })
-
-    @app.delete("/api/sessions/{session_id}")
-    async def delete_session(session_id: str):
-        _chat_sessions.pop(session_id, None)
-        return JSONResponse({"ok": True})
+    # Register core routers
+    app.include_router(status_router)
+    app.include_router(config_router)
+    app.include_router(env_router)
+    app.include_router(sessions_router)
+    app.include_router(models_router)
+    app.include_router(logs_router)
+    app.include_router(skills_router)
+    app.include_router(cron_router)
+    app.include_router(channels_router)
+    app.include_router(system_router)
+    app.include_router(mcp_router)
 
     async def ws_chat_handler(websocket: WebSocket):
-        token = websocket.query_params.get("token", "")
-        if token != _session_token:
+        if not await verify_ws_token(websocket):
             _log.warning("WebSocket rejected: invalid token")
             await websocket.close(code=4401)
             return
@@ -149,18 +123,17 @@ def _build_app():
         agent = await _get_agent()
 
         session_id: str | None = None
-        session_key: str | None = None
 
         def _ensure_session():
-            nonlocal session_id, session_key
+            nonlocal session_id
             if session_id is None:
                 session_id = secrets.token_urlsafe(8)
-                session_key = f"web:{session_id}"
+                s = store.create_session(session_id, "新对话")
                 _chat_sessions[session_id] = {
                     "title": "新对话",
                     "messages": [],
-                    "created_at": time.time(),
-                    "last_active": time.time(),
+                    "created_at": s["created_at"],
+                    "last_active": s["last_active"],
                 }
 
         try:
@@ -175,61 +148,61 @@ def _build_app():
 
                 if msg_type == "new_session":
                     session_id = None
-                    session_key = None
-                    await websocket.send_text(json.dumps({
-                        "type": "session_cleared",
-                    }))
+                    await websocket.send_text(json.dumps({"type": "session_cleared"}))
                     continue
 
                 if msg_type == "resume_session":
                     target = data.get("session_id", "")
-                    if target and target in _chat_sessions:
-                        session_id = target
-                        session_key = f"web:{session_id}"
-                        await websocket.send_text(json.dumps({
-                            "type": "session",
-                            "session_id": session_id,
-                        }))
+                    if target:
+                        sess = store.get_session(target)
+                        if sess:
+                            session_id = target
+                            _chat_sessions[target] = sess
+                            await websocket.send_text(json.dumps({
+                                "type": "session",
+                                "session_id": session_id,
+                            }))
                     continue
 
                 user_content = data.get("content", "").strip()
-                if not user_content:
+                user_media: list[str] = data.get("media", [])
+
+                if not user_content and not user_media:
                     continue
 
+                user_display = user_content or "(附件)"
                 _ensure_session()
 
-                _chat_sessions[session_id]["messages"].append({
-                    "role": "user",
-                    "content": user_content,
-                    "timestamp": time.time(),
+                store.add_message(session_id, "user", user_display)
+                sess_dict = _chat_sessions.setdefault(session_id, {})
+                sess_dict.setdefault("messages", []).append({
+                    "role": "user", "content": user_display, "timestamp": time.time(),
+                    "media": user_media,
                 })
-                _chat_sessions[session_id]["last_active"] = time.time()
+                sess_dict["last_active"] = time.time()
 
-                if len(_chat_sessions[session_id]["messages"]) == 1:
-                    _chat_sessions[session_id]["title"] = user_content[:60]
+                if len(sess_dict["messages"]) == 1:
+                    store.update_title(session_id, user_display[:60])
+                    sess_dict["title"] = user_display[:60]
 
-                await websocket.send_text(json.dumps({
-                    "type": "session",
-                    "session_id": session_id,
-                }))
+                await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
 
                 collected_chunks: list[str] = []
+                collected_media: list[str] = []
 
                 async def on_stream(delta: str):
                     collected_chunks.append(delta)
                     try:
                         await websocket.send_text(json.dumps({
-                            "type": "stream_delta",
-                            "delta": delta,
+                            "type": "stream_delta", "delta": delta,
                         }))
                     except Exception:
                         pass
 
-                async def on_progress(text: str):
+                async def on_progress(text: str, **kwargs: object):
                     try:
                         await websocket.send_text(json.dumps({
-                            "type": "progress",
-                            "content": text,
+                            "type": "progress", "content": text,
                         }))
                     except Exception:
                         pass
@@ -237,100 +210,157 @@ def _build_app():
                 async def on_tool_start(tool_id: str, name: str, context: str | None):
                     try:
                         await websocket.send_text(json.dumps({
-                            "type": "tool_start",
-                            "tool_id": tool_id,
-                            "name": name,
-                            "context": context,
+                            "type": "tool_start", "tool_id": tool_id, "name": name, "context": context,
                         }))
                     except Exception:
                         pass
 
-                async def on_tool_complete(
-                    tool_id: str, name: str, summary: str | None, error: str | None
-                ):
+                async def on_tool_complete(tool_id: str, name: str, summary: str | None, error: str | None):
                     try:
                         await websocket.send_text(json.dumps({
-                            "type": "tool_complete",
-                            "tool_id": tool_id,
-                            "name": name,
-                            "summary": summary,
-                            "error": error,
+                            "type": "tool_complete", "tool_id": tool_id, "name": name,
+                            "summary": summary, "error": error,
                         }))
                     except Exception:
                         pass
+
+                async def on_outbound_message(om):
+                    for fp in (om.media or []):
+                        p = Path(fp)
+                        if p.exists():
+                            upload_dir = await _ensure_upload_dir()
+                            name = f"gen_{secrets.token_urlsafe(8)}_{p.name}"
+                            shutil.copy2(fp, upload_dir / name)
+                            collected_media.append(f"/api/media/{name}")
+                    if om.content and not collected_chunks:
+                        collected_chunks.append(om.content)
 
                 try:
                     response = await agent.process_direct(
                         user_content,
-                        session_key=session_key,
+                        session_key=f"web:{session_id}",
                         channel="web",
                         chat_id=session_id,
+                        media=user_media,
                         on_progress=on_progress,
                         on_stream=on_stream,
                         on_tool_start=on_tool_start,
                         on_tool_complete=on_tool_complete,
+                        on_outbound_message=on_outbound_message,
                     )
 
                     if collected_chunks:
                         full_content = "".join(collected_chunks)
-                        _chat_sessions[session_id]["messages"].append({
-                            "role": "assistant",
-                            "content": full_content,
-                            "timestamp": time.time(),
+                        store.add_message(session_id, "assistant", full_content)
+                        sess_dict["messages"].append({
+                            "role": "assistant", "content": full_content, "timestamp": time.time(),
+                            "media": collected_media,
                         })
-                        await websocket.send_text(json.dumps({
-                            "type": "stream_end",
-                        }))
+                        payload: dict[str, Any] = {"type": "stream_end"}
+                        if collected_media:
+                            payload["media"] = collected_media
+                        await websocket.send_text(json.dumps(payload))
                     else:
                         content = response.content if response else ""
-                        _chat_sessions[session_id]["messages"].append({
-                            "role": "assistant",
-                            "content": content,
-                            "timestamp": time.time(),
+                        store.add_message(session_id, "assistant", content)
+                        sess_dict["messages"].append({
+                            "role": "assistant", "content": content, "timestamp": time.time(),
+                            "media": collected_media,
                         })
-                        await websocket.send_text(json.dumps({
-                            "type": "message",
-                            "content": content,
+                        payload = {
+                            "type": "message", "content": content,
                             "metadata": response.metadata if response else {},
-                        }))
+                        }
+                        if collected_media:
+                            payload["media"] = collected_media
+                        await websocket.send_text(json.dumps(payload))
 
-                    _chat_sessions[session_id]["last_active"] = time.time()
+                    sess_dict["last_active"] = time.time()
 
                 except Exception as e:
                     _log.exception("Error processing message")
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "content": str(e),
-                    }))
+                    await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
 
         except Exception:
             _log.info("WebSocket disconnected")
 
     app.routes.insert(0, WebSocketRoute("/api/ws/chat", endpoint=ws_chat_handler))
 
+    async def _ensure_upload_dir():
+        nonlocal _upload_dir
+        if _upload_dir is not None:
+            return _upload_dir
+        from markbot.config.loader import load_config
+        cfg = load_config()
+        d = Path(cfg.workspace_path) / ".web_uploads"
+        d.mkdir(parents=True, exist_ok=True)
+        _upload_dir = d
+        return d
+
+    from fastapi import File, UploadFile as FastAPIUploadFile
+
+    @app.post("/api/upload")
+    async def upload_file(file: FastAPIUploadFile = File(...)):
+        upload_dir = await _ensure_upload_dir()
+        name = f"{secrets.token_urlsafe(8)}_{file.filename or 'file'}"
+        dest = upload_dir / name
+        content = await file.read()
+        dest.write_bytes(content)
+        return {"url": f"/api/media/{name}", "name": name}
+
+    @app.get("/api/media/{path:path}")
+    async def serve_media(path: str):
+        upload_dir = await _ensure_upload_dir()
+        file_path = upload_dir / path
+        if not file_path.exists() or not file_path.is_file():
+            return FastResponse(status_code=404)
+        ext = file_path.suffix.lower()
+        media_types = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+            ".pdf": "application/pdf", ".mp3": "audio/mpeg", ".mp4": "video/mp4",
+            ".txt": "text/plain", ".json": "application/json",
+        }
+        mt = media_types.get(ext, "application/octet-stream")
+        return FileResponse(str(file_path), media_type=mt)
+
+    def _spa_response():
+        content = (WEB_DIST / "index.html").read_bytes()
+        html = content.decode("utf-8")
+        html = html.replace(
+            "</head>",
+            f'<script>window.__MARKBOT_SESSION_TOKEN__="{get_token()}";</script></head>',
+            1,
+        )
+        return FastResponse(
+            html.encode("utf-8"),
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
     if WEB_DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(WEB_DIST / "assets")), name="static-assets")
 
         @app.get("/")
         async def serve_index():
-            from starlette.responses import Response as StarletteResponse
-            content = (WEB_DIST / "index.html").read_bytes()
-            return StarletteResponse(
-                content,
-                media_type="text/html",
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                },
-            )
+            return _spa_response()
+
+        @app.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            if full_path.startswith("api/"):
+                return FastResponse(status_code=404)
+            return _spa_response()
 
         @app.get("/favicon.ico")
         async def serve_favicon():
             favicon = WEB_DIST / "favicon.ico"
             if favicon.exists():
                 return FileResponse(favicon)
-            return Response(status_code=204)
+            return FastResponse(status_code=204)
     else:
         @app.get("/")
         async def no_frontend():
@@ -343,13 +373,9 @@ def _build_app():
 
 
 def start_server(host: str = "127.0.0.1", port: int = 9120):
-    """Start the Markbot web server."""
     import uvicorn
-
     app = _build_app()
-
     print("\n  Markbot Web UI")
     print(f"  Listening on http://{host}:{port}")
     print("  Press Ctrl+C to stop\n")
-
     uvicorn.run(app, host=host, port=port, log_level="info")
