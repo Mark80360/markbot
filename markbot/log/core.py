@@ -78,16 +78,20 @@ def setup_logging(
     else:
         effective_level = level
 
-    logger.add(
-        sys.stderr,
-        level=effective_level,
-        format=console_format,
-        colorize=True,
-        backtrace=True,
-        diagnose=True,
-        catch=True,
-        filter=default_filter,
-    )
+    # Only add console sink when stderr is a real TTY.
+    # In daemon mode, stderr is redirected to a file; adding a
+    # colorized console sink would dump raw ANSI codes into the log.
+    if sys.stderr.isatty():
+        logger.add(
+            sys.stderr,
+            level=effective_level,
+            format=console_format,
+            colorize=True,
+            backtrace=True,
+            diagnose=True,
+            catch=True,
+            filter=default_filter,
+        )
 
     if log_file is not None:
         logger.add(

@@ -18,7 +18,7 @@ class TestBootstrapFilesConstant:
         assert len(BOOTSTRAP_FILES) == len(set(BOOTSTRAP_FILES))
 
     def test_core_files_present(self):
-        core = {"SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md"}
+        core = {"SOUL.md", "PROFILE.md", "TOOLS.md", "MEMORY.md"}
         assert core.issubset(set(BOOTSTRAP_FILES))
 
 

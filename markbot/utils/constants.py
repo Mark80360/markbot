@@ -1,4 +1,4 @@
-"""Shared constants for all agent tools.
+﻿"""Shared constants for all agent tools.
 
 This module provides unified constants to ensure consistency across
 search, filesystem, explore, and other tools.
@@ -7,7 +7,7 @@ search, filesystem, explore, and other tools.
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Memory file constants (canonical definitions — import from here)
+# Memory file constants (canonical definitions 鈥?import from here)
 # ---------------------------------------------------------------------------
 MEMORY_FILENAME: str = "MEMORY.md"
 USER_FILENAME: str = "PROFILE.md"
@@ -112,11 +112,27 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\b/dev/tcp/",
 ]
 
-BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", MEMORY_FILENAME, USER_FILENAME, "ARCHITECTURE.md"]
+# -- Bootstrap file tiers ------------------------------------------------
+# Tier 1 (ESSENTIAL): loaded into every system prompt. Small, high-value.
+BOOTSTRAP_FILES_ESSENTIAL: list[str] = ["AGENTS.md", "SOUL.md", USER_FILENAME]
+# Tier 2 (CONDITIONAL): loaded on-demand or per-session-type.
+BOOTSTRAP_FILES_CONDITIONAL: list[str] = [MEMORY_FILENAME]
+# Tier 3 (REFERENCE): loaded only when explicitly requested via context tools.
+# TOOLS.md is redundant with function-calling tool schemas.
+# ARCHITECTURE.md is reference material, rarely needed mid-conversation.
+BOOTSTRAP_FILES_REFERENCE: list[str] = ["TOOLS.md", "ARCHITECTURE.md"]
+# Legacy union for backward compatibility (template sync, etc.)
+BOOTSTRAP_FILES: list[str] = [
+    *BOOTSTRAP_FILES_ESSENTIAL,
+    *BOOTSTRAP_FILES_CONDITIONAL,
+    *BOOTSTRAP_FILES_REFERENCE,
+]
 
+# Template files that should exist on disk (excludes conditionally-used files
+# like BOOTSTRAP.md, HEARTBEAT.md, USER.md which are intentionally not in BOOTSTRAP_FILES)
 _TEMPLATE_DIR_NAMES: frozenset[str] = frozenset({
-    "AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", MEMORY_FILENAME,
-    USER_FILENAME, "ARCHITECTURE.md", "HEARTBEAT.md", "BOOTSTRAP.md",
+    "AGENTS.md", "SOUL.md", "TOOLS.md", MEMORY_FILENAME,
+    USER_FILENAME, "ARCHITECTURE.md",
 })
 
 

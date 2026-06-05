@@ -21,6 +21,10 @@ _MAX_MSG_CONTENT = 3000
 _MAX_TOOL_ARGS = 500
 
 
+# Maximum age for interaction log files (days).
+_LOG_RETENTION_DAYS = 14
+
+
 class InteractionLogger:
     """Append-only interaction log writer for LLM request/response pairs.
 
@@ -36,6 +40,8 @@ class InteractionLogger:
     When context compaction resets the message counter, unchanged system
     messages and tool defs are replaced with a short ``[unchanged, skipped]``
     marker instead of being re-logged in full.
+
+    Log rotation: files older than ``_LOG_RETENTION_DAYS`` are pruned on init.
     """
 
     def __init__(self, log_dir: Path | None = None):
@@ -47,6 +53,28 @@ class InteractionLogger:
         self._logged_msg_counts: dict[str, int] = {}
         self._system_msg_hash: dict[str, str] = {}
         self._tool_defs_hash: dict[str, str] = {}
+        self._prune_old_logs()
+
+
+    def _prune_old_logs(self) -> None:
+        """Remove interaction log files older than _LOG_RETENTION_DAYS."""
+        import time
+        cutoff = time.time() - (_LOG_RETENTION_DAYS * 86400)
+        pruned = 0
+        try:
+            for f in self._log_dir.iterdir():
+                if not f.is_file():
+                    continue
+                # Match YYYY-MM-DD.log and YYYY-MM-DD.jsonl patterns
+                name = f.stem
+                if len(name) == 10 and name[4] == "-" and name[7] == "-":
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        pruned += 1
+            if pruned:
+                logger.info("Pruned {} interaction log files older than {} days", pruned, _LOG_RETENTION_DAYS)
+        except Exception as e:
+            logger.debug("Log pruning failed: {}", e)
 
     def log_interaction(
         self,
