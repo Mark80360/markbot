@@ -1,7 +1,8 @@
 """Message processing pipeline with composable middleware.
 
-Provides a clean separation of concerns for message handling,
-replacing the monolithic _process_message method in AgentLoop.
+Provides a middleware chain around message handling, allowing cross-cutting
+concerns (question routing, memory lifecycle, error handling) to be separated
+from the core agent logic in AgentLoop.
 """
 
 from __future__ import annotations

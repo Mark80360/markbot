@@ -119,6 +119,22 @@ class BaseChannel(ABC):
             "details": {"running": self._running}
         }
 
+    async def restart(self) -> None:
+        """Restart the channel by stopping and starting it.
+
+        Override in subclasses if special cleanup is needed before restart.
+        Default implementation calls stop() then start().
+        """
+        try:
+            await self.stop()
+        except Exception as e:
+            logger.warning("{}: error during stop before restart: {}", self.name, e)
+        try:
+            await self.start()
+        except Exception as e:
+            logger.error("{}: failed to restart: {}", self.name, e)
+            raise
+
     @property
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""

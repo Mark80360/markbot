@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from markbot.memory.encoder import MemoryEncoder
     from markbot.providers.fallback import FallbackManager
     from markbot.schedule.cron import CronService
+    from markbot.session.app_state import AppStateProvider
     from markbot.session.bootstrap import SessionBootstrap
     from markbot.session.handoff import HandoffManager
     from markbot.session.session import SessionManager
@@ -132,6 +133,7 @@ class AgentContext:
     session_bootstrap: "SessionBootstrap | None" = None
     task_tracker: "TaskTracker | None" = None
     memory_encoder: "MemoryEncoder | None" = None
+    app_state: "AppStateProvider | None" = None
 
     _init_timings: dict[str, float] = field(default_factory=dict)
 
@@ -349,6 +351,7 @@ class AgentContext:
         from markbot.memory.daily_log import DailyLogManager as _DLM
         from markbot.memory.encoder import MemoryEncoder as _ME
         from markbot.memory.manager import MemoryManager as _HMM
+        from markbot.session.app_state import AppStateProvider as _ASP
         from markbot.session.bootstrap import SessionBootstrap as _SB
         from markbot.session.handoff import HandoffManager as _HM
         from markbot.session.session import SessionManager as _SM2
@@ -536,6 +539,7 @@ class AgentContext:
         handoff_manager = _HM(workspace)
         task_tracker = _TT(workspace)
         memory_encoder = _ME(workspace, memory_store=getattr(memory_manager, "_memory_store", None))
+        app_state = _ASP.initialize()
         session_bootstrap = _SB(
             workspace,
             handoff_manager=handoff_manager,
@@ -594,6 +598,7 @@ class AgentContext:
             session_bootstrap=session_bootstrap,
             task_tracker=task_tracker,
             memory_encoder=memory_encoder,
+            app_state=app_state,
             _init_timings=timings,
         )
 

@@ -57,8 +57,9 @@ def _check_pyautogui(force: bool = False) -> bool:
     if _PYAUTOGUI_AVAILABLE is not None and not force:
         return _PYAUTOGUI_AVAILABLE
     try:
+        import pyautogui  # noqa: F401
         _PYAUTOGUI_AVAILABLE = True
-    except Exception:
+    except ImportError:
         _PYAUTOGUI_AVAILABLE = False
     return _PYAUTOGUI_AVAILABLE
 
@@ -153,10 +154,10 @@ def _list_apps_linux() -> List[Dict[str, Any]]:
         )
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
-                parts = line.split(None, 5)
+                parts = line.split(None, 4)
                 if len(parts) >= 5:
                     apps.append({
-                        "name": parts[5] if len(parts) > 5 else parts[4],
+                        "name": parts[4],
                         "pid": parts[2],
                     })
     except FileNotFoundError:
@@ -282,8 +283,9 @@ class PyAutoGUIBackend(ComputerUseBackend):
 
         try:
             screenshot = pyautogui.screenshot()
-        except Exception:
-            return CaptureResult(mode=mode, width=0, height=0)
+        except Exception as e:
+            logger.warning("Screenshot failed: %s", e)
+            return CaptureResult(mode=mode, width=0, height=0, app=str(e))
 
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
@@ -476,7 +478,13 @@ class PyAutoGUIBackend(ComputerUseBackend):
                 if result.returncode == 0:
                     return ActionResult(ok=True, action="focus_app", message=f"Focused app: {app}")
 
-                return ActionResult(ok=False, action="focus_app", message=f"Could not focus app: {app}")
+                return ActionResult(
+                    ok=False, action="focus_app",
+                    message=(
+                        f"Could not focus app: {app}. "
+                        "Install wmctrl or xdotool: sudo apt-get install wmctrl xdotool"
+                    ),
+                )
         except FileNotFoundError as e:
             return ActionResult(ok=False, action="focus_app", message=f"Focus tool not found: {e}")
         except Exception as e:

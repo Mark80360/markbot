@@ -254,6 +254,33 @@ class CuaDriverBackend(ComputerUseBackend):
         if not self._started:
             self.start()
 
+    def _get_image_dimensions(self, b64_data: str) -> tuple[int, int]:
+        """Extract width and height from a base64-encoded JPEG/PNG image."""
+        try:
+            import base64 as b64mod
+            raw = b64mod.b64decode(b64_data)
+            # JPEG: SOF0 marker (0xFFC0) contains dimensions
+            if raw[:2] == b'\xff\xd8':
+                i = 2
+                while i < len(raw) - 9:
+                    if raw[i] != 0xFF:
+                        break
+                    marker = raw[i + 1]
+                    if marker in (0xC0, 0xC1, 0xC2):
+                        h = int.from_bytes(raw[i + 5:i + 7], 'big')
+                        w = int.from_bytes(raw[i + 7:i + 9], 'big')
+                        return w, h
+                    length = int.from_bytes(raw[i + 2:i + 4], 'big')
+                    i += 2 + length
+            # PNG: IHDR chunk contains dimensions
+            elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+                w = int.from_bytes(raw[16:20], 'big')
+                h = int.from_bytes(raw[20:24], 'big')
+                return w, h
+        except Exception:
+            pass
+        return 0, 0
+
     def _action(self, name: str, args: dict[str, Any]) -> ActionResult:
         self._ensure_started()
         try:
@@ -315,6 +342,7 @@ class CuaDriverBackend(ComputerUseBackend):
             )
             if sc_out["images"]:
                 png_b64 = sc_out["images"][0]
+                width, height = self._get_image_dimensions(png_b64)
         else:
             gws_out = self._session.call_tool(
                 "get_window_state",
@@ -336,6 +364,7 @@ class CuaDriverBackend(ComputerUseBackend):
 
             if gws_out["images"]:
                 png_b64 = gws_out["images"][0]
+                width, height = self._get_image_dimensions(png_b64)
 
         if png_b64:
             png_bytes_len = len(png_b64.encode("ascii"))

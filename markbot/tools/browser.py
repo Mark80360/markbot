@@ -15,8 +15,8 @@ import logging
 import time
 from typing import Any, Optional
 
-from markbot.tools.base import BaseTool
-from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
+from markbot.tools.base import Tool
+from markbot.types.tool import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -127,36 +127,38 @@ def _get_task_id(context: ToolContext) -> str:
     return context.session_id or "default"
 
 
-class BrowserNavigateTool(BaseTool):
+class BrowserNavigateTool(Tool):
     """Navigate to a URL in the browser."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_navigate",
-            description=(
-                "Navigate to a URL in the browser. Initializes the session and loads the page. "
-                "Must be called before other browser tools. For simple information retrieval, prefer "
-                "web_search or web_extract (faster, cheaper). For plain-text endpoints (URLs ending "
-                "in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any "
-                "documented API endpoint), prefer web_extract or curl via terminal; the browser "
-                "stack is much slower for these. Use browser tools when you need to interact with a "
-                "page (click, fill forms, dynamic content). Returns a compact page snapshot with "
-                "interactive elements and ref IDs — no need to call browser_snapshot separately "
-                "after navigating."
-            ),
-            parameters=[
-                ToolParameter(name="url", type="string", description="URL to navigate to.", required=True),
-            ],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_navigate"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Navigate to a URL in the browser. Initializes the session and loads the page. "
+            "Must be called before other browser tools. For simple information retrieval, prefer "
+            "web_search or web_extract (faster, cheaper). For plain-text endpoints (URLs ending "
+            "in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any "
+            "documented API endpoint), prefer web_extract or curl via terminal; the browser "
+            "stack is much slower for these. Use browser tools when you need to interact with a "
+            "page (click, fill forms, dynamic content). Returns a compact page snapshot with "
+            "interactive elements and ref IDs — no need to call browser_snapshot separately "
+            "after navigating."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to navigate to."},
+            },
+            "required": ["url"],
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        url = params.get("url", "")
+    async def _legacy_execute(self, url: str = "", **kwargs: Any) -> Any:
         if not url:
             return "Error: 'url' parameter is required"
 
@@ -170,6 +172,7 @@ class BrowserNavigateTool(BaseTool):
         if policy_error:
             return f"Error: {policy_error}"
 
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
         timeout = 30000
 
@@ -186,31 +189,33 @@ class BrowserNavigateTool(BaseTool):
             return f"Navigation error: {e}"
 
 
-class BrowserSnapshotTool(BaseTool):
+class BrowserSnapshotTool(Tool):
     """Get accessibility snapshot of the current page."""
 
+    _is_read_only = True
+
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_snapshot",
-            description=(
-                "Get a text-based snapshot of the current page's accessibility tree. "
-                "Returns interactive elements with ref IDs (like @e1, @e2) for browser_click "
-                "and browser_type. Full=false (default): compact view with interactive elements. "
-                "Full=true: complete page content. Snapshots over 8000 chars are truncated. "
-                "Requires browser_navigate first. Note: browser_navigate already returns a compact "
-                "snapshot — use this to refresh after interactions that change the page, or with "
-                "full=true for complete content."
-            ),
-            parameters=[],
-            is_read_only=True,
+    def name(self) -> str:
+        return "browser_snapshot"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get a text-based snapshot of the current page's accessibility tree. "
+            "Returns interactive elements with ref IDs (like @e1, @e2) for browser_click "
+            "and browser_type. Full=false (default): compact view with interactive elements. "
+            "Full=true: complete page content. Snapshots over 8000 chars are truncated. "
+            "Requires browser_navigate first. Note: browser_navigate already returns a compact "
+            "snapshot — use this to refresh after interactions that change the page, or with "
+            "full=true for complete content."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+    async def _legacy_execute(self, **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -251,34 +256,37 @@ def _format_snapshot(node: dict, lines: list[str], depth: int) -> None:
         _format_snapshot(child, lines, depth + 1)
 
 
-class BrowserClickTool(BaseTool):
+class BrowserClickTool(Tool):
     """Click an element on the page."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_click",
-            description=(
-                "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). "
-                "The ref IDs are shown in square brackets in the snapshot output. "
-                "Requires browser_navigate and browser_snapshot to be called first."
-            ),
-            parameters=[
-                ToolParameter(name="element", type="string", description="Element reference (e.g. 'e5' or '@e5').", required=True),
-            ],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_click"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). "
+            "The ref IDs are shown in square brackets in the snapshot output. "
+            "Requires browser_navigate and browser_snapshot to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "element": {"type": "string", "description": "Element reference (e.g. 'e5' or '@e5')."},
+            },
+            "required": ["element"],
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        element_ref = params.get("element", "")
-        if not element_ref:
+    async def _legacy_execute(self, element: str = "", **kwargs: Any) -> Any:
+        if not element:
             return "Error: 'element' parameter is required"
 
-        element_ref = element_ref.lstrip("@")
+        element_ref = element.lstrip("@")
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -322,38 +330,40 @@ def _find_element_coords(snapshot: dict, target_ref: str) -> dict[str, float] | 
     return None
 
 
-class BrowserTypeTool(BaseTool):
+class BrowserTypeTool(Tool):
     """Type text into an element on the page."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_type",
-            description=(
-                "Type text into an input field identified by its ref ID. "
-                "Clears the field first, then types the new text. "
-                "Requires browser_navigate and browser_snapshot to be called first."
-            ),
-            parameters=[
-                ToolParameter(name="element", type="string", description="Element reference (e.g. 'e5').", required=True),
-                ToolParameter(name="text", type="string", description="Text to type.", required=True),
-            ],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_type"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Type text into an input field identified by its ref ID. "
+            "Clears the field first, then types the new text. "
+            "Requires browser_navigate and browser_snapshot to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "element": {"type": "string", "description": "Element reference (e.g. 'e5')."},
+                "text": {"type": "string", "description": "Text to type."},
+            },
+            "required": ["element", "text"],
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        element_ref = params.get("element", "")
-        text = params.get("text", "")
-        if not element_ref:
+    async def _legacy_execute(self, element: str = "", text: str = "", **kwargs: Any) -> Any:
+        if not element:
             return "Error: 'element' parameter is required"
         if not text:
             return "Error: 'text' parameter is required"
 
-        element_ref = element_ref.lstrip("@")
+        element_ref = element.lstrip("@")
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -372,45 +382,42 @@ class BrowserTypeTool(BaseTool):
         return f"Could not find element @{element_ref} on the page"
 
 
-class BrowserScrollTool(BaseTool):
+class BrowserScrollTool(Tool):
     """Scroll the page."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_scroll",
-            description=(
-                "Scroll the page in a direction. Use this to reveal more content that "
-                "may be below or above the current viewport. "
-                "Requires browser_navigate to be called first."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="direction",
-                    type="string",
-                    description="Scroll direction.",
-                    required=False,
-                    enum=["up", "down"],
-                    default="down",
-                ),
-                ToolParameter(
-                    name="amount",
-                    type="integer",
-                    description="Scroll amount in pixels.",
-                    required=False,
-                    default=300,
-                ),
-            ],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_scroll"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Scroll the page in a direction. Use this to reveal more content that "
+            "may be below or above the current viewport. "
+            "Requires browser_navigate to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "description": "Scroll direction.",
+                    "enum": ["up", "down"],
+                    "default": "down",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Scroll amount in pixels.",
+                    "default": 300,
+                },
+            },
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        direction = params.get("direction", "down")
-        amount = params.get("amount", 300)
+    async def _legacy_execute(self, direction: str = "down", amount: int = 300, **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         delta_y = -amount if direction == "up" else amount
@@ -421,38 +428,39 @@ class BrowserScrollTool(BaseTool):
             return f"Scroll error: {e}"
 
 
-class BrowserPressTool(BaseTool):
+class BrowserPressTool(Tool):
     """Press a keyboard key."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_press",
-            description=(
-                "Press a keyboard key. Useful for submitting forms (Enter), "
-                "navigating (Tab), or keyboard shortcuts. "
-                "Requires browser_navigate to be called first."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="key",
-                    type="string",
-                    description="Key to press (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown').",
-                    required=True,
-                ),
-            ],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_press"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Press a keyboard key. Useful for submitting forms (Enter), "
+            "navigating (Tab), or keyboard shortcuts. "
+            "Requires browser_navigate to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Key to press (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown').",
+                },
+            },
+            "required": ["key"],
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        key = params.get("key", "")
+    async def _legacy_execute(self, key: str = "", **kwargs: Any) -> Any:
         if not key:
             return "Error: 'key' parameter is required"
 
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -462,26 +470,26 @@ class BrowserPressTool(BaseTool):
             return f"Press error: {e}"
 
 
-class BrowserBackTool(BaseTool):
+class BrowserBackTool(Tool):
     """Navigate back in browser history."""
 
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_back",
-            description=(
-                "Navigate back to the previous page in browser history. "
-                "Requires browser_navigate to be called first."
-            ),
-            parameters=[],
-            is_read_only=False,
+    def name(self) -> str:
+        return "browser_back"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Navigate back to the previous page in browser history. "
+            "Requires browser_navigate to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+    async def _legacy_execute(self, **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -493,39 +501,42 @@ class BrowserBackTool(BaseTool):
             return f"Back navigation error: {e}"
 
 
-class BrowserVisionTool(BaseTool):
+class BrowserVisionTool(Tool):
     """Take a screenshot of the current page."""
 
+    _is_read_only = True
+
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_vision",
-            description=(
-                "Take a screenshot of the current page so you can inspect it visually. "
-                "Use this when you need to understand what the page looks like — especially for "
-                "CAPTCHAs, visual verification challenges, complex layouts, or cases where the "
-                "text snapshot misses important visual information. When your active model has "
-                "native vision, the screenshot is attached to your context directly; otherwise "
-                "the framework falls back to an auxiliary vision model and returns a text analysis. "
-                "Requires browser_navigate to be called first."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="annotate",
-                    type="boolean",
-                    description="If true, annotate the screenshot with element numbers.",
-                    required=False,
-                    default=False,
-                ),
-            ],
-            is_read_only=True,
+    def name(self) -> str:
+        return "browser_vision"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Take a screenshot of the current page so you can inspect it visually. "
+            "Use this when you need to understand what the page looks like — especially for "
+            "CAPTCHAs, visual verification challenges, complex layouts, or cases where the "
+            "text snapshot misses important visual information. When your active model has "
+            "native vision, the screenshot is attached to your context directly; otherwise "
+            "the framework falls back to an auxiliary vision model and returns a text analysis. "
+            "Requires browser_navigate to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "annotate": {
+                    "type": "boolean",
+                    "description": "If true, annotate the screenshot with element numbers.",
+                    "default": False,
+                },
+            },
+        }
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+    async def _legacy_execute(self, annotate: bool = False, **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -543,51 +554,50 @@ class BrowserVisionTool(BaseTool):
             return f"Screenshot error: {e}"
 
 
-class BrowserConsoleTool(BaseTool):
+class BrowserConsoleTool(Tool):
     """Get browser console output or evaluate JavaScript."""
 
+    _is_read_only = True
+
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_console",
-            description=(
-                "Get browser console output and JavaScript errors from the current page. "
-                "Returns console.log/warn/error/info messages and uncaught JS exceptions. "
-                "Use this to detect silent JavaScript errors, failed API calls, and application warnings. "
-                "When 'expression' is provided, evaluates JavaScript in the page context and "
-                "returns the result — use this for DOM inspection, reading page state, or "
-                "extracting data programmatically. Requires browser_navigate to be called first."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="clear",
-                    type="boolean",
-                    description="If true, clear the message buffers after reading.",
-                    required=False,
-                    default=False,
-                ),
-                ToolParameter(
-                    name="expression",
-                    type="string",
-                    description=(
+    def name(self) -> str:
+        return "browser_console"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get browser console output and JavaScript errors from the current page. "
+            "Returns console.log/warn/error/info messages and uncaught JS exceptions. "
+            "Use this to detect silent JavaScript errors, failed API calls, and application warnings. "
+            "When 'expression' is provided, evaluates JavaScript in the page context and "
+            "returns the result — use this for DOM inspection, reading page state, or "
+            "extracting data programmatically. Requires browser_navigate to be called first."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "clear": {
+                    "type": "boolean",
+                    "description": "If true, clear the message buffers after reading.",
+                    "default": False,
+                },
+                "expression": {
+                    "type": "string",
+                    "description": (
                         "JavaScript expression to evaluate in the page context. "
                         "Runs in the browser like DevTools console — full access to DOM, "
                         "window, document. Return values are serialized to JSON. "
                         "Example: 'document.title' or 'document.querySelectorAll(\"a\").length'"
                     ),
-                    required=False,
-                ),
-            ],
-            is_read_only=True,
-        )
+                },
+            },
+        }
 
-    @property
-    def is_enabled(self) -> bool:
-        return True
-
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
-        expression = params.get("expression", "")
-        clear = params.get("clear", False)
+    async def _legacy_execute(self, clear: bool = False, expression: str = "", **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -617,27 +627,29 @@ class BrowserConsoleTool(BaseTool):
             return f"Console error: {e}"
 
 
-class BrowserGetImagesTool(BaseTool):
+class BrowserGetImagesTool(Tool):
     """Get all images on the current page."""
 
+    _is_read_only = True
+
     @property
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name="browser_get_images",
-            description=(
-                "Get a list of all images on the current page with their URLs and alt text. "
-                "Useful for finding images to analyze with the vision tool. "
-                "Requires browser_navigate to be called first."
-            ),
-            parameters=[],
-            is_read_only=True,
+    def name(self) -> str:
+        return "browser_get_images"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get a list of all images on the current page with their URLs and alt text. "
+            "Useful for finding images to analyze with the vision tool. "
+            "Requires browser_navigate to be called first."
         )
 
     @property
-    def is_enabled(self) -> bool:
-        return True
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
 
-    async def execute(self, params: dict[str, Any], context: ToolContext) -> Any:
+    async def _legacy_execute(self, **kwargs: Any) -> Any:
+        context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
@@ -666,7 +678,7 @@ class BrowserGetImagesTool(BaseTool):
             return f"Get images error: {e}"
 
 
-BROWSER_TOOLS: list[BaseTool] = [
+BROWSER_TOOLS: list[Tool] = [
     BrowserNavigateTool(),
     BrowserSnapshotTool(),
     BrowserClickTool(),

@@ -26,7 +26,12 @@ class ChannelManager:
     Responsibilities:
     - Start/stop channels
     - Route outbound messages
+    - Health checking with auto-restart
     """
+
+    # Auto-restart thresholds
+    _MAX_CONSECUTIVE_FAILURES = 3
+    _RESTART_COOLDOWN_S = 300  # 5 minutes between restart attempts
 
     def __init__(self, config: Config, bus: MessageBus):
         self.config = config
@@ -34,6 +39,9 @@ class ChannelManager:
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._health_check_task: asyncio.Task | None = None
+        self._consecutive_failures: dict[str, int] = {}
+        self._last_restart: dict[str, float] = {}
+        self._restarting: dict[str, bool] = {}
 
         self._init_channels()
 
@@ -225,9 +233,14 @@ class ChannelManager:
         return self.channels.get(name)
 
     def get_status(self) -> dict[str, Any]:
-        """Get status of all channels."""
+        """Get status of all channels including health and restart info."""
         return {
-            name: {"enabled": True, "running": channel.is_running}
+            name: {
+                "enabled": True,
+                "running": channel.is_running,
+                "consecutive_failures": self._consecutive_failures.get(name, 0),
+                "restarting": self._restarting.get(name, False),
+            }
             for name, channel in self.channels.items()
         }
 
@@ -237,24 +250,40 @@ class ChannelManager:
         return list(self.channels.keys())
 
     async def _health_check_loop(self) -> None:
-        """Periodically check health of all channels."""
+        """Periodically check health of all channels with auto-restart."""
         await asyncio.sleep(10)  # Wait 10s for channels to start
 
         while True:
             try:
                 for name, channel in self.channels.items():
+                    if self._restarting.get(name):
+                        continue
+
                     try:
                         result = await channel.health_check()
-                        if not result.get("healthy", False):
-                            logger.warning(
-                                "Health check failed for {}: {}",
-                                name,
-                                result.get("error", "Unknown error"),
-                            )
-                        else:
+                        if result.get("healthy", False):
                             logger.debug("Health check passed for {}", name)
+                            self._consecutive_failures[name] = 0
+                        else:
+                            error = result.get("error", "Unknown error")
+                            self._consecutive_failures[name] = (
+                                self._consecutive_failures.get(name, 0) + 1
+                            )
+                            failures = self._consecutive_failures[name]
+                            logger.warning(
+                                "Health check failed for {} ({}/{}): {}",
+                                name,
+                                failures,
+                                self._MAX_CONSECUTIVE_FAILURES,
+                                error,
+                            )
+                            if failures >= self._MAX_CONSECUTIVE_FAILURES:
+                                await self._try_restart_channel(name, channel)
                     except Exception as e:
                         logger.error("Health check error for {}: {}", name, e)
+                        self._consecutive_failures[name] = (
+                            self._consecutive_failures.get(name, 0) + 1
+                        )
 
                 await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
             except asyncio.CancelledError:
@@ -262,3 +291,30 @@ class ChannelManager:
             except Exception as e:
                 logger.error("Health check loop error: {}", e)
                 await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
+
+    async def _try_restart_channel(self, name: str, channel: BaseChannel) -> None:
+        """Attempt to restart a failing channel with cooldown."""
+        import time
+
+        now = time.monotonic()
+        last = self._last_restart.get(name, 0)
+        if now - last < self._RESTART_COOLDOWN_S:
+            logger.info(
+                "Skipping restart for {} — cooldown ({:.0f}s remaining)",
+                name,
+                self._RESTART_COOLDOWN_S - (now - last),
+            )
+            return
+
+        self._restarting[name] = True
+        logger.info("Attempting to restart {} channel...", name)
+        try:
+            await channel.restart()
+            self._consecutive_failures[name] = 0
+            self._last_restart[name] = time.monotonic()
+            logger.info("Successfully restarted {} channel", name)
+        except Exception as e:
+            logger.error("Failed to restart {} channel: {}", name, e)
+            self._last_restart[name] = time.monotonic()
+        finally:
+            self._restarting[name] = False

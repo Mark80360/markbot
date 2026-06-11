@@ -40,7 +40,7 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional
 
-from markbot.tools.base import BaseTool
+from markbot.tools.base import Tool
 from markbot.tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
@@ -49,7 +49,7 @@ from markbot.tools.computer_use.backend import (
 )
 from markbot.tools.computer_use.schema import get_computer_use_schema
 from markbot.types.permission import PermissionDecision
-from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
+from markbot.types.tool import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +66,16 @@ _DESTRUCTIVE_ACTIONS = frozenset({
 })
 
 _BLOCKED_KEY_COMBOS = {
+    # macOS
     frozenset({"cmd", "shift", "backspace"}),
     frozenset({"cmd", "option", "backspace"}),
     frozenset({"cmd", "ctrl", "q"}),
     frozenset({"cmd", "shift", "q"}),
     frozenset({"cmd", "option", "shift", "q"}),
+    # Windows/Linux
+    frozenset({"ctrl", "alt", "delete"}),
+    frozenset({"ctrl", "shift", "esc"}),
+    frozenset({"ctrl", "alt", "del"}),
 }
 
 _KEY_ALIASES = {"command": "cmd", "control": "ctrl", "alt": "option", "\u2318": "cmd", "\u2325": "option"}
@@ -438,7 +443,7 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
 # ComputerUseTool — markbot BaseTool integration
 # ---------------------------------------------------------------------------
 
-class ComputerUseTool(BaseTool):
+class ComputerUseTool(Tool):
     """Desktop control tool — screenshots, mouse, keyboard, scroll, drag.
 
     Automatically selects the best backend for the current platform:
@@ -450,33 +455,16 @@ class ComputerUseTool(BaseTool):
         self._config = config
 
     @property
-    def definition(self) -> ToolDefinition:
-        schema = get_computer_use_schema()
-        params_schema = schema.get("parameters", {})
-        properties = params_schema.get("properties", {})
-        required = params_schema.get("required", [])
+    def name(self) -> str:
+        return "computer_use"
 
-        tool_params = []
-        for name, prop in properties.items():
-            param = ToolParameter(
-                name=name,
-                type=prop.get("type", "string"),
-                description=prop.get("description", ""),
-                required=name in required,
-            )
-            if "enum" in prop:
-                param.enum = prop["enum"]
-            if "default" in prop:
-                param.default = prop["default"]
-            tool_params.append(param)
+    @property
+    def description(self) -> str:
+        return get_computer_use_schema()["description"]
 
-        return ToolDefinition(
-            name=schema["name"],
-            description=schema["description"],
-            parameters=tool_params,
-            is_read_only=False,
-            is_destructive=False,
-        )
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return get_computer_use_schema()["parameters"]
 
     @property
     def is_enabled(self) -> bool:
@@ -520,7 +508,8 @@ class ComputerUseTool(BaseTool):
 
         return await super().check_permission(params, context)
 
-    async def execute(self, params: Dict[str, Any], context: ToolContext) -> Any:
+    async def _legacy_execute(self, **kwargs: Any) -> Any:
+        params = {k: v for k, v in kwargs.items() if not k.startswith("_")}
         action = (params.get("action") or "").strip().lower()
         if not action:
             return json.dumps({"error": "missing `action`"})

@@ -1,6 +1,6 @@
 # MarkBot 🦞
 
-> Version 2.3.0
+> Version 2.3.1
 
 A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
 
@@ -19,7 +19,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 - **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, HuggingFace, xAI, NVIDIA NIM, and more (28 providers supported)
 - **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
-- **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, with auto-reconnect and health monitoring
+- **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, with auto-reconnect, health monitoring, and auto-restart on failure
 - **OAuth Authentication**: Native support for OpenAI Codex and GitHub Copilot with OAuth flow
 - **Local Model Support**: Integration with vLLM, Ollama, and OVMS for local deployments
 
@@ -31,7 +31,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 ### Tool System
 
-- **Built-in Tools**: 25+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot, Computer Use, Browser
+- **Built-in Tools**: 40+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot (7 tools), Computer Use, Browser (10 tools)
 - **MCP Support**: Model Context Protocol for seamless tool integration (stdio, SSE, streamable HTTP)
 - **Web Integration**: Built-in web browsing, content extraction, and search (Brave, Tavily, DuckDuckGo, SearXNG, Jina)
 - **Code Execution**: Sandboxed Python code execution with security scanning and resource limits
@@ -136,7 +136,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     Channel Manager                                 │
 │              (Route to appropriate channel)                         │
-│         (Auto-discovery + health monitoring + auto-reconnect)       │
+│         (Auto-discovery + health monitoring + auto-restart)         │
 └─────────────────────────────────────────────────────────────────────┘
           │
           ▼
