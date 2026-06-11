@@ -567,14 +567,14 @@ class AgentLoop:
         self._scrubber_pool.clear()
         try:
             self.sessions.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to close sessions on stop: {}", e)
         try:
             worker = getattr(self.memory_manager, "_worker_task", None)
             if worker and not worker.done():
                 worker.cancel()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to cancel memory worker on stop: {}", e)
         logger.info("Agent loop stopping")
 
     def get_cost_summary(self) -> dict[str, Any]:

@@ -38,6 +38,22 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
 
+  getSessionStats: () =>
+    request<{ total: number; active: number; messages: number }>("/api/sessions/stats"),
+
+  bulkDeleteSessions: (ids: string[]) =>
+    request<{ ok: boolean; deleted: number }>("/api/sessions/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+
+  exportSession: (id: string, format: "markdown" | "json" = "markdown") => {
+    const token = getToken();
+    return fetch(`/api/sessions/${id}/export?format=${format}`, {
+      headers: { "X-Markbot-Session-Token": token },
+    });
+  },
+
   getConfig: () => request<any>("/api/config"),
   getRawConfig: () => request<{ raw: string }>("/api/config/raw"),
   saveConfig: (data: any) =>

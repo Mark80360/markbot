@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import json_repair
+from loguru import logger
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -601,6 +602,7 @@ class OpenAICompatProvider(LLMProvider):
             msg = f"Error calling LLM: {e}"
         else:
             msg = "Error calling LLM: connection failed or timed out (empty error from provider)"
+        logger.error("Provider error: {}: {}", type(e).__name__, e)
         return LLMResponse(
             content=msg,
             finish_reason="error",

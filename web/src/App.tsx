@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { ChatProvider } from "@/contexts/ChatContext";
 import { SidebarProvider } from "@/contexts/SidebarContext";
+import { ToastProvider } from "@/components/Toast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "@/components/Sidebar";
 import ChatPage from "@/pages/ChatPage";
@@ -42,11 +43,13 @@ export default function App() {
   return (
     <BrowserRouter>
       <ThemeProvider>
-        <SidebarProvider>
-          <ChatProvider>
-            <AppLayout />
-          </ChatProvider>
-        </SidebarProvider>
+        <ToastProvider>
+          <SidebarProvider>
+            <ChatProvider>
+              <AppLayout />
+            </ChatProvider>
+          </SidebarProvider>
+        </ToastProvider>
       </ThemeProvider>
     </BrowserRouter>
   );

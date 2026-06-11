@@ -7,9 +7,11 @@ interface ChatAreaProps {
   messages: Message[];
   isStreaming: boolean;
   onSuggestionClick?: (text: string) => void;
+  onEdit?: (serverTimestamp: number, newContent: string) => void;
+  onRegenerate?: (serverTimestamp: number) => void;
 }
 
-export function ChatArea({ messages, isStreaming, onSuggestionClick }: ChatAreaProps) {
+export function ChatArea({ messages, isStreaming, onSuggestionClick, onEdit, onRegenerate }: ChatAreaProps) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -28,7 +30,13 @@ export function ChatArea({ messages, isStreaming, onSuggestionClick }: ChatAreaP
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
         {messages.map((msg) => (
-          <ChatMessage key={msg.id} message={msg} />
+          <ChatMessage
+            key={msg.id}
+            message={msg}
+            isStreaming={isStreaming}
+            onEdit={onEdit}
+            onRegenerate={onRegenerate}
+          />
         ))}
         {isStreaming && messages[messages.length - 1]?.role === "user" && (
           <div className="flex items-start gap-3 message-enter">

@@ -155,3 +155,67 @@ class WebSessionStore:
         )
         self._conn.commit()
         return cur.rowcount
+
+    def get_session_stats(self) -> dict[str, Any]:
+        total = self._conn.execute("SELECT COUNT(*) FROM web_sessions").fetchone()[0]
+        active = self._conn.execute(
+            "SELECT COUNT(*) FROM web_sessions WHERE message_count > 0"
+        ).fetchone()[0]
+        messages = self._conn.execute("SELECT COUNT(*) FROM web_messages").fetchone()[0]
+        return {"total": total, "active": active, "messages": messages}
+
+    def bulk_delete_sessions(self, ids: list[str]) -> int:
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        cur = self._conn.execute(
+            f"DELETE FROM web_sessions WHERE id IN ({placeholders})", ids,
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def delete_messages_from(self, session_id: str, timestamp: float) -> int:
+        cur = self._conn.execute(
+            "DELETE FROM web_messages WHERE session_id = ? AND timestamp >= ?",
+            (session_id, timestamp),
+        )
+        self._conn.commit()
+        self._conn.execute(
+            "UPDATE web_sessions SET message_count = (SELECT COUNT(*) FROM web_messages WHERE session_id = ?) WHERE id = ?",
+            (session_id, session_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def add_messages_batch(self, session_id: str, messages: list[dict[str, str]]) -> None:
+        now = time.time()
+        for msg in messages:
+            self._conn.execute(
+                "INSERT INTO web_messages (session_id, role, content, timestamp, metadata) VALUES (?, ?, ?, ?, ?)",
+                (session_id, msg["role"], msg["content"], now, "{}"),
+            )
+        self._conn.execute(
+            "UPDATE web_sessions SET last_active = ?, message_count = message_count + ? WHERE id = ?",
+            (now, len(messages), session_id),
+        )
+        self._conn.commit()
+
+    def export_session_markdown(self, session_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT title FROM web_sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        title = row["title"]
+        msgs = self._conn.execute(
+            "SELECT role, content, timestamp FROM web_messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        lines = [f"# {title}", ""]
+        for m in msgs:
+            role_name = "You" if m["role"] == "user" else "Markbot"
+            lines.append(f"## {role_name}")
+            lines.append("")
+            lines.append(m["content"])
+            lines.append("")
+        return "\n".join(lines)

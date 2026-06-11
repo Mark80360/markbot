@@ -752,8 +752,8 @@ class IterationRunner:
                     context_str = f"{tc.name}({args_preview})"
                 try:
                     await self.on_tool_start(tc.id, tc.name, context_str)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("on_tool_start callback failed: {}", e)
 
         results = await asyncio.gather(
             *(
@@ -816,8 +816,8 @@ class IterationRunner:
                         summary = result[:200] if len(result) > 200 else result
                 try:
                     await self.on_tool_complete(tool_call.id, tool_call.name, summary, error_msg)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("on_tool_complete callback failed: {}", e)
         logger.info(
             "Added {} tool results to messages, continue to next iteration",
             len(results),

@@ -206,7 +206,8 @@ class SessionBootstrap:
                 message=f"Handoff is {age_hours:.1f} hours old.",
                 details={"age_hours": age_hours},
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Handoff timestamp unreadable: {}", e)
             return BootstrapCheckResult(
                 name="handoff_freshness",
                 status="ok",
@@ -339,8 +340,8 @@ class SessionBootstrap:
                 for ht in handoff.active_tasks:
                     if ht.id and ht.id not in tracker_tasks:
                         stale_ids.append(ht.id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to check task consistency: {}", e)
 
         if stale_ids:
             return BootstrapCheckResult(

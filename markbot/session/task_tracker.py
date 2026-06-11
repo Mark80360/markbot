@@ -125,7 +125,6 @@ class TaskTracker:
             "updated_at": registry.updated_at,
         }
         atomic_write_json(self._registry_path, data)
-        self._cache = None
 
     def _invalidate_cache(self) -> None:
         self._cache = None
@@ -161,9 +160,14 @@ class TaskTracker:
                 registry.active_task_id = None
 
             self._save_registry(registry)
-            if self._cache is None:
-                self._cache = {}
-            self._cache[task.id] = task
+            self._cache = {}
+            for t_dict in registry.tasks:
+                try:
+                    tid = t_dict.get("id")
+                    if tid:
+                        self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                except Exception:
+                    pass
 
     def create_task(
         self,
@@ -314,5 +318,13 @@ class TaskTracker:
             removed = before - len(registry.tasks)
             if removed > 0:
                 self._save_registry(registry)
+                self._cache = {}
+                for t_dict in registry.tasks:
+                    try:
+                        tid = t_dict.get("id")
+                        if tid:
+                            self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                    except Exception:
+                        pass
                 logger.info("Cleaned up {} completed tasks", removed)
             return removed

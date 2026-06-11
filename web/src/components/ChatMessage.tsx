@@ -1,4 +1,4 @@
-import { Check, Copy, FileText, ImageIcon, User } from "lucide-react";
+import { Check, Copy, FileText, Pencil, RotateCcw, User, X, Check as CheckIcon } from "lucide-react";
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,16 +8,43 @@ import type { Message } from "@/types/chat";
 
 interface ChatMessageProps {
   message: Message;
+  isStreaming?: boolean;
+  onEdit?: (serverTimestamp: number, newContent: string) => void;
+  onRegenerate?: (serverTimestamp: number) => void;
 }
 
-export function ChatMessage({ message }: ChatMessageProps) {
+export function ChatMessage({ message, isStreaming, onEdit, onRegenerate }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editValue, setEditValue] = useState(message.content);
   const isUser = message.role === "user";
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(message.content);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
+  };
+
+  const handleEditSubmit = () => {
+    if (editValue.trim() && message.serverTimestamp && onEdit) {
+      onEdit(message.serverTimestamp, editValue.trim());
+      setEditing(false);
+    }
+  };
+
+  const handleEditCancel = () => {
+    setEditValue(message.content);
+    setEditing(false);
+  };
+
+  const handleEditKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleEditSubmit();
+    }
+    if (e.key === "Escape") {
+      handleEditCancel();
+    }
   };
 
   return (
@@ -67,9 +94,49 @@ export function ChatMessage({ message }: ChatMessageProps) {
                   })}
                 </div>
               )}
-              {message.content && <div className="whitespace-pre-wrap">{message.content}</div>}
-              {!message.content && message.media && message.media.length > 0 && (
-                <span className="text-text-muted text-xs">附件已发送</span>
+              {editing ? (
+                <div className="min-w-[200px]">
+                  <textarea
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    onKeyDown={handleEditKeyDown}
+                    className="w-full bg-transparent border border-border-accent rounded-lg p-2 text-sm text-text-primary resize-none outline-none min-h-[60px]"
+                    autoFocus
+                  />
+                  <div className="flex gap-1.5 mt-1.5 justify-end">
+                    <button
+                      onClick={handleEditCancel}
+                      className="p-1 rounded text-text-muted hover:text-text-primary hover:bg-background-tertiary transition-all"
+                      title="取消"
+                    >
+                      <X size={14} />
+                    </button>
+                    <button
+                      onClick={handleEditSubmit}
+                      className="p-1 rounded text-accent-teal hover:bg-accent-teal-dim transition-all"
+                      title="发送"
+                    >
+                      <CheckIcon size={14} />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {message.content && <div className="whitespace-pre-wrap">{message.content}</div>}
+                  {!message.content && message.media && message.media.length > 0 && (
+                    <span className="text-text-muted text-xs">附件已发送</span>
+                  )}
+                </>
+              )}
+
+              {!editing && !isStreaming && message.serverTimestamp && onEdit && (
+                <button
+                  onClick={() => { setEditing(true); setEditValue(message.content); }}
+                  className="absolute -bottom-1 right-7 opacity-0 group-hover:opacity-100 p-1 rounded-md transition-all bg-background-tertiary border border-border text-text-tertiary hover:text-midground"
+                  title="编辑"
+                >
+                  <Pencil size={12} />
+                </button>
               )}
             </div>
           ) : (
@@ -151,13 +218,24 @@ export function ChatMessage({ message }: ChatMessageProps) {
               )}
 
               {!message.streaming && message.content && (
-                <button
-                  onClick={handleCopy}
-                  className="absolute -bottom-1 right-0 opacity-0 group-hover:opacity-100 p-1 rounded-md transition-all bg-background-tertiary border border-border text-text-tertiary hover:text-midground"
-                  title="复制"
-                >
-                  <Copy size={12} />
-                </button>
+                <div className="flex items-center gap-1 absolute -bottom-1 right-0 opacity-0 group-hover:opacity-100 transition-all">
+                  {message.serverTimestamp && onRegenerate && (
+                    <button
+                      onClick={() => onRegenerate(message.serverTimestamp!)}
+                      className="p-1 rounded-md bg-background-tertiary border border-border text-text-tertiary hover:text-midground"
+                      title="重新生成"
+                    >
+                      <RotateCcw size={12} />
+                    </button>
+                  )}
+                  <button
+                    onClick={handleCopy}
+                    className="p-1 rounded-md bg-background-tertiary border border-border text-text-tertiary hover:text-midground"
+                    title="复制"
+                  >
+                    <Copy size={12} />
+                  </button>
+                </div>
               )}
             </div>
           )}

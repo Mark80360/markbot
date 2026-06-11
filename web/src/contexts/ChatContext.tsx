@@ -6,13 +6,16 @@ export type SessionInfo = any;
 
 interface ChatContextValue {
   messages: Message[];
-  sendMessage: (content: string) => void;
+  sendMessage: (content: string, files?: File[]) => void;
   isStreaming: boolean;
   clearMessages: () => void;
   currentSessionId: string | null;
   sessions: SessionInfo[];
   switchSession: (id: string) => void;
   deleteSession: (id: string) => void;
+  stopStreaming: () => void;
+  editAndResend: (serverTimestamp: number, content: string, files?: File[]) => void;
+  regenerate: (serverTimestamp: number) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);

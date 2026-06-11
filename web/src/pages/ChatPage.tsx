@@ -9,6 +9,7 @@ export default function ChatPage() {
   const sessionParam = searchParams.get("session");
   const {
     messages, sendMessage, isStreaming, switchSession, currentSessionId,
+    stopStreaming, editAndResend, regenerate,
   } = useChatContext();
 
   useEffect(() => {
@@ -23,8 +24,15 @@ export default function ChatPage() {
         messages={messages}
         isStreaming={isStreaming}
         onSuggestionClick={sendMessage}
+        onEdit={editAndResend}
+        onRegenerate={regenerate}
       />
-      <ChatInput onSend={sendMessage} disabled={isStreaming} />
+      <ChatInput
+        onSend={sendMessage}
+        disabled={isStreaming}
+        onStop={stopStreaming}
+        isStreaming={isStreaming}
+      />
     </main>
   );
 }

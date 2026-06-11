@@ -30,6 +30,7 @@ export function useChat() {
   const reconnectAttemptsRef = useRef(0);
   const intentionalCloseRef = useRef(false);
   const currentSessionIdRef = useRef<string | null>(null);
+  const isStreamingRef = useRef(false);
 
   const setCurrentSessionIdWithRef = useCallback((id: string | null) => {
     currentSessionIdRef.current = id;
@@ -79,6 +80,13 @@ export function useChat() {
             break;
           }
 
+          case "messages_trimmed": {
+            setMessages((prev) =>
+              prev.filter((m) => m.serverTimestamp == null || m.serverTimestamp < data.timestamp)
+            );
+            break;
+          }
+
           case "stream_delta": {
             streamBufferRef.current += data.delta;
             const bufId = currentMsgIdRef.current;
@@ -116,6 +124,7 @@ export function useChat() {
               );
             }
             setIsStreaming(false);
+            isStreamingRef.current = false;
             currentMsgIdRef.current = null;
             streamBufferRef.current = "";
             activeToolCallsRef.current.clear();
@@ -137,6 +146,7 @@ export function useChat() {
               },
             ]);
             setIsStreaming(false);
+            isStreamingRef.current = false;
             activeToolCallsRef.current.clear();
             fetchSessions();
             break;
@@ -214,6 +224,7 @@ export function useChat() {
               },
             ]);
             setIsStreaming(false);
+            isStreamingRef.current = false;
             currentMsgIdRef.current = null;
             streamBufferRef.current = "";
             activeToolCallsRef.current.clear();
@@ -291,9 +302,116 @@ export function useChat() {
     ]);
 
     setIsStreaming(true);
+    isStreamingRef.current = true;
     const payload: Record<string, any> = { content };
     if (mediaUrls.length > 0) payload.media = mediaUrls;
     ws.send(JSON.stringify(payload));
+  }, []);
+
+  const stopStreaming = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "stop_streaming" }));
+    setIsStreaming(false);
+    isStreamingRef.current = false;
+    if (currentMsgIdRef.current) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === currentMsgIdRef.current
+            ? { ...m, streaming: false }
+            : m
+        )
+      );
+    }
+    currentMsgIdRef.current = null;
+    streamBufferRef.current = "";
+    activeToolCallsRef.current.clear();
+  }, []);
+
+  const editAndResend = useCallback(async (serverTimestamp: number, content: string, files?: File[]) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    let mediaUrls: string[] = [];
+    if (files && files.length > 0) {
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+          const res = await authFetch("/api/upload", { method: "POST", body: formData });
+          if (res.ok) {
+            const data = await res.json();
+            mediaUrls.push(data.url);
+          }
+        } catch { /* ignore */ }
+      }
+    }
+
+    const userMsg: Message = {
+      id: generateId(),
+      role: "user",
+      content: content || "(附件)",
+      timestamp: Date.now(),
+      serverTimestamp,
+      media: mediaUrls.length > 0 ? mediaUrls : undefined,
+    };
+
+    setMessages((prev) => {
+      const filtered = prev.filter((m) => m.serverTimestamp == null || m.serverTimestamp < serverTimestamp);
+      return [...filtered, userMsg];
+    });
+
+    const assistantId = generateId();
+    currentMsgIdRef.current = assistantId;
+    streamBufferRef.current = "";
+    activeToolCallsRef.current.clear();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        streaming: true,
+        toolCalls: [],
+      },
+    ]);
+
+    setIsStreaming(true);
+    isStreamingRef.current = true;
+    const payload: Record<string, any> = { type: "edit_and_resend", content, timestamp: serverTimestamp };
+    if (mediaUrls.length > 0) payload.media = mediaUrls;
+    ws.send(JSON.stringify(payload));
+  }, []);
+
+  const regenerate = useCallback((serverTimestamp: number) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    setMessages((prev) => {
+      const filtered = prev.filter((m) => m.serverTimestamp == null || m.serverTimestamp < serverTimestamp);
+      return filtered;
+    });
+
+    const assistantId = generateId();
+    currentMsgIdRef.current = assistantId;
+    streamBufferRef.current = "";
+    activeToolCallsRef.current.clear();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        streaming: true,
+        toolCalls: [],
+      },
+    ]);
+
+    setIsStreaming(true);
+    isStreamingRef.current = true;
+    ws.send(JSON.stringify({ type: "regenerate", timestamp: serverTimestamp }));
   }, []);
 
   const clearMessages = useCallback(() => {
@@ -305,6 +423,7 @@ export function useChat() {
     streamBufferRef.current = "";
     currentMsgIdRef.current = null;
     setIsStreaming(false);
+    isStreamingRef.current = false;
     activeToolCallsRef.current.clear();
     setCurrentSessionIdWithRef(null);
     fetchSessions();
@@ -320,16 +439,19 @@ export function useChat() {
       .then((data) => {
         if (data.error) return;
         setCurrentSessionIdWithRef(sessionId);
-        const loaded: Message[] = (data.messages || []).map((m: any) => ({
+        const loaded: Message[] = (data.messages || []).map((m: any, i: number) => ({
           id: generateId(),
           role: m.role,
           content: m.content,
           timestamp: (m.timestamp || 0) * 1000,
+          serverTimestamp: m.timestamp || 0,
+          media: m.media,
         }));
         setMessages(loaded);
         streamBufferRef.current = "";
         currentMsgIdRef.current = null;
         setIsStreaming(false);
+        isStreamingRef.current = false;
         activeToolCallsRef.current.clear();
       })
       .catch(() => {});
@@ -353,5 +475,8 @@ export function useChat() {
     sessions,
     switchSession,
     deleteSession,
+    stopStreaming,
+    editAndResend,
+    regenerate,
   };
 }

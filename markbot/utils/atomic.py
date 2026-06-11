@@ -44,6 +44,10 @@ class FileLock:
     data file can be atomically replaced without ever holding a lock
     on the data file itself. The lock file is created on demand.
 
+    A threading lock is used internally to serialize in-process access,
+    since portalocker's Windows backend (msvcrt) does not safely handle
+    concurrent lock/unlock from multiple threads on the same file handle.
+
     Example::
 
         with FileLock(path, timeout=5.0):
@@ -52,14 +56,18 @@ class FileLock:
     """
 
     def __init__(self, path: Path, timeout: float = 5.0) -> None:
+        import threading
+
         self._path = Path(path)
         self._timeout = timeout
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._fh: object | None = None
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_path.touch(exist_ok=True)
+        self._thread_lock = threading.Lock()
 
     def __enter__(self) -> None:
+        self._thread_lock.acquire()
         try:
             lock = portalocker.Lock(
                 str(self._lock_path),
@@ -72,17 +80,21 @@ class FileLock:
             lock.__enter__()
             self._fh = lock
         except portalocker.exceptions.LockException as exc:
+            self._thread_lock.release()
             raise LockAcquisitionError(
                 f"Could not acquire lock on {self._lock_path} "
                 f"within {self._timeout}s: {exc}"
             ) from exc
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.__exit__(exc_type, exc, tb)
-            finally:
-                self._fh = None
+        try:
+            if self._fh is not None:
+                try:
+                    self._fh.__exit__(exc_type, exc, tb)
+                finally:
+                    self._fh = None
+        finally:
+            self._thread_lock.release()
 
 
 def atomic_write_json(

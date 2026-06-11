@@ -84,8 +84,8 @@ class MessagePipeline:
                 logger.error("Middleware before hook failed: {}", e)
                 try:
                     await mw.on_error(ctx, e)
-                except Exception:
-                    pass
+                except Exception as on_err_exc:
+                    logger.debug("Middleware on_error hook also failed: {}", on_err_exc)
 
         try:
             response = await handler(ctx)
@@ -94,8 +94,8 @@ class MessagePipeline:
             for mw in reversed(self._middlewares):
                 try:
                     await mw.on_error(ctx, e)
-                except Exception:
-                    pass
+                except Exception as on_err_exc:
+                    logger.debug("Middleware on_error hook also failed: {}", on_err_exc)
             raise
 
         for mw in reversed(self._middlewares):

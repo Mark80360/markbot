@@ -157,8 +157,8 @@ class EventEmitter:
         if self._persist_file is not None:
             try:
                 self._persist_file.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to close persist file: {}", e)
             self._persist_file = None
 
 

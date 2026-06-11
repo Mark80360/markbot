@@ -145,6 +145,11 @@ def _build_app():
                     data = {"content": raw}
 
                 msg_type = data.get("type", "")
+                _stop_requested = False
+
+                if msg_type == "stop_streaming":
+                    _stop_requested = True
+                    continue
 
                 if msg_type == "new_session":
                     session_id = None
@@ -162,6 +167,176 @@ def _build_app():
                                 "type": "session",
                                 "session_id": session_id,
                             }))
+                    continue
+
+                if msg_type == "edit_and_resend":
+                    edit_content = data.get("content", "").strip()
+                    edit_media: list[str] = data.get("media", [])
+                    edit_timestamp = data.get("timestamp", 0)
+                    if not edit_content and not edit_media:
+                        continue
+                    if not session_id:
+                        _ensure_session()
+                    store.delete_messages_from(session_id, edit_timestamp)
+                    sess_dict = _chat_sessions.get(session_id, {})
+                    msgs = sess_dict.get("messages", [])
+                    while msgs and msgs[-1].get("timestamp", 0) >= edit_timestamp:
+                        msgs.pop()
+                    user_display = edit_content or "(附件)"
+                    store.add_message(session_id, "user", user_display)
+                    msgs.append({
+                        "role": "user", "content": user_display,
+                        "timestamp": time.time(), "media": edit_media,
+                    })
+                    sess_dict["last_active"] = time.time()
+                    if len(msgs) == 1:
+                        store.update_title(session_id, user_display[:60])
+                        sess_dict["title"] = user_display[:60]
+                    await websocket.send_text(json.dumps({"type": "messages_trimmed", "timestamp": edit_timestamp}))
+                    await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
+                    collected_chunks: list[str] = []
+                    collected_media: list[str] = []
+                    async def on_stream_edit(delta: str):
+                        collected_chunks.append(delta)
+                        try:
+                            await websocket.send_text(json.dumps({"type": "stream_delta", "delta": delta}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send stream_delta failed: %s", exc)
+                    async def on_progress_edit(text: str, **kw: object):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "progress", "content": text}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send progress failed: %s", exc)
+                    async def on_tool_start_edit(tool_id: str, name: str, context: str | None):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "tool_start", "tool_id": tool_id, "name": name, "context": context}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send tool_start failed: %s", exc)
+                    async def on_tool_complete_edit(tool_id: str, name: str, summary: str | None, error: str | None):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "tool_complete", "tool_id": tool_id, "name": name, "summary": summary, "error": error}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send tool_complete failed: %s", exc)
+                    async def on_outbound_edit(om):
+                        for fp in (om.media or []):
+                            p = Path(fp)
+                            if p.exists():
+                                upload_dir = await _ensure_upload_dir()
+                                name = f"gen_{secrets.token_urlsafe(8)}_{p.name}"
+                                shutil.copy2(fp, upload_dir / name)
+                                collected_media.append(f"/api/media/{name}")
+                        if om.content and not collected_chunks:
+                            collected_chunks.append(om.content)
+                    try:
+                        response = await agent.process_direct(
+                            edit_content, session_key=f"web:{session_id}",
+                            channel="web", chat_id=session_id, media=edit_media,
+                            on_progress=on_progress_edit, on_stream=on_stream_edit,
+                            on_tool_start=on_tool_start_edit, on_tool_complete=on_tool_complete_edit,
+                            on_outbound_message=on_outbound_edit,
+                        )
+                        if collected_chunks:
+                            full_content = "".join(collected_chunks)
+                            store.add_message(session_id, "assistant", full_content)
+                            msgs.append({"role": "assistant", "content": full_content, "timestamp": time.time(), "media": collected_media})
+                            payload: dict[str, Any] = {"type": "stream_end"}
+                            if collected_media:
+                                payload["media"] = collected_media
+                            await websocket.send_text(json.dumps(payload))
+                        else:
+                            content = response.content if response else ""
+                            store.add_message(session_id, "assistant", content)
+                            msgs.append({"role": "assistant", "content": content, "timestamp": time.time(), "media": collected_media})
+                            payload = {"type": "message", "content": content, "metadata": response.metadata if response else {}}
+                            if collected_media:
+                                payload["media"] = collected_media
+                            await websocket.send_text(json.dumps(payload))
+                        sess_dict["last_active"] = time.time()
+                    except Exception as e:
+                        _log.exception("Error processing edited message")
+                        await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
+                    continue
+
+                if msg_type == "regenerate":
+                    reg_timestamp = data.get("timestamp", 0)
+                    if not session_id:
+                        continue
+                    store.delete_messages_from(session_id, reg_timestamp)
+                    sess_dict = _chat_sessions.get(session_id, {})
+                    msgs = sess_dict.get("messages", [])
+                    while msgs and msgs[-1].get("timestamp", 0) >= reg_timestamp:
+                        msgs.pop()
+                    await websocket.send_text(json.dumps({"type": "messages_trimmed", "timestamp": reg_timestamp}))
+                    await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
+                    last_user_msg = next(
+                        (m for m in reversed(msgs) if m["role"] == "user"), None
+                    )
+                    if not last_user_msg:
+                        await websocket.send_text(json.dumps({"type": "error", "content": "No user message to regenerate from"}))
+                        continue
+                    user_content = last_user_msg["content"]
+                    user_media_list: list[str] = last_user_msg.get("media", [])
+                    collected_chunks = []
+                    collected_media = []
+                    async def on_stream_reg(delta: str):
+                        collected_chunks.append(delta)
+                        try:
+                            await websocket.send_text(json.dumps({"type": "stream_delta", "delta": delta}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send stream_delta failed: %s", exc)
+                    async def on_progress_reg(text: str, **kw: object):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "progress", "content": text}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send progress failed: %s", exc)
+                    async def on_tool_start_reg(tool_id: str, name: str, context: str | None):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "tool_start", "tool_id": tool_id, "name": name, "context": context}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send tool_start failed: %s", exc)
+                    async def on_tool_complete_reg(tool_id: str, name: str, summary: str | None, error: str | None):
+                        try:
+                            await websocket.send_text(json.dumps({"type": "tool_complete", "tool_id": tool_id, "name": name, "summary": summary, "error": error}))
+                        except Exception as exc:
+                            _log.debug("WebSocket send tool_complete failed: %s", exc)
+                    async def on_outbound_reg(om):
+                        for fp in (om.media or []):
+                            p = Path(fp)
+                            if p.exists():
+                                upload_dir = await _ensure_upload_dir()
+                                name = f"gen_{secrets.token_urlsafe(8)}_{p.name}"
+                                shutil.copy2(fp, upload_dir / name)
+                                collected_media.append(f"/api/media/{name}")
+                        if om.content and not collected_chunks:
+                            collected_chunks.append(om.content)
+                    try:
+                        response = await agent.process_direct(
+                            user_content, session_key=f"web:{session_id}",
+                            channel="web", chat_id=session_id, media=user_media_list,
+                            on_progress=on_progress_reg, on_stream=on_stream_reg,
+                            on_tool_start=on_tool_start_reg, on_tool_complete=on_tool_complete_reg,
+                            on_outbound_message=on_outbound_reg,
+                        )
+                        if collected_chunks:
+                            full_content = "".join(collected_chunks)
+                            store.add_message(session_id, "assistant", full_content)
+                            msgs.append({"role": "assistant", "content": full_content, "timestamp": time.time(), "media": collected_media})
+                            payload = {"type": "stream_end"}
+                            if collected_media:
+                                payload["media"] = collected_media
+                            await websocket.send_text(json.dumps(payload))
+                        else:
+                            content = response.content if response else ""
+                            store.add_message(session_id, "assistant", content)
+                            msgs.append({"role": "assistant", "content": content, "timestamp": time.time(), "media": collected_media})
+                            payload = {"type": "message", "content": content, "metadata": response.metadata if response else {}}
+                            if collected_media:
+                                payload["media"] = collected_media
+                            await websocket.send_text(json.dumps(payload))
+                        sess_dict["last_active"] = time.time()
+                    except Exception as e:
+                        _log.exception("Error regenerating message")
+                        await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
                     continue
 
                 user_content = data.get("content", "").strip()
@@ -196,24 +371,24 @@ def _build_app():
                         await websocket.send_text(json.dumps({
                             "type": "stream_delta", "delta": delta,
                         }))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("WebSocket send stream_delta failed: %s", exc)
 
                 async def on_progress(text: str, **kwargs: object):
                     try:
                         await websocket.send_text(json.dumps({
                             "type": "progress", "content": text,
                         }))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("WebSocket send progress failed: %s", exc)
 
                 async def on_tool_start(tool_id: str, name: str, context: str | None):
                     try:
                         await websocket.send_text(json.dumps({
                             "type": "tool_start", "tool_id": tool_id, "name": name, "context": context,
                         }))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("WebSocket send tool_start failed: %s", exc)
 
                 async def on_tool_complete(tool_id: str, name: str, summary: str | None, error: str | None):
                     try:
@@ -221,8 +396,8 @@ def _build_app():
                             "type": "tool_complete", "tool_id": tool_id, "name": name,
                             "summary": summary, "error": error,
                         }))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("WebSocket send tool_complete failed: %s", exc)
 
                 async def on_outbound_message(om):
                     for fp in (om.media or []):

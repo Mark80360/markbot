@@ -106,16 +106,16 @@ async def _close_session(task_id: str) -> None:
         return
     try:
         await session["context"].close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to close browser context for %s: %s", task_id, e)
     try:
         await session["browser"].close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to close browser for %s: %s", task_id, e)
     try:
         await session["playwright"].stop()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to stop playwright for %s: %s", task_id, e)
 
 
 async def _get_page(task_id: str, config: Optional[Any] = None):
@@ -295,8 +295,8 @@ class BrowserClickTool(Tool):
             if count > 0:
                 await locator.first.click()
                 return f"Clicked element @{element_ref}"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Click by data-ref failed: %s", e)
 
         try:
             snapshot = await page.accessibility.snapshot()
@@ -305,8 +305,8 @@ class BrowserClickTool(Tool):
                 if coords:
                     await page.mouse.click(coords["x"], coords["y"])
                     return f"Clicked element @{element_ref} at ({coords['x']}, {coords['y']})"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Click by accessibility snapshot failed: %s", e)
 
         return f"Could not find element @{element_ref} on the page"
 

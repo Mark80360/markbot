@@ -233,8 +233,8 @@ class SubagentManager:
                     cost_tracker_to_use.update_from_response(response, model=_actual_model)
                 except BudgetExceededError:
                     raise
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to update cost tracker: {}", e)
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -370,8 +370,8 @@ class SubagentManager:
         if tool_name in descriptions:
             try:
                 return descriptions[tool_name](args)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Tool description formatter failed for {}: {}", tool_name, e)
 
         return f"Using {tool_name}"
 

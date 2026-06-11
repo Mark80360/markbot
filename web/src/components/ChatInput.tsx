@@ -1,13 +1,15 @@
-import { ArrowUp, Image, X } from "lucide-react";
+import { ArrowUp, Image, Square, X } from "lucide-react";
 import { type KeyboardEvent, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 interface ChatInputProps {
   onSend: (message: string, files?: File[]) => void;
   disabled: boolean;
+  onStop?: () => void;
+  isStreaming?: boolean;
 }
 
-export function ChatInput({ onSend, disabled }: ChatInputProps) {
+export function ChatInput({ onSend, disabled, onStop, isStreaming }: ChatInputProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -98,23 +100,33 @@ export function ChatInput({ onSend, disabled }: ChatInputProps) {
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={handleKeyDown}
             onInput={handleInput}
-            placeholder="输入消息..."
+            placeholder={isStreaming ? "正在生成中..." : "输入消息..."}
             disabled={disabled}
             rows={1}
             className="flex-1 bg-transparent resize-none text-sm outline-none max-h-[200px] py-1 text-text-primary placeholder:text-text-muted"
           />
-          <button
-            onClick={handleSend}
-            disabled={!canSend}
-            className={cn(
-              "p-2 rounded-xl transition-all flex-shrink-0",
-              canSend
-                ? "bg-accent-teal text-background-base cursor-pointer"
-                : "bg-background-tertiary text-text-muted cursor-not-allowed",
-            )}
-          >
-            <ArrowUp size={16} />
-          </button>
+          {isStreaming ? (
+            <button
+              onClick={onStop}
+              className="p-2 rounded-xl transition-all flex-shrink-0 bg-destructive text-destructive-foreground hover:opacity-90"
+              title="停止生成"
+            >
+              <Square size={16} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!canSend}
+              className={cn(
+                "p-2 rounded-xl transition-all flex-shrink-0",
+                canSend
+                  ? "bg-accent-teal text-background-base cursor-pointer"
+                  : "bg-background-tertiary text-text-muted cursor-not-allowed",
+              )}
+            >
+              <ArrowUp size={16} />
+            </button>
+          )}
         </div>
         <p className="text-xs text-center mt-2 text-text-muted">
           Enter 发送 · Shift+Enter 换行

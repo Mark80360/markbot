@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from markbot.tools.base import Tool, _resolve_path
 from markbot.utils.constants import IGNORE_DIRS as _SHARED_IGNORE_DIRS
 from markbot.utils.helpers import build_image_content_blocks, detect_image_mime
@@ -56,16 +58,16 @@ class _FsTool(Tool):
             shutil.copy2(file_path, backup_path)
 
             self._cleanup_old_backups(backup_root)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to create backup for {}: {}", file_path, e)
 
     def _cleanup_old_backups(self, backup_dir: Path) -> None:
         try:
             backups = sorted(backup_dir.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
             for old_backup in backups[self._max_backups:]:
                 old_backup.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to cleanup old backups: {}", e)
 
 
 # ---------------------------------------------------------------------------

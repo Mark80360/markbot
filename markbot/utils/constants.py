@@ -1,4 +1,4 @@
-﻿"""Shared constants for all agent tools.
+"""Shared constants for all agent tools.
 
 This module provides unified constants to ensure consistency across
 search, filesystem, explore, and other tools.
@@ -162,9 +162,8 @@ def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
             disk_files.add(p.name)
 
     known = set(BOOTSTRAP_FILES)
-    in_template_dir = disk_files & _TEMPLATE_DIR_NAMES
 
-    missing_from_constant = in_template_dir - known
+    missing_from_constant = disk_files - known
     if missing_from_constant:
         warnings.append(
             f"Template file(s) on disk but not in BOOTSTRAP_FILES: "

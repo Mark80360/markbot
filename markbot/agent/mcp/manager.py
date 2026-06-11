@@ -65,8 +65,8 @@ class McpManager:
             if self._mcp_stack:
                 try:
                     await self._mcp_stack.aclose()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to close MCP stack: {}", e)
                 self._mcp_stack = None
         finally:
             self._connecting = False

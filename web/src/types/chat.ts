@@ -12,6 +12,7 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   timestamp: number;
+  serverTimestamp?: number;
   streaming?: boolean;
   toolCalls?: ToolCallInfo[];
   media?: string[];
