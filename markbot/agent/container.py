@@ -52,17 +52,6 @@ if TYPE_CHECKING:
     from markbot.providers.fallback import FallbackManager
     from markbot.schedule.cron import CronService
     from markbot.session.app_state import AppStateProvider
-    # Cache layer (always present, lazily imported to keep the
-    # dependency surface small in non-cache-using tests).
-    from markbot.agent.prefix_cache import (
-        PrefixStabilityManager as _PrefixStabilityManager,
-    )
-    from markbot.agent.llm_response_cache import (
-        LLMResponseCache as _LLMResponseCache,
-    )
-    from markbot.agent.token_estimate_cache import (
-        TokenEstimateCache as _TokenEstimateCache,
-    )
     from markbot.session.bootstrap import SessionBootstrap
     from markbot.session.handoff import HandoffManager
     from markbot.session.session import SessionManager
@@ -73,6 +62,14 @@ if TYPE_CHECKING:
     from markbot.tools.message import MessageTool
     from markbot.tools.question import AskUserQuestionTool
     from markbot.tools.registry import ToolRegistry
+
+
+# Cache layer (runtime imports — these are instantiated below in
+# from_legacy_params, so they MUST be importable at module load time,
+# not only under TYPE_CHECKING).
+from markbot.agent.prefix_cache import PrefixStabilityManager
+from markbot.agent.llm_response_cache import LLMResponseCache
+from markbot.agent.token_estimate_cache import TokenEstimateCache
 
 
 @runtime_checkable
@@ -624,9 +621,9 @@ class AgentContext:
             # persistent piece.  See markbot.agent.{prefix_cache,
             # llm_response_cache, token_estimate_cache}.
             # ------------------------------------------------------------------
-            prefix_stability=_PrefixStabilityManager(),
-            llm_response_cache=_LLMResponseCache(),
-            token_estimate_cache=_TokenEstimateCache(),
+            prefix_stability=PrefixStabilityManager(),
+            llm_response_cache=LLMResponseCache(),
+            token_estimate_cache=TokenEstimateCache(),
             _init_timings=timings,
         )
 
