@@ -270,31 +270,16 @@ class AnthropicProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[str | list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]] | None]:
-        marker = {"type": "ephemeral"}
-
-        if isinstance(system, str) and system:
-            system = [{"type": "text", "text": system, "cache_control": marker}]
-        elif isinstance(system, list) and system:
-            system = list(system)
-            system[-1] = {**system[-1], "cache_control": marker}
-
-        new_msgs = list(messages)
-        if len(new_msgs) >= 3:
-            m = new_msgs[-2]
-            c = m.get("content")
-            if isinstance(c, str):
-                new_msgs[-2] = {**m, "content": [{"type": "text", "text": c, "cache_control": marker}]}
-            elif isinstance(c, list) and c:
-                nc = list(c)
-                nc[-1] = {**nc[-1], "cache_control": marker}
-                new_msgs[-2] = {**m, "content": nc}
-
-        new_tools = tools
-        if tools:
-            new_tools = list(tools)
-            new_tools[-1] = {**new_tools[-1], "cache_control": marker}
-
-        return system, new_msgs, new_tools
+        # Delegate to the canonical ``system_and_3`` strategy defined
+        # in :mod:`markbot.agent.anthropic_breakpoints`.  This keeps
+        # the breakpoint policy in one place so the TUI / Langfuse
+        # observers can introspect the same layout the provider used.
+        from markbot.agent.anthropic_breakpoints import system_and_3
+        return system_and_3(
+            system=system,
+            tools=tools,
+            messages=messages,
+        )
 
     # ------------------------------------------------------------------
     # Build API kwargs

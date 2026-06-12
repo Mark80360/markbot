@@ -1,7 +1,5 @@
 # MarkBot 🦞
 
-> Version 2.3.1
-
 A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
 
 ## Core Strengths

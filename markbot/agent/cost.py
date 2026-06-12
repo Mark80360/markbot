@@ -13,11 +13,12 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from loguru import logger
 
 from markbot.types.exceptions import BudgetExceededError
+from markbot.agent.cache_protocol import CanonicalUsage
 
 
 @dataclass
@@ -208,6 +209,28 @@ class CostTracker:
 
         return round(cost, 6)
 
+    def add_canonical_usage(
+        self,
+        usage: CanonicalUsage,
+        *,
+        model: str = "unknown",
+    ) -> float:
+        """Record a :class:`CanonicalUsage` snapshot.
+
+        Falls back to the per-field ``add_usage`` path for any
+        provider that still hands us the legacy dict shape.  This is
+        the preferred entry point once a :class:`CanonicalUsage` is
+        available — it transparently handles the OpenAI / DeepSeek /
+        Anthropic bucket-name differences.
+        """
+        return self.add_usage(
+            model=model,
+            input_tokens=usage.input_tokens or 0,
+            output_tokens=usage.output_tokens or 0,
+            cache_creation_input_tokens=usage.cache_creation_tokens or 0,
+            cache_read_input_tokens=usage.cache_read_tokens or 0,
+        )
+
     def update_from_response(self, response: Any, model: str = "unknown") -> float:
         """Convenience: extract usage from a provider response object.
 
@@ -239,6 +262,34 @@ class CostTracker:
 
     def get_model_usage(self, model: str) -> ModelUsage | None:
         return self.state.model_usage.get(model)
+
+    def last_turn_cache_savings(self, model: str | None = None) -> Optional[float]:
+        """Estimate USD saved by the *most recent* call's cache reads.
+
+        The most-recent call is approximated by the last record in
+        ``state.model_usage[model].api_calls``; we look up the model
+        that was most recently updated.  Returns ``None`` if there
+        is no data.
+        """
+        if not self.state.model_usage:
+            return None
+        target_model = model
+        if target_model is None:
+            # Pick the model with the most recent increment.
+            for name in reversed(list(self.state.model_usage.keys())):
+                target_model = name
+                break
+        if target_model is None:
+            return None
+        mu = self.state.model_usage.get(target_model)
+        if mu is None or mu.cache_read_input_tokens == 0:
+            return None
+        price = self.pricing.get(target_model)
+        # Saved cost = (miss_rate - hit_rate) * tokens
+        saved = (mu.cache_read_input_tokens / 1000.0) * (
+            price.input_per_1k - price.cache_read_per_1k
+        )
+        return round(max(0.0, saved), 6)
 
     def get_summary(self) -> dict[str, Any]:
         models = {}

@@ -61,7 +61,7 @@ class OpenAICodexProvider(LLMProvider):
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=True,
                     on_content_delta=on_content_delta,
                 )
@@ -69,11 +69,11 @@ class OpenAICodexProvider(LLMProvider):
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=False,
                     on_content_delta=on_content_delta,
                 )
-            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
+            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason, usage=usage)
         except Exception as e:
             return LLMResponse(
                 content=f"Error calling Codex: {e}",
@@ -131,7 +131,7 @@ async def _request_codex(
     body: dict[str, Any],
     verify: bool,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
@@ -257,11 +257,12 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
 async def _consume_sse(
     response: httpx.Response,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
+    usage: dict[str, int] = {}
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -309,12 +310,17 @@ async def _consume_sse(
                     )
                 )
         elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
+            resp_obj = event.get("response") or {}
+            status = resp_obj.get("status")
             finish_reason = _map_finish_reason(status)
+            # Extract usage from the completed response.
+            raw_usage = resp_obj.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = _extract_codex_usage(raw_usage)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    return content, tool_calls, finish_reason, usage
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
@@ -322,6 +328,23 @@ _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "er
 
 def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
+
+
+def _extract_codex_usage(raw: dict[str, Any]) -> dict[str, int]:
+    """Normalise Codex Responses API usage into a flat dict.
+
+    The Codex Responses API returns fields like
+    ``input_tokens``, ``output_tokens``, and ``cached_input_tokens``.
+    """
+    return {
+        "input_tokens": int(raw.get("input_tokens") or 0),
+        "output_tokens": int(raw.get("output_tokens") or 0),
+        "prompt_tokens": int(raw.get("input_tokens") or 0),
+        "completion_tokens": int(raw.get("output_tokens") or 0),
+        "total_tokens": int((raw.get("input_tokens") or 0) + (raw.get("output_tokens") or 0)),
+        # Codex-specific cache field
+        "cached_tokens": int(raw.get("cached_input_tokens") or 0),
+    }
 
 
 def _friendly_error(status_code: int, raw: str) -> str:

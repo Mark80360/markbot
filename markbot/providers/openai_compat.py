@@ -365,8 +365,14 @@ class OpenAICompatProvider(LLMProvider):
                 "total_tokens": tt,
                 "input_tokens": int(usage_map.get("input_tokens") or pt),
                 "output_tokens": int(usage_map.get("output_tokens") or ct),
+                # Anthropic-style cache fields
                 "cache_creation_input_tokens": int(usage_map.get("cache_creation_input_tokens") or 0),
                 "cache_read_input_tokens": int(usage_map.get("cache_read_input_tokens") or 0),
+                # DeepSeek / OpenAI-style cache fields
+                "prompt_cache_hit_tokens": int(usage_map.get("prompt_cache_hit_tokens") or 0),
+                "prompt_cache_miss_tokens": int(usage_map.get("prompt_cache_miss_tokens") or 0),
+                # OpenAI Codex Responses-style cache fields
+                "cached_tokens": int(usage_map.get("cached_tokens") or 0),
             }
             return result
 
@@ -380,8 +386,14 @@ class OpenAICompatProvider(LLMProvider):
                 "total_tokens": tt,
                 "input_tokens": getattr(usage_obj, "input_tokens", 0) or pt,
                 "output_tokens": getattr(usage_obj, "output_tokens", 0) or ct,
+                # Anthropic-style cache fields
                 "cache_creation_input_tokens": getattr(usage_obj, "cache_creation_input_tokens", 0) or 0,
                 "cache_read_input_tokens": getattr(usage_obj, "cache_read_input_tokens", 0) or 0,
+                # DeepSeek / OpenAI-style cache fields
+                "prompt_cache_hit_tokens": getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
+                "prompt_cache_miss_tokens": getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+                # OpenAI Codex Responses-style cache fields
+                "cached_tokens": getattr(usage_obj, "cached_tokens", 0) or 0,
             }
             return result
         return {}

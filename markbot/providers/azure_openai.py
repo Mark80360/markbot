@@ -199,6 +199,12 @@ class AzureOpenAIProvider(LLMProvider):
                     "total_tokens": usage_data.get("total_tokens", 0),
                     "input_tokens": pt,
                     "output_tokens": ct,
+                    # DeepSeek / OpenAI-style cache fields
+                    "prompt_cache_hit_tokens": int(usage_data.get("prompt_cache_hit_tokens") or 0),
+                    "prompt_cache_miss_tokens": int(usage_data.get("prompt_cache_miss_tokens") or 0),
+                    # Anthropic-style cache fields
+                    "cache_creation_input_tokens": int(usage_data.get("cache_creation_input_tokens") or 0),
+                    "cache_read_input_tokens": int(usage_data.get("cache_read_input_tokens") or 0),
                 }
 
             reasoning_content = message.get("reasoning_content") or None

@@ -19,6 +19,15 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 from markbot.agent.tokens import estimate_tokens
+from markbot.agent.turn_metadata import (
+    TurnMetadata,
+    attach_turn_meta,
+    make_turn_metadata,
+)
+from markbot.agent.cache_discipline import (
+    CACHE_DISCIPLINE_SECTION,
+    VOLATILE_BOUNDARY_MARKER,
+)
 from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 from markbot.utils.constants import (
     BOOTSTRAP_FILES,
@@ -190,6 +199,15 @@ You have browser tools for web page interaction. Use them when you need to inter
 
         sections: list[PromptSection] = []
 
+        # Priority 1: Cache discipline — sits at the *top* of the
+        # system prompt so it is the first thing the model reads.
+        # Written to the model itself so it internalises the rules
+        # without per-prompt enforcement.  See
+        # :mod:`markbot.agent.cache_discipline` for the rationale.
+        sections.append(PromptSection(
+            content=CACHE_DISCIPLINE_SECTION, name="cache_discipline", priority=1,
+        ))
+
         # Priority 1: Core identity
         sections.append(PromptSection(
             content=self._get_identity(), name="identity", priority=1,
@@ -277,6 +295,29 @@ You have browser tools for web page interaction. Use them when you need to inter
             ))
 
         result = self._assemble_sections(sections)
+        # Inject the volatile boundary marker so an operator reading
+        # the assembled prompt can see where the cache-friendly
+        # region ends.  Has no effect on the model — it's an HTML
+        # comment.
+        result = f"{result}\n\n{VOLATILE_BOUNDARY_MARKER}"
+        # Try to persist / load the base section via prompt_persist
+        # for cross-session reuse.
+        try:
+            from markbot.agent.prompt_persist import (
+                hash_base_section,
+                load_cached_base_section,
+                save_cached_base_section,
+            )
+            base_hash = hash_base_section(result)
+            workspace = getattr(self, "workspace", None)
+            if workspace is not None:
+                cached = load_cached_base_section(base_hash, workspace)
+                if cached is not None:
+                    result = cached
+                else:
+                    save_cached_base_section(base_hash, workspace, result)
+        except Exception:
+            pass  # Non-critical; don't break the prompt build.
         self._context_cache[cache_key] = (time.monotonic(), result)
         return result
 
@@ -718,6 +759,7 @@ Dynamically load background info when you need more context:
         extra_system_context: str | None = None,
         session_key: str | None = None,
         session: Any = None,
+        turn_meta: TurnMetadata | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -732,6 +774,11 @@ Dynamically load background info when you need more context:
             extra_system_context: Extra system context
             session_key: Session identifier
             session: Session object
+            turn_meta: Optional per-turn metadata.  When provided it
+                is appended **at the tail** of the user message as a
+                ``<turn_meta>{...}</turn_meta>`` block.  This keeps
+                the leading user text byte-identical across turns so
+                the server-side prefix cache can hit on it.
         """
         system_content = self.build_system_prompt(skill_names)
 
@@ -751,6 +798,14 @@ Dynamically load background info when you need more context:
             merged = [
                 {"type": "text", "text": injected_text}
             ] + user_content
+
+        # Append the per-turn metadata block at the **tail** of the user
+        # message.  Putting it at the head (e.g. prepending the date)
+        # would bust the server-side KV prefix cache every time the
+        # date or model route changes.  See markbot.agent.turn_metadata
+        # for the full rationale.
+        if turn_meta is not None:
+            merged = attach_turn_meta(merged, turn_meta)
 
         return [
             {"role": "system", "content": system_content},

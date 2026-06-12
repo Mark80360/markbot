@@ -123,6 +123,18 @@ class AgentLoop:
         self.sessions = ctx.sessions
         self.subagents = ctx.subagents
 
+        # ------------------------------------------------------------------
+        # Prefix-cache & response-cache state.  See
+        # :mod:`markbot.agent.prefix_cache` and
+        # :mod:`markbot.agent.llm_response_cache` for the rationale.
+        # ------------------------------------------------------------------
+        self.prefix_stability = ctx.prefix_stability
+        self.llm_response_cache = ctx.llm_response_cache
+        self.token_estimate_cache = ctx.token_estimate_cache
+        # Increment on every add/remove/clear of the message list so
+        # the token-estimate cache invalidates correctly.
+        self._messages_revision: int = 0
+
         self._running = False
         self.mcp = ctx.mcp
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
@@ -677,6 +689,8 @@ class AgentLoop:
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=200)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            from markbot.agent.turn_metadata import make_turn_metadata as _make_meta_sys
+            _sys_meta = _make_meta_sys(model=self.config.primary_model_ref if self.config else "")
             messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content,
@@ -685,6 +699,7 @@ class AgentLoop:
                 current_role=current_role,
                 session_key=key,
                 session=session,
+                turn_meta=_sys_meta,
             )
             try:
                 final_content, _, all_msgs, _new_start = await self._run_agent_loop(
@@ -737,6 +752,13 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=200)
+        # Build a fresh turn_meta so the user message can carry the
+        # per-turn metadata at its tail.  This keeps the leading
+        # user input byte-identical across turns so the server-side
+        # KV prefix cache can hit on it.  See
+        # markbot.agent.turn_metadata for the full rationale.
+        from markbot.agent.turn_metadata import make_turn_metadata as _make_meta
+        _meta = _make_meta(model=self.config.primary_model_ref if self.config else "")
         initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,
@@ -745,6 +767,7 @@ class AgentLoop:
             chat_id=chat_id,
             session_key=key,
             session=session,
+            turn_meta=_meta,
         )
 
         # Bootstrap hook: prepend guidance on first interaction

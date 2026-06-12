@@ -52,6 +52,17 @@ if TYPE_CHECKING:
     from markbot.providers.fallback import FallbackManager
     from markbot.schedule.cron import CronService
     from markbot.session.app_state import AppStateProvider
+    # Cache layer (always present, lazily imported to keep the
+    # dependency surface small in non-cache-using tests).
+    from markbot.agent.prefix_cache import (
+        PrefixStabilityManager as _PrefixStabilityManager,
+    )
+    from markbot.agent.llm_response_cache import (
+        LLMResponseCache as _LLMResponseCache,
+    )
+    from markbot.agent.token_estimate_cache import (
+        TokenEstimateCache as _TokenEstimateCache,
+    )
     from markbot.session.bootstrap import SessionBootstrap
     from markbot.session.handoff import HandoffManager
     from markbot.session.session import SessionManager
@@ -134,6 +145,14 @@ class AgentContext:
     task_tracker: "TaskTracker | None" = None
     memory_encoder: "MemoryEncoder | None" = None
     app_state: "AppStateProvider | None" = None
+
+    # ------------------------------------------------------------------
+    # Cache layer (see markbot.agent.{prefix_cache,llm_response_cache,
+    # token_estimate_cache,prompt_persist}).
+    # ------------------------------------------------------------------
+    prefix_stability: Any = None
+    llm_response_cache: Any = None
+    token_estimate_cache: Any = None
 
     _init_timings: dict[str, float] = field(default_factory=dict)
 
@@ -599,6 +618,15 @@ class AgentContext:
             task_tracker=task_tracker,
             memory_encoder=memory_encoder,
             app_state=app_state,
+            # ------------------------------------------------------------------
+            # Cache layer — always construct fresh per process so the
+            # cross-session disk cache in prompt_persist is the only
+            # persistent piece.  See markbot.agent.{prefix_cache,
+            # llm_response_cache, token_estimate_cache}.
+            # ------------------------------------------------------------------
+            prefix_stability=_PrefixStabilityManager(),
+            llm_response_cache=_LLMResponseCache(),
+            token_estimate_cache=_TokenEstimateCache(),
             _init_timings=timings,
         )
 

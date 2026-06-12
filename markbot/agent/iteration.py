@@ -20,6 +20,15 @@ from loguru import logger
 
 from markbot.agent.compact import CompactAction, is_prompt_too_long_error, offload_tool_output
 from markbot.agent.cost import BudgetExceededError
+from markbot.agent.cache_protocol import (
+    CanonicalUsage,
+    CacheEvent,
+    UsageNormaliser,
+)
+from markbot.agent.prefix_cache import (
+    PrefixStabilityManager,
+    system_prompt_text,
+)
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
 from markbot.session.handoff import build_handoff_from_session
@@ -33,6 +42,58 @@ if TYPE_CHECKING:
 # Tag for internal context messages injected after system prompt.
 # These are per-turn and should not be persisted to session history.
 _INTERNAL_CONTEXT_TAG = "[Agent Internal Context"
+
+
+# ---------------------------------------------------------------------------
+# Provider-specific usage normalisers
+# ---------------------------------------------------------------------------
+
+class _OpenAICompatNormaliser(UsageNormaliser):
+    """DeepSeek / OpenAI / CodeWhale: ``prompt_cache_hit/miss_tokens``."""
+
+    cache_read_key = "prompt_cache_hit_tokens"
+    cache_miss_key = "prompt_cache_miss_tokens"
+
+
+class _CodexResponsesNormaliser(UsageNormaliser):
+    """OpenAI Codex Responses API: ``cached_tokens``."""
+
+    cache_read_key = "cached_tokens"
+    cache_miss_key = None  # implicit (input_tokens - cached)
+
+
+class _AnthropicNormaliser(UsageNormaliser):
+    """Anthropic Messages: ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``."""
+
+    cache_read_key = "cache_read_input_tokens"
+    cache_creation_key = "cache_creation_input_tokens"
+    cache_miss_key = None
+
+
+#: Lookup table; ``provider`` here is the provider class name (or
+#: a lowercase short-form).  Falls back to :class:`_OpenAICompatNormaliser`
+#: since it covers the largest set.
+USAGE_NORMALISERS: dict[str, UsageNormaliser] = {
+    "openai_compat": _OpenAICompatNormaliser(),
+    "deepseek": _OpenAICompatNormaliser(),
+    "openai": _OpenAICompatNormaliser(),
+    "azure_openai": _OpenAICompatNormaliser(),
+    "openai_codex": _CodexResponsesNormaliser(),
+    "codex": _CodexResponsesNormaliser(),
+    "anthropic": _AnthropicNormaliser(),
+    "claude": _AnthropicNormaliser(),
+}
+
+
+def normalise_usage(
+    provider_name: str | None,
+    usage: dict[str, Any] | None,
+) -> CanonicalUsage:
+    """Pick the right normaliser for a provider name and apply it."""
+    key = (provider_name or "").lower()
+    normaliser = USAGE_NORMALISERS.get(key) or _OpenAICompatNormaliser()
+    return normaliser.normalise(usage)
 
 
 @dataclass
@@ -50,6 +111,8 @@ class LoopState:
     last_attempts: list = field(default_factory=list)
     last_compact_action: CompactAction = CompactAction.NONE
     steer_continues: int = 0
+    # Cache telemetry (populated by _phase_call_llm).
+    last_cache_event: CacheEvent | None = None
 
 
 @dataclass
@@ -129,7 +192,12 @@ class IterationRunner:
         return state.final_content, state.tools_used, state.messages, state.new_msg_start
 
     async def _run_one_iteration(self, state: LoopState) -> IterationResult:
-        state.current_tokens = token_count_with_estimation(state.messages)
+        # Bump the messages revision so the token estimate cache
+        # knows to recompute on the next call.
+        rev = getattr(self.loop, "_messages_revision", None)
+        if rev is not None:
+            self.loop._messages_revision = rev + 1
+        state.current_tokens = self._estimate_tokens(state)
         logger.debug("Estimated context tokens: {}", state.current_tokens)
 
         await self._phase_compact(state)
@@ -470,6 +538,21 @@ class IterationRunner:
                 )
                 await self.on_stream_end(discard=True)
                 self._stream_filter.reset()
+        # ------------------------------------------------------------------
+        # Prefix-stability check.  Runs *before* the LLM call so the
+        # operator can see the drift on the same frame as the response
+        # that triggered it.  See markbot.agent.prefix_cache.
+        # ------------------------------------------------------------------
+        self._check_prefix_stability(state, tool_defs)
+        # ------------------------------------------------------------------
+        # LLM response cache: short-circuit deterministic requests.
+        # See markbot.agent.llm_response_cache for the rationale.
+        # ------------------------------------------------------------------
+        cache_hit = self._try_response_cache(state, tool_defs)
+        if cache_hit is not None:
+            state.last_response = cache_hit
+            state.last_attempts = []
+            return None
         try:
             if self.on_stream:
                 logger.info("Calling LLM with streaming...")
@@ -486,9 +569,124 @@ class IterationRunner:
                 )
             state.last_response = response
             state.last_attempts = attempts
+            # Normalise the response usage and feed it to the cost tracker.
+            # The provider name comes from the most recent successful
+            # attempt when available, else we fall back to "unknown".
+            self._record_canonical_usage(response, attempts)
+            # Write to the LLM response cache if the request was cacheable.
+            self._maybe_write_response_cache(state, tool_defs, response, attempts)
             return None
         except Exception as llm_exc:
             return await self._handle_llm_error(state, tool_defs, llm_exc)
+
+    def _check_prefix_stability(
+        self, state: LoopState, tool_defs: list[dict]
+    ) -> None:
+        """Run :class:`PrefixStabilityManager` and emit a :class:`CacheEvent`.
+
+        The event payload is logged at INFO level so the operator gets
+        a one-line summary of every turn; the bus payload itself is
+        kept tiny so it can also be forwarded to TUI / Langfuse
+        without redaction overhead.
+        """
+        pm: PrefixStabilityManager | None = getattr(
+            self.loop, "prefix_stability", None
+        )
+        if pm is None:
+            return
+        sys_text = system_prompt_text(state.messages)
+        try:
+            stable, change = pm.check_and_update(sys_text, tool_defs or None)
+        except Exception as exc:
+            logger.debug("prefix_stability check failed: {}", exc)
+            return
+        # Compute the cache_read_tokens from the *previous* response
+        # (if any) so the TUI chip can render a sensible rate.
+        last_usage: dict[str, Any] = {}
+        last_resp = state.last_response
+        if last_resp is not None:
+            usage = getattr(last_resp, "usage", None)
+            if isinstance(usage, dict):
+                last_usage = usage
+        provider_name = ""
+        # Try to find the provider name from the latest attempts.
+        for a in reversed(state.last_attempts or []):
+            provider_cfg = getattr(a, "provider", None)
+            if provider_cfg is not None and getattr(provider_cfg, "type", None):
+                provider_name = str(provider_cfg.type)
+                break
+        canonical = normalise_usage(provider_name, last_usage)
+        event = CacheEvent(
+            description=(
+                "stable" if stable
+                else (str(change) if change is not None else "drift")
+            ),
+            system_prompt_changed=bool(change and change.system_changed),
+            tools_changed=bool(change and change.tools_changed),
+            stability_pct=int(round(pm.stability_ratio * 100)),
+            changed=not stable,
+            pinned_combined_hash=(
+                pm.pinned.short() if pm.pinned else ""
+            ),
+            cache_read_tokens=canonical.cache_read_tokens,
+            cache_miss_tokens=canonical.cache_miss_tokens,
+        )
+        if not stable:
+            logger.warning(
+                "[cache] prefix drift detected: {} (stability={}%)",
+                event.description,
+                event.stability_pct,
+            )
+        else:
+            logger.debug(
+                "[cache] prefix stable ({}% over {} turns, last_change={})",
+                event.stability_pct,
+                pm.check_count,
+                event.description if event.changed else "none",
+            )
+        # Stash the event on the state so the slash command / TUI
+        # can surface it without re-running the check.
+        state.last_cache_event = event  # type: ignore[attr-defined]
+
+    def _record_canonical_usage(
+        self,
+        response: Any,
+        attempts: list[Any] | None,
+    ) -> None:
+        """Normalise the response usage and feed it to the cost tracker.
+
+        Falls back to ``update_from_response`` (legacy path) when no
+        attempts are recorded, so the cost tracker keeps working for
+        provider adapters that haven't been migrated yet.
+        """
+        if response is None:
+            return
+        usage = getattr(response, "usage", None)
+        if not isinstance(usage, dict):
+            return
+        provider_name = ""
+        if attempts:
+            for a in reversed(attempts):
+                provider_cfg = getattr(a, "provider", None)
+                if provider_cfg is not None and getattr(provider_cfg, "type", None):
+                    provider_name = str(provider_cfg.type)
+                    break
+        canonical = normalise_usage(provider_name, usage)
+        # Best-effort: also surface to cost tracker.
+        cost_tracker = getattr(self.loop, "cost_tracker", None)
+        model = ""
+        if attempts:
+            for a in reversed(attempts):
+                m = getattr(a, "model_ref", None)
+                if m:
+                    model = str(m)
+                    break
+        if cost_tracker is not None and hasattr(cost_tracker, "add_canonical_usage"):
+            try:
+                cost_tracker.add_canonical_usage(canonical, model=model or "unknown")
+            except Exception as exc:
+                # Don't break the loop on a billing glitch.
+                logger.debug("cost_tracker.add_canonical_usage failed: {}", exc)
 
     async def _handle_llm_error(
         self, state: LoopState, tool_defs: list[dict], llm_exc: Exception
@@ -548,6 +746,112 @@ class IterationRunner:
                 "to reduce it enough. Please start a new session or simplify your request."
             )
             return IterationResult(should_break=True)
+
+    # ------------------------------------------------------------------
+    # LLM response cache helpers
+    # ------------------------------------------------------------------
+
+    def _try_response_cache(
+        self, state: LoopState, tool_defs: list[dict]
+    ) -> Any | None:
+        """Check the LLM response cache for a deterministic hit.
+
+        Returns the cached response on hit, or ``None`` on miss /
+        when the request is not cacheable.
+        """
+        cache = getattr(self.loop, "llm_response_cache", None)
+        if cache is None:
+            return None
+        from markbot.agent.llm_response_cache import (
+            request_is_cacheable,
+            make_response_cache_key,
+            canonicalise_body,
+        )
+        # Streaming requests are never cacheable.
+        if self.on_stream:
+            return None
+        if not request_is_cacheable(
+            stream=False,
+            tools=tool_defs or None,
+        ):
+            return None
+        # Build a cache key from the messages body.
+        try:
+            body = canonicalise_body(state.messages)
+            key = make_response_cache_key(
+                provider="markbot",
+                base_url="",
+                path_suffix=None,
+                api_key=None,
+                body=body,
+            )
+            entry = cache.get(key)
+            if entry is not None:
+                logger.info(
+                    "[llm_response_cache] hit: key={}.., hits={}",
+                    key.hex()[:12],
+                    cache.stats["hits"],
+                )
+                return entry.body
+        except Exception as exc:
+            logger.debug("[llm_response_cache] lookup failed: {}", exc)
+        return None
+
+    def _maybe_write_response_cache(
+        self,
+        state: LoopState,
+        tool_defs: list[dict],
+        response: Any,
+        attempts: list[Any] | None,
+    ) -> None:
+        """Write the response to the LLM response cache if cacheable."""
+        cache = getattr(self.loop, "llm_response_cache", None)
+        if cache is None:
+            return
+        from markbot.agent.llm_response_cache import (
+            request_is_cacheable,
+            make_response_cache_key,
+            canonicalise_body,
+        )
+        if self.on_stream:
+            return
+        if not request_is_cacheable(
+            stream=False,
+            tools=tool_defs or None,
+        ):
+            return
+        try:
+            body = canonicalise_body(state.messages)
+            key = make_response_cache_key(
+                provider="markbot",
+                base_url="",
+                path_suffix=None,
+                api_key=None,
+                body=body,
+            )
+            cache.put(key, response)
+            logger.debug(
+                "[llm_response_cache] write: key={}..",
+                key.hex()[:12],
+            )
+        except Exception as exc:
+            logger.debug("[llm_response_cache] write failed: {}", exc)
+
+    def _estimate_tokens(self, state: LoopState) -> int:
+        """Estimate the current token count, using the estimate cache
+        when available."""
+        tec = getattr(self.loop, "token_estimate_cache", None)
+        rev = getattr(self.loop, "_messages_revision", 0)
+        if tec is not None:
+            try:
+                return tec.lookup_or_compute(
+                    messages_revision=rev,
+                    system_prompt=None,
+                    messages=state.messages,
+                )
+            except Exception:
+                pass
+        return token_count_with_estimation(state.messages)
 
     def _phase_track_response(
         self, state: LoopState, response: Any, attempts: list[Any]
@@ -1014,6 +1318,21 @@ class IterationRunner:
             token_summary["total"]["cache_creation_input_tokens"],
             token_summary["total"]["cache_read_input_tokens"],
         )
+
+        # Log cache effectiveness from the last cache event.
+        cache_event = getattr(state, "last_cache_event", None)
+        if cache_event is not None:
+            from markbot.agent.cache_chip import render_cache_status_line
+            try:
+                status_text = render_cache_status_line(cache_event)
+                logger.info("Cache status: {}", status_text.plain)
+            except Exception:
+                logger.info(
+                    "Cache status: stability={}%, read={}, miss={}",
+                    cache_event.stability_pct,
+                    cache_event.cache_read_tokens,
+                    cache_event.cache_miss_tokens,
+                )
 
         cost_summary = self.loop.cost_tracker.get_summary()
         logger.info(
