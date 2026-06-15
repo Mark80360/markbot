@@ -555,20 +555,52 @@ Advanced built-in memory management:
 
 ### Features
 
-- **Semantic Search**: Vector-based similarity search across memories (OpenAI and Ollama embedding backends)
+- **Hybrid Semantic Search (Long-Term Memory)**: Vector-based similarity search that recalls content *by meaning, not just keywords*. Uses a layered embedder (OpenAI-compatible API → local sentence-transformers → zero-dependency hashing fallback) so it works in every environment. Results are fused with keyword search via Reciprocal Rank Fusion. Turn histories, memory writes, and subagent delegations are all indexed automatically.
+- **Vector Consolidation**: Periodic dedup (cosine-based near-duplicate merging), importance decay, and auto-promotion of frequently-recalled memories into `MEMORY.md`. Keeps the index from growing without bound.
 - **4-Tier Progressive Compaction**: Context Collapse → Micro-Compact → Auto-Compaction → History Snip, escalating only when needed
 - **Head+Tail Context Collapse**: Preserves both beginning and end of content during truncation
 - **CompactAttachment**: Preserves key context across compaction rounds
 - **Tool Output Offloading**: Oversized tool results offloaded to files with inline previews
 - **PTL Retry**: Prompt-Too-Long retry with head truncation
 - **Summarization**: Extract key information from interactions into MEMORY.md
-- **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule
+- **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule (includes vector consolidation)
 - **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
 - **Security Scanner**: Injection and exfiltration detection for memory content
 - **Sensitive Data Redaction**: Automatic scrubbing of API keys, tokens, passwords, JWTs, and connection strings before LLM summarization
 - **Context Fencing**: `<memory-context>` tags with streaming scrubber
+- **Pluggable Vector Backends**: SQLite (default, zero extra deps) or ChromaDB (`pip install markbot[chroma]`)
 - **Plugin Discovery**: External memory providers via entry points, naming convention (`markbot_memory_*`), or manual registration
-- **ChromaDB Provider**: Reference implementation for vector-based semantic memory with ChromaDB
+
+### Long-Term Memory Configuration
+
+Long-term (vector) memory is **enabled by default** and requires zero configuration — it auto-selects the best available embedder and uses the built-in SQLite vector store. To tune it:
+
+```json
+{
+  "tools": {
+    "memory": {
+      "longTermEnabled": true,
+      "vectorBackend": "sqlite",
+      "vectorMaxRecords": 50000,
+      "vectorMinScore": 0.15,
+      "embeddingBackend": "openai",
+      "embeddingApiKey": "sk-...",
+      "embeddingModelName": "text-embedding-3-small"
+    }
+  }
+}
+```
+
+**Embedding backends** (auto-selected by priority):
+1. `openai` — when `embeddingApiKey` is set (best quality, needs network). Point `embeddingBaseUrl` at any OpenAI-compatible service.
+2. Local `sentence-transformers` — when installed via `pip install 'markbot[local-embeddings]'` (multilingual, offline after first download).
+3. Hashing fallback — always available, zero dependencies.
+
+**Vector stores**:
+- `sqlite` (default): standard library only, cosine ranking in memory. Handles up to ~50k vectors.
+- `chroma`: `pip install 'markbot[chroma]'` then set `"vectorBackend": "chroma"`. Uses our embedder (not Chroma's bundled model) for consistency.
+
+To **disable** long-term memory (keyword search only): `"longTermEnabled": false`.
 
 ### Memory Provider Plugins
 
@@ -637,19 +669,80 @@ Cross-platform desktop control tool that lets the AI agent interact with your co
 
 **Backend Selection** (automatic by default):
 - **macOS + cua-driver**: Background operation without stealing the user's cursor or keyboard focus
-- **Linux/Windows + pyautogui**: Foreground operation using the real cursor
-- **Override**: Set `MARKBOT_COMPUTER_USE_BACKEND` environment variable (`cua`, `pyautogui`, or `noop`)
+- **Linux + AT-SPI** (`pyatspi` + `pyautogui`): Foreground operation with real element bounds — preferred when an a11y stack is available
+- **Linux/Windows + pyautogui**: Foreground fallback with coordinate-only targeting when AT-SPI is unavailable
+- **Override**: Set `MARKBOT_COMPUTER_USE_BACKEND` environment variable (`cua`, `atspi`, `pyautogui`, or `noop`)
 
 **Installation**:
 
-```bash
-# For Linux/Windows (pyautogui backend)
-pip install -e ".[desktop]"
+`pyproject.toml` ships the umbrella `.[desktop]` extra plus three
+platform-specific aliases (`desktop-macos` / `desktop-linux` /
+`desktop-windows`). They all resolve to the same Python deps today; pick
+whichever matches your host. Each platform additionally needs a few
+system-level packages and (on macOS) a separate binary driver.
 
-# For macOS (cua-driver backend — automatic if available)
-# cua-driver is auto-detected; falls back to pyautogui if not installed
+```bash
+# Cross-platform Python deps — works on macOS, Linux, and Windows
 pip install -e ".[desktop]"
+# Or pick the platform-specific alias:
+pip install -e ".[desktop-linux]"     # adds pyatspi on Linux
+pip install -e ".[desktop-macos]"     # macOS only
+pip install -e ".[desktop-windows]"   # Windows only
 ```
+
+**macOS extras** (for the `cua` background backend — optional; if skipped,
+markbot falls back to the `pyautogui` backend automatically):
+
+```bash
+# cua-driver: ships a private SkyLight-based driver (not Apple-public)
+#   Ref: https://github.com/trycua/cua
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+
+# Or point markbot at an existing binary
+export MARKBOT_CUA_DRIVER_CMD=/absolute/path/to/cua-driver
+```
+
+After install, the binary is auto-detected via `shutil.which('cua-driver')`.
+Grant the running Terminal / markbot process **Accessibility** and
+**Screen Recording** permissions in *System Settings → Privacy & Security*
+or the `capture` action will return empty results.
+
+**Linux extras**:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y \
+    python3-tk python3-xlib scrot \
+    at-spi2-core at-spi2-atk \
+    wmctrl xdotool
+
+# Fedora / RHEL
+sudo dnf install -y python3-tkinter python3-xlibb scrot \
+                   at-spi2-core at-spi2-atk wmctrl xdotool
+
+# Arch / Manjaro
+sudo pacman -S tk python-xlib scrot at-spi2-core wmctrl xdotool
+```
+
+- A reachable display is required: set `$DISPLAY` (X11) or `$WAYLAND_DISPLAY`,
+  or run under `Xvfb` (markbot auto-probes `Xvfb` on `:99` when neither is set).
+- The `atspi` backend needs a running AT-SPI registry daemon — typically
+  provided by GNOME, KDE, or `at-spi2-core` plus a session bus.
+- `wmctrl` *or* `xdotool` is used by `list_apps`; install at least one.
+- Force a specific backend with `MARKBOT_COMPUTER_USE_BACKEND=atspi` /
+  `pyautogui` (the former hard-errors if the a11y stack is missing).
+
+**Windows extras**:
+
+- No additional system packages required — `pyautogui` and PowerShell are
+  pre-installed on supported Windows versions.
+- `list_apps` enumerates processes via PowerShell's `Get-Process`; make sure
+  the markbot process has a desktop session (not running headless as a
+  Windows service).
+- The markbot backend runs **in the foreground** (real cursor / active
+  window) and only supports coordinate-based targeting; SOM overlays and
+  element indexing are unavailable.
 
 **Configuration** in `config.yaml`:
 

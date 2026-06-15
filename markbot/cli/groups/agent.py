@@ -133,6 +133,13 @@ def agent(
         log_file=_gateway_paths()["agent_log_file"],
     )
 
+    # Bridge TOOL_PROGRESS events to loguru so streamed tool output
+    # (e.g. ``pip install`` lines) is visible in the session log file.
+    # The producer in agent.iteration emits these unconditionally; without
+    # a subscriber the bus is fire-and-forget and the user sees no progress.
+    from markbot.cli.progress import register_progress_subscriber
+    register_progress_subscriber()
+
     _cmd_start = time.time()
     logger.info("agent command starting...")
 

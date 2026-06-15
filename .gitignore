@@ -38,3 +38,4 @@ test/
 node_modules/
 web/node_modules/
 .markbot/
+.mimocode/

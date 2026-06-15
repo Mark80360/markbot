@@ -13,6 +13,7 @@ class EventType(Enum):
     TOOL_CALLED = auto()
     TOOL_COMPLETED = auto()
     TOOL_FAILED = auto()
+    TOOL_PROGRESS = auto()
     PERMISSION_REQUESTED = auto()
     PERMISSION_GRANTED = auto()
     PERMISSION_DENIED = auto()

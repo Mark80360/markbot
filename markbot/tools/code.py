@@ -135,11 +135,24 @@ class CodeExecutionTool(Tool):
             if workspace and hasattr(workspace, "workspace"):
                 cwd = Path(workspace.workspace)
 
+            # Stream each stdout line to the bus via ToolContext.report_progress,
+            # so long-running scripts (pip install, training loops) surface
+            # live progress instead of blocking silently until completion.
+            report_progress = getattr(workspace, "report_progress", None)
+
+            async def _on_output_line(line: str) -> None:
+                if report_progress is not None:
+                    try:
+                        report_progress(line, None)
+                    except Exception:
+                        pass
+
             result = await sandbox.run(
                 script=script_path,
                 language="python",
                 args={},
                 cwd=cwd,
+                on_output_line=_on_output_line if report_progress is not None else None,
             )
 
             output = self._format_result(result)
@@ -257,6 +270,20 @@ class CodeExecutionTool(Tool):
             parts.append(f"\n[exit code: {result.exit_code}]")
         elif not parts:
             parts.append("(no output)")
+
+        # Close the loop on missing-package failures: the sandbox preamble
+        # already prints a hint to stderr when ImportError is raised, but a
+        # bare `import foo` with a missing-but-not-installed module sometimes
+        # surfaces as a ModuleNotFoundError only. Surface a short reminder
+        # pointing the model at the `dependencies` parameter so it does not
+        # guess or retry blindly.
+        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        if "ModuleNotFoundError" in combined or "ImportError" in combined:
+            parts.append(
+                "\n[markbot hint] Detected an import failure. If a third-party "
+                "package is missing, declare it via the `dependencies` parameter "
+                "on the next run_code call, e.g. dependencies=[\"requests\"]."
+            )
 
         if result.execution_time_ms > 1000:
             parts.append(f"\n[executed in {result.execution_time_ms / 1000:.1f}s]")

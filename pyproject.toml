@@ -1,6 +1,6 @@
 [project]
 name = "markbot"
-version = "2.3.2"
+version = "2.3.3"
 description = "A lightweight personal AI assistant framework"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -58,11 +58,43 @@ langsmith = [
 chroma = [
     "chromadb>=0.4.0",
 ]
+local-embeddings = [
+    "sentence-transformers>=2.2.0",
+]
 web = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
 ]
+# Cross-platform Python deps for the ``computer_use`` tool.
+# Platform-specific notes (see README "Computer Use" section for full setup):
+#   - macOS:   ``pyautogui`` + ``Pillow`` (works). For background control,
+#              install ``cua-driver`` separately — it is a third-party
+#              macOS binary, NOT a pip dependency:
+#                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+#   - Linux:   adds ``pyatspi`` (PEP 508 marker). Also requires system
+#              packages — see README for the apt/dnf/pacman one-liners
+#              (python3-tk, python3-xlib, scrot, at-spi2-core, wmctrl/xdotool).
+#   - Windows: ``pyautogui`` + ``Pillow`` only; PowerShell ships with the OS.
 desktop = [
+    "pyautogui>=0.9.54",
+    "Pillow>=10.0.0",
+    "pyatspi>=2.38.0; sys_platform == 'linux'",
+]
+# Per-platform alias extras — install whichever matches the host.
+# They all resolve to the same Python deps today; kept distinct so the
+# README instructions map 1:1 to an installable extra, and so we have a
+# place to add platform-specific pip deps later (e.g. a future macOS
+# sandbox shim) without breaking the ``desktop`` umbrella.
+desktop-macos = [
+    "pyautogui>=0.9.54",
+    "Pillow>=10.0.0",
+]
+desktop-linux = [
+    "pyautogui>=0.9.54",
+    "Pillow>=10.0.0",
+    "pyatspi>=2.38.0; sys_platform == 'linux'",
+]
+desktop-windows = [
     "pyautogui>=0.9.54",
     "Pillow>=10.0.0",
 ]

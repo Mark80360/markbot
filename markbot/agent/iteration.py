@@ -1038,6 +1038,39 @@ class IterationRunner:
 
         logger.info("Executing {} tool calls...", len(response.tool_calls))
 
+        # Build a per-turn progress callback so long-running tools
+        # (run_code streaming a pip install, exec running a build) can push
+        # incremental stdout lines onto the event bus. The bus-side payload
+        # carries the session key so subscribers (CLI, web UI) can render
+        # live progress. report_progress is sync per the ToolContext
+        # contract; we hop into the loop to emit the async event.
+        _progress_session_key = self.session_key
+        _progress_loop = asyncio.get_running_loop()
+        _active_tool_names = [tc.name for tc in response.tool_calls]
+
+        def _report_progress(text: str, percent: float | None = None) -> None:
+            try:
+                from markbot.bus.emitter import get_event_emitter
+                from markbot.bus.events import EventType
+
+                emitter = get_event_emitter()
+                payload = {
+                    "text": text,
+                    "percent": percent,
+                    "tools": _active_tool_names,
+                    "channel": self.channel,
+                    "chat_id": self.chat_id,
+                }
+                _progress_loop.create_task(
+                    emitter.emit(
+                        EventType.TOOL_PROGRESS,
+                        payload,
+                        session_key=_progress_session_key,
+                    )
+                )
+            except Exception as e:
+                logger.debug("report_progress emit failed: {}", e)
+
         _tool_ctx = ToolContext(
             session_id=f"{self.channel}:{self.chat_id}",
             workspace=str(self.loop.workspace),
@@ -1047,6 +1080,7 @@ class IterationRunner:
             channel=self.channel,
             chat_id=self.chat_id,
             message_id=self.message_id,
+            report_progress=_report_progress,
         )
 
         for tc in response.tool_calls:
@@ -1086,12 +1120,21 @@ class IterationRunner:
                 logger.info("Tool {} result (multimodal): {}", tool_call.name, safe_preview)
             else:
                 result_str = str(result)
-                if len(result_str) > self.loop.compactor.config.tool_output_inline_chars:
+                # Dynamic per-tool budget: when the model calls N tools in one
+                # turn, each tool's inline allowance shrinks proportionally so
+                # the total injected text stays bounded regardless of fan-out.
+                # This prevents a single turn with many verbose tools from
+                # forcing a compaction that would lose information.
+                _tool_count = max(1, len(response.tool_calls))
+                _inline_budget = max(
+                    2000, self.loop.compactor.config.tool_output_inline_chars // _tool_count
+                )
+                if len(result_str) > _inline_budget:
                     inline, artifact_path = offload_tool_output(
                         result_str,
                         tool_call.name,
                         tool_call.id,
-                        inline_limit=self.loop.compactor.config.tool_output_inline_chars,
+                        inline_limit=_inline_budget,
                         preview_chars=self.loop.compactor.config.tool_output_preview_chars,
                     )
                     if artifact_path:

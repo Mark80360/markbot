@@ -876,6 +876,17 @@ Dynamically load background info when you need more context:
         """
         content = unwrap_multimodal_result(result)
 
+        # Neutralise fence injection (4+ backtick runs) and memory-context
+        # tag spoofing before the result enters the conversation. This is
+        # the single choke point for all tool output, so every tool result
+        # is normalised exactly once regardless of producer. Multimodal
+        # content blocks (lists) are already provider-structured and pass
+        # through untouched.
+        if isinstance(content, str):
+            from markbot.agent.tool_output import sanitize_tool_output
+
+            content = sanitize_tool_output(content)
+
         messages.append(
             {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content}
         )
