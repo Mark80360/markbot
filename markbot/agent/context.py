@@ -69,6 +69,28 @@ class PromptSection:
         return estimate_tokens(self.content)
 
 
+def unwrap_multimodal_result(result: Any) -> str | list[dict[str, Any]]:
+    """Unwrap a tool result into a form providers can consume as message content.
+
+    Multimodal tool results (e.g. ``computer_use`` screenshots) are returned as a
+    dict marked ``_multimodal`` containing a ``content`` list of text/image_url
+    blocks plus a ``text_summary`` fallback. Non-vision models must not receive
+    the image blocks, so when the active model routes to text-only we substitute
+    the ``text_summary``.
+
+    Returns a string for text-only results, or a content block list for
+    multimodal results. Anything that is not a ``_multimodal`` dict is stringified
+    (matching the previous behaviour of ``add_tool_result``).
+    """
+    if result is None:
+        return ""
+    if isinstance(result, dict) and result.get("_multimodal"):
+        from markbot.tools.computer_use.vision_routing import should_route_to_text_only
+        if should_route_to_text_only():
+            return result.get("text_summary") or json.dumps(result, default=str)
+        return result.get("content") or result.get("text_summary", "")
+    return result if isinstance(result, str) else str(result)
+
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent.
@@ -850,20 +872,12 @@ Dynamically load background info when you need more context:
         the inner ``content`` list (text + image_url blocks) is unwrapped so
         provider adapters receive a proper content array instead of a raw dict.
         If the active model does not support vision, the ``text_summary`` field
-        is used as a text-only fallback.
+        is used as a text-only fallback. See ``unwrap_multimodal_result``.
         """
-        if result is None:
-            result = ""
-
-        if isinstance(result, dict) and result.get("_multimodal"):
-            from markbot.tools.computer_use.vision_routing import should_route_to_text_only
-            if should_route_to_text_only():
-                result = result.get("text_summary") or json.dumps(result, default=str)
-            else:
-                result = result.get("content") or result.get("text_summary", "")
+        content = unwrap_multimodal_result(result)
 
         messages.append(
-            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content}
         )
         return messages
 

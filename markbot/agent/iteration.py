@@ -1025,15 +1025,16 @@ class IterationRunner:
                     self.loop.guardrail_manager.start_guarding(skill_def)
                     logger.info("Guardrail activated for skill: {}", skill_name)
 
-            violations = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
-            for v in violations:
-                logger.warning(
-                    "Guardrail violation [{}] {} (tool: {}, skill: {})",
-                    v.severity.upper(),
-                    v.message,
-                    tc.name,
-                    getattr(v, 'tool_name', 'unknown'),
-                )
+            results = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
+            for gr in results:
+                for v in gr.violations:
+                    logger.warning(
+                        "Guardrail violation [{}] {} (tool: {}, skill: {})",
+                        v.severity.upper(),
+                        v.message,
+                        tc.name,
+                        getattr(v, 'tool_name', 'unknown'),
+                    )
 
         logger.info("Executing {} tool calls...", len(response.tool_calls))
 
@@ -1074,6 +1075,15 @@ class IterationRunner:
                     "Tool {} failed with exception: {}", tool_call.name, result
                 )
                 result = f"Error: {type(result).__name__}: {result}"
+            elif isinstance(result, dict) and result.get("_multimodal"):
+                # Multimodal results (e.g. computer_use screenshots) carry a
+                # base64 image that dwarfs the inline-char threshold. They must
+                # NOT be stringified or offloaded — add_tool_result unwraps the
+                # dict into a content array (text + image_url) for the provider.
+                # Logging the text_summary keeps base64 out of the log.
+                preview = (result.get("text_summary") or "")[:100]
+                safe_preview = preview.replace("{", "{{").replace("}", "}}")
+                logger.info("Tool {} result (multimodal): {}", tool_call.name, safe_preview)
             else:
                 result_str = str(result)
                 if len(result_str) > self.loop.compactor.config.tool_output_inline_chars:

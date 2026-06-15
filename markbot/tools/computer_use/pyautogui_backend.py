@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from markbot.tools.computer_use.backend import (
     ActionResult,
+    BackendCapabilities,
     CaptureResult,
     ComputerUseBackend,
 )
@@ -89,7 +90,11 @@ _PLATFORM_ALIASES: dict[str, str] = {
 
 
 def _parse_key_combo(key_combo: str) -> Tuple[str, str]:
-    """Split 'cmd+a' or 'ctrl+s' into the last key and an optional modifier prefix."""
+    """Split 'cmd+a' or 'ctrl+s' into the last key and an optional modifier prefix.
+
+    Kept for backwards-compat; new code should prefer ``_parse_key_combo_list``
+    which handles arbitrary modifier counts (e.g. ``ctrl+shift+t``).
+    """
     parts = key_combo.strip().split()
     if len(parts) == 1:
         p = parts[0]
@@ -103,6 +108,34 @@ def _parse_key_combo(key_combo: str) -> Tuple[str, str]:
         return (parts[0].lower(), parts[1])
     else:
         return ("", key_combo)
+
+
+def _parse_key_combo_list(key_combo: str) -> Tuple[List[str], str]:
+    """Parse a key combo into a list of modifiers and a single final key.
+
+    Handles any number of modifiers joined by '+':
+      ``'ctrl+shift+t'``  -> ``(["ctrl", "shift"], "t")``
+      ``'cmd+s'``         -> ``(["cmd"], "s")``
+      ``'return'``        -> ``([], "return")``
+
+    The previous implementation used ``rfind('+')`` and so produced an invalid
+    ``"ctrl+shift"`` modifier token for three-key combos, which pyautogui
+    rejected. Splitting on '+' fixes ``cmd+shift+3``, ``ctrl+alt+delete``, etc.
+    Whitespace-separated forms ("ctrl shift t") are also accepted.
+    """
+    text = key_combo.strip()
+    if not text:
+        return ([], "")
+    # Whitespace-separated: treat every token but the last as a modifier.
+    if " " in text and "+" not in text:
+        tokens = [t.lower() for t in text.split()]
+        return (tokens[:-1], tokens[-1])
+    parts = [p.strip().lower() for p in text.split("+") if p.strip()]
+    if not parts:
+        return ([], "")
+    if len(parts) == 1:
+        return ([], parts[0])
+    return (parts[:-1], parts[-1])
 
 
 _KEY_MAP: dict[str, str] = {
@@ -248,6 +281,20 @@ class PyAutoGUIBackend(ComputerUseBackend):
         self._started = False
         self._screen_width = 0
         self._screen_height = 0
+        self._device_scale = 1.0
+
+    def _to_logical(self, x: Optional[int], y: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+        """Convert model-supplied physical pixels to pyautogui logical points.
+
+        Models compute coordinates against the capture width/height, which on
+        HiDPI is the physical (scaled) pixel size. pyautogui's click/move use
+        logical points, so we divide by the device scale when > 1.
+        """
+        if self._device_scale == 1.0:
+            return x, y
+        sx = None if x is None else int(round(x / self._device_scale))
+        sy = None if y is None else int(round(y / self._device_scale))
+        return sx, sy
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -259,13 +306,40 @@ class PyAutoGUIBackend(ComputerUseBackend):
                 return False
         return _check_pyautogui(force=_PYAUTOGUI_AVAILABLE is False)
 
+    def capabilities(self) -> BackendCapabilities:
+        # pyautogui has no accessibility tree: only pixel coordinates work.
+        # element targeting / som overlay / ax tree / set_value are all N/A.
+        return BackendCapabilities(
+            coordinate_targeting=True,
+            element_targeting=False,
+            som_overlay=False,
+            ax_tree=False,
+            set_value=False,
+        )
+
     def start(self) -> None:
         if self._started:
             return
         import pyautogui
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
-        self._screen_width, self._screen_height = pyautogui.size()
+        logical_w, logical_h = pyautogui.size()
+        # Probe the device pixel scale by taking one screenshot. On Retina /
+        # HiDPI displays pyautogui.screenshot() returns physical pixels (2x),
+        # while pyautogui.click(x, y) expects logical points — mixing the two
+        # shifts every click into the top-left quadrant. We record the scale so
+        # coordinate entry points can downscale model-supplied physical coords.
+        try:
+            probe = pyautogui.screenshot()
+            self._device_scale = probe.width / logical_w if logical_w else 1.0
+        except Exception:
+            self._device_scale = 1.0
+        if abs(self._device_scale - round(self._device_scale)) > 0.01:
+            # fractional / unexpected scale: keep raw, _to_physical is a no-op
+            self._device_scale = 1.0
+        else:
+            self._device_scale = max(1.0, round(self._device_scale))
+        self._screen_width, self._screen_height = logical_w, logical_h
         self._started = True
 
     def stop(self) -> None:
@@ -285,7 +359,7 @@ class PyAutoGUIBackend(ComputerUseBackend):
             screenshot = pyautogui.screenshot()
         except Exception as e:
             logger.warning("Screenshot failed: %s", e)
-            return CaptureResult(mode=mode, width=0, height=0, app=str(e))
+            return CaptureResult(mode=mode, width=0, height=0, app=str(e), capabilities=self.capabilities())
 
         buf = io.BytesIO()
         screenshot.save(buf, format="PNG")
@@ -301,6 +375,7 @@ class PyAutoGUIBackend(ComputerUseBackend):
             png_b64=png_b64,
             elements=[],
             png_bytes_len=png_bytes_len,
+            capabilities=self.capabilities(),
         )
 
     # ── Pointer actions ────────────────────────────────────────────
@@ -324,17 +399,28 @@ class PyAutoGUIBackend(ComputerUseBackend):
         if x is None or y is None:
             return ActionResult(ok=False, action="click", message="click requires x and y coordinates")
 
+        # Downscale from physical (capture) pixels to logical points.
+        lx, ly = self._to_logical(x, y)
         try:
             if modifiers:
                 import pyautogui as pag
-                for m in modifiers:
-                    pag.keyDown(_normalize_modifier(m))
-                pyautogui.click(x=x, y=y, button=button, clicks=click_count)
-                for m in reversed(modifiers):
-                    pag.keyUp(_normalize_modifier(m))
+                mod_keys = [_normalize_modifier(m) for m in modifiers]
+                # Press modifiers, click, then release in try/finally so a
+                # click exception cannot leave cmd/shift held down — a stuck
+                # modifier would make the user's keyboard unusable.
+                for m in mod_keys:
+                    pag.keyDown(m)
+                try:
+                    pyautogui.click(x=lx, y=ly, button=button, clicks=click_count)
+                finally:
+                    for m in reversed(mod_keys):
+                        try:
+                            pag.keyUp(m)
+                        except Exception:
+                            pass
             else:
-                pyautogui.click(x=x, y=y, button=button, clicks=click_count)
-            return ActionResult(ok=True, action="click", message=f"Clicked at ({x}, {y}) button={button} clicks={click_count}")
+                pyautogui.click(x=lx, y=ly, button=button, clicks=click_count)
+            return ActionResult(ok=True, action="click", message=f"Clicked at ({x},{y}) -> logical ({lx},{ly}) button={button} clicks={click_count}")
         except Exception as e:
             return ActionResult(ok=False, action="click", message=f"Click failed: {e}")
 
@@ -357,9 +443,12 @@ class PyAutoGUIBackend(ComputerUseBackend):
         if from_xy is None or to_xy is None:
             return ActionResult(ok=False, action="drag", message="drag requires from_xy and to_xy")
 
+        # Downscale from physical (capture) pixels to logical points.
+        lfx, lfy = self._to_logical(from_xy[0], from_xy[1])
+        ltx, lty = self._to_logical(to_xy[0], to_xy[1])
         try:
-            pyautogui.moveTo(from_xy[0], from_xy[1])
-            pyautogui.drag(to_xy[0] - from_xy[0], to_xy[1] - from_xy[1], duration=0.3, button=button)
+            pyautogui.moveTo(lfx, lfy)
+            pyautogui.drag(ltx - lfx, lty - lfy, duration=0.3, button=button)
             return ActionResult(ok=True, action="drag", message=f"Dragged from {from_xy} to {to_xy}")
         except Exception as e:
             return ActionResult(ok=False, action="drag", message=f"Drag failed: {e}")
@@ -382,17 +471,25 @@ class PyAutoGUIBackend(ComputerUseBackend):
 
         try:
             if x is not None and y is not None:
-                pyautogui.moveTo(x, y)
+                lx, ly = self._to_logical(x, y)
+                pyautogui.moveTo(lx, ly)
 
-            direction = direction.lower()
-            if direction == "up":
-                pyautogui.scroll(amount)
-            elif direction == "down":
-                pyautogui.scroll(-amount)
-            elif direction == "left":
-                pyautogui.hscroll(-amount)
-            elif direction == "right":
-                pyautogui.hscroll(amount)
+            mod_keys = [_normalize_modifier(m) for m in modifiers] if modifiers else []
+            for m in mod_keys:
+                pyautogui.keyDown(m)
+            try:
+                direction = direction.lower()
+                if direction == "up":
+                    pyautogui.scroll(amount)
+                elif direction == "down":
+                    pyautogui.scroll(-amount)
+                elif direction == "left":
+                    pyautogui.hscroll(-amount)
+                elif direction == "right":
+                    pyautogui.hscroll(amount)
+            finally:
+                for m in reversed(mod_keys):
+                    pyautogui.keyUp(m)
             return ActionResult(ok=True, action="scroll", message=f"Scrolled {direction} {amount}")
         except Exception as e:
             return ActionResult(ok=False, action="scroll", message=f"Scroll failed: {e}")
@@ -413,25 +510,17 @@ class PyAutoGUIBackend(ComputerUseBackend):
         self._require_started()
         import pyautogui
 
-        modifier_prefix, key_str = _parse_key_combo(keys)
+        modifiers, key_str = _parse_key_combo_list(keys)
+        resolved_mods = [_normalize_modifier(m) for m in modifiers]
+        resolved_final = _resolve_key(key_str)
 
         try:
-            if modifier_prefix:
-                mod = _normalize_modifier(modifier_prefix)
-                resolved = _resolve_key(key_str)
-                if mod == "command" and sys.platform == "darwin":
-                    pyautogui.hotkey("command", resolved)
-                elif mod == "ctrl":
-                    pyautogui.hotkey("ctrl", resolved)
-                elif mod == "alt":
-                    pyautogui.hotkey("alt", resolved)
-                elif mod == "shift":
-                    pyautogui.hotkey("shift", resolved)
-                else:
-                    pyautogui.hotkey(mod, resolved)
+            if resolved_mods:
+                # hotkey accepts any number of keys and presses them in order,
+                # releasing in reverse — supports ctrl+shift+t, cmd+shift+3, etc.
+                pyautogui.hotkey(*resolved_mods, resolved_final)
             else:
-                resolved = _resolve_key(key_str)
-                pyautogui.press(resolved)
+                pyautogui.press(resolved_final)
             return ActionResult(ok=True, action="key", message=f"Pressed key: {keys}")
         except Exception as e:
             return ActionResult(ok=False, action="key", message=f"Key press failed: {e}")

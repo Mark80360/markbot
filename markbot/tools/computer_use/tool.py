@@ -32,6 +32,7 @@ tool-result blocks — they see the text summary only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -59,11 +60,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps"})
-
-_DESTRUCTIVE_ACTIONS = frozenset({
-    "click", "double_click", "right_click", "middle_click",
-    "drag", "scroll", "type", "key", "set_value", "focus_app",
-})
 
 _BLOCKED_KEY_COMBOS = {
     # macOS
@@ -124,7 +120,7 @@ def _get_backend() -> ComputerUseBackend:
             elif backend_name == "pyautogui":
                 from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
                 _backend = PyAutoGUIBackend()
-            elif backend_name in {"cua", "cua-driver", ""}:
+            elif backend_name in {"cua", "cua-driver", "atspi", ""}:
                 if sys.platform == "darwin":
                     from markbot.tools.computer_use.cua_backend import (
                         CuaDriverBackend,
@@ -132,6 +128,24 @@ def _get_backend() -> ComputerUseBackend:
                     )
                     if cua_driver_binary_available():
                         _backend = CuaDriverBackend()
+                    else:
+                        from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
+                        _backend = PyAutoGUIBackend()
+                elif sys.platform == "linux":
+                    # Linux: prefer AT-SPI (element targeting with real bounds),
+                    # fall back to pyautogui if pyatspi / at-spi2 registry is
+                    # unavailable. Explicit atspi + unavailability = hard error.
+                    from markbot.tools.computer_use.atspi_backend import _probe_pyatspi
+                    atspi_ok = _probe_pyatspi()
+                    if atspi_ok:
+                        from markbot.tools.computer_use.atspi_backend import AtspiBackend
+                        _backend = AtspiBackend()
+                    elif backend_name == "atspi":
+                        raise RuntimeError(
+                            "MARKBOT_COMPUTER_USE_BACKEND=atspi but pyatspi or the "
+                            "at-spi2 registry is unavailable (install python3-pyatspi "
+                            "and ensure an at-spi session bus is running)"
+                        )
                     else:
                         from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
                         _backend = PyAutoGUIBackend()
@@ -295,8 +309,14 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         f"capture mode={cap.mode} {cap.width}x{cap.height}"
         + (f" app={cap.app}" if cap.app else "")
         + (f" window={cap.window_title!r}" if cap.window_title else ""),
-        f"{total_elements} interactable element(s):",
     ]
+    # Tell the model which targeting mode this backend supports. The summary
+    # text is the only channel that reliably reaches the model (add_tool_result
+    # keeps content/text_summary and drops other top-level keys), so the
+    # capability hint MUST live here.
+    if cap.capabilities is not None:
+        summary_lines.append(cap.capabilities.short_label())
+    summary_lines.append(f"{total_elements} interactable element(s):")
     if element_index:
         summary_lines.extend(element_index)
     summary = "\n".join(summary_lines)
@@ -542,7 +562,10 @@ class ComputerUseTool(Tool):
             })
 
         try:
-            return _dispatch(backend, action, params)
+            # Backends are synchronous (cua-driver's _AsyncBridge.run blocks up
+            # to 30s). Run dispatch in a worker thread so the agent event loop
+            # is not frozen during a single capture/action.
+            return await asyncio.to_thread(_dispatch, backend, action, params)
         except Exception as e:
             logger.exception("computer_use %s failed", action)
             return json.dumps({"error": f"{action} failed: {e}"})

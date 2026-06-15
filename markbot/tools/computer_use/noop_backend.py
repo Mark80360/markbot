@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from markbot.tools.computer_use.backend import (
     ActionResult,
+    BackendCapabilities,
     CaptureResult,
     ComputerUseBackend,
     UIElement,
@@ -17,6 +18,16 @@ class NoopBackend(ComputerUseBackend):
 
     def is_available(self) -> bool:
         return True
+
+    def capabilities(self) -> BackendCapabilities:
+        # Report full capability so tests exercise the element-targeting path.
+        return BackendCapabilities(
+            coordinate_targeting=True,
+            element_targeting=True,
+            som_overlay=True,
+            ax_tree=True,
+            set_value=True,
+        )
 
     def start(self) -> None:
         pass
@@ -36,6 +47,7 @@ class NoopBackend(ComputerUseBackend):
             height=1080,
             elements=elements,
             png_b64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" if mode != "ax" else None,
+            capabilities=self.capabilities(),
         )
 
     def click(

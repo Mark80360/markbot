@@ -8,6 +8,7 @@ models that were trained on them (e.g. Claude's computer-use RL).
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict
 
 COMPUTER_USE_SCHEMA: Dict[str, Any] = {
@@ -17,8 +18,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
         "scroll, drag. On macOS with cua-driver, operates in the background "
         "without stealing the user's cursor, keyboard focus, or Space — "
         "you and the user can share the same machine simultaneously. On "
-        "Linux/Windows with pyautogui, operates in the foreground via the "
-        "real cursor. Preferred workflow: call with action='capture' "
+        "Linux with the AT-SPI accessibility stack, operates in the foreground "
+        "via the real cursor but reads real element bounds for reliable "
+        "element-index targeting. On Linux without AT-SPI or on Windows, "
+        "operates in the foreground with coordinate-only targeting. "
+        "Preferred workflow: call with action='capture' "
         "(mode='som' gives numbered element overlays), then click by "
         "`element` index for reliability. Pixel coordinates via "
         "`coordinate` are supported for models trained on them."
@@ -207,5 +211,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
 
 
 def get_computer_use_schema() -> Dict[str, Any]:
-    """Return the generic OpenAI function-calling schema."""
-    return COMPUTER_USE_SCHEMA
+    """Return the generic OpenAI function-calling schema.
+
+    Returns a deep copy so callers cannot mutate the module-level constant.
+    """
+    return copy.deepcopy(COMPUTER_USE_SCHEMA)

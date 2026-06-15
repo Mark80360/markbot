@@ -13,6 +13,33 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
+class BackendCapabilities:
+    """What a backend can actually do — drives schema/schema-copy guidance.
+
+    The generic ``computer_use`` schema advertises element-based targeting and
+    ``set_value`` as the *preferred* path, but not every backend can deliver it.
+    These flags let the tool layer tell the model, per capture, which targeting
+    mode to use so it does not call an unsupported action and get a dead-end
+    error like "element-based click not supported".
+    """
+
+    coordinate_targeting: bool = True   # click/drag/scroll by pixel [x,y]
+    element_targeting: bool = False     # click/drag by SOM element index
+    som_overlay: bool = False           # capture(mode='som') draws numbered overlays
+    ax_tree: bool = False               # capture(mode='ax') returns an element list
+    set_value: bool = False             # native value mutation (popups/sliders)
+
+    def short_label(self, backend_name: str = "") -> str:
+        """One-line hint for capture summaries (goes straight to the model)."""
+        name = f"backend={backend_name}" if backend_name else "backend"
+        if self.element_targeting:
+            mode = "element indexing available (preferred; use element=N)"
+        else:
+            mode = "coordinate targeting only (element indexing NOT supported; use coordinate=[x,y])"
+        return f"{name} \u00b7 {mode}"
+
+
+@dataclass
 class UIElement:
     """One interactable element on the current screen."""
 
@@ -50,6 +77,7 @@ class CaptureResult:
     app: str = ""
     window_title: str = ""
     png_bytes_len: int = 0
+    capabilities: Optional[BackendCapabilities] = None
 
 
 @dataclass
@@ -75,6 +103,10 @@ class ComputerUseBackend(ABC):
     @abstractmethod
     def is_available(self) -> bool:
         """Return True if the backend can be used on this host right now."""
+
+    @abstractmethod
+    def capabilities(self) -> BackendCapabilities:
+        """Report which targeting modes / actions this backend supports."""
 
     # ── Capture ─────────────────────────────────────────────────────
     @abstractmethod

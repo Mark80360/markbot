@@ -476,6 +476,17 @@ class AgentContext:
             force_memory_search=getattr(memory_cfg, "force_memory_search", False),
             force_max_results=getattr(memory_cfg, "force_max_results", 1),
             force_min_score=getattr(memory_cfg, "force_min_score", 0.3),
+            long_term_enabled=getattr(memory_cfg, "long_term_enabled", True),
+            vector_backend=getattr(memory_cfg, "vector_backend", "sqlite"),
+            vector_max_records=getattr(memory_cfg, "vector_max_records", 50_000),
+            vector_min_content_chars=getattr(memory_cfg, "vector_min_content_chars", 12),
+            vector_top_k_multiplier=getattr(memory_cfg, "vector_top_k_multiplier", 2),
+            vector_min_score=getattr(memory_cfg, "vector_min_score", 0.15),
+            consolidation_enabled=getattr(memory_cfg, "consolidation_enabled", True),
+            consolidation_dedup_threshold=getattr(memory_cfg, "consolidation_dedup_threshold", 0.95),
+            consolidation_age_decay_days=getattr(memory_cfg, "consolidation_age_decay_days", 90.0),
+            consolidation_promote_access=getattr(memory_cfg, "consolidation_promote_access", 5),
+            provider_config=getattr(memory_cfg, "provider_config", None),
         )
         timings["memory_manager"] = time.time() - _t0
 

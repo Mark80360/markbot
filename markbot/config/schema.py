@@ -291,6 +291,85 @@ class MemoryToolsConfig(Base):
         default_factory=dict,
         description="Configuration dict passed to the external memory provider"
     )
+    # -- Long-term (vector) memory -----------------------------------------
+    long_term_enabled: bool = Field(
+        default=True,
+        description="Enable semantic vector recall in memory_search (hybrid keyword + vector). "
+                    "When True, turns/notes/delegations are embedded and recalled by meaning."
+    )
+    vector_backend: str = Field(
+        default="sqlite",
+        description="Vector store backend: 'sqlite' (default, zero extra deps) or 'chroma' (needs markbot[chroma])."
+    )
+    vector_max_records: int = Field(
+        default=50_000,
+        ge=100,
+        description="Hard cap on stored vectors; oldest low-importance records are evicted (LRU) past this."
+    )
+    vector_min_content_chars: int = Field(
+        default=12,
+        description="Minimum content length (chars) to index as a vector; shorter text is skipped."
+    )
+    vector_top_k_multiplier: int = Field(
+        default=2,
+        ge=1,
+        description="Over-fetch factor for vector recall before fusion with keyword results."
+    )
+    vector_min_score: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Minimum cosine similarity for a vector result to be included in fused output."
+    )
+    # -- Consolidation / forgetting ----------------------------------------
+    consolidation_enabled: bool = Field(
+        default=True,
+        description="Enable periodic dedup + importance-decay of the vector index (runs during dream)."
+    )
+    consolidation_dedup_threshold: float = Field(
+        default=0.95,
+        ge=0.5,
+        le=1.0,
+        description="Cosine similarity above which two vectors are treated as duplicates during consolidation."
+    )
+    consolidation_age_decay_days: float = Field(
+        default=90.0,
+        ge=1.0,
+        description="Half-life for age-based importance decay; older rarely-recalled records decay faster."
+    )
+    consolidation_promote_access: int = Field(
+        default=5,
+        ge=1,
+        description="access_count above which a record is proposed for promotion to MEMORY.md."
+    )
+    # -- Force-search knobs (previously orphaned getattr defaults) ---------
+    force_memory_search: bool = Field(
+        default=False,
+        description="Automatically inject memory search results before each LLM call."
+    )
+    force_max_results: int = Field(
+        default=1,
+        ge=1,
+        description="Max results for forced memory search injection."
+    )
+    force_min_score: float = Field(
+        default=0.3,
+        ge=0.0,
+        description="Minimum score for forced memory search injection."
+    )
+    # -- Compaction ratios (previously orphaned getattr defaults) ---------
+    memory_compact_ratio: float = Field(
+        default=0.75,
+        ge=0.1,
+        le=0.99,
+        description="Fraction of context window at which compaction triggers."
+    )
+    memory_reserve_ratio: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=0.9,
+        description="Fraction of messages to reserve (not compact) during context compression."
+    )
 
 
 class MCPServerConfig(Base):

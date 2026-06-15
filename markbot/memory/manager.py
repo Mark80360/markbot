@@ -116,6 +116,77 @@ def _add_compaction_prefix(summary: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion
+# ---------------------------------------------------------------------------
+
+#: RRF smoothing constant. 60 is the value from the original paper and
+#: works well across heterogeneous retrievers; it dampens the influence
+#: of a single retriever's top-1 so a fluke vector match can't dominate.
+_RRF_K = 60
+
+
+def _rrf_fuse(
+    keyword_results: list[dict],
+    vector_results: list[dict],
+    max_results: int,
+    dedup_key,
+) -> list[dict]:
+    """Fuse two ranked lists via Reciprocal Rank Fusion.
+
+    Each input list is assumed pre-sorted by relevance (best first).
+    The fused score is ``sum(1 / (k + rank))`` across lists where the
+    item appears. Items are deduplicated by ``dedup_key`` so the same
+    content surfaced by both retrievers counts once but gets the
+    combined score boost.
+
+    Args:
+        keyword_results: Results from keyword/token search (any score scale).
+        vector_results: Results from vector similarity search (cosine).
+        max_results: Cap on returned items.
+        dedup_key: Callable ``dict -> hashable`` for deduplication.
+
+    Returns:
+        Fused list, best first, each dict carrying an ``rrf_score`` and
+        the original ``source``/``content``/``score`` fields preserved.
+    """
+    scores: dict[Any, float] = {}
+    # Keep the richest record per dedup key (prefer vector scores since
+    # cosine is more comparable across queries, but either is fine).
+    best_record: dict[Any, dict] = {}
+
+    def _absorb(results: list[dict], weight: float = 1.0) -> None:
+        for rank, r in enumerate(results):
+            key = dedup_key(r)
+            if not key or not key[1]:
+                continue
+            contribution = weight / (_RRF_K + rank + 1)
+            scores[key] = scores.get(key, 0.0) + contribution
+            existing = best_record.get(key)
+            if existing is None:
+                best_record[key] = r
+            else:
+                # Prefer the record with a higher raw score (keeps the
+                # more confident source's content/source label).
+                if r.get("score", 0) > existing.get("score", 0):
+                    best_record[key] = r
+
+    _absorb(keyword_results)
+    _absorb(vector_results)
+
+    # Order by fused score, then by raw score as a tiebreaker.
+    ordered = sorted(
+        scores.items(),
+        key=lambda kv: (-kv[1], -best_record[kv[0]].get("score", 0)),
+    )
+    out: list[dict] = []
+    for key, fused in ordered[:max_results]:
+        rec = dict(best_record[key])
+        rec["rrf_score"] = round(fused, 5)
+        out.append(rec)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # MemoryManager
 # ---------------------------------------------------------------------------
 
@@ -154,6 +225,18 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         tool_result_recent_max_bytes: int = 50000,
         tool_result_retention_days: int = 5,
         max_input_length: int = 131072,
+        # -- Long-term (vector) memory -------------------------------------
+        long_term_enabled: bool = True,
+        vector_backend: str = "sqlite",
+        vector_max_records: int = 50_000,
+        vector_min_content_chars: int = 12,
+        vector_top_k_multiplier: int = 2,
+        vector_min_score: float = 0.15,
+        consolidation_enabled: bool = True,
+        consolidation_dedup_threshold: float = 0.95,
+        consolidation_age_decay_days: float = 90.0,
+        consolidation_promote_access: int = 5,
+        provider_config: dict | None = None,
     ):
         import time
         _init_start = time.time()
@@ -199,7 +282,97 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # Summary toolkit (for dream optimization)
         self._summary_toolkit: Any = None
 
+        # -- Long-term (vector) memory wiring -----------------------------
+        self._long_term_enabled = long_term_enabled
+        self._vector_min_score = vector_min_score
+        self._consolidation_enabled = consolidation_enabled
+        self._longterm: Any = None
+        self._consolidator: Any = None
+        self._reindex_task: Any = None
+        # Dedicated thread pool for prefetch vector recall so a slow
+        # (network-bound) embedder can't block the agent loop. Single
+        # worker is enough — prefetch is called once per turn.
+        import concurrent.futures
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mem-prefetch",
+        )
+        # Hard timeout for prefetch vector recall. Local embedders finish
+        # in <50ms; this only bites on a stalled remote API. Tune via
+        # the environment if needed (kept as a plain attribute, not config,
+        # because it's an operational safety valve, not a user knob).
+        self._prefetch_timeout_s = 3.0
+        if long_term_enabled:
+            self._init_long_term_memory(
+                vector_backend=vector_backend,
+                vector_max_records=vector_max_records,
+                vector_min_content_chars=vector_min_content_chars,
+                vector_top_k_multiplier=vector_top_k_multiplier,
+                consolidation_dedup_threshold=consolidation_dedup_threshold,
+                consolidation_age_decay_days=consolidation_age_decay_days,
+                consolidation_promote_access=consolidation_promote_access,
+                provider_config=provider_config,
+            )
+
         logger.info("Initialization took {:.3f}s", time.time() - _init_start)
+
+    def _init_long_term_memory(
+        self,
+        *,
+        vector_backend: str,
+        vector_max_records: int,
+        vector_min_content_chars: int,
+        vector_top_k_multiplier: int,
+        consolidation_dedup_threshold: float,
+        consolidation_age_decay_days: float,
+        consolidation_promote_access: int,
+        provider_config: dict | None,
+    ) -> None:
+        """Build the embedder, vector store, LongTermMemory, and consolidator.
+
+        Failures here must NOT crash the agent — memory search degrades
+        gracefully to keyword-only when the vector layer can't start.
+        """
+        try:
+            from .embedder import build_embedder
+            from .longterm import LongTermConfig, LongTermMemory
+            from .consolidation import ConsolidationConfig, Consolidator
+            from .vectorstore_factory import build_vectorstore
+
+            vs_config = {
+                "vector_backend": vector_backend,
+                "vector_max_records": vector_max_records,
+                "provider_config": provider_config or {},
+            }
+            embedder = build_embedder(self._embedding_config)
+            store = build_vectorstore(vs_config, embedder, self.working_dir)
+            ltm_config = LongTermConfig(
+                min_content_chars=vector_min_content_chars,
+                top_k_multiplier=vector_top_k_multiplier,
+            )
+            self._longterm = LongTermMemory(
+                self.working_dir,
+                embedder=embedder,
+                vectorstore=store,
+                config=ltm_config,
+            )
+            if self._consolidation_enabled:
+                self._consolidator = Consolidator(
+                    store,
+                    ConsolidationConfig(
+                        dedup_threshold=consolidation_dedup_threshold,
+                        age_decay_days=consolidation_age_decay_days,
+                        promote_access=consolidation_promote_access,
+                    ),
+                )
+            logger.info(
+                "Long-term memory enabled (backend={}, embedder={}, dim={})",
+                vector_backend, embedder.backend_name, embedder.dim,
+            )
+        except Exception as exc:
+            # Degrade gracefully — keyword search still works.
+            logger.warning("Long-term memory init failed (keyword-only mode): {}", exc)
+            self._longterm = None
+            self._consolidator = None
 
     # -- MemoryProvider interface -------------------------------------------
 
@@ -233,44 +406,114 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 
-        Uses stored query from queue_prefetch() if available, otherwise
-        searches daily logs for the given query.
+        This is the **automatic** recall path — the agent loop calls it
+        on the first iteration of every turn (via
+        ``_phase_inject_memory_context``) to inject relevant background
+        before the LLM reasons. It must surface *semantic* matches, not
+        just keyword hits, or the long-term vector index never gets a
+        chance to help in normal conversation.
+
+        Recall strategy (results merged, best first):
+        1. **Vector recall** (primary) — semantic similarity from the
+           long-term memory index. This is what finds content with no
+           lexical overlap, e.g. query "Python 后端" matching a stored
+           turn about "Django + DRF".
+        2. **Keyword recall** (supplement) — daily-log token search.
+           Catches exact-term matches the embedder may have missed
+           (code identifiers, file paths, rare tokens).
 
         Args:
             query: The user message text.
             session_id: Optional session identifier.
 
         Returns:
-            Formatted context string, or empty string.
+            Formatted, fence-tagged context string, or empty string.
         """
         search_query = self._prefetch_query or query
         if not search_query:
             return ""
 
+        # Parse channel/chat_id from session_id for session-scoped recall.
+        channel = ""
+        chat_id = ""
+        if session_id and ":" in session_id:
+            channel, chat_id = session_id.split(":", 1)
+
+        # De-dup by content so the same memory from two recall paths
+        # (vector vs keyword) isn't shown twice.
+        seen_content: set[str] = set()
+        lines: list[tuple[float, str]] = []
+
+        # 1. Vector recall (semantic) — the whole point of long-term memory.
+        #    Guarded by a timeout so a slow embedder (e.g. remote OpenAI API)
+        #    can't block the first-iteration injection. On timeout we fall
+        #    back to keyword-only recall (path 2 below), which is local and fast.
+        if self._longterm is not None:
+            try:
+                import concurrent.futures
+                # Run the (possibly network-bound) vector search on a worker
+                # thread with a hard timeout. prefetch() is called synchronously
+                # from the agent loop's first iteration, so we must not block
+                # the event loop indefinitely.
+                future = self._prefetch_executor.submit(
+                    lambda: self._longterm.search(
+                        search_query,
+                        max_results=MAX_PREFETCH_RESULTS,
+                        min_score=self._vector_min_score,
+                        channel=channel or None,
+                        chat_id=chat_id or None,
+                    )
+                )
+                try:
+                    vec_results = future.result(timeout=self._prefetch_timeout_s)
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    logger.debug(
+                        "Prefetch vector recall timed out ({:.1f}s); "
+                        "falling back to keyword-only",
+                        self._prefetch_timeout_s,
+                    )
+                    vec_results = []
+                for r in vec_results:
+                    content = r.get("content", "")
+                    score = r.get("score", 0)
+                    if not content or content in seen_content:
+                        continue
+                    seen_content.add(content)
+                    # Vector results carry the semantic score (0..1); boost
+                    # their sort weight so semantic matches rank first.
+                    lines.append((score + 0.5, f"- {content[:300]} [recall: {score:.2f}]"))
+            except Exception as e:
+                logger.debug("Prefetch vector recall failed: {}", e)
+
+        # 2. Keyword recall (supplement) — daily-log token search.
         try:
-            results = self._search_daily_logs(
+            log_results = self._search_daily_logs(
                 query=search_query,
                 max_results=MAX_PREFETCH_RESULTS,
             )
-            if not results:
-                return ""
-
-            lines: list[str] = []
-            for r in results[:MAX_PREFETCH_RESULTS]:
+            for r in log_results:
                 content = r.get("content", "")
                 score = r.get("score", 0)
-                if content and score >= MIN_PREFETCH_SCORE:
-                    lines.append(f"- {content[:300]} [relevance: {score:.2f}]")
-
-            if not lines:
-                return ""
-
-            context = "## Prefetched Memory\n\n" + "\n".join(lines)
-            return fence_context(context, system_note=True)
-
+                if not content or content in seen_content:
+                    continue
+                if score < MIN_PREFETCH_SCORE:
+                    continue
+                seen_content.add(content)
+                lines.append((score, f"- {content[:300]} [relevance: {score:.2f}]"))
         except Exception as e:
-            logger.debug("Prefetch failed: {}", e)
+            logger.debug("Prefetch keyword recall failed: {}", e)
+
+        if not lines:
             return ""
+
+        # Best first: semantic matches (boosted) rank above keyword hits.
+        lines.sort(key=lambda x: -x[0])
+
+        context = "## Prefetched Memory\n\n" + "\n".join(
+            line for _, line in lines[:MAX_PREFETCH_RESULTS * 2]
+        )
+        return fence_context(context, system_note=True)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.
@@ -305,6 +548,17 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 channel=channel,
                 chat_id=chat_id,
             )
+        # Index into long-term vector memory (fire-and-forget).
+        if self._longterm is not None and (user_content or assistant_content):
+            channel = ""
+            chat_id = ""
+            if session_id and ":" in session_id:
+                channel, chat_id = session_id.split(":", 1)
+            meta = {"channel": channel, "chat_id": chat_id} if channel else {}
+            if user_content:
+                self._longterm.index_async(user_content, "turn/user", meta)
+            if assistant_content:
+                self._longterm.index_async(assistant_content, "turn/assistant", meta)
 
     def shutdown(self) -> None:
         """Clean up resources."""
@@ -337,6 +591,19 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 channel="memory_tool",
                 chat_id=action,
             )
+        # Keep the vector index in sync with curated memory writes.
+        # add/replace → upsert; remove → delete by content hash.
+        if self._longterm is not None and content:
+            try:
+                if action in ("add", "replace"):
+                    self._longterm.index_async(content, f"memory/{target}")
+                elif action == "remove":
+                    # Best-effort delete (idempotent if absent).
+                    import hashlib
+                    rid = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()[:32]
+                    self._longterm.store.delete(rid)
+            except Exception as exc:
+                logger.debug("on_memory_write vector sync failed: {}", exc)
 
     def _on_store_write(self, action: str, target: str, content: str) -> None:
         """Callback from MemoryStore to trigger on_memory_write."""
@@ -351,14 +618,21 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         **kwargs,
     ) -> None:
         """Called on the PARENT agent when a subagent completes."""
+        summary = f"[Delegation] Task: {task[:200]}... Result: {result[:500]}..."
         if self._daily_log:
-            summary = f"[Delegation] Task: {task[:200]}... Result: {result[:500]}..."
             self._daily_log.append_turn(
                 user_content=f"[Subagent {child_session_id}] Delegated task",
                 assistant_content=summary,
                 channel="subagent",
                 chat_id=child_session_id,
             )
+        # Index the delegation result so it's semantically recallable.
+        if self._longterm is not None:
+            meta = {"delegation": child_session_id} if child_session_id else {}
+            if task:
+                self._longterm.index_async(task, "delegation/task", meta)
+            if result:
+                self._longterm.index_async(result, "delegation/result", meta)
 
     # -- BaseMemoryManager interface (markbot compatibility) -----------------
 
@@ -374,10 +648,26 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self._compressed_summary = self._load_compressed_summary()
         self._started = True
         logger.info("Started")
+        # Backfill the vector index from existing daily logs on first run
+        # (or after an embedding backend switch wiped it). Runs in the
+        # background so the first turn isn't blocked.
+        self._maybe_kick_off_reindex()
 
     async def close(self) -> bool:
         """Close and cleanup."""
         self._save_compressed_summary(self._compressed_summary)
+        # Shut down the long-term vector layer (flushes its executor,
+        # closes the SQLite connection / Chroma client).
+        if self._longterm is not None:
+            try:
+                self._longterm.close()
+            except Exception as e:
+                logger.debug("LongTermMemory close failed: {}", e)
+        # Shut down the prefetch thread pool.
+        try:
+            self._prefetch_executor.shutdown(wait=False)
+        except Exception:
+            pass
         self._started = False
         logger.info("Closed")
         return True
@@ -697,19 +987,39 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 except Exception:
                     pass
 
-        # Deduplicate by (source, content) so the same text from two
-        # sources (e.g. daily log vs. memory entry) is preserved, while
-        # truly duplicate rows are dropped. Sort by score descending.
-        seen_keys: set[tuple[str, str]] = set()
-        unique_results: list[dict] = []
-        for r in sorted(results, key=lambda x: -x.get("score", 0)):
-            key = (r.get("source", ""), r.get("content", ""))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            unique_results.append(r)
-            if len(unique_results) >= max_results:
-                break
+        # 5. Semantic vector recall (long-term memory).
+        # This is the path that finds content with NO lexical overlap —
+        # e.g. query "我喜欢用 Python 写后端" matching a stored turn
+        # "我的技术栈是 Django + DRF". Fused with the keyword results
+        # above via Reciprocal Rank Fusion below.
+        vector_results: list[dict] = []
+        if self._longterm is not None:
+            try:
+                import asyncio
+                vec = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._longterm.search(
+                        query,
+                        max_results=max_results,
+                        min_score=max(min_score, self._vector_min_score),
+                        channel=channel,
+                        chat_id=chat_id,
+                    ),
+                )
+                vector_results = vec or []
+            except Exception as e:
+                logger.debug("Vector memory search failed: {}", e)
+
+        # Fuse keyword results (paths 1-4) with vector results (path 5)
+        # using Reciprocal Rank Fusion. RRF is robust to incomparable
+        # score scales (keyword hit-ratio vs cosine similarity) because
+        # it only uses ranks. ``k=60`` is the standard constant.
+        unique_results = _rrf_fuse(
+            keyword_results=results,
+            vector_results=vector_results,
+            max_results=max_results,
+            dedup_key=lambda r: (r.get("source", ""), r.get("content", "")),
+        )
 
         return unique_results
 
@@ -898,9 +1208,24 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
             self._memory_store.refresh_snapshot()
 
+            # Run vector-index consolidation (dedup + promotion) as part
+            # of the dream cycle so the semantic index stays tidy too.
+            consolidation_msg = ""
+            if self._consolidation_enabled:
+                try:
+                    report = self.consolidate_long_term()
+                    if report.get("deduped", 0) or report.get("promoted", 0):
+                        consolidation_msg = (
+                            f" Vector consolidation: {report.get('deduped', 0)} "
+                            f"deduped, {report.get('promoted', 0)} promoted."
+                        )
+                except Exception as exc:
+                    logger.debug("Dream consolidation step failed: {}", exc)
+
             return (
                 f"Dream optimization completed: {added} entries kept, "
                 f"{skipped} skipped (limit/security). Backup at {backup_path}"
+                f"{consolidation_msg}"
             )
         except Exception as e:
             # Any unexpected failure (LLM timeout, scanner bug, etc.)
@@ -1037,6 +1362,143 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     async def restart_embedding_model(self) -> None:
         """Restart the embedding model (no-op for file-based backend)."""
         logger.debug("restart_embedding_model: no-op for file backend")
+
+    # -- Long-term memory: reindex + consolidation --------------------------
+
+    def _maybe_kick_off_reindex(self) -> None:
+        """Backfill the vector index from daily logs if it's empty.
+
+        Triggered on ``start()``. No-op when the index already has
+        records (the normal steady state) or when long-term memory is
+        disabled. The reindex runs on the LongTermMemory executor so
+        it never blocks the first turn.
+        """
+        if self._longterm is None:
+            return
+        try:
+            if self._longterm.count > 0:
+                return  # Already populated — nothing to backfill.
+        except Exception:
+            return
+        if self._daily_log is None:
+            return
+        try:
+            items = self._collect_reindex_items()
+        except Exception as e:
+            logger.debug("Reindex item collection failed: {}", e)
+            return
+        if not items:
+            return
+
+        def _task() -> None:
+            try:
+                n = self._longterm.reindex_all(
+                    items,
+                    progress_cb=lambda done, total: logger.debug(
+                        "Reindex progress: {}/{}", done, total,
+                    ) if done % 500 == 0 else None,
+                )
+                logger.info("Background reindex complete: {} items", n)
+            except Exception as e:
+                logger.warning("Background reindex failed: {}", e)
+
+        import threading
+        t = threading.Thread(target=_task, name="ltm-reindex", daemon=True)
+        self._reindex_task = t
+        t.start()
+        logger.info("Background reindex started ({} items)", len(items))
+
+    def _collect_reindex_items(self) -> list[tuple[str, str, dict]]:
+        """Gather (content, source, metadata) tuples for reindexing.
+
+        Sources, in priority order:
+        1. Curated MEMORY.md / PROFILE.md entries (highest value).
+        2. Daily log user/assistant turns (the bulk of history).
+        """
+        items: list[tuple[str, str, dict]] = []
+
+        # 1. Curated memory entries.
+        if self._memory_store is not None:
+            for target, entries in (
+                ("memory", self._memory_store.memory_entries),
+                ("user", self._memory_store.user_entries),
+            ):
+                for entry in entries:
+                    if entry and entry.strip():
+                        items.append((entry.strip(), f"memory/{target}", {}))
+
+        # 2. Daily log turns.
+        if self._daily_log is not None:
+            try:
+                import re as _re
+                daily_dir = self._daily_log.daily_dir
+                for md_file in sorted(daily_dir.glob("*.md")):
+                    try:
+                        text = md_file.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    # Parse the alternating **User**: / **Assistant**: blocks.
+                    sections = _re.split(r"^## \[", text, flags=_re.MULTILINE)
+                    for section in sections:
+                        if not section.strip():
+                            continue
+                        header_line = section.split("\n", 1)[0]
+                        # Extract chat_id/channel for session metadata.
+                        chat_id = ""
+                        channel = ""
+                        m = _re.search(r"`([^`]+)`", header_line)
+                        if m:
+                            chat_id = m.group(1)
+                        m = _re.search(r"via\s+(\S+)", header_line)
+                        if m:
+                            channel = m.group(1)
+                        meta = {}
+                        if channel:
+                            meta["channel"] = channel
+                        if chat_id:
+                            meta["chat_id"] = chat_id
+                        # Pull user + assistant text blocks.
+                        for role, label in (("turn/user", r"\*\*User\*\*"),
+                                            ("turn/assistant", r"\*\*Assistant\*\*")):
+                            m = _re.search(
+                                rf"{label}:\s*\n+(.*?)\n+---",
+                                section, _re.DOTALL,
+                            )
+                            if m:
+                                content = m.group(1).strip()
+                                if content:
+                                    items.append((content, role, dict(meta)))
+            except Exception as e:
+                logger.debug("Daily log reindex scan failed: {}", e)
+
+        return items
+
+    def consolidate_long_term(self) -> dict:
+        """Run a consolidation sweep (dedup + promotion) on the vector index.
+
+        Called by the dream scheduler. Returns a report dict. Safe to
+        call when long-term memory is disabled (returns an empty report).
+        """
+        if self._longterm is None or self._consolidator is None:
+            return {"deduped": 0, "promoted": 0, "enabled": False}
+        embedder = self._longterm.embedder
+
+        def _promote(content: str, source: str) -> None:
+            # Promote frequently-recalled content into curated MEMORY.md
+            # so it becomes part of the always-injected system prompt.
+            if self._memory_store is not None and content:
+                try:
+                    tagged = f"{content}  [auto-promoted from {source}]"
+                    self._memory_store.add("memory", tagged)
+                except Exception as e:
+                    logger.debug("Auto-promote to MEMORY.md failed: {}", e)
+
+        try:
+            report = self._consolidator.run(embedder, promote_cb=_promote)
+            return report.to_dict()
+        except Exception as e:
+            logger.warning("Consolidation failed: {}", e)
+            return {"deduped": 0, "promoted": 0, "error": str(e)}
 
     # -- Internal helpers ---------------------------------------------------
 

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from markbot.tools.computer_use.backend import (
     ActionResult,
+    BackendCapabilities,
     CaptureResult,
     ComputerUseBackend,
     UIElement,
@@ -237,6 +238,15 @@ class CuaDriverBackend(ComputerUseBackend):
             return False
         return cua_driver_binary_available()
 
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            coordinate_targeting=True,
+            element_targeting=True,
+            som_overlay=True,
+            ax_tree=True,
+            set_value=True,
+        )
+
     def start(self) -> None:
         if not self._started:
             self._session.start()
@@ -317,7 +327,7 @@ class CuaDriverBackend(ComputerUseBackend):
             windows = _parse_windows_from_text(raw_text)
 
         if not windows:
-            return CaptureResult(mode=mode, width=0, height=0)
+            return CaptureResult(mode=mode, width=0, height=0, capabilities=self.capabilities())
 
         if app:
             matches = [w for w in windows if app.lower() in w["app_name"].lower()]
@@ -371,12 +381,13 @@ class CuaDriverBackend(ComputerUseBackend):
 
         return CaptureResult(
             mode=mode,
-            width=width or 1920,
-            height=height or 1080,
+            width=width,
+            height=height,
             png_b64=png_b64,
             elements=elements,
             app=app_name,
             png_bytes_len=png_bytes_len,
+            capabilities=self.capabilities(),
         )
 
     # ── Pointer actions ────────────────────────────────────────────
@@ -468,6 +479,8 @@ class CuaDriverBackend(ComputerUseBackend):
             args["x"] = x
         if y is not None:
             args["y"] = y
+        if modifiers:
+            args["modifiers"] = modifiers
 
         return self._action("scroll", args)
 
