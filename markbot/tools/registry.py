@@ -11,7 +11,7 @@ from loguru import logger
 
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision, PermissionMode, ToolPermissionContext
-from markbot.types.tool import ToolContext, ToolDefinition
+from markbot.types.tool import ToolContext, ToolDefinition, _sanitize_tool_name
 
 
 class ToolRegistry:
@@ -24,6 +24,10 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, BaseTool] = {}
         self._aliases: dict[str, str] = {}  # alias -> name
+        # Reverse map: sanitised wire-name -> original name. Populated on
+        # register() so that a model returning the sanitised name (the form
+        # we send on the wire) can be resolved back to the in-process tool.
+        self._sanitised: dict[str, str] = {}
         self._permission_handlers: list[
             Callable[[BaseTool, dict, ToolContext], PermissionDecision]
         ] = []
@@ -41,6 +45,15 @@ class ToolRegistry:
         for alias in tool.definition.aliases:
             self._aliases[alias] = name
 
+        # Register sanitised name -> original name for round-tripping
+        # provider-returned tool_call.function.name back to our registry.
+        sanitised = _sanitize_tool_name(name)
+        if sanitised and sanitised != name:
+            # Only add the reverse mapping if the sanitised form actually
+            # differs (i.e. the original name had a non-ASCII char) so that
+            # we don't shadow unrelated tools when the name was already safe.
+            self._sanitised.setdefault(sanitised, name)
+
         self._invalidate_cache()
         logger.debug("Registered tool: {}", name)
 
@@ -54,6 +67,10 @@ class ToolRegistry:
             for alias in list(self._aliases.keys()):
                 if self._aliases[alias] == name:
                     del self._aliases[alias]
+            # Remove sanitised reverse mapping
+            for sanitised, original in list(self._sanitised.items()):
+                if original == name:
+                    del self._sanitised[sanitised]
 
             self._invalidate_cache()
 
@@ -68,6 +85,11 @@ class ToolRegistry:
         # Check alias
         if name in self._aliases:
             return self._tools.get(self._aliases[name])
+
+        # Check sanitised name (provider may echo the wire form)
+        resolved = self._sanitised.get(name)
+        if resolved is not None:
+            return self._tools.get(resolved)
 
         return None
 
@@ -90,6 +112,13 @@ class ToolRegistry:
     def tool_names(self) -> list[str]:
         """Get all tool names."""
         return list(self._tools.keys())
+
+    def resolve_sanitised_name(self, name: str) -> str:
+        """Return the in-process name for a wire (sanitised) name.
+
+        If *name* is not a known sanitised alias, it is returned unchanged.
+        """
+        return self._sanitised.get(name, name)
 
     def add_permission_handler(
         self,

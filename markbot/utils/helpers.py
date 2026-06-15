@@ -198,13 +198,19 @@ def build_assistant_message(
     Ensures ``content`` is never ``None`` — normalises to empty string.
     This prevents downstream crashes in serialisation / compaction / context-checking
     paths that assume content is always iterable or string-castable.
+
+    When *reasoning_content* is provided (including empty string or ``None``)
+    the field is always written to the message. DeepSeek's API rejects
+    subsequent turns with ``reasoning_content must be passed back`` if
+    the field is missing entirely once thinking mode is on, so being
+    explicit (even with ``None``) is safer than omitting the key.
     """
     if content is None:
         content = ""
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
-    if reasoning_content is not None:
+    if reasoning_content is not None or reasoning_content == "":
         msg["reasoning_content"] = reasoning_content
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks

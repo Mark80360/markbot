@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from markbot.types.permission import PermissionMode, ToolPermissionContext
+
+# OpenAI-compatible providers (DeepSeek, etc.) require tool names to match
+# ^[a-zA-Z0-9_-]+$. Some local names (e.g. "tmux.find-sessions" from skill
+# scripts, or MCP server names containing dots/colons) include characters
+# that get rejected with HTTP 400. We normalise those at schema-generation
+# time so the in-process name keeps its meaning while the wire name is safe.
+_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_tool_name(name: str, max_len: int = 64) -> str:
+    """Return *name* with all characters outside [a-zA-Z0-9_-] replaced by '_'.
+
+    The result is truncated to *max_len* to satisfy provider length limits
+    (e.g. 64 chars for some OpenAI-compatible endpoints). If sanitising
+    yields an empty string, a single underscore is returned.
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    cleaned = _TOOL_NAME_PATTERN.sub("_", name)
+    if max_len and len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned or "_"
 
 
 @dataclass
@@ -46,7 +69,7 @@ class ToolDefinition:
         return {
             "type": "function",
             "function": {
-                "name": self.name,
+                "name": _sanitize_tool_name(self.name),
                 "description": self.description,
                 "parameters": {
                     "type": "object",
@@ -73,7 +96,7 @@ class ToolDefinition:
                 required.append(param.name)
 
         return {
-            "name": self.name,
+            "name": _sanitize_tool_name(self.name),
             "description": self.description,
             "input_schema": {
                 "type": "object",

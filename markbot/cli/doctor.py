@@ -786,7 +786,7 @@ def plan_fixes(
                 planned.append(
                     PlannedFix(
                         "trim-gateway-log",
-                        f"trim {log_file} ({size_mb:.1f} MB 鈫?keep last {max_lines} lines)",
+                        f"trim {log_file} ({size_mb:.1f} MB →?keep last {max_lines} lines)",
                         (log_file,),
                         _trim,
                     )
@@ -916,7 +916,7 @@ def _section(title: str, color: str = "cyan") -> None:
     W = 60
     title_text = f"  {title}  "
     pad = W - len(title_text) - 2
-    line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'鈹€' * pad}[/]")
+    line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
     console.print(line)
 
 
@@ -942,7 +942,7 @@ def _hint(message: str) -> None:
 
 
 def _divider() -> None:
-    console.print(Text.from_markup(f"[dim]{'鈹€' * 58}[/dim]"))
+    console.print(Text.from_markup(f"[dim]{'─' * 58}[/dim]"))
 
 
 @doctor_app.callback(invoke_without_command=True)
@@ -962,7 +962,7 @@ def doctor_main(
 
     failed = False
 
-    # 鈹€鈹€ Environment 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Environment ──────────────────────────────────────────────────────
     _section("Environment")
     for line in environment_summary_lines():
         console.print(f"  {line}")
@@ -974,7 +974,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Config 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Config ───────────────────────────────────────────────────────────
     _section("Config")
     config_ok, config_detail = check_config_file()
     if config_ok:
@@ -991,7 +991,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Load config for further checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Load config for further checks ───────────────────────────────────
     cfg = None
     if config_ok:
         try:
@@ -1009,7 +1009,7 @@ def doctor_main(
             raise typer.Exit(1)
         return
 
-    # 鈹€鈹€ Model Chain 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Model Chain ──────────────────────────────────────────────────────
     _section("Model Chain")
     chain_ok, chain_detail = check_model_chain(cfg)
     if chain_ok:
@@ -1032,7 +1032,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Workspace 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Workspace ────────────────────────────────────────────────────────
     _section("Workspace")
     ws_ok, ws_detail = check_workspace(cfg)
     if ws_ok:
@@ -1051,7 +1051,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Channels 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Channels ─────────────────────────────────────────────────────────
     _section("Channels")
     ch_ok, ch_detail = check_channels(cfg)
     if ch_ok:
@@ -1066,7 +1066,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ MCP Servers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── MCP Servers ──────────────────────────────────────────────────────
     _section("MCP Servers")
     mcp_notes = check_mcp_servers(cfg)
     if mcp_notes:
@@ -1078,7 +1078,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Skills 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Skills ───────────────────────────────────────────────────────────
     _section("Skills")
     sk_ok, sk_detail = check_skills(cfg)
     if sk_ok:
@@ -1089,7 +1089,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Memory / Embedding 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Memory / Embedding ───────────────────────────────────────────────
     _section("Memory / Embedding")
     mem_notes = check_memory_config(cfg)
     if mem_notes:
@@ -1100,7 +1100,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Cron 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Cron ─────────────────────────────────────────────────────────────
     _section("Cron")
     cron_ok, cron_detail = check_cron_jobs(cfg)
     if cron_ok:
@@ -1111,7 +1111,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Sessions 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Sessions ─────────────────────────────────────────────────────────
     _section("Sessions")
     sess_ok, sess_detail = check_sessions(cfg)
     if sess_ok:
@@ -1122,7 +1122,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Gateway 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Gateway ──────────────────────────────────────────────────────────
     _section("Gateway")
     gw_ok, gw_detail = check_gateway_pid()
     if gw_ok:
@@ -1138,7 +1138,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Data Directory 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Data Directory ───────────────────────────────────────────────────
     _section("Data Directory")
     dd_ok, dd_detail = check_data_dir_writable()
     if dd_ok:
@@ -1149,7 +1149,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Optional Dependencies 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Optional Dependencies ────────────────────────────────────────────
     _section("Optional Dependencies")
     dep_notes = check_optional_dependencies()
     if dep_notes:
@@ -1160,7 +1160,7 @@ def doctor_main(
 
     _divider()
 
-    # 鈹€鈹€ Deep Checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Deep Checks ──────────────────────────────────────────────────────
     if deep:
         _section("Deep Checks", "magenta")
 
@@ -1171,19 +1171,19 @@ def doctor_main(
 
         _divider()
 
-    # 鈹€鈹€ Summary 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── Summary ──────────────────────────────────────────────────────────
     console.print()
     if failed:
         console.print(
             Text.from_markup(
-                "  [bold red]鉁?Issues found[/bold red] review the FAIL items above"
+                "  [bold red]✓?Issues found[/bold red] review the FAIL items above"
             )
         )
         raise typer.Exit(1)
     else:
         console.print(
             Text.from_markup(
-                "  [bold green]鉁?All checks passed[/bold green]"
+                "  [bold green]✓?All checks passed[/bold green]"
             )
         )
 
@@ -1344,7 +1344,7 @@ def _extract_channel_port(name: str, section: Any) -> int | None:
     return None
 
 
-# 鈹€鈹€ fix sub-command 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── fix sub-command ──────────────────────────────────────────────────────
 
 
 @doctor_app.command("fix")

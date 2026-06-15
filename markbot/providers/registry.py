@@ -99,6 +99,18 @@ class ProviderSpec:
     # cheap model for auxiliary tasks (compression, vision, etc.)
     default_aux_model: str = ""
 
+    # Case-insensitive substrings that, when present in the resolved
+    # model name, indicate the upstream model is in thinking/reasoning
+    # mode and will reject subsequent turns if reasoning_content is not
+    # round-tripped (e.g. DeepSeek-V4, Kimi-K2, Qwen-QwQ, o1/o3, etc.).
+    # An empty tuple (the default) means the spec never assumes thinking
+    # mode — useful for plain OpenAI-compat endpoints with no a-priori
+    # knowledge of the upstream model. The companion list
+    # ``thinking_model_excludes`` lets a spec veto a match (e.g. the
+    # ``deepseek-v`` marker must not fire for ``deepseek-v3``).
+    thinking_model_markers: tuple[str, ...] = ()
+    thinking_model_excludes: tuple[str, ...] = ()
+
     # whether /models health check is meaningful
     supports_health_check: bool = True
 
@@ -119,6 +131,33 @@ class ProviderSpec:
         if self.default_api_base:
             return urlparse(self.default_api_base).hostname or ""
         return ""
+
+    def model_supports_thinking(
+        self,
+        model: str | None,
+        extra_markers: tuple[str, ...] = (),
+        extra_excludes: tuple[str, ...] = (),
+    ) -> bool:
+        """Return True when *model* should be served in thinking mode.
+
+        Generic, data-driven check: lower-cases the model name, drops any
+        ``provider/`` prefix, then looks for any positive marker. If a
+        negative marker is also present the match is vetoed. Caller can
+        pass *extra_markers* / *extra_excludes* to extend the spec's own
+        lists at runtime (e.g. from user config) without subclassing.
+        """
+        if not model:
+            return False
+        markers = self.thinking_model_markers + extra_markers
+        excludes = self.thinking_model_excludes + extra_excludes
+        if not markers:
+            return False
+        bare = model.strip().lower().split("/")[-1]
+        if not bare:
+            return False
+        if excludes and any(ex.lower() in bare for ex in excludes):
+            return False
+        return any(mk.lower() in bare for mk in markers)
 
     # ------------------------------------------------------------------
     # Hooks — override in subclass for provider-specific quirks
@@ -188,6 +227,7 @@ class ProviderSpec:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
 class DeepSeekSpec(ProviderSpec):
     """DeepSeek — extra_body.thinking + top-level reasoning_effort.
 
@@ -197,16 +237,11 @@ class DeepSeekSpec(ProviderSpec):
     This spec explicitly sets thinking to avoid that trap.
     """
 
-    @staticmethod
-    def _model_supports_thinking(model: str | None) -> bool:
-        m = (model or "").strip().lower()
-        if not m:
-            return False
-        if m.startswith("deepseek-v") and not m.startswith("deepseek-v3"):
-            return True
-        if m == "deepseek-reasoner":
-            return True
-        return False
+    thinking_model_markers: tuple[str, ...] = (
+        "deepseek-v",       # deepseek-v4, deepseek-v4-flash, deepseek-v5…
+        "deepseek-reasoner",
+    )
+    thinking_model_excludes: tuple[str, ...] = ("deepseek-v3",)
 
     def build_api_kwargs_extras(
         self,
@@ -218,7 +253,7 @@ class DeepSeekSpec(ProviderSpec):
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
-        if not self._model_supports_thinking(model):
+        if not self.model_supports_thinking(model):
             return extra_body, top_level
 
         enabled = True
@@ -359,17 +394,54 @@ class GeminiSpec(ProviderSpec):
         }
 
 
+@dataclass(frozen=True)
 class CustomSpec(ProviderSpec):
-    """Custom/Ollama local provider — think=false and num_ctx support."""
+    """Custom/Ollama local provider — think=false and num_ctx support.
+
+    The base :class:`ProviderSpec` provides a generic, data-driven
+    thinking-model detector. We populate it with markers that cover the
+    OpenAI-compat endpoints the custom slot is typically aimed at
+    (DeepSeek-V4+, Kimi-K2+, Qwen-QwQ/QVQ, o1/o3, GLM-Z1, …) so the spec
+    mirrors :class:`DeepSeekSpec` for thinking-mode handling without
+    hardcoding a model list — anything matching a substring is treated
+    as a thinking model, and ``deepseek-v3`` is explicitly excluded
+    from the ``deepseek-v`` marker. The lists are extensible at
+    runtime via :py:meth:`ProviderSpec.model_supports_thinking`.
+    """
+
+    thinking_model_markers: tuple[str, ...] = (
+        "deepseek-v",       # deepseek-v4, deepseek-v4-flash, deepseek-v5…
+        "deepseek-reasoner",
+        "kimi-k2",          # kimi-k2, kimi-k2.5
+        "kimi-thinking",
+        "qwq",              # Qwen QwQ preview
+        "qvq",              # Qwen QVQ
+        "qwen3",            # Qwen 3 thinking variants
+        "o1",               # OpenAI o1, o1-mini, o1-pro
+        "o3",               # OpenAI o3, o3-mini
+        "o4",               # OpenAI o4-mini
+        "glm-z1",           # GLM Z1 reasoning
+        "minimax",          # minimax reasoning models
+        "reasoner",         # generic -reasoner suffix
+        "-thinking",        # generic -thinking suffix
+        "_thinking",        # generic _thinking suffix
+    )
+    thinking_model_excludes: tuple[str, ...] = (
+        "deepseek-v3",      # V3 has no thinking mode
+    )
 
     def build_api_kwargs_extras(
         self,
         *,
         reasoning_config: dict | None = None,
         ollama_num_ctx: int | None = None,
+        model: str | None = None,
+        extra_thinking_markers: tuple[str, ...] = (),
+        extra_thinking_excludes: tuple[str, ...] = (),
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
 
         if ollama_num_ctx:
             options = extra_body.get("options", {})
@@ -382,7 +454,30 @@ class CustomSpec(ProviderSpec):
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
 
-        return extra_body, {}
+        # Generic thinking-mode handling — applies to any model whose
+        # name matches one of the markers above. We set
+        # ``extra_body.thinking = {"type": "enabled"}`` so the server
+        # doesn't silently default to thinking mode and then reject the
+        # next turn for missing ``reasoning_content``. If the user has
+        # explicitly disabled reasoning, we mirror that.
+        if self.model_supports_thinking(
+            model,
+            extra_markers=extra_thinking_markers,
+            extra_excludes=extra_thinking_excludes,
+        ):
+            enabled = True
+            if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
+                enabled = False
+            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+
+            if enabled and isinstance(reasoning_config, dict):
+                effort = (reasoning_config.get("effort") or "").strip().lower()
+                if effort in {"xhigh", "max"}:
+                    top_level["reasoning_effort"] = "max"
+                elif effort in {"low", "medium", "high"}:
+                    top_level["reasoning_effort"] = effort
+
+        return extra_body, top_level
 
     def fetch_models(
         self,

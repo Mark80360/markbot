@@ -514,6 +514,7 @@ class OpenAICompatProvider(LLMProvider):
     @classmethod
     def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         usage: dict[str, int] = {}
@@ -544,6 +545,31 @@ class OpenAICompatProvider(LLMProvider):
             if fn_prov:
                 buf["fn_prov"] = fn_prov
 
+        def _accum_reasoning(value: Any) -> None:
+            """Append one reasoning delta (string or list) to the accumulator."""
+            if value is None:
+                return
+            if isinstance(value, str):
+                if value:
+                    reasoning_parts.append(value)
+                return
+            if isinstance(value, list):
+                for part in value:
+                    if isinstance(part, str):
+                        if part:
+                            reasoning_parts.append(part)
+                        continue
+                    part_map = cls._maybe_mapping(part)
+                    if part_map is not None:
+                        text = part_map.get("text") or part_map.get("reasoning")
+                        if isinstance(text, str) and text:
+                            reasoning_parts.append(text)
+                return
+            # Some OpenAI-compatible SDKs expose nested objects
+            text = getattr(value, "text", None) or getattr(value, "reasoning", None)
+            if isinstance(text, str) and text:
+                reasoning_parts.append(text)
+
         for chunk in chunks:
             if isinstance(chunk, str):
                 content_parts.append(chunk)
@@ -559,6 +585,9 @@ class OpenAICompatProvider(LLMProvider):
                     )
                     if text:
                         content_parts.append(text)
+                    # Some providers surface reasoning at the top level on
+                    # the final chunk.
+                    _accum_reasoning(chunk_map.get("reasoning_content"))
                     continue
                 choice = cls._maybe_mapping(choices[0]) or {}
                 if choice.get("finish_reason"):
@@ -567,6 +596,8 @@ class OpenAICompatProvider(LLMProvider):
                 text = cls._extract_text_content(delta.get("content"))
                 if text:
                     content_parts.append(text)
+                # Streamed reasoning_content arrives as a delta field.
+                _accum_reasoning(delta.get("reasoning_content"))
                 for idx, tc in enumerate(delta.get("tool_calls") or []):
                     _accum_tc(tc, idx)
                 usage = cls._extract_usage(chunk_map) or usage
@@ -574,6 +605,8 @@ class OpenAICompatProvider(LLMProvider):
 
             if not chunk.choices:
                 usage = cls._extract_usage(chunk) or usage
+                # Some SDKs surface reasoning_content on usage-chunk.
+                _accum_reasoning(getattr(chunk, "reasoning_content", None))
                 continue
             choice = chunk.choices[0]
             if choice.finish_reason:
@@ -581,11 +614,16 @@ class OpenAICompatProvider(LLMProvider):
             delta = choice.delta
             if delta and delta.content:
                 content_parts.append(delta.content)
+            # Streamed reasoning_content (DeepSeek / Kimi / etc.).
+            if delta is not None:
+                _accum_reasoning(getattr(delta, "reasoning_content", None))
             for tc in (delta.tool_calls or []) if delta else []:
                 _accum_tc(tc, getattr(tc, "index", 0))
 
         if finish_reason == "content_filter":
             content_parts = []
+
+        reasoning_content: str | None = "".join(reasoning_parts) if reasoning_parts else None
 
         return LLMResponse(
             content="".join(content_parts) or "",
@@ -602,6 +640,7 @@ class OpenAICompatProvider(LLMProvider):
             ],
             finish_reason=finish_reason,
             usage=usage,
+            reasoning_content=reasoning_content,
             error_type=ErrorType.CONTENT if finish_reason == "content_filter" else None,
         )
 

@@ -995,7 +995,7 @@ class IterationRunner:
                 f"Please use only the tools listed above."
             )
             for tc in response.tool_calls:
-                if tc.name not in self.loop.tools.tool_names:
+                if not self.loop.tools.has(tc.name):
                     state.messages = self.loop.context.add_tool_result(
                         state.messages, tc.id, tc.name, error_msg
                     )
@@ -1018,8 +1018,11 @@ class IterationRunner:
             self._invalid_tool_retries = 0
 
         for tc in response.tool_calls:
-            if "." in tc.name:
-                skill_name = tc.name.split(".", 1)[0]
+            # Resolve provider-echoed (sanitised) name back to in-process name
+            # so downstream detection (skill guardrail, etc.) still works.
+            lookup_name = self.loop.tools.resolve_sanitised_name(tc.name)
+            if "." in lookup_name:
+                skill_name = lookup_name.split(".", 1)[0]
                 skill_def = self.loop.skill_registry.get(skill_name)
                 if skill_def and skill_name not in self.loop.guardrail_manager.active_skills:
                     self.loop.guardrail_manager.start_guarding(skill_def)
@@ -1270,6 +1273,9 @@ class IterationRunner:
             List of tool names that could not be repaired.
         """
         valid_names = set(self.loop.tools.tool_names)
+        # Sanitised names are accepted because we send the sanitised form on
+        # the wire and the model echoes that back in tool_call.function.name.
+        valid_names.update(self.loop.tools._sanitised.keys())
         invalid: list[str] = []
 
         for tc in response.tool_calls:
