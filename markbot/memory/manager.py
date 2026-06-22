@@ -10,7 +10,6 @@ Provides a file-based memory system with:
 - Context fencing with <memory-context> tags
 - Context compression via compact_memory()
 - Keyword + daily log search via memory_search()
-- Tool result offload via compact_tool_result()
 - Dream-based memory optimization
 """
 
@@ -219,10 +218,6 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         force_memory_search: bool = False,
         force_max_results: int = 1,
         force_min_score: float = 0.3,
-        tool_result_compact_enabled: bool = True,
-        tool_result_recent_n: int = 2,
-        tool_result_old_max_bytes: int = 3000,
-        tool_result_recent_max_bytes: int = 50000,
         tool_result_retention_days: int = 5,
         max_input_length: int = 131072,
         # -- Long-term (vector) memory -------------------------------------
@@ -258,16 +253,13 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self.force_memory_search = force_memory_search
         self.force_max_results = force_max_results
         self.force_min_score = force_min_score
-        self.tool_result_compact_enabled = tool_result_compact_enabled
-        self.tool_result_recent_n = tool_result_recent_n
-        self.tool_result_old_max_bytes = tool_result_old_max_bytes
-        self.tool_result_recent_max_bytes = tool_result_recent_max_bytes
         self.tool_result_retention_days = tool_result_retention_days
         self.max_input_length = max_input_length
 
         self._started = False
         self._compressed_summary: str = ""
         self._session_summaries: dict[str, str] = {}
+        self._session_archived_counts: dict[str, int] = {}
 
         self._memory_store: MemoryStore | None = None
         self._daily_log: DailyLogManager | None = None
@@ -278,9 +270,6 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         self._prefetch_query: str = ""
         self._prefetch_session_key: str | None = None
-
-        # Summary toolkit (for dream optimization)
-        self._summary_toolkit: Any = None
 
         # -- Long-term (vector) memory wiring -----------------------------
         self._long_term_enabled = long_term_enabled
@@ -672,41 +661,6 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         logger.info("Closed")
         return True
 
-    async def compact_tool_result(self, **kwargs) -> None:
-        """Compact tool results by truncating large outputs.
-
-        Keeps the last N tool results intact, truncates older ones.
-        """
-        if not self.tool_result_compact_enabled:
-            return
-        messages = kwargs.get("messages", [])
-        if not messages:
-            return
-
-        recent_n = self.tool_result_recent_n
-        old_max_bytes = self.tool_result_old_max_bytes
-        recent_max_bytes = self.tool_result_recent_max_bytes
-
-        # Find tool result indices
-        tool_indices = [
-            i for i, m in enumerate(messages)
-            if isinstance(m, dict) and m.get("role") == "tool"
-        ]
-
-        # Keep recent N intact
-        keep_indices = set(tool_indices[-recent_n:]) if recent_n > 0 else set()
-
-        for i, m in enumerate(messages):
-            if not isinstance(m, dict) or m.get("role") != "tool":
-                continue
-            content = m.get("content", "")
-            if not isinstance(content, str):
-                continue
-
-            max_bytes = recent_max_bytes if i in keep_indices else old_max_bytes
-            if len(content) > max_bytes:
-                m["content"] = content[:max_bytes] + "\n\n... [truncated by compact_tool_result]"
-
     async def check_context(self, **kwargs) -> tuple:
         """Check context size and determine if compaction is needed.
 
@@ -833,26 +787,37 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         result = self._simple_truncation(messages, previous_summary)
         return _add_compaction_prefix(result)
 
-    async def summary_memory(self, messages: list, **kwargs) -> str:
-        """Generate a comprehensive summary and write to MEMORY.md.
+    async def summary_memory(
+        self, messages: list, *, compact_summary: str = "", **kwargs
+    ) -> str:
+        """Extract durable facts and write to MEMORY.md.
 
-        Uses LLM if available, then appends to MemoryStore.
+        If ``compact_summary`` is provided (from ``compact_memory``), uses it
+        as input instead of re-summarising raw messages — this avoids a
+        redundant LLM call with overlapping content.
 
         Returns:
             Summary string.
         """
-        if not messages:
+        if not messages and not compact_summary:
             return ""
 
-        conversation_text = self._format_messages_for_summary(messages)
+        # Prefer the compact summary as input — it is much shorter than
+        # the raw conversation and already distils key information.
+        if compact_summary:
+            conversation_text = compact_summary
+        else:
+            conversation_text = self._format_messages_for_summary(messages)
         conversation_text = redact_sensitive_text(conversation_text)
 
         if self._fallback_manager:
             try:
                 system_prompt = (
-                    "Generate a comprehensive summary of this conversation. "
-                    "Extract: user preferences, project decisions, technical details, "
-                    "environment facts, and action items. Format as concise bullet points."
+                    "Extract durable facts from the following summary that should "
+                    "be remembered long-term. Focus on: user preferences, project "
+                    "decisions, technical details, and environment facts. "
+                    "Format as concise bullet points. Omit transient or "
+                    "conversation-specific details."
                 )
                 response, _ = await self._fallback_manager.chat_with_fallback(
                     messages=[
@@ -892,6 +857,15 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             except Exception as e:
                 logger.warning("summary_memory LLM failed: {}", e)
 
+        # Fallback: if we have a compact summary, write it directly;
+        # otherwise truncate raw messages.
+        if compact_summary:
+            if self._memory_store:
+                try:
+                    self._memory_store.add("memory", compact_summary)
+                except Exception as e:
+                    logger.warning("Failed to write compact summary to MemoryStore: {}", e)
+            return compact_summary
         return self._simple_truncation(messages, "")
 
     async def memory_search(
@@ -1198,15 +1172,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             # Commit. From here on, a _persist failure means the on-disk
             # file might be stale relative to the in-memory list, so we
             # also restore from the disk snapshot we took above.
-            self._memory_store.memory_entries = staged
             try:
-                self._memory_store._persist("memory")
+                self._memory_store.replace_entries("memory", staged)
             except Exception as persist_err:
-                logger.error("Dream _persist failed, restoring from snapshot: {}", persist_err)
+                logger.error("Dream replace_entries failed, restoring from snapshot: {}", persist_err)
                 self._restore_entries(old_entries, old_disk_bytes, memory_path)
                 return f"Dream optimization failed during persist: {persist_err}"
-
-            self._memory_store.refresh_snapshot()
 
             # Run vector-index consolidation (dedup + promotion) as part
             # of the dream cycle so the semantic index stays tidy too.
@@ -1333,13 +1304,78 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             self._compressed_summary = summary
             self._save_compressed_summary(summary)
 
+    def get_archived_count(self, *, session_key: str | None = None) -> int:
+        """Return the number of history messages already archived for this session."""
+        if session_key:
+            if session_key not in self._session_archived_counts:
+                self._session_archived_counts[session_key] = self._load_archived_count(session_key)
+            return self._session_archived_counts.get(session_key, 0)
+        return getattr(self, "_archived_count", 0)
+
+    def set_archived_count(
+        self,
+        count: int,
+        *,
+        session_key: str | None = None,
+    ) -> None:
+        """Update the archived message count."""
+        if session_key:
+            self._session_archived_counts[session_key] = count
+            self._save_archived_count(session_key, count)
+        else:
+            self._archived_count = count
+
+    def evict_session_cache(self, session_key: str) -> None:
+        """Evict in-memory caches for a session to free memory.
+
+        Per-session state (compressed summary, archived count) is persisted
+        to disk and will be transparently reloaded on next access.  This
+        should be called when a session becomes idle to prevent unbounded
+        growth of ``_session_summaries`` / ``_session_archived_counts`` in
+        long-running multi-user deployments.
+        """
+        removed = 0
+        if session_key in self._session_summaries:
+            del self._session_summaries[session_key]
+            removed += 1
+        if session_key in self._session_archived_counts:
+            del self._session_archived_counts[session_key]
+            removed += 1
+        if removed:
+            logger.debug("Evicted session cache for {}: {} entries", session_key, removed)
+
+    def _load_archived_count(self, session_key: str) -> int:
+        """Load per-session archived count from disk."""
+        path = self._archived_count_path(session_key)
+        if path.exists():
+            try:
+                return int(path.read_text(encoding="utf-8").strip())
+            except Exception:
+                pass
+        return 0
+
+    def _save_archived_count(self, session_key: str, count: int) -> None:
+        """Save per-session archived count to disk."""
+        path = self._archived_count_path(session_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(str(count), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to save archived count: {}", e)
+
+    def _archived_count_path(self, session_key: str) -> Path:
+        """Get path for per-session archived count file."""
+        safe_key = session_key.replace(":", "_").replace("/", "_")
+        return Path(self.working_dir) / "memory" / f".archive_count_{safe_key}"
+
     def get_memory_context(self, query: str | None = None, *, session_key: str | None = None) -> str:
         """Get formatted memory context for system prompt injection.
 
-        Combines compressed summary and MemoryStore entries.
+        Combines compressed summary and MemoryStore entries into a single
+        fenced block for consistent context isolation.
 
         Returns:
-            Formatted context string, or empty string.
+            Fenced context string, or empty string.
         """
         parts: list[str] = []
 
@@ -1349,15 +1385,15 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if summary:
             parts.append(f"## Compressed Summary\n\n{summary}")
 
-        if self._memory_store:
-            memory_ctx = self._memory_store.get_memory_context(query=query)
-            if memory_ctx:
-                parts.append(memory_ctx)
+        # Use the raw snapshot (not the pre-fenced get_memory_context)
+        # so we can wrap everything in a single consistent fence.
+        if self._memory_store and self._memory_store.system_prompt_snapshot:
+            parts.append(self._memory_store.system_prompt_snapshot)
 
         if not parts:
             return ""
 
-        return "\n\n".join(parts)
+        return fence_context("\n\n".join(parts), system_note=True)
 
     async def restart_embedding_model(self) -> None:
         """Restart the embedding model (no-op for file-based backend)."""

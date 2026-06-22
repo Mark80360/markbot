@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -97,6 +98,12 @@ class MemoryStore:
 
         self._lock_path = self._working_dir / ".memory.lock"
 
+        # In-process lock protecting memory_entries / user_entries mutations.
+        # The file lock (_file_lock) only serialises disk writes; this lock
+        # guards the live list state against concurrent tool calls and
+        # background dream() bulk replacements.
+        self._state_lock = threading.RLock()
+
         self._on_write = on_write
 
         self._load_all()
@@ -127,7 +134,8 @@ class MemoryStore:
         the frozen snapshot purpose), but can be called explicitly
         when needed.
         """
-        self._build_snapshot()
+        with self._state_lock:
+            self._build_snapshot()
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Add a new entry to the specified store.
@@ -146,28 +154,29 @@ class MemoryStore:
 
         content = self._scanner.sanitize(content)
 
-        if target == "memory":
-            entries = self.memory_entries
-            char_limit = self.memory_char_limit
-        else:
-            entries = self.user_entries
-            char_limit = self.user_char_limit
+        with self._state_lock:
+            if target == "memory":
+                entries = self.memory_entries
+                char_limit = self.memory_char_limit
+            else:
+                entries = self.user_entries
+                char_limit = self.user_char_limit
 
-        # Check total char limit.
-        # N entries are joined by N-1 delimiters (no leading/trailing delimiter).
-        # The on-disk layout also adds a header and trailing newline, but those
-        # are constant overhead and not counted against the entry budget here.
-        current_total = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries) - 1, 0)
-        if current_total + len(content) + len(ENTRY_DELIMITER) > char_limit:
-            return {
-                "success": False,
-                "message": f"Character limit reached ({char_limit}). "
-                           f"Remove or replace existing entries first.",
-                "entries": list(entries),
-            }
+            # Check total char limit.
+            # N entries are joined by N-1 delimiters (no leading/trailing delimiter).
+            # The on-disk layout also adds a header and trailing newline, but those
+            # are constant overhead and not counted against the entry budget here.
+            current_total = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries) - 1, 0)
+            if current_total + len(content) + len(ENTRY_DELIMITER) > char_limit:
+                return {
+                    "success": False,
+                    "message": f"Character limit reached ({char_limit}). "
+                               f"Remove or replace existing entries first.",
+                    "entries": list(entries),
+                }
 
-        entries.append(content)
-        self._persist(target)
+            entries.append(content)
+            self._persist(target)
         self._notify_write("add", target, content)
         logger.info("Added entry to {}: {}...", target, content[:60])
         return {"success": True, "message": "Entry added.", "entries": list(entries)}
@@ -190,20 +199,21 @@ class MemoryStore:
 
         new_content = self._scanner.sanitize(new_content)
 
-        if target == "memory":
-            entries = self.memory_entries
-        else:
-            entries = self.user_entries
+        with self._state_lock:
+            if target == "memory":
+                entries = self.memory_entries
+            else:
+                entries = self.user_entries
 
-        for i, entry in enumerate(entries):
-            if old_text in entry:
-                entries[i] = new_content
-                self._persist(target)
-                self._notify_write("replace", target, new_content)
-                logger.info("Replaced entry in {}: {}...", target, old_text[:40])
-                return {"success": True, "message": "Entry replaced.", "entries": list(entries)}
+            for i, entry in enumerate(entries):
+                if old_text in entry:
+                    entries[i] = new_content
+                    self._persist(target)
+                    self._notify_write("replace", target, new_content)
+                    logger.info("Replaced entry in {}: {}...", target, old_text[:40])
+                    return {"success": True, "message": "Entry replaced.", "entries": list(entries)}
 
-        return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
+            return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove an entry identified by substring match.
@@ -215,20 +225,21 @@ class MemoryStore:
         Returns:
             Dict with keys: success, message, entries.
         """
-        if target == "memory":
-            entries = self.memory_entries
-        else:
-            entries = self.user_entries
+        with self._state_lock:
+            if target == "memory":
+                entries = self.memory_entries
+            else:
+                entries = self.user_entries
 
-        for i, entry in enumerate(entries):
-            if old_text in entry:
-                removed = entries.pop(i)
-                self._persist(target)
-                self._notify_write("remove", target, removed)
-                logger.info("Removed entry from {}: {}...", target, removed[:40])
-                return {"success": True, "message": "Entry removed.", "entries": list(entries)}
+            for i, entry in enumerate(entries):
+                if old_text in entry:
+                    removed = entries.pop(i)
+                    self._persist(target)
+                    self._notify_write("remove", target, removed)
+                    logger.info("Removed entry from {}: {}...", target, removed[:40])
+                    return {"success": True, "message": "Entry removed.", "entries": list(entries)}
 
-        return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
+            return {"success": False, "message": f"No entry containing '{old_text[:40]}' found.", "entries": list(entries)}
 
     def read(self, target: str) -> Dict[str, Any]:
         """Read all entries from the specified store.
@@ -239,12 +250,12 @@ class MemoryStore:
         Returns:
             Dict with keys: success, message, entries.
         """
-        if target == "memory":
-            entries = self.memory_entries
-        else:
-            entries = self.user_entries
-
-        return {"success": True, "message": f"{len(entries)} entries.", "entries": list(entries)}
+        with self._state_lock:
+            if target == "memory":
+                entries = self.memory_entries
+            else:
+                entries = self.user_entries
+            return {"success": True, "message": f"{len(entries)} entries.", "entries": list(entries)}
 
     def get_memory_context(self, query: str | None = None) -> str:
         """Get formatted memory context for system prompt injection.
@@ -258,11 +269,26 @@ class MemoryStore:
         Returns:
             Fenced memory context string, or empty string.
         """
-        if not self._system_prompt_snapshot:
+        with self._state_lock:
+            if not self._system_prompt_snapshot:
+                self._build_snapshot()
+            if not self._system_prompt_snapshot:
+                return ""
+            return fence_context(self._system_prompt_snapshot, system_note=True)
+
+    def replace_entries(self, target: str, new_entries: List[str]) -> None:
+        """Atomically replace all entries in a store (used by dream/consolidation).
+
+        Thread-safe bulk replacement that persists to disk and refreshes
+        the snapshot in one atomic operation.
+        """
+        with self._state_lock:
+            if target == "memory":
+                self.memory_entries = list(new_entries)
+            else:
+                self.user_entries = list(new_entries)
+            self._persist(target)
             self._build_snapshot()
-        if not self._system_prompt_snapshot:
-            return ""
-        return fence_context(self._system_prompt_snapshot, system_note=True)
 
     # -- Internal ------------------------------------------------------------
 

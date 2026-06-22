@@ -175,6 +175,33 @@ class MemoryCompactionHook:
                 logger.info("All messages already compacted, skipping")
                 return None
 
+            # Skip messages that were archived in previous turns.
+            # The _markbot_compacted metadata marker does not survive
+            # session save/load (get_history strips metadata), so we
+            # track the archived count per session as a durable record.
+            archived_count = self.memory_manager.get_archived_count(session_key=session_key)
+            if archived_count > 0:
+                skipped = 0
+                filtered: list[dict] = []
+                for m in messages_to_compact:
+                    if (
+                        skipped < archived_count
+                        and isinstance(m, dict)
+                        and m.get("role") != "system"
+                    ):
+                        skipped += 1
+                        continue
+                    filtered.append(m)
+                if not filtered:
+                    logger.info(
+                        "All compactable messages already archived (count={})",
+                        archived_count,
+                    )
+                    return None
+                if skipped > 0:
+                    logger.info("Skipped {} already-archived messages", skipped)
+                messages_to_compact = filtered
+
             if not is_valid:
                 logger.warning("Invalid messages during compaction, adjusting...")
                 keep_length = MEMORY_COMPACT_KEEP_RECENT
@@ -197,12 +224,31 @@ class MemoryCompactionHook:
                 logger.info("All messages already compacted after adjustment, skipping")
                 return None
 
-            # Phase 1: Always trigger async summary archival for long-term memory
-            if self.memory_summary_enabled:
-                self.memory_manager.add_async_summary_task(
-                    messages=messages_to_compact,
-                )
+            # Re-apply archived-count skip after is_valid adjustment
+            # (the adjustment may have reset messages_to_compact).
+            if archived_count > 0:
+                skipped = 0
+                filtered = []
+                for m in messages_to_compact:
+                    if (
+                        skipped < archived_count
+                        and isinstance(m, dict)
+                        and m.get("role") != "system"
+                    ):
+                        skipped += 1
+                        continue
+                    filtered.append(m)
+                if not filtered:
+                    logger.info(
+                        "All compactable messages already archived after adjustment"
+                    )
+                    return None
+                messages_to_compact = filtered
 
+            # Phase 1: Context compaction (skip if MultiLevelCompactor
+            # already handled it).  We run this BEFORE the async summary
+            # task so the compact summary can be reused as input — this
+            # avoids a redundant LLM call with overlapping content.
             pre_compact_tokens = _estimate_tokens(
                 "".join(
                     m.get("content", "") if isinstance(m.get("content", ""), str)
@@ -220,7 +266,8 @@ class MemoryCompactionHook:
                 )
             )
 
-            # Phase 2: Context compaction (skip if MultiLevelCompactor already handled it)
+            compact_content: str | None = None
+
             if skip_context_compact:
                 logger.info(
                     "[Compaction] Skipping context compaction "
@@ -228,45 +275,52 @@ class MemoryCompactionHook:
                     "async summary archival still triggered for {} messages",
                     len(messages_to_compact),
                 )
-                return None
-
-            logger.info(
-                "[Compaction] Starting 鈥?compacting {} messages "
-                "({} tokens), total context ~{} tokens",
-                len(messages_to_compact),
-                pre_compact_tokens,
-                pre_total_tokens,
-            )
-
-            if self.context_compact_enabled:
-                compressed_summary = self.memory_manager.get_compressed_summary(session_key=session_key)
-                compact_content = await self.memory_manager.compact_memory(
-                    messages=messages_to_compact,
-                    previous_summary=compressed_summary,
-                )
-                if not compact_content:
-                    logger.warning("Context compaction failed.")
-                else:
-                    post_summary_tokens = _estimate_tokens(compact_content)
-                    saved_tokens = pre_compact_tokens - post_summary_tokens
-                    logger.info(
-                        "[Compaction] Completed 鈥?summary: {} tokens, "
-                        "saved ~{} tokens ({:.0f}% reduction)",
-                        post_summary_tokens,
-                        max(saved_tokens, 0),
-                        (saved_tokens / pre_compact_tokens * 100)
-                        if pre_compact_tokens > 0
-                        else 0,
-                    )
-                    self._mark_compacted(messages_to_compact)
-                    self.memory_manager.set_compressed_summary(
-                        compact_content, session_key=session_key,
-                    )
-                    return compact_content
             else:
-                logger.info("Context compaction skipped")
+                logger.info(
+                    "[Compaction] Starting — compacting {} messages "
+                    "({} tokens), total context ~{} tokens",
+                    len(messages_to_compact),
+                    pre_compact_tokens,
+                    pre_total_tokens,
+                )
 
-            return None
+                if self.context_compact_enabled:
+                    compressed_summary = self.memory_manager.get_compressed_summary(session_key=session_key)
+                    compact_content = await self.memory_manager.compact_memory(
+                        messages=messages_to_compact,
+                        previous_summary=compressed_summary,
+                    )
+                    if not compact_content:
+                        logger.warning("Context compaction failed.")
+                    else:
+                        post_summary_tokens = _estimate_tokens(compact_content)
+                        saved_tokens = pre_compact_tokens - post_summary_tokens
+                        logger.info(
+                            "[Compaction] Completed — summary: {} tokens, "
+                            "saved ~{} tokens ({:.0f}% reduction)",
+                            post_summary_tokens,
+                            max(saved_tokens, 0),
+                            (saved_tokens / pre_compact_tokens * 100)
+                            if pre_compact_tokens > 0
+                            else 0,
+                        )
+                        self._mark_compacted(messages_to_compact)
+                        self.memory_manager.set_compressed_summary(
+                            compact_content, session_key=session_key,
+                        )
+                else:
+                    logger.info("Context compaction skipped")
+
+            # Phase 2: Trigger async summary archival for long-term memory.
+            # Pass the compact summary as input so summary_memory can reuse
+            # it instead of making a separate LLM call over raw messages.
+            if self.memory_summary_enabled:
+                self.memory_manager.add_async_summary_task(
+                    messages=messages_to_compact,
+                    compact_summary=compact_content or "",
+                )
+
+            return compact_content
 
         except Exception as e:
             logger.exception("Failed to compact memory in pre_reasoning hook: {}", e)

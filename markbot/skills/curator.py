@@ -99,13 +99,26 @@ class CuratorService:
 
                 # Auto-apply if auto_archive is enabled
                 if self._auto_archive and tr.target_state in ("stale", "archived"):
-                    result = lifecycle.transition(tr.skill_name, tr.target_state)
+                    # Look up is_builtin from the skill list so we don't
+                    # accidentally archive a builtin skill.
+                    skill_def = next((s for s in skills if s.name == tr.skill_name), None)
+                    is_builtin = skill_def.is_builtin if skill_def else False
+                    result = lifecycle.transition(tr.skill_name, tr.target_state, is_builtin=is_builtin)
                     if result.applied:
                         report.transitions[-1]["applied"] = True
                         logger.info(
                             "Curator: {} -> {} ({})",
                             tr.skill_name, tr.target_state, tr.reason,
                         )
+                        # After archiving, unload the skill from the registry
+                        # so its tools are removed and the agent can't call
+                        # scripts whose files have been moved.
+                        if tr.target_state == "archived" and self._registry is not None:
+                            self._registry.unload_skill(tr.skill_name)
+                            logger.info(
+                                "Curator: unloaded skill '{}' from registry",
+                                tr.skill_name,
+                            )
                     else:
                         report.transitions[-1]["applied"] = False
                         report.transitions[-1]["error"] = result.reason
@@ -134,8 +147,12 @@ class CuratorService:
             improver = SkillImprover(self._workspace)
 
             for skill in skills:
-                # Only evaluate non-builtin skills that are stale or low-quality
+                # Only evaluate non-builtin, non-archived skills that are
+                # stale or low-quality. Archived skills have already been
+                # moved out of the active set and shouldn't be scored.
                 if skill.is_builtin:
+                    continue
+                if getattr(skill, "state", None) == "archived":
                     continue
 
                 eval_result = improver.run_eval(skill.name, skill)

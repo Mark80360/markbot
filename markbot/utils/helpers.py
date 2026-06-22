@@ -199,19 +199,22 @@ def build_assistant_message(
     This prevents downstream crashes in serialisation / compaction / context-checking
     paths that assume content is always iterable or string-castable.
 
-    When *reasoning_content* is provided (including empty string or ``None``)
-    the field is always written to the message. DeepSeek's API rejects
-    subsequent turns with ``reasoning_content must be passed back`` if
-    the field is missing entirely once thinking mode is on, so being
-    explicit (even with ``None``) is safer than omitting the key.
+    ``reasoning_content`` is **always** written to the message, even when the
+    model didn't return any reasoning on this turn (we substitute an empty
+    string). Thinking-mode providers such as DeepSeek V4+ and Kimi K2 reject
+    subsequent turns with HTTP 400 ``reasoning_content must be passed back``
+    when the field is missing entirely once thinking mode is on, so the
+    explicit empty string is the safest acknowledgement. See debug session
+    ``markbot-multimodal-chain-fail``.
     """
     if content is None:
         content = ""
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
-    if reasoning_content is not None or reasoning_content == "":
-        msg["reasoning_content"] = reasoning_content
+    # Always emit ``reasoning_content``; substitute "" when absent so the
+    # provider sees a stable shape across turns.
+    msg["reasoning_content"] = reasoning_content if reasoning_content is not None else ""
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks
     return msg

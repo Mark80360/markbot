@@ -192,13 +192,19 @@ pip install -e ".[dev]"
 ### Optional Dependencies
 
 ```bash
-pip install -e ".[weixin]"     # WeChat integration (qrcode, pycryptodome)
-pip install -e ".[langsmith]"  # LangSmith tracing
-pip install -e ".[chroma]"     # ChromaDB vector memory provider
-pip install -e ".[desktop]"    # Computer Use desktop control (pyautogui, Pillow)
-pip install -e ".[web]"        # Web gateway server (FastAPI, uvicorn)
+pip install -e ".[weixin]"            # WeChat integration (qrcode, pycryptodome)
+pip install -e ".[langsmith]"         # LangSmith tracing
+pip install -e ".[chroma]"            # ChromaDB vector memory provider
+pip install -e ".[local-embeddings]"  # Local sentence-transformers embedder (offline long-term memory)
+pip install -e ".[desktop]"           # Computer Use desktop control (pyautogui, Pillow) — umbrella
+pip install -e ".[desktop-macos]"     # Computer Use extras for macOS (pyautogui, Pillow)
+pip install -e ".[desktop-linux]"     # Computer Use extras for Linux (adds pyatspi)
+pip install -e ".[desktop-windows]"   # Computer Use extras for Windows (pyautogui, Pillow)
+pip install -e ".[web]"               # Web UI server (FastAPI, uvicorn)
 pip install playwright && playwright install chromium  # Browser automation
 ```
+
+> **Tip**: The `desktop-*` extras all resolve to the same Python deps today; pick whichever matches the host. On Linux you also need system packages (`python3-tk`, `python3-xlib`, `scrot`, `at-spi2-core`, `wmctrl`/`xdotool`) and a reachable display. See the [Computer Use](#computer-use) section below for the full setup.
 
 ## Quick Start
 
@@ -278,18 +284,18 @@ MarkBot supports 28 LLM providers out of the box:
 ### Direct Providers
 | Provider | Models | Authentication | Prompt Caching |
 |----------|--------|----------------|----------------|
-| **Anthropic** | Claude 3.5/3.7 Sonnet, Claude 3 Opus/Haiku, Claude 4 | API Key | ✅ |
+| **Anthropic** | Claude 4.5 Sonnet/Haiku, Claude 4 Sonnet, Claude 3.5/3.7 Sonnet, Claude 3 Opus | API Key | ✅ |
 | **OpenAI** | GPT-4o, GPT-4, GPT-3.5 | API Key | — |
 | **OpenAI Codex** | GPT-5.1 Codex | OAuth | — |
 | **GitHub Copilot** | Copilot models | OAuth | — |
 | **Azure OpenAI** | GPT-4, GPT-3.5 | Azure credentials | — |
 | **DeepSeek** | DeepSeek-V3, DeepSeek-R1, DeepSeek-Coder | API Key | — |
-| **Gemini** | Gemini Pro, Gemini Ultra | API Key | — |
-| **Moonshot** | Kimi K2.5, Kimi K1.5 | API Key | — |
+| **Gemini** | Gemini 2.5 Pro/Flash (and newer) | API Key | — |
+| **Moonshot** | Kimi K2, K2.5, K2-Turbo-Preview, K1.5 | API Key | — |
 | **Zhipu (智谱)** | GLM-4, GLM-3 | API Key | — |
 | **DashScope (通义)** | Qwen2.5, Qwen-Coder | API Key | — |
-| **MiniMax** | MiniMax models | API Key | — |
-| **Mistral** | Mistral Large, Medium, Small | API Key | — |
+| **MiniMax** | MiniMax M2.7 / M3 (and newer) | API Key | — |
+| **Mistral** | Mistral Large, Medium, Small (OpenAI-compatible API) | API Key | — |
 | **Step Fun (阶跃星辰)** | Step models | API Key | — |
 | **xAI** | Grok models | API Key | — |
 | **NVIDIA NIM** | Nemotron and other NVIDIA models | API Key | — |
@@ -308,25 +314,42 @@ MarkBot supports 28 LLM providers out of the box:
 | **HuggingFace** | HuggingFace Inference API | — |
 
 ### OAuth-Based Providers
-| Provider | Description |
-|----------|-------------|
-| **OpenAI Codex** | OpenAI's coding assistant |
-| **GitHub Copilot** | GitHub's AI pair programmer |
+
+The two providers below are listed above as well (in **Direct Providers**); the
+rows here are just a quick reference for their auth model. Both use OAuth
+flows via the `oauth-cli-kit` package — no API key is stored on disk.
+
+| Provider | Backend | Notes |
+|----------|---------|-------|
+| **OpenAI Codex** | OpenAI Responses API (`chatgpt.com/backend-api`) | Default model: `openai-codex/gpt-5.1-codex` |
+| **GitHub Copilot** | OpenAI-compatible (`api.githubcopilot.com`) | Uses GitHub device flow |
+
+### Direct / Bring-Your-Own Endpoint
+
+`custom` is registered as `is_direct=true` — the user supplies the
+`api_base` (and optionally an `api_key`) themselves. It is the recommended
+choice when you have an OpenAI-compatible HTTP endpoint that does not
+match any of the named providers above. Aliases: `custom`, `ollama`,
+`local`, `vllm`, `llamacpp`.
 
 ### Local Deployment
+
+These providers are matched by config key (not by `api_base`) and are
+flagged `is_local=true`. They all speak the OpenAI Chat Completions
+protocol, so you can plug in a `custom` block instead if you prefer.
+
 | Provider | Description |
 |----------|-------------|
-| **Custom** | Any OpenAI-compatible endpoint (Ollama, vLLM, LLamaCPP, etc.) |
 | **vLLM** | High-throughput LLM serving engine |
-| **Ollama** | Local model runner |
-| **OVMS** | OpenVINO Model Server |
+| **Ollama** | Local model runner (default `http://localhost:11434/v1`) |
+| **OVMS** | OpenVINO Model Server (`http://localhost:8000/v3`) |
 
 ### Provider Aliases
 
 Each provider supports alias-based lookup via `find_by_name()`. For example:
 - `anthropic` can also be referenced as `claude`
 - `gemini` accepts `google` or `google-gemini`
-- `custom` covers `ollama`, `local`, `vllm`, `llamacpp`
+- `custom` covers `ollama`, `local`, `vllm`, `llamacpp` (see *Direct / Bring-Your-Own Endpoint* above)
 - `dashscope` accepts `alibaba`, `alibaba-cloud`, `qwen-dashscope`
 
 Provider metadata includes `description` and `signup_url` for guided setup wizards.
@@ -341,7 +364,7 @@ MarkBot uses a YAML configuration file located at `~/.markbot/config.yaml` by de
 agents:
   defaults:
     model_chain:
-      - anthropic/claude-sonnet-4-20250514
+      - anthropic/claude-sonnet-4-5-20250514
       - openai/gpt-4o
       - deepseek/deepseek-chat
     max_tokens: 8192
@@ -831,6 +854,119 @@ Checks include:
 - Channel configuration
 - Workspace integrity
 
+## Deployment
+
+MarkBot can be run in three modes, depending on the use case. All three
+read the same `~/.markbot/config.yaml`, so you can switch modes without
+touching your model/key configuration.
+
+### 1. Interactive CLI (REPL)
+
+Best for local development and one-off sessions.
+
+```bash
+markbot                       # default workspace (~/.markbot/workspace)
+markbot --workspace /path/to/ws
+```
+
+The CLI loads the agent loop, reads the model chain from
+`agents.defaults.model_chain`, and prompts for input in a Rich REPL.
+Press `Ctrl+C` (or send `/stop`) to break out of an in-flight iteration.
+
+### 2. Gateway (background service with channels)
+
+Best for production: long-lived daemon that holds all your chat
+channels (DingTalk / Feishu / QQ / WeChat / Email) and a Heartbeat
+service that watches the workspace for triggers. The daemon is
+controlled by `markbot gateway` and stores its PID under
+`~/.markbot/gateway/`.
+
+```bash
+markbot gateway start             # daemonize (default)
+markbot gateway start --foreground # run in the foreground
+markbot gateway start --port 18790 --workspace /srv/markbot
+markbot gateway status            # health summary + uptime
+markbot gateway stop
+markbot gateway restart
+```
+
+`markbot gateway start` honours the following env vars and config keys:
+
+| Source | Key | Default | Purpose |
+|--------|-----|---------|---------|
+| CLI | `--port` | `18790` | Diagnostic / control port advertised to peers |
+| YAML | `gateway.host` | `0.0.0.0` | Bind address for embedded services |
+| YAML | `gateway.heartbeat.enabled` | `true` | Enable the workspace heartbeat service |
+| YAML | `gateway.heartbeat.interval_s` | `1800` | Heartbeat interval (seconds) |
+| YAML | `channels.<name>.enabled` | `false` | Toggle each channel individually |
+
+Logs are written to `~/.markbot/gateway/gateway.log` (or
+`./markbot-gateway.log` when run in the foreground). The agent loop's
+per-event log lives at `~/.markbot/logs/agent.log`. Use
+`markbot doctor` if the gateway fails to start.
+
+### 3. Web UI server (FastAPI + WebSocket)
+
+Best for self-hosting a single-user chat UI in the browser. The web
+server reuses the same agent loop and tool registry as the gateway,
+but exposes a SPA over a WebSocket channel plus a small REST surface
+(`/api/status`, `/api/sessions`, `/api/skills`, `/api/cron`, …).
+
+```bash
+pip install -e ".[web]"            # install FastAPI + uvicorn
+markbot web                        # default: http://127.0.0.1:9120
+markbot web --host 0.0.0.0 --port 8080
+markbot web --config /etc/markbot/config.yaml --workspace /srv/markbot
+```
+
+Authentication is a single session token that the server generates at
+startup. The CLI prints the URL together with the token on first
+boot — paste the `?token=…` value (or send the
+`x-markbot-session-token` header) to authenticate subsequent
+requests. The token persists for the lifetime of the process; call
+`markbot web` with a fresh restart to rotate it.
+
+The web server reuses the gateway's tool stack (web tools, browser,
+computer use, MCP) and the same `~/.markbot/workspace` directory, so
+skills and memory are shared between modes. To run **gateway + web
+side by side**, start the gateway first, then run `markbot web` on a
+different port.
+
+### Docker / systemd tips
+
+A minimal `Dockerfile` and a `markbot.service` unit are not shipped
+out of the box, but the daemon maps cleanly onto either:
+
+```bash
+# systemd unit (drop into /etc/systemd/system/markbot.service)
+[Service]
+ExecStart=/usr/local/bin/markbot gateway start --foreground
+Restart=on-failure
+User=markbot
+WorkingDirectory=/var/lib/markbot
+Environment=MARKBOT_CONFIG=/etc/markbot/config.yaml
+```
+
+```dockerfile
+# minimal Dockerfile
+FROM python:3.12-slim
+RUN pip install markbot[web,desktop-linux,chroma]
+COPY config.yaml /etc/markbot/config.yaml
+ENV MARKBOT_CONFIG=/etc/markbot/config.yaml
+EXPOSE 9120
+CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120"]
+```
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `MARKBOT_CONFIG` | Override the config file path (default `~/.markbot/config.yaml`) |
+| `MARKBOT_WORKSPACE` | Override the workspace directory |
+| `MARKBOT_COMPUTER_USE_BACKEND` | Force `cua` / `atspi` / `pyautogui` / `noop` |
+| `MARKBOT_CUA_DRIVER_CMD` | Path to a pre-installed `cua-driver` binary |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.yaml`) |
+
 ## Development
 
 ### Project Structure
@@ -838,35 +974,46 @@ Checks include:
 ```
 markbot/
 ├── agent/              # Core agent loop and processing
-│   ├── loop.py         # Main agent processing engine
-│   ├── compact.py      # 4-tier progressive compaction
-│   ├── container.py    # Agent context container
-│   ├── context.py      # Context builder for agent prompts
-│   ├── cost.py         # Token & cost tracking with budget control
-│   ├── stream.py       # Stream filtering (think-tag removal)
-│   ├── tokens.py       # Token estimation
-│   ├── iteration.py    # Iteration runner for agent loop
-│   ├── tool_binder.py  # Tool registration and binding
-│   ├── pipeline/       # Message pipeline middleware
-│   │   ├── engine.py   # Pipeline engine
-│   │   └── middleware.py # Built-in middleware (QuestionResponse, MemoryLifecycle)
-│   ├── subagent/       # Background task delegation
-│   │   ├── capability.py  # CapabilityToken for delegation
-│   │   ├── manager.py     # Subagent manager
-│   │   ├── progress.py    # Progress tracking
-│   │   ├── spawn.py       # Spawn tool
-│   │   └── tools.py       # Check/List subagent tools
-│   ├── mcp/            # MCP protocol support
-│   │   └── manager.py  # MCP connection manager
-│   ├── hooks/          # Agent lifecycle hooks
-│   │   ├── bootstrap.py   # Bootstrap hooks
-│   │   └── compaction.py  # Compaction hooks
-│   └── services/       # Agent services
-│       ├── executor.py    # Tool execution service
-│       └── interaction.py # Interaction logger
+│   ├── loop.py             # Main agent processing engine
+│   ├── iteration.py        # Iteration runner for agent loop
+│   ├── tool_binder.py      # Tool registration and binding
+│   ├── compact.py          # 4-tier progressive compaction
+│   ├── context.py          # Context builder for agent prompts
+│   ├── container.py        # Agent context container
+│   ├── cost.py             # Token & cost tracking with budget control
+│   ├── tokens.py           # Token estimation
+│   ├── tool_output.py      # Tool output offloading + head+tail collapse
+│   ├── stream.py           # Stream filtering (think-tag removal)
+│   ├── stream_scrubber.py  # Stream scrubber for memory-context fencing
+│   ├── anthropic_breakpoints.py # Anthropic cache_control breakpoint strategy
+│   ├── cache_chip.py       # Per-block cache chip / prefix-cache bookkeeping
+│   ├── cache_discipline.py # Cache discipline / TTL policy
+│   ├── cache_protocol.py   # Provider-agnostic cache protocol types
+│   ├── prefix_cache.py     # Cross-provider prefix-cache helpers
+│   ├── llm_response_cache.py # LLM response cache
+│   ├── token_estimate_cache.py # Memoized token estimates
+│   ├── prompt_persist.py   # Persist & restore raw prompt payloads
+│   ├── turn_metadata.py    # Per-turn metadata (cache hits, usage, etc.)
+│   ├── pipeline/           # Message pipeline middleware
+│   │   ├── engine.py       # Pipeline engine
+│   │   └── middleware.py   # Built-in middleware (QuestionResponse, MemoryLifecycle)
+│   ├── subagent/           # Background task delegation
+│   │   ├── capability.py   # CapabilityToken for delegation
+│   │   ├── manager.py      # Subagent manager
+│   │   ├── progress.py     # Progress tracking
+│   │   ├── spawn.py        # Spawn tool
+│   │   └── tools.py        # Check/List subagent tools
+│   ├── mcp/                # MCP protocol support
+│   │   └── manager.py      # MCP connection manager
+│   ├── hooks/              # Agent lifecycle hooks
+│   │   ├── bootstrap.py    # Bootstrap hooks
+│   │   └── compaction.py   # Compaction hooks
+│   └── services/           # Agent services
+│       ├── executor.py     # Tool execution service
+│       └── interaction.py  # Interaction logger
 ├── channels/           # Multi-channel messaging
 │   ├── base.py         # BaseChannel ABC
-│   ├── manager.py      # ChannelManager
+│   ├── manager.py      # ChannelManager (health checks + auto-restart)
 │   ├── discovery.py    # Auto-discovery for built-in + plugins
 │   ├── dingtalk.py     # DingTalk integration
 │   ├── feishu.py       # Feishu/Lark integration
@@ -891,15 +1038,16 @@ markbot/
 │   ├── context_explorer.py # Context catalog/search/load
 │   ├── cron.py         # Cron scheduling
 │   ├── mcp.py          # MCP client tool wrapper
-│   ├── browser.py      # Playwright browser automation
+│   ├── browser.py      # Playwright browser automation (10 tools)
 │   └── computer_use/   # Cross-platform desktop control
-│       ├── tool.py     # ComputerUseTool
-│       ├── backend.py  # Abstract backend interface
-│       ├── cua_backend.py    # macOS cua-driver backend
+│       ├── tool.py             # ComputerUseTool
+│       ├── backend.py          # Abstract backend interface
+│       ├── cua_backend.py      # macOS cua-driver backend
 │       ├── pyautogui_backend.py # Cross-platform pyautogui backend
-│       ├── noop_backend.py   # Testing stub backend
-│       ├── schema.py   # Tool schema definition
-│       └── vision_routing.py # Vision model routing
+│       ├── atspi_backend.py    # Linux AT-SPI a11y backend
+│       ├── noop_backend.py     # Testing stub backend
+│       ├── schema.py           # Tool schema definition
+│       └── vision_routing.py   # Vision model routing
 ├── skills/             # Skill system
 │   ├── core/           # Skill framework
 │   │   ├── loader.py   # Skill loading
@@ -908,6 +1056,7 @@ markbot/
 │   │   ├── guardrail.py # Safety guardrails
 │   │   ├── sandbox.py  # Sandboxed execution
 │   │   ├── config.py   # Config resolution
+│   │   ├── preamble.py # Skill preamble injection
 │   │   ├── manage.py   # Skill management tool
 │   │   ├── tool.py     # Skill tools (list/view)
 │   │   └── helpers.py  # Skill helpers
@@ -929,6 +1078,7 @@ markbot/
 │   ├── base.py         # LLMProvider ABC
 │   ├── registry.py     # ProviderSpec registry (28 providers)
 │   ├── fallback.py     # FallbackManager with circuit breaker
+│   ├── errors.py       # Provider error taxonomy
 │   ├── anthropic.py    # Anthropic native SDK
 │   ├── openai_compat.py # OpenAI-compatible provider
 │   ├── azure_openai.py # Azure OpenAI
@@ -941,18 +1091,23 @@ markbot/
 │   └── validator.py    # Config validation
 ├── memory/             # Memory system
 │   ├── base.py         # BaseMemoryManager ABC
-│   ├── manager.py      # File-based memory manager
+│   ├── manager.py      # Main MemoryManager (file-backed + vector index)
+│   ├── longterm.py     # Long-term vector memory (hybrid semantic search)
+│   ├── consolidation.py # Vector consolidation (dedup, decay, promotion)
 │   ├── provider.py     # MemoryProvider ABC
 │   ├── daily_log.py    # Daily log management
-│   ├── encoder.py      # Embedding encoder
+│   ├── encoder.py      # Encoding helpers
+│   ├── embedder.py     # Layered embedder (openai / sentence-transformers / hashing)
+│   ├── vectorstore.py          # Vector store protocol
+│   ├── vectorstore_factory.py  # Vector store factory (sqlite / chroma)
 │   ├── scanner.py      # Security scanner
 │   ├── fencing.py      # Context fencing
 │   ├── tool.py         # MemoryStore
-│   ├── manager.py      # Main MemoryManager
 │   ├── plugins/        # Memory plugin discovery
 │   │   └── discovery.py # MemoryPluginDiscovery (entry points, naming, manual)
-│   └── providers/      # Memory provider implementations
-│       └── chroma.py   # ChromaDB vector memory provider
+│   ├── providers/      # Memory provider implementations
+│   │   └── chroma.py   # ChromaDB vector memory provider
+│   └── vectorstores/   # Built-in vector store implementations
 ├── bus/                # Event bus infrastructure
 │   ├── events.py       # Event types (28 event types)
 │   ├── queue.py        # MessageBus (inbound/outbound)
@@ -974,20 +1129,40 @@ markbot/
 ├── autopilot/          # Automated task pipeline
 │   ├── service.py      # AutopilotService
 │   ├── store.py        # Task store
-│   ├── tools.py        # Autopilot tools
+│   ├── tools.py        # Autopilot tools (7 tools)
 │   ├── types.py        # Task types
 │   └── verification.py # Verification system
 ├── cli/                # Command-line interface
 │   ├── commands.py     # Main CLI entry point
+│   ├── runtime.py      # Provider/factory wiring used by subcommands
+│   ├── daemon.py       # Gateway daemonization (start/stop/status)
+│   ├── ui.py           # Rich UI helpers + banner
+│   ├── stream.py       # Stream rendering
+│   ├── progress.py     # Progress indicators
+│   ├── onboard.py      # Interactive onboarding
+│   ├── doctor.py       # Diagnostic commands
 │   ├── skills.py       # Skill management commands
 │   ├── autopilot.py    # Autopilot commands
-│   ├── doctor.py       # Diagnostic commands
-│   ├── onboard.py      # Interactive onboarding
 │   ├── models.py       # Model suggestions
-│   ├── stream.py       # Stream rendering
-│   └── slash_commands/ # Slash command routing
-│       ├── router.py   # CommandRouter
-│       └── builtin.py  # Built-in commands
+│   ├── slash_commands/ # Slash command routing
+│   │   ├── router.py   # CommandRouter
+│   │   └── builtin.py  # Built-in commands
+│   └── groups/         # Top-level command groups
+│       ├── agent.py        # `markbot agent` subcommands
+│       ├── channels.py     # `markbot channels` subcommands
+│       ├── config.py       # `markbot config` subcommands
+│       ├── gateway.py      # `markbot gateway` lifecycle
+│       ├── onboard.py      # `markbot onboard` wizard
+│       ├── plugins.py      # `markbot plugins` (skill plugins)
+│       ├── provider.py     # `markbot provider` subcommands
+│       ├── status.py       # `markbot status`
+│       └── web.py          # `markbot web` UI server
+├── web/                # Web UI server (FastAPI)
+│   ├── server.py       # App factory + WebSocket chat
+│   ├── auth.py         # Token-based auth middleware
+│   ├── store.py        # Web session store
+│   ├── routers/        # REST routers (status/config/sessions/...)
+│   └── static/         # Compiled SPA assets
 ├── types/              # Type definitions
 │   ├── exceptions.py   # Custom exceptions
 │   ├── permission.py   # Permission types
@@ -997,11 +1172,15 @@ markbot/
 ├── utils/              # Utility functions
 │   ├── constants.py    # Shared constants
 │   ├── helpers.py      # Helper functions
-│   └── network.py      # Network utilities
+│   ├── tokens.py       # Token utilities
+│   ├── atomic.py       # Atomic file write helpers
+│   ├── ssrf.py         # SSRF guard for outbound HTTP
+│   └── website_policy.py # Per-domain website policy (allow/deny/proxy)
 ├── log/                # Logging
-│   ├── core.py         # Core logging
+│   ├── core.py         # Core logging (loguru)
 │   ├── filter.py       # Log filters
-│   └── format.py       # Log formatters
+│   ├── format.py       # Log formatters
+│   └── redact.py       # Sensitive-data redaction
 └── templates/          # Prompt templates
     ├── SOUL.md         # Agent personality
     ├── TOOLS.md        # Tool descriptions

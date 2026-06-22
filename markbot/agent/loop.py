@@ -433,6 +433,11 @@ class AgentLoop:
 
         The session_key format is ``channel:chat_id``. We parse it to
         route the notification back through the correct channel.
+
+        In-flight tasks are given a grace period to complete before
+        cleanup, so we don't cancel active LLM calls or tool executions
+        mid-flight (which could leave files half-written or sessions
+        unsaved).
         """
         channel = chat_id = session_key
         if ":" in session_key:
@@ -451,27 +456,63 @@ class AgentLoop:
         # except Exception as e:
         #     logger.warning("Failed to publish idle timeout notification: {}", e)
 
+        # Gracefully wait for in-flight tasks before cleaning up.
+        # This prevents cancelling active LLM calls or tool executions
+        # that could leave state inconsistent.
+        tasks = self._active_tasks.get(session_key, [])
+        pending = [t for t in tasks if not t.done()]
+        if pending:
+            logger.info(
+                "Waiting for {} in-flight task(s) to complete for session {} "
+                "(up to 30s grace period)",
+                len(pending), session_key,
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Tasks for session {} did not complete in 30s, cancelling",
+                    session_key,
+                )
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+                # Wait briefly for cancellation to propagate.
+                await asyncio.gather(*pending, return_exceptions=True)
+
         self._cleanup_session_state(session_key)
 
     def _cleanup_session_state(self, session_key: str) -> None:
         """Release resources held by *session_key* after idle timeout.
 
-        Cancels any in-flight tasks, removes session locks, resets the
-        streaming scrubber, and cleans up steer / last-active tracking
-        so the next message from this session starts fresh.
+        Removes session locks, resets the streaming scrubber, evicts
+        memory manager session caches, and cleans up steer / last-active
+        tracking so the next message from this session starts fresh.
+
+        Note: in-flight task cancellation is handled by
+        ``_notify_idle_timeout`` before this method is called.
         """
-        # Cancel active tasks for this session.
-        tasks = self._active_tasks.pop(session_key, None)
-        if tasks:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
+        # Active tasks are already handled by _notify_idle_timeout.
+        # Just pop the list to clear the reference.
+        self._active_tasks.pop(session_key, None)
 
         # Release session-level lock.
         self._session_locks.pop(session_key, None)
 
         # Reset streaming scrubber state for this session.
         self._scrubber_pool.reset(session_key)
+
+        # Evict memory manager per-session caches (summaries, archived
+        # counts).  State is persisted to disk and reloaded on next use.
+        memory_manager = getattr(self, "memory_manager", None)
+        if memory_manager and hasattr(memory_manager, "evict_session_cache"):
+            try:
+                memory_manager.evict_session_cache(session_key)
+            except Exception as e:
+                logger.debug("Failed to evict memory session cache: {}", e)
 
         # Clear steer and idle tracking.
         self._pending_steer.pop(session_key, None)

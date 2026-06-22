@@ -456,10 +456,16 @@ class CustomSpec(ProviderSpec):
 
         # Generic thinking-mode handling — applies to any model whose
         # name matches one of the markers above. We set
-        # ``extra_body.thinking = {"type": "enabled"}`` so the server
+        # ``extra_body.thinking = {"type": "..."}`` so the server
         # doesn't silently default to thinking mode and then reject the
         # next turn for missing ``reasoning_content``. If the user has
         # explicitly disabled reasoning, we mirror that.
+        #
+        # Provider-specific note: MiniMax-M* accepts only
+        # ``{"type": "adaptive"}`` or ``{"type": "disabled"}`` for the
+        # ``thinking`` field.  The DeepSeek-style ``"enabled"`` value is
+        # rejected upstream with HTTP 400.  See debug session
+        # ``markbot-multimodal-chain-fail``.
         if self.model_supports_thinking(
             model,
             extra_markers=extra_thinking_markers,
@@ -468,7 +474,10 @@ class CustomSpec(ProviderSpec):
             enabled = True
             if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
                 enabled = False
-            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            enabled_type = "adaptive" if self._uses_adaptive_thinking(model) else "enabled"
+            extra_body["thinking"] = {
+                "type": enabled_type if enabled else "disabled",
+            }
 
             if enabled and isinstance(reasoning_config, dict):
                 effort = (reasoning_config.get("effort") or "").strip().lower()
@@ -478,6 +487,22 @@ class CustomSpec(ProviderSpec):
                     top_level["reasoning_effort"] = effort
 
         return extra_body, top_level
+
+    @staticmethod
+    def _uses_adaptive_thinking(model: str | None) -> bool:
+        """Return True if *model*'s upstream expects ``thinking.type=adaptive``.
+
+        MiniMax-M* servers reject ``"enabled"`` and accept only
+        ``"adaptive"`` / ``"disabled"``.  Keep this data-driven — extend
+        the marker list as new providers with the same quirk appear.
+        """
+        if not model:
+            return False
+        bare = model.strip().lower().split("/")[-1]
+        for marker in ("minimax-m", "minimax-m2", "minimax-m3"):
+            if marker in bare:
+                return True
+        return False
 
     def fetch_models(
         self,

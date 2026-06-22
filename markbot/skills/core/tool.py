@@ -31,12 +31,14 @@ class SkillTool(BaseTool):
         workspace: Path,
         usage_store: Any = None,
         loader: Any = None,
+        skill_registry: Any = None,
     ):
         self._skill_name = skill_name
         self._script = script
         self._workspace = workspace
         self._usage_store = usage_store
         self._loader = loader
+        self._skill_registry = skill_registry
 
     @property
     def definition(self) -> ToolDefinition:
@@ -90,8 +92,11 @@ class SkillTool(BaseTool):
         if errors:
             return f"Error: {'; '.join(errors)}"
 
-        # Record skill usage
-        if self._usage_store:
+        # Record skill usage — prefer registry.bump_use so in-memory
+        # SkillDefinition stays in sync and stale skills get reactivated.
+        if self._skill_registry is not None:
+            self._skill_registry.bump_use(self._skill_name)
+        elif self._usage_store:
             self._usage_store.bump_use(self._skill_name)
 
         skill_path = self._resolve_skill_path()
@@ -255,7 +260,12 @@ class SkillsListTool(BaseTool):
             desc = skill.description[:100] + "..." if len(skill.description) > 100 else skill.description
             has_scripts = " (has scripts)" if skill.scripts else ""
             usage = f" [views:{skill.view_count} uses:{skill.use_count}]" if skill.view_count or skill.use_count else ""
-            lines.append(f"- **{skill.name}** `[{tag}]`: {desc}{has_scripts}{usage}")
+            state_marker = ""
+            if skill.state == "stale":
+                state_marker = " ⚠️stale"
+            elif skill.state == "archived":
+                state_marker = " 📦archived"
+            lines.append(f"- **{skill.name}** `[{tag}]`: {desc}{has_scripts}{usage}{state_marker}")
 
         lines.append("\nUse `skill_view(name)` to load a skill's full instructions.")
         return "\n".join(lines)

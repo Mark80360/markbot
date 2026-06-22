@@ -17,7 +17,7 @@ from markbot.skills.core.loader import SkillLoader
 from markbot.skills.core.scanner import Finding, ScanResult, SecurityScanner, should_allow
 from markbot.skills.core.tool import SkillTool
 from markbot.skills.usage import SkillUsageStore
-from markbot.types.skill import SkillDefinition
+from markbot.types.skill import SkillDefinition, SkillState
 
 if TYPE_CHECKING:
     from markbot.tools.registry import ToolRegistry
@@ -51,36 +51,123 @@ class SkillRegistry:
         skills = self._loader.load_all()
 
         for skill in skills:
-            if not self._loader.check_requirements(skill):
-                logger.debug("Skill '{}' requirements not met, skipping", skill.name)
-                continue
-
-            trust_level = "builtin" if skill.is_builtin else "workspace"
-            skill_path = self._loader.get_skill_path(skill.name)
-            if skill_path:
-                scanner = SecurityScanner()
-                scan_result = scanner.scan_skill_dir(skill_path, trust_level)
-                allowed, reason = should_allow(scan_result, trust_level)
-                if not allowed:
-                    logger.warning("Skill '{}' blocked by security scan: {}", skill.name, reason)
-                    continue
-                if reason:
-                    logger.info("Skill '{}' scan note: {}", skill.name, reason)
-
-            # Populate usage data from store
-            usage = self._usage_store.get(skill.name)
-            skill.view_count = usage.view_count
-            skill.use_count = usage.use_count
-            skill.last_activity_at = usage.last_activity_at
-
-            self._skills[skill.name] = skill
-
-            if skill.config_vars:
-                config = self._config_resolver.resolve(skill)
-                if config:
-                    self._config_cache[skill.name] = config
+            self._ingest_skill(skill, register_scripts=False)
 
         logger.info("Loaded {} skills", len(self._skills))
+
+    def _ingest_skill(self, skill: SkillDefinition, register_scripts: bool) -> bool:
+        """Run security/config checks and store a skill in the registry.
+
+        Shared by :meth:`load_all` (bulk) and :meth:`load_skill` (hot
+        reload).  Returns True if the skill was accepted, False if it was
+        rejected by the security scan or requirements check.
+
+        When *register_scripts* is True (hot-reload path), each script is
+        registered with the ToolRegistry immediately so the agent can call
+        the newly created tool in the same session.
+        """
+        if not self._loader.check_requirements(skill):
+            logger.debug("Skill '{}' requirements not met, skipping", skill.name)
+            return False
+
+        trust_level = "builtin" if skill.is_builtin else "workspace"
+        skill_path = self._loader.get_skill_path(skill.name)
+        if skill_path:
+            scanner = SecurityScanner()
+            scan_result = scanner.scan_skill_dir(skill_path, trust_level)
+            allowed, reason = should_allow(scan_result, trust_level)
+            if not allowed:
+                logger.warning("Skill '{}' blocked by security scan: {}", skill.name, reason)
+                return False
+            if reason:
+                logger.info("Skill '{}' scan note: {}", skill.name, reason)
+
+        # Populate usage data from store
+        usage = self._usage_store.get(skill.name)
+        skill.view_count = usage.view_count
+        skill.use_count = usage.use_count
+        skill.last_activity_at = usage.last_activity_at
+        skill.state = usage.state
+
+        # Replace any previously-loaded version so edits take effect.
+        self._skills[skill.name] = skill
+
+        if skill.config_vars:
+            config = self._config_resolver.resolve(skill)
+            if config:
+                self._config_cache[skill.name] = config
+
+        if register_scripts and self.tool_registry:
+            # Unregister old script tools for this skill first, in case an
+            # edit changed the script set. SkillTool names are
+            # ``{skill_name}.{script_name}``.  Only match tools whose
+            # remainder after the skill prefix contains no dot, so that
+            # reloading skill "foo" doesn't accidentally unregister tools
+            # belonging to a skill named "foo.bar".
+            prefix = f"{skill.name}."
+            for existing_name in list(self.tool_registry.tool_names):
+                if existing_name.startswith(prefix):
+                    remainder = existing_name[len(prefix):]
+                    if "." not in remainder:
+                        self.tool_registry.unregister(existing_name)
+            for script in skill.scripts:
+                tool = SkillTool(
+                    skill.name, script, self.workspace, self._usage_store,
+                    loader=self._loader, skill_registry=self,
+                )
+                self.tool_registry.register(tool)
+                logger.info("Hot-loaded skill tool: {}", tool.definition.name)
+
+        return True
+
+    def load_skill(self, name: str) -> bool:
+        """Hot-load (or reload) a single skill by name.
+
+        Used after :class:`SkillManageTool` creates or edits a skill so the
+        agent can use the new tool in the same session without a restart.
+        Returns True if the skill was loaded (or reloaded) successfully.
+        """
+        skill_path = self._loader.get_skill_path(name)
+        if not skill_path:
+            logger.debug("load_skill: skill '{}' not found on disk", name)
+            return False
+
+        skill_file = skill_path / "SKILL.md"
+        if not skill_file.exists():
+            logger.debug("load_skill: SKILL.md missing for '{}'", name)
+            return False
+
+        try:
+            skill = self._loader.load(skill_file, is_builtin=False)
+        except Exception as e:
+            logger.warning("load_skill: failed to parse '{}': {}", name, e)
+            return False
+
+        accepted = self._ingest_skill(skill, register_scripts=True)
+        if accepted:
+            logger.info("Skill '{}' hot-loaded", name)
+        return accepted
+
+    def unload_skill(self, name: str) -> bool:
+        """Remove a skill and unregister its script tools.
+
+        Used after :class:`SkillManageTool` deletes a skill so stale
+        tools don't linger in the registry. Returns True if anything was
+        removed.
+        """
+        removed = self._skills.pop(name, None) is not None
+        self._config_cache.pop(name, None)
+        if self.tool_registry:
+            # Skill tools are named ``{skill_name}.{script_name}``, so only
+            # match the prefix. An exact-name match would risk unregistering
+            # an unrelated built-in tool that happens to share the name.
+            prefix = f"{name}."
+            for existing_name in list(self.tool_registry.tool_names):
+                if existing_name.startswith(prefix):
+                    self.tool_registry.unregister(existing_name)
+        if removed:
+            logger.info("Skill '{}' unloaded", name)
+        return removed
 
     def register_script_tools(self) -> None:
         """Register all skill scripts as tools into the associated tool_registry.
@@ -93,7 +180,10 @@ class SkillRegistry:
             return
         for skill in self._skills.values():
             for script in skill.scripts:
-                tool = SkillTool(skill.name, script, self.workspace, self._usage_store, loader=self._loader)
+                tool = SkillTool(
+                    skill.name, script, self.workspace, self._usage_store,
+                    loader=self._loader, skill_registry=self,
+                )
                 self.tool_registry.register(tool)
                 logger.debug("Registered skill tool: {}", tool.definition.name)
 
@@ -347,19 +437,37 @@ class SkillRegistry:
         return self._usage_store
 
     def bump_view(self, skill_name: str) -> None:
-        """Record a skill view event."""
+        """Record a skill view event.
+
+        Viewing a STALE skill reactivates it (transitions back to ACTIVE),
+        since the agent showed interest in it.
+        """
         self._usage_store.bump_view(skill_name)
         skill = self._skills.get(skill_name)
         if skill:
             entry = self._usage_store.get(skill_name)
             skill.view_count = entry.view_count
             skill.last_activity_at = entry.last_activity_at
+            # Reactivate stale skills on view
+            if skill.state == SkillState.STALE:
+                skill.state = SkillState.ACTIVE
+                self._usage_store.set_state(skill_name, SkillState.ACTIVE)
+                logger.info("Skill '{}' reactivated (viewed)", skill_name)
 
     def bump_use(self, skill_name: str) -> None:
-        """Record a skill use (execution) event."""
+        """Record a skill use (execution) event.
+
+        Using a STALE skill reactivates it (transitions back to ACTIVE),
+        since the agent actively executed it.
+        """
         self._usage_store.bump_use(skill_name)
         skill = self._skills.get(skill_name)
         if skill:
             entry = self._usage_store.get(skill_name)
             skill.use_count = entry.use_count
             skill.last_activity_at = entry.last_activity_at
+            # Reactivate stale skills on use
+            if skill.state == SkillState.STALE:
+                skill.state = SkillState.ACTIVE
+                self._usage_store.set_state(skill_name, SkillState.ACTIVE)
+                logger.info("Skill '{}' reactivated (used)", skill_name)

@@ -156,7 +156,12 @@ class ToolBinder:
         if self._code_execution_config is None or self._code_execution_config.enable:
             from markbot.tools.code import CodeExecutionTool
 
-            self._tools.register(CodeExecutionTool())
+            self._tools.register(
+                CodeExecutionTool(
+                    config=self._code_execution_config,
+                    skill_registry=self._skill_registry,
+                )
+            )
 
     def _register_agent_tools(self) -> None:
         """Register tools specific to agent operation."""
@@ -231,7 +236,11 @@ class ToolBinder:
             self._tools.register(SkillViewTool(registry=self._skill_registry))
             self._tools.register(SkillsListTool(registry=self._skill_registry))
             self._skill_registry.register_script_tools()
-        self._tools.register(SkillManageTool(workspace=self._workspace))
+            self._tools.register(
+                SkillManageTool(workspace=self._workspace, skill_registry=self._skill_registry)
+            )
+        else:
+            self._tools.register(SkillManageTool(workspace=self._workspace))
 
     def _register_autopilot_tools(self) -> None:
         """Register autopilot pipeline tools."""

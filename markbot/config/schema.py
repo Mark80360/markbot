@@ -65,6 +65,54 @@ class ModelConfig(Base):
     context_window: int = Field(65536, ge=1024, description="Context window size")
     temperature: float | None = Field(None, ge=0.0, le=2.0, description="Override default temperature")
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(None, description="Reasoning effort level")
+    capabilities: list[str] = Field(
+        default_factory=lambda: ["text"],
+        description=(
+            "Declared model capabilities. Drives capability-aware routing in the fallback chain "
+            "(e.g. per-model image stripping) and selection in feature-specific tool calls. "
+            "Allowed values: text, image (vision input / 识图), image_edit, image_generate, "
+            "video, audio, music, embedding, tool_use."
+        ),
+    )
+
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def _normalize_capabilities(cls, v: Any) -> list[str]:
+        """Accept a comma-separated string, single string, or list; lowercase + dedupe + validate enum.
+
+        String forms are split on commas so users can write
+        ``capabilities: "text, image"`` in YAML / ``.markbot/config.json``
+        without converting to a list first.
+        """
+        allowed = {
+            "text", "image", "image_edit", "image_generate",
+            "video", "audio", "music", "embedding", "tool_use",
+        }
+        if v is None or v == "":
+            return ["text"]
+        if isinstance(v, str):
+            items = [chunk for chunk in v.split(",") if chunk.strip()]
+        elif isinstance(v, list):
+            items = [str(x) for x in v]
+        else:
+            raise ValueError(f"capabilities must be a string or list of strings, got {type(v).__name__}")
+        out: list[str] = []
+        for raw in items:
+            tag = raw.strip().lower()
+            if not tag:
+                continue
+            if tag not in allowed:
+                raise ValueError(
+                    f"Unknown capability {raw!r}; allowed: {sorted(allowed)}"
+                )
+            if tag not in out:
+                out.append(tag)
+        return out or ["text"]
+
+    def has_capability(self, cap: str) -> bool:
+        """Return True if *cap* (case-insensitive) is declared."""
+        want = cap.strip().lower()
+        return any(c.lower() == want for c in self.capabilities)
 
 
 class ProviderConfig(Base):
@@ -383,6 +431,7 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    enabled: bool = True  # If False, server is skipped during connection
 
 class ComputerUseConfig(Base):
     """Computer use (desktop control) tool configuration."""

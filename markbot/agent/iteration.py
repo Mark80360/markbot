@@ -353,8 +353,85 @@ class IterationRunner:
             channel=self.channel,
             chat_id=self.chat_id,
         )
-        if new_summary:
-            logger.info("Memory compaction applied, summary updated")
+        if not new_summary:
+            return
+
+        # Remove messages marked as compacted by the hook, then inject the
+        # summary so the LLM retains the essential context for this turn.
+        # System messages and per-turn internal-context messages are always
+        # preserved — only history messages that the hook summarised are
+        # eligible for removal.
+        def _is_compactable(m: dict) -> bool:
+            if m.get("role") == "system":
+                return False
+            content = m.get("content")
+            if isinstance(content, str) and content.startswith(_INTERNAL_CONTEXT_TAG):
+                return False
+            meta = m.get("metadata")
+            return isinstance(meta, dict) and meta.get("_markbot_compacted", False)
+
+        # Capture original index boundary before removal so we can tell
+        # history messages (index < new_msg_start) from current-turn ones.
+        original_new_msg_start = state.new_msg_start
+
+        before_count = len(state.messages)
+        # Determine which messages are compacted and whether they were
+        # history (loaded from session) or new (produced this turn).
+        history_archived = 0
+        kept: list[dict] = []
+        for i, m in enumerate(state.messages):
+            if _is_compactable(m):
+                if i < original_new_msg_start:
+                    history_archived += 1
+            else:
+                kept.append(m)
+        state.messages = kept
+        removed = before_count - len(state.messages)
+
+        if removed > 0:
+            # Fix orphaned tool_call/tool_result pairs left by removal.
+            state.messages = self.loop._strip_orphan_tool_results(state.messages)
+
+            # Inject the summary as internal context so the LLM still has
+            # the essential information from the removed messages.
+            sys_idx = next(
+                (i for i, m in enumerate(state.messages) if m.get("role") == "system"),
+                None,
+            )
+            if sys_idx is not None:
+                summary_block = (
+                    "[Context Summary — the following messages were compacted "
+                    "to save space. Use this summary, not the original messages.]\n"
+                    + new_summary
+                )
+                self._inject_internal_context(state, sys_idx, summary_block)
+
+            # Recalculate indices and token count for the shrunken context.
+            state.new_msg_start = self.loop._recalc_new_msg_start_after_compact(
+                state.messages, state.initial_count, state.new_msg_start,
+            )
+            state.current_tokens = self._estimate_tokens(state)
+
+            # Persist the archived count so the hook can skip these
+            # messages on the next turn (metadata markers are stripped
+            # by get_history during session save/load).
+            if history_archived > 0:
+                session_key = f"{self.channel}:{self.chat_id}"
+                mm = getattr(self.loop, "memory_manager", None)
+                if mm is not None:
+                    old_count = mm.get_archived_count(session_key=session_key)
+                    mm.set_archived_count(
+                        old_count + history_archived,
+                        session_key=session_key,
+                    )
+
+            logger.info(
+                "Memory compaction applied to current context: "
+                "removed {} messages ({} history), {} remaining, ~{} tokens",
+                removed, history_archived, len(state.messages), state.current_tokens,
+            )
+        else:
+            logger.info("Memory compaction summary stored for next turn")
 
     async def _phase_session_bootstrap(self, state: LoopState) -> None:
         bootstrap = getattr(self.loop, "session_bootstrap", None)
@@ -1191,6 +1268,18 @@ class IterationRunner:
         self, state: LoopState, response: Any
     ) -> IterationResult:
         logger.info("LLM returned final response (no tool calls)")
+
+        # The agent is done calling tools, so any active skill guardrails
+        # have served their purpose. Stop them to avoid leaking guardrail
+        # state across unrelated turns / sessions.
+        if self.loop.guardrail_manager:
+            for skill_name in list(self.loop.guardrail_manager.active_skills):
+                result = self.loop.guardrail_manager.stop_guarding(skill_name)
+                if result and result.violations:
+                    logger.info(
+                        "Guardrail stopped for '{}': {} violation(s)",
+                        skill_name, len(result.violations),
+                    )
 
         if self.on_stream and self.on_stream_end:
             had_content_filter = any(

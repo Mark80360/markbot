@@ -64,7 +64,9 @@ def _build_app():
         from markbot.agent.loop import AgentLoop
         from markbot.bus.queue import MessageBus
         from markbot.config.loader import load_config
-        from markbot.schedule.cron import CronService
+        from markbot.config.paths import get_cron_dir
+        from markbot.schedule.cron import CronJob, CronService
+        from markbot.session.session import SessionManager
 
         config = load_config()
         bus = MessageBus()
@@ -72,8 +74,10 @@ def _build_app():
         from markbot.cli.runtime import make_provider
         provider = make_provider(config)
 
-        cron_store_path = Path(config.workspace_path) / ".cron" / "jobs.json"
+        cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
         cron = CronService(cron_store_path)
+
+        session_manager = SessionManager(config.workspace_path)
 
         loop = AgentLoop(
             ctx_or_bus=bus,
@@ -89,6 +93,7 @@ def _build_app():
             memory_config=config.tools.memory,
             cron_service=cron,
             restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
             timezone=config.agents.defaults.timezone,
@@ -97,6 +102,23 @@ def _build_app():
             warn_threshold_usd=config.budget.warn_threshold_usd,
             budget_config=config.budget if config.budget.enabled else None,
         )
+
+        # Wire up cron job execution callback (mirrors gateway behavior)
+        async def _on_cron_job(job: CronJob) -> str | None:
+            reminder_note = (
+                "[Scheduled Task] Timer finished.\n\n"
+                f"Task '{job.name}' has been triggered.\n"
+                f"Scheduled instruction: {job.payload.message}"
+            )
+            resp = await loop.process_direct(
+                reminder_note,
+                session_key=f"cron:{job.id}",
+                channel=job.payload.channel or "web",
+                chat_id=job.payload.to or "direct",
+            )
+            return resp.content if resp else None
+
+        cron.on_job = _on_cron_job
         return loop
 
     # Register core routers
@@ -123,6 +145,9 @@ def _build_app():
         agent = await _get_agent()
 
         session_id: str | None = None
+        # Shared stop flag across the connection; set by stop_streaming,
+        # checked and cleared by the streaming loop.
+        stop_flag: dict[str, bool] = {"stop": False}
 
         def _ensure_session():
             nonlocal session_id
@@ -145,10 +170,9 @@ def _build_app():
                     data = {"content": raw}
 
                 msg_type = data.get("type", "")
-                _stop_requested = False
 
                 if msg_type == "stop_streaming":
-                    _stop_requested = True
+                    stop_flag["stop"] = True
                     continue
 
                 if msg_type == "new_session":
@@ -196,7 +220,10 @@ def _build_app():
                     await websocket.send_text(json.dumps({"type": "session", "session_id": session_id}))
                     collected_chunks: list[str] = []
                     collected_media: list[str] = []
+                    stop_flag["stop"] = False
                     async def on_stream_edit(delta: str):
+                        if stop_flag["stop"]:
+                            raise RuntimeError("Streaming stopped by user")
                         collected_chunks.append(delta)
                         try:
                             await websocket.send_text(json.dumps({"type": "stream_delta", "delta": delta}))
@@ -278,7 +305,10 @@ def _build_app():
                     user_media_list: list[str] = last_user_msg.get("media", [])
                     collected_chunks = []
                     collected_media = []
+                    stop_flag["stop"] = False
                     async def on_stream_reg(delta: str):
+                        if stop_flag["stop"]:
+                            raise RuntimeError("Streaming stopped by user")
                         collected_chunks.append(delta)
                         try:
                             await websocket.send_text(json.dumps({"type": "stream_delta", "delta": delta}))
@@ -364,8 +394,12 @@ def _build_app():
 
                 collected_chunks: list[str] = []
                 collected_media: list[str] = []
+                # Reset stop flag at the start of a new turn
+                stop_flag["stop"] = False
 
                 async def on_stream(delta: str):
+                    if stop_flag["stop"]:
+                        raise RuntimeError("Streaming stopped by user")
                     collected_chunks.append(delta)
                     try:
                         await websocket.send_text(json.dumps({
@@ -486,7 +520,12 @@ def _build_app():
     @app.get("/api/media/{path:path}")
     async def serve_media(path: str):
         upload_dir = await _ensure_upload_dir()
-        file_path = upload_dir / path
+        file_path = (upload_dir / path).resolve()
+        # Prevent path traversal: ensure resolved path is within upload_dir
+        try:
+            file_path.relative_to(upload_dir.resolve())
+        except ValueError:
+            return FastResponse(status_code=403)
         if not file_path.exists() or not file_path.is_file():
             return FastResponse(status_code=404)
         ext = file_path.suffix.lower()
@@ -524,18 +563,19 @@ def _build_app():
         async def serve_index():
             return _spa_response()
 
-        @app.get("/{full_path:path}")
-        async def serve_spa(full_path: str):
-            if full_path.startswith("api/"):
-                return FastResponse(status_code=404)
-            return _spa_response()
-
+        # Register favicon BEFORE the catch-all SPA route so it isn't shadowed
         @app.get("/favicon.ico")
         async def serve_favicon():
             favicon = WEB_DIST / "favicon.ico"
             if favicon.exists():
                 return FileResponse(favicon)
             return FastResponse(status_code=204)
+
+        @app.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            if full_path.startswith("api/"):
+                return FastResponse(status_code=404)
+            return _spa_response()
     else:
         @app.get("/")
         async def no_frontend():

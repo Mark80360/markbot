@@ -38,10 +38,15 @@ class SkillManageTool(BaseTool):
     successful approaches into reusable skills and keep them up to date.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, skill_registry: Any = None):
         self._workspace = workspace
         self._workspace_skills = workspace / "skills"
         self._usage_store = SkillUsageStore(workspace)
+        # Optional SkillRegistry reference for hot-reloading. When set,
+        # create/edit/patch/write_file/remove_file/delete trigger
+        # load_skill/unload_skill so the agent can use a newly created
+        # tool in the same session — closing the self-extension loop.
+        self._skill_registry = skill_registry
 
     @property
     def definition(self) -> ToolDefinition:
@@ -151,7 +156,22 @@ class SkillManageTool(BaseTool):
             return f"Error: Unknown action '{action}'. Valid actions: {', '.join(dispatch.keys())}"
 
         try:
-            return handler(params)
+            result = handler(params)
+            # Hot-reload the skill registry so newly created/edited tools
+            # are available immediately. Only trigger on success (result
+            # strings starting with "Error:" are skipped). ``delete``
+            # unloads the skill entirely; the other mutating actions
+            # reload it so script changes take effect.
+            if (
+                self._skill_registry is not None
+                and isinstance(result, str)
+                and not result.startswith("Error:")
+            ):
+                if action == "delete":
+                    self._skill_registry.unload_skill(name)
+                elif action in ("create", "edit", "patch", "write_file", "remove_file"):
+                    self._skill_registry.load_skill(name)
+            return result
         except Exception as e:
             logger.exception("skill_manage {} failed for {}", action, name)
             return f"Error: {e}"

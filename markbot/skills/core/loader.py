@@ -60,6 +60,10 @@ class SkillLoader:
         if self.workspace_skills.exists():
             for skill_dir in sorted(self.workspace_skills.iterdir()):
                 if skill_dir.is_dir() and not skill_dir.name.startswith("."):
+                    # Skip the archived directory — it holds skills that
+                    # have been moved out of the active set by the curator.
+                    if skill_dir.name == "archived":
+                        continue
                     try:
                         skill = self._load_from_dir(skill_dir, is_builtin=False)
                         if skill:
@@ -304,6 +308,9 @@ class SkillLoader:
 
     def get_skill_path(self, name: str) -> Path | None:
         """Get the path to a skill directory by name."""
+        if not name or name == "archived":
+            return None
+
         workspace_skill = self.workspace_skills / name
         if workspace_skill.exists():
             return workspace_skill

@@ -57,10 +57,6 @@ class BaseMemoryManager(ABC):
         """Close the memory manager and perform cleanup."""
 
     @abstractmethod
-    async def compact_tool_result(self, **kwargs) -> None:
-        """Compact tool results by truncating large outputs."""
-
-    @abstractmethod
     async def check_context(self, **kwargs) -> tuple:
         """Check context size and determine if compaction is needed.
 
@@ -83,11 +79,16 @@ class BaseMemoryManager(ABC):
         """
 
     @abstractmethod
-    async def summary_memory(self, messages: list, **kwargs) -> str:
-        """Generate a comprehensive summary of the given messages.
+    async def summary_memory(
+        self, messages: list, *, compact_summary: str = "", **kwargs
+    ) -> str:
+        """Extract durable facts from messages and persist to long-term memory.
+
+        If ``compact_summary`` is provided, it is used as input instead of
+        raw messages to avoid a redundant LLM call.
 
         Returns:
-            Comprehensive summary string.
+            Summary string.
         """
 
     @abstractmethod
@@ -141,6 +142,25 @@ class BaseMemoryManager(ABC):
         """
         self._compressed_summary = summary
 
+    def get_archived_count(self, *, session_key: str | None = None) -> int:
+        """Return the number of history messages already archived for this session.
+
+        Implementations should override to add persistence.
+        """
+        return getattr(self, "_archived_count", 0)
+
+    def set_archived_count(
+        self,
+        count: int,
+        *,
+        session_key: str | None = None,
+    ) -> None:
+        """Update the archived message count.
+
+        Implementations may override to add persistence.
+        """
+        self._archived_count = count
+
     # -- Background summary worker (serial FIFO queue) -----------------------
 
     async def _summarize_worker(self) -> None:
@@ -167,7 +187,7 @@ class BaseMemoryManager(ABC):
                 info["status"] = "cancelled"
                 logger.info("Task {} cancelled", task_id)
                 raise
-            except BaseException as e:
+            except Exception as e:
                 info["status"] = "failed"
                 info["error"] = str(e)
                 logger.error("Task {} failed: {}", task_id, e)

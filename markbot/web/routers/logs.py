@@ -10,12 +10,37 @@ router = APIRouter()
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_LOG_DIR = Path.home() / ".markbot" / "logs"
+
+def _candidate_log_dirs() -> list[Path]:
+    """Return candidate log directories in priority order."""
+    from markbot.config.paths import get_gateway_dir, get_logs_dir
+
+    dirs: list[Path] = []
+    try:
+        dirs.append(get_logs_dir())
+    except Exception:
+        pass
+    try:
+        dirs.append(get_gateway_dir())
+    except Exception:
+        pass
+    # Legacy fallback
+    dirs.append(Path.home() / ".markbot" / "logs")
+    return dirs
+
+
+def _resolve_log_dir() -> Path:
+    """Return the first existing log directory, or the primary candidate."""
+    dirs = _candidate_log_dirs()
+    for d in dirs:
+        if d.exists():
+            return d
+    return dirs[0] if dirs else (Path.home() / ".markbot" / "logs")
 
 
 @router.get("/api/logs")
 async def get_logs(file: str = "markbot.log", lines: int = 200, level: str = "", component: str = ""):
-    log_dir = DEFAULT_LOG_DIR
+    log_dir = _resolve_log_dir()
     if not log_dir.exists():
         return JSONResponse({"logs": [], "file": file, "path": str(log_dir)})
     log_file = log_dir / file
@@ -36,7 +61,7 @@ async def get_logs(file: str = "markbot.log", lines: int = 200, level: str = "",
 
 @router.get("/api/logs/files")
 async def list_log_files():
-    log_dir = DEFAULT_LOG_DIR
+    log_dir = _resolve_log_dir()
     if not log_dir.exists():
         return JSONResponse({"files": []})
     files = sorted(f.name for f in log_dir.iterdir() if f.is_file() and f.suffix in (".log", ".txt"))

@@ -123,9 +123,48 @@ class FallbackManager:
 
         return self._providers_cache[cache_key]
 
+    @staticmethod
+    def _adapt_messages_for_model(
+        messages: list[dict[str, Any]],
+        provider_name: str,
+        model_config: ModelConfig | None,
+    ) -> list[dict[str, Any]]:
+        """Return a message list adapted to *model_config*'s declared capabilities.
+
+        Today this handles only the vision downgrade: when the target model
+        does **not** declare the ``image`` capability and the message stream
+        contains ``image_url`` content blocks, replace them with text
+        placeholders so the upstream schema accepts the request. The original
+        ``messages`` list is never mutated; on no-op we return it as-is.
+        """
+        if model_config is not None and model_config.has_capability("image"):
+            return messages
+        if not messages:
+            return messages
+        try:
+            from markbot.providers.base import LLMProvider as _LLMProvider
+            stripped = _LLMProvider._strip_image_content(messages)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("image-strip fallback failed for {}: {}", provider_name, exc)
+            return messages
+        if stripped is None:
+            return messages
+        # The first non-vision model to attempt the chain will be the one
+        # whose attempt fails; we don't pre-strip for the leading models
+        # that *do* support images. The log line below makes the downgrade
+        # visible in `markbot doctor` / log search.
+        logger.info(
+            "Downgraded image content to text placeholder for non-vision model {}",
+            provider_name,
+        )
+        return stripped
+
     # Callable that invokes a specific LLM provider method (chat or chat_stream).
+    # The trailing list[dict] is the per-model message list — already adapted for
+    # the target model's declared capabilities (e.g. images stripped for non-vision
+    # models). The caller MUST forward this list as the ``messages`` argument.
     _ModelCaller = Callable[
-        [LLMProvider, ModelConfig, int, float, str | None],
+        [LLMProvider, ModelConfig, int, float, str | None, list[dict[str, Any]]],
         Awaitable[LLMResponse],
     ]
 
@@ -178,8 +217,19 @@ class FallbackManager:
                 )
                 _reasoning = model_config.reasoning_effort or defaults.reasoning_effort
 
+                # Per-model capability adaptation: strip image content for
+                # models that do not declare the ``image`` capability. This
+                # lets a vision-capable model in the chain keep the image
+                # while a downstream text-only model still has a chance to
+                # process the conversation (with a text placeholder).
+                model_messages = self._adapt_messages_for_model(
+                    messages, provider_name, model_config,
+                )
+
                 logger.info("Trying model: {}", model_ref)
-                response = await caller(provider, model_config, _max_tokens, _temperature, _reasoning)
+                response = await caller(
+                    provider, model_config, _max_tokens, _temperature, _reasoning, model_messages,
+                )
 
                 if response.finish_reason == "error":
                     error_msg = response.content or "Unknown error"
@@ -288,9 +338,10 @@ class FallbackManager:
             max_tok: int,
             temp: float,
             reasoning: str | None,
+            model_messages: list[dict[str, Any]],
         ) -> LLMResponse:
             return await provider.chat(
-                messages=messages,
+                messages=model_messages,
                 tools=tools,
                 model=model_config.name,
                 max_tokens=max_tok,
@@ -318,9 +369,10 @@ class FallbackManager:
             max_tok: int,
             temp: float,
             reasoning: str | None,
+            model_messages: list[dict[str, Any]],
         ) -> LLMResponse:
             return await provider.chat_stream(
-                messages=messages,
+                messages=model_messages,
                 tools=tools,
                 model=model_config.name,
                 max_tokens=max_tok,

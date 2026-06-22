@@ -261,6 +261,21 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
                 console.print(f"[green]✓[/green] Dream: cron={dream_cron}")
 
             await heartbeat.start()
+
+            # Start the skill curator for lifecycle management
+            # (auto-archive stale skills, evaluate quality).
+            curator = None
+            if agent.skill_registry is not None:
+                from markbot.skills.curator import CuratorService
+                curator = CuratorService(
+                    workspace=config.workspace_path,
+                    skill_registry=agent.skill_registry,
+                    auto_archive=True,
+                    interval_hours=6,
+                )
+                await curator.start()
+                console.print("[green]✓[/green] Skill curator: interval=6h")
+
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -274,6 +289,8 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         finally:
             if dream_task:
                 dream_task.cancel()
+            if curator:
+                await curator.stop()
             await agent.close_mcp()
             await heartbeat.stop()
             cron.stop()

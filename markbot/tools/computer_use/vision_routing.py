@@ -7,11 +7,15 @@ image content inside a tool_result block.  If it is not, the screenshot
 must be replaced by its ``text_summary`` fallback so the conversation can
 continue without errors.
 
-The routing decision is based on:
+The routing decision is based on (highest priority first):
 1. An explicit config override (``auxiliary.vision.force_text_only``).
-2. A built-in model capability table that records which provider/model
-   combinations accept images in tool results.
-3. A runtime probe of the model chain in the active agent session.
+2. A per-model ``capabilities`` declaration on ``ModelConfig`` —
+   if the active model lists ``"image"`` we keep the image, otherwise
+   we downgrade.  This is the recommended mechanism: it lives next to
+   the rest of the model config in ``.markbot/config.json``.
+3. A built-in model capability table that records which provider/model
+   combinations accept images in tool results (legacy fallback).
+4. A runtime probe of the model chain in the active agent session.
 """
 
 from __future__ import annotations
@@ -110,6 +114,37 @@ def _model_name_supports_vision(model: str) -> Optional[bool]:
     return None
 
 
+def _config_declares_vision(provider: Optional[str], model: Optional[str]) -> Optional[bool]:
+    """Look up the model in the loaded config and check its ``capabilities``.
+
+    Returns True if ``"image"`` is declared, False if the model is found
+    but ``"image"`` is absent, and None when no matching model is found
+    (caller should fall through to the next strategy).
+    """
+    if not provider or not model:
+        return None
+    try:
+        from markbot.config.loader import load_config
+        from markbot.config.schema import ProvidersConfig
+        config = load_config()
+    except Exception:
+        return None
+    if config is None:
+        return None
+    providers = getattr(config, "providers", None)
+    if not isinstance(providers, ProvidersConfig):
+        return None
+    provider_cfg = providers.get_provider(provider)
+    if provider_cfg is None:
+        return None
+    # ``model`` may be the *id* (e.g. "minimax-m3") or the *name* (e.g. "MiniMax-M3").
+    target = model.strip().lower()
+    for m in provider_cfg.models:
+        if m.id.strip().lower() == target or m.name.strip().lower() == target:
+            return m.has_capability("image")
+    return None
+
+
 def should_route_to_text_only(
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -119,8 +154,10 @@ def should_route_to_text_only(
     Decision order:
     1. Session-level override (set by the agent).
     2. Config / env override.
-    3. Provider + model capability lookup.
-    4. Default: False (allow images).
+    3. Per-model ``capabilities`` declaration in config.json (preferred
+       mechanism — colocated with the rest of the model config).
+    4. Built-in provider + model pattern tables (legacy fallback).
+    5. Default: False (allow images).
     """
     if _session_vision_override is not None:
         return _session_vision_override
@@ -128,6 +165,11 @@ def should_route_to_text_only(
     config_override = _check_config_override()
     if config_override is not None:
         return config_override
+
+    # Per-model config declaration is the recommended source of truth.
+    config_vision = _config_declares_vision(provider, model)
+    if config_vision is not None:
+        return not config_vision
 
     if provider:
         provider_vision = _provider_supports_vision(provider)
