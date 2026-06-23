@@ -152,7 +152,9 @@ class CronTool(Tool):
 
         # Build schedule
         delete_after = False
-        if every_seconds:
+        if every_seconds is not None:
+            if every_seconds <= 0:
+                return "Error: every_seconds must be positive"
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
             effective_tz = tz or self._default_timezone
@@ -171,20 +173,25 @@ class CronTool(Tool):
                     return err
                 dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
             at_ms = int(dt.timestamp() * 1000)
+            if at_ms <= int(__import__("time").time() * 1000):
+                return "Error: 'at' time must be in the future"
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
-        job = self._cron.add_job(
-            name=message[:30],
-            schedule=schedule,
-            message=message,
-            deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
-            delete_after_run=delete_after,
-        )
+        try:
+            job = self._cron.add_job(
+                name=message[:30],
+                schedule=schedule,
+                message=message,
+                deliver=True,
+                channel=self._channel,
+                to=self._chat_id,
+                delete_after_run=delete_after,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:

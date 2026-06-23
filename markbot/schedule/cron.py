@@ -113,6 +113,26 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
         except Exception:
             raise ValueError(f"unknown timezone '{schedule.tz}'") from None
 
+    if schedule.kind == "cron":
+        if not schedule.expr:
+            raise ValueError("cron expression is required for cron schedules")
+        try:
+            from croniter import croniter
+
+            croniter(schedule.expr, datetime.now())
+        except Exception as e:
+            raise ValueError(f"invalid cron expression '{schedule.expr}': {e}") from None
+
+    if schedule.kind == "every":
+        if not schedule.every_ms or schedule.every_ms <= 0:
+            raise ValueError("every_ms must be positive for every schedules")
+
+    if schedule.kind == "at":
+        if not schedule.at_ms:
+            raise ValueError("at_ms is required for at schedules")
+        if schedule.at_ms <= _now_ms():
+            raise ValueError("at_ms must be in the future for at schedules")
+
 
 class CronService:
     """Service for managing and executing scheduled jobs."""
@@ -284,13 +304,15 @@ class CronService:
             self._timer_task = None
 
     def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+        """Recompute next run times for enabled jobs with missing or past-due schedules."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                # Preserve future schedules; only recompute missing or past-due ones
+                if job.state.next_run_at_ms is None or job.state.next_run_at_ms <= now:
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -334,7 +356,8 @@ class CronService:
         for job in due_jobs:
             await self._execute_job(job)
 
-        self._save_store()
+        if due_jobs:
+            self._save_store()
         self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:

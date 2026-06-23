@@ -9,9 +9,28 @@ from starlette.responses import JSONResponse
 
 router = APIRouter()
 
+# Shared CronService instance set by the web server on startup.
+# When set, all router endpoints operate on the same in-memory store as the
+# running agent loop, avoiding data races between the router and the timer.
+_shared_cron_service = None
+
+
+def set_cron_service(svc) -> None:
+    """Inject the shared CronService (called by web server after agent loop creation)."""
+    global _shared_cron_service
+    _shared_cron_service = svc
+
 
 def _get_cron_service():
-    """Get the CronService instance pointing to the persistent store."""
+    """Get the CronService instance.
+
+    Returns the shared instance when available (so that router operations and
+    the agent loop's timer operate on the same in-memory store). Falls back to
+    constructing a standalone instance pointing at the persistent store.
+    """
+    if _shared_cron_service is not None:
+        return _shared_cron_service
+
     from markbot.config.loader import load_config
     from markbot.config.paths import get_cron_dir
     from markbot.schedule.cron import CronService
@@ -136,11 +155,12 @@ async def update_cron_job(job_id: str, data: CronUpdate):
             job.payload.message = data.command
             changed = True
         if data.schedule is not None or data.tz is not None:
-            from markbot.schedule.cron import CronSchedule, _compute_next_run, _now_ms
+            from markbot.schedule.cron import CronSchedule, _compute_next_run, _now_ms, _validate_schedule_for_add
             new_expr = data.schedule if data.schedule is not None else (job.schedule.expr or "")
             new_tz = data.tz if data.tz is not None else job.schedule.tz
-            # Validate cron expression before applying
             new_schedule = CronSchedule(kind="cron", expr=new_expr, tz=new_tz)
+            # Validate cron expression and timezone before applying
+            _validate_schedule_for_add(new_schedule)
             job.schedule = new_schedule
             # Recompute next run for the new schedule
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms()) if job.enabled else None

@@ -105,20 +105,41 @@ def _build_app():
 
         # Wire up cron job execution callback (mirrors gateway behavior)
         async def _on_cron_job(job: CronJob) -> str | None:
+            from markbot.tools.cron import CronTool
+
             reminder_note = (
                 "[Scheduled Task] Timer finished.\n\n"
                 f"Task '{job.name}' has been triggered.\n"
                 f"Scheduled instruction: {job.payload.message}"
             )
-            resp = await loop.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "web",
-                chat_id=job.payload.to or "direct",
-            )
-            return resp.content if resp else None
+
+            # Prevent cron jobs from recursively scheduling new jobs
+            cron_tool = loop.tools.get("cron")
+            cron_token = None
+            if isinstance(cron_tool, CronTool):
+                cron_token = cron_tool.set_cron_context(True)
+            try:
+                resp = await loop.process_direct(
+                    reminder_note,
+                    session_key=f"cron:{job.id}",
+                    channel=job.payload.channel or "web",
+                    chat_id=job.payload.to or "direct",
+                )
+            finally:
+                if isinstance(cron_tool, CronTool) and cron_token is not None:
+                    cron_tool.reset_cron_context(cron_token)
+            return resp.content if resp else ""
 
         cron.on_job = _on_cron_job
+
+        # Start the cron timer so scheduled jobs actually fire in web mode
+        await cron.start()
+
+        # Share the cron service with the router so API operations use the
+        # same in-memory store as the timer (avoids data races).
+        from markbot.web.routers.cron import set_cron_service
+        set_cron_service(cron)
+
         return loop
 
     # Register core routers
