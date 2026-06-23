@@ -108,52 +108,64 @@ _backend_lock = threading.Lock()
 _backend: Optional[ComputerUseBackend] = None
 
 
-def _get_backend() -> ComputerUseBackend:
+def _select_backend(config: Any = None) -> ComputerUseBackend:
+    """Instantiate a backend WITHOUT starting it.
+
+    Used by ``is_enabled`` to probe availability without spawning subprocesses
+    (cua-driver MCP server) or stealing the cursor. The caller is responsible
+    for calling ``start()`` if it intends to actually use the backend.
+    """
+    env_name = os.environ.get("MARKBOT_COMPUTER_USE_BACKEND", "").lower().strip()
+    cfg_name = ""
+    if config is not None:
+        cfg_name = (getattr(config, "backend", "") or "").lower().strip()
+    # Env var overrides config (useful for CI / debugging overrides).
+    backend_name = env_name or cfg_name
+
+    if backend_name == "noop":
+        from markbot.tools.computer_use.noop_backend import NoopBackend
+        return NoopBackend()
+    if backend_name == "pyautogui":
+        from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
+        return PyAutoGUIBackend()
+    if backend_name in {"cua", "cua-driver", "atspi", ""}:
+        if sys.platform == "darwin":
+            from markbot.tools.computer_use.cua_backend import (
+                CuaDriverBackend,
+                cua_driver_binary_available,
+            )
+            if cua_driver_binary_available():
+                return CuaDriverBackend()
+            from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
+            return PyAutoGUIBackend()
+        if sys.platform == "linux":
+            # Linux: prefer AT-SPI (element targeting with real bounds),
+            # fall back to pyautogui if pyatspi / at-spi2 registry is
+            # unavailable. Explicit atspi + unavailability = hard error.
+            from markbot.tools.computer_use.atspi_backend import _probe_pyatspi
+            atspi_ok = _probe_pyatspi()
+            if atspi_ok:
+                from markbot.tools.computer_use.atspi_backend import AtspiBackend
+                return AtspiBackend()
+            if backend_name == "atspi":
+                raise RuntimeError(
+                    "MARKBOT_COMPUTER_USE_BACKEND=atspi but pyatspi or the "
+                    "at-spi2 registry is unavailable (install python3-pyatspi "
+                    "and ensure an at-spi session bus is running)"
+                )
+            from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
+            return PyAutoGUIBackend()
+        from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
+        return PyAutoGUIBackend()
+    raise RuntimeError(f"Unknown MARKBOT_COMPUTER_USE_BACKEND={backend_name!r}")
+
+
+def _get_backend(config: Any = None) -> ComputerUseBackend:
+    """Return the cached backend, instantiating and starting it on first call."""
     global _backend
     with _backend_lock:
         if _backend is None:
-            backend_name = os.environ.get("MARKBOT_COMPUTER_USE_BACKEND", "").lower().strip()
-
-            if backend_name == "noop":
-                from markbot.tools.computer_use.noop_backend import NoopBackend
-                _backend = NoopBackend()
-            elif backend_name == "pyautogui":
-                from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
-                _backend = PyAutoGUIBackend()
-            elif backend_name in {"cua", "cua-driver", "atspi", ""}:
-                if sys.platform == "darwin":
-                    from markbot.tools.computer_use.cua_backend import (
-                        CuaDriverBackend,
-                        cua_driver_binary_available,
-                    )
-                    if cua_driver_binary_available():
-                        _backend = CuaDriverBackend()
-                    else:
-                        from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
-                        _backend = PyAutoGUIBackend()
-                elif sys.platform == "linux":
-                    # Linux: prefer AT-SPI (element targeting with real bounds),
-                    # fall back to pyautogui if pyatspi / at-spi2 registry is
-                    # unavailable. Explicit atspi + unavailability = hard error.
-                    from markbot.tools.computer_use.atspi_backend import _probe_pyatspi
-                    atspi_ok = _probe_pyatspi()
-                    if atspi_ok:
-                        from markbot.tools.computer_use.atspi_backend import AtspiBackend
-                        _backend = AtspiBackend()
-                    elif backend_name == "atspi":
-                        raise RuntimeError(
-                            "MARKBOT_COMPUTER_USE_BACKEND=atspi but pyatspi or the "
-                            "at-spi2 registry is unavailable (install python3-pyatspi "
-                            "and ensure an at-spi session bus is running)"
-                        )
-                    else:
-                        from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
-                        _backend = PyAutoGUIBackend()
-                else:
-                    from markbot.tools.computer_use.pyautogui_backend import PyAutoGUIBackend
-                    _backend = PyAutoGUIBackend()
-            else:
-                raise RuntimeError(f"Unknown MARKBOT_COMPUTER_USE_BACKEND={backend_name!r}")
+            _backend = _select_backend(config)
             if _backend.is_available():
                 _backend.start()
         return _backend
@@ -170,19 +182,32 @@ def reset_backend_for_tests() -> None:
         _backend = None
 
 
+_DEFAULT_MAX_ELEMENTS = 100
+_MAX_ALLOWED_MAX_ELEMENTS = 1000
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
-def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
-    capture_after = bool(args.get("capture_after"))
+def _dispatch(
+    backend: ComputerUseBackend,
+    action: str,
+    args: Dict[str, Any],
+    capture_after_default: bool = True,
+    max_elements_default: int = _DEFAULT_MAX_ELEMENTS,
+) -> Any:
+    # ``capture_after`` defaults to the tool-level config value when the model
+    # doesn't explicitly request or suppress it.
+    ca_raw = args.get("capture_after")
+    capture_after = bool(ca_raw) if ca_raw is not None else capture_after_default
 
     if action == "capture":
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
         cap = backend.capture(mode=mode, app=args.get("app"))
-        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
+        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements"), max_elements_default))
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -281,19 +306,15 @@ def _text_response(res: ActionResult) -> str:
     return json.dumps(payload)
 
 
-_DEFAULT_MAX_ELEMENTS = 100
-_MAX_ALLOWED_MAX_ELEMENTS = 1000
-
-
-def _coerce_max_elements(value: Any) -> int:
+def _coerce_max_elements(value: Any, default: int = _DEFAULT_MAX_ELEMENTS) -> int:
     if value is None:
-        return _DEFAULT_MAX_ELEMENTS
+        return default
     try:
         n = int(value)
     except (TypeError, ValueError):
-        return _DEFAULT_MAX_ELEMENTS
+        return default
     if n < 1:
-        return _DEFAULT_MAX_ELEMENTS
+        return default
     if n > _MAX_ALLOWED_MAX_ELEMENTS:
         return _MAX_ALLOWED_MAX_ELEMENTS
     return n
@@ -474,6 +495,41 @@ class ComputerUseTool(Tool):
     def __init__(self, config: Any = None) -> None:
         self._config = config
 
+        # Merge module-level safety defaults with config-provided extras so
+        # users can extend (but never shrink) the blocked lists via YAML.
+        self._blocked_key_combos: set = set(_BLOCKED_KEY_COMBOS)
+        self._blocked_type_patterns: list = list(_BLOCKED_TYPE_PATTERNS)
+        self._max_elements_default: int = _DEFAULT_MAX_ELEMENTS
+        self._capture_after_default: bool = True
+
+        if config is not None:
+            for combo_str in getattr(config, "blocked_key_combos", None) or []:
+                self._blocked_key_combos.add(_canon_key_combo(combo_str))
+            for pat_str in getattr(config, "blocked_type_patterns", None) or []:
+                try:
+                    self._blocked_type_patterns.append(re.compile(pat_str, re.IGNORECASE))
+                except re.error:
+                    logger.warning("invalid blocked_type_patterns regex: %r", pat_str)
+            cfg_max = getattr(config, "max_elements", None)
+            if cfg_max is not None:
+                self._max_elements_default = max(10, min(_MAX_ALLOWED_MAX_ELEMENTS, int(cfg_max)))
+            self._capture_after_default = bool(getattr(config, "capture_after_actions", True))
+
+    # ── Instance-level safety checks (config-aware) ──────────────────
+
+    def _is_blocked_type(self, text: str) -> Optional[str]:
+        for pat in self._blocked_type_patterns:
+            if pat.search(text):
+                return pat.pattern
+        return None
+
+    def _is_blocked_key_combo(self, keys: str) -> Optional[list]:
+        combo = _canon_key_combo(keys)
+        for blocked in self._blocked_key_combos:
+            if blocked.issubset(combo):
+                return sorted(blocked)
+        return None
+
     @property
     def name(self) -> str:
         return "computer_use"
@@ -488,8 +544,14 @@ class ComputerUseTool(Tool):
 
     @property
     def is_enabled(self) -> bool:
+        """Probe backend availability WITHOUT starting it.
+
+        ``_select_backend`` only instantiates the backend object; it does not
+        call ``start()``, so no cua-driver subprocess is spawned and no cursor
+        is grabbed just because the tool registry asked ``is_enabled``.
+        """
         try:
-            backend = _get_backend()
+            backend = _select_backend(self._config)
             return backend.is_available()
         except Exception:
             return False
@@ -509,7 +571,7 @@ class ComputerUseTool(Tool):
 
         if action == "type":
             text = params.get("text", "")
-            pat = _is_blocked_type(text)
+            pat = self._is_blocked_type(text)
             if pat:
                 return PermissionDecision(
                     behavior="deny",
@@ -518,13 +580,12 @@ class ComputerUseTool(Tool):
 
         if action == "key":
             keys = params.get("keys", "")
-            combo = _canon_key_combo(keys)
-            for blocked in _BLOCKED_KEY_COMBOS:
-                if blocked.issubset(combo) and len(blocked) <= len(combo):
-                    return PermissionDecision(
-                        behavior="deny",
-                        reason=f"blocked key combo: {sorted(blocked)}",
-                    )
+            blocked = self._is_blocked_key_combo(keys)
+            if blocked:
+                return PermissionDecision(
+                    behavior="deny",
+                    reason=f"blocked key combo: {blocked}",
+                )
 
         return await super().check_permission(params, context)
 
@@ -536,7 +597,7 @@ class ComputerUseTool(Tool):
 
         if action == "type":
             text = params.get("text", "")
-            pat = _is_blocked_type(text)
+            pat = self._is_blocked_type(text)
             if pat:
                 return json.dumps({
                     "error": f"blocked pattern in type text: {pat!r}",
@@ -545,16 +606,15 @@ class ComputerUseTool(Tool):
 
         if action == "key":
             keys = params.get("keys", "")
-            combo = _canon_key_combo(keys)
-            for blocked in _BLOCKED_KEY_COMBOS:
-                if blocked.issubset(combo) and len(blocked) <= len(combo):
-                    return json.dumps({
-                        "error": f"blocked key combo: {sorted(blocked)}",
-                        "hint": "Destructive system shortcuts are hard-blocked.",
-                    })
+            blocked = self._is_blocked_key_combo(keys)
+            if blocked:
+                return json.dumps({
+                    "error": f"blocked key combo: {blocked}",
+                    "hint": "Destructive system shortcuts are hard-blocked.",
+                })
 
         try:
-            backend = _get_backend()
+            backend = _get_backend(self._config)
         except Exception as e:
             return json.dumps({
                 "error": f"computer_use backend unavailable: {e}",
@@ -565,7 +625,10 @@ class ComputerUseTool(Tool):
             # Backends are synchronous (cua-driver's _AsyncBridge.run blocks up
             # to 30s). Run dispatch in a worker thread so the agent event loop
             # is not frozen during a single capture/action.
-            return await asyncio.to_thread(_dispatch, backend, action, params)
+            return await asyncio.to_thread(
+                _dispatch, backend, action, params,
+                self._capture_after_default, self._max_elements_default,
+            )
         except Exception as e:
             logger.exception("computer_use %s failed", action)
             return json.dumps({"error": f"{action} failed: {e}"})
@@ -576,8 +639,9 @@ class ComputerUseTool(Tool):
 # ---------------------------------------------------------------------------
 
 def check_computer_use_requirements() -> bool:
+    """Probe whether a computer_use backend is available (without starting it)."""
     try:
-        backend = _get_backend()
+        backend = _select_backend()
         return backend.is_available()
     except Exception:
         return False

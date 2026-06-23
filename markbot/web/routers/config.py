@@ -24,9 +24,8 @@ async def get_config():
 
 @router.get("/api/config/raw")
 async def get_raw_config():
-    from pathlib import Path
-    from markbot.config.defaults import default_config_path
-    p = default_config_path()
+    from markbot.config.loader import get_config_path
+    p = get_config_path()
     if p and p.exists():
         return JSONResponse({"raw": p.read_text(encoding="utf-8")})
     return JSONResponse({"raw": ""})

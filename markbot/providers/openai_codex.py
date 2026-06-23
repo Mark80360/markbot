@@ -22,9 +22,18 @@ DEFAULT_ORIGINATOR = "markbot"
 class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
-        super().__init__(api_key=None, api_base=None)
+    def __init__(
+        self,
+        default_model: str = "openai-codex/gpt-5.1-codex",
+        api_key: str | None = None,
+        api_base: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        spec: Any = None,
+    ):
+        super().__init__(api_key=api_key, api_base=api_base)
         self.default_model = default_model
+        self.extra_headers = extra_headers or {}
+        self._spec = spec
 
     async def _call_codex(
         self,

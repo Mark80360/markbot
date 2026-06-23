@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 
 from markbot import __logo__
-from markbot.cli.ui import console, markbot_banner
+from markbot.cli.ui import console, make_section_helpers, markbot_banner
 
 app = typer.Typer(help="Manage channels")
 
@@ -15,8 +15,6 @@ app = typer.Typer(help="Manage channels")
 @app.command("status")
 def status():
     """Show channel status."""
-    from rich.text import Text
-
     from markbot.channels.discovery import discover_all
     from markbot.config.loader import load_config
 
@@ -24,21 +22,7 @@ def status():
 
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -49,6 +33,12 @@ def status():
     enabled_count = 0
 
     for name, cls in sorted(all_channels.items()):
+        try:
+            display_name = cls.display_name
+        except Exception as exc:
+            kv(name, f"[red]✗ load failed: {exc}[/red]")
+            continue
+
         section_cfg = getattr(config.channels, name, None)
         if section_cfg is None:
             enabled = False
@@ -59,9 +49,9 @@ def status():
 
         if enabled:
             enabled_count += 1
-            kv(cls.display_name, "[green]● Enabled[/green]")
+            kv(display_name, "[green]● Enabled[/green]")
         else:
-            kv(cls.display_name, "[dim]○ Disabled[/dim]")
+            kv(display_name, "[dim]○ Disabled[/dim]")
 
     divider()
 
@@ -142,8 +132,6 @@ def login(
     force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
 ):
     """Authenticate with a channel via QR code or other interactive login."""
-    from rich.text import Text
-
     from markbot.channels.discovery import discover_all
     from markbot.config.loader import load_config
 
@@ -162,21 +150,7 @@ def login(
 
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -188,7 +162,11 @@ def login(
     console.print()
 
     channel_cls = all_channels[channel_name]
-    channel = channel_cls(channel_cfg, bus=None)
+    # Pass a real MessageBus so channels that publish events during login
+    # (e.g. status updates) don't NPE on bus.publish_*.
+    from markbot.bus.queue import MessageBus
+    bus = MessageBus()
+    channel = channel_cls(channel_cfg, bus=bus)
 
     success = asyncio.run(channel.login(force=force))
 

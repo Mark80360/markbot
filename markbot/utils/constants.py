@@ -129,22 +129,35 @@ BOOTSTRAP_FILES: list[str] = [
 ]
 
 # Template files that should exist on disk (excludes conditionally-used files
-# like BOOTSTRAP.md, HEARTBEAT.md, USER.md which are intentionally not in BOOTSTRAP_FILES)
-_TEMPLATE_DIR_NAMES: frozenset[str] = frozenset({
+# like BOOTSTRAP.md, HEARTBEAT.md which are intentionally not in BOOTSTRAP_FILES)
+_TEMPLATE_ESSENTIAL: frozenset[str] = frozenset({
     "AGENTS.md", "SOUL.md", "TOOLS.md", MEMORY_FILENAME,
     USER_FILENAME, "ARCHITECTURE.md",
 })
 
+# Conditional/reference templates that exist on disk but are not loaded into
+# the system prompt automatically (loaded on-demand or per-event).
+_TEMPLATE_CONDITIONAL: frozenset[str] = frozenset({
+    "BOOTSTRAP.md",               # deleted after first-run onboarding
+    "HEARTBEAT.md",               # heartbeat task file
+    "clean-state-checklist.md",   # reference checklist
+    "evaluator-rubric.md",        # reference rubric
+    "quality-document.md",        # reference quality snapshot
+})
+
+# All known template .md files (used by check_template_sync to detect drift).
+_ALL_TEMPLATE_FILES: frozenset[str] = _TEMPLATE_ESSENTIAL | _TEMPLATE_CONDITIONAL
+
 
 def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
-    """Cross-check BOOTSTRAP_FILES constant against the templates directory.
+    """Cross-check template constants against the templates directory.
 
     Returns a list of warning messages for any discrepancies found:
-    - Template files in the directory that are not in BOOTSTRAP_FILES
-    - Entries in BOOTSTRAP_FILES that have no corresponding template file
+    - Template files on disk that are not in the known allowlist (drift)
+    - Essential template files missing from disk
 
     This function is called at startup to catch drift between the
-    hardcoded constant and the actual template files on disk.
+    hardcoded constants and the actual template files on disk.
     """
     from pathlib import Path
 
@@ -161,22 +174,21 @@ def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
         if p.is_file() and p.suffix == ".md":
             disk_files.add(p.name)
 
-    known = set(BOOTSTRAP_FILES)
-
-    missing_from_constant = disk_files - known
-    if missing_from_constant:
+    unexpected_on_disk = disk_files - _ALL_TEMPLATE_FILES
+    if unexpected_on_disk:
         warnings.append(
-            f"Template file(s) on disk but not in BOOTSTRAP_FILES: "
-            f"{sorted(missing_from_constant)}. "
-            f"Consider adding them if they should be loaded at startup."
+            f"Template file(s) on disk but not in known template sets: "
+            f"{sorted(unexpected_on_disk)}. "
+            f"Either add them to _TEMPLATE_CONDITIONAL in constants.py, "
+            f"or remove them from the templates directory."
         )
 
-    missing_from_disk = known - disk_files
-    if missing_from_disk:
+    missing_essential = _TEMPLATE_ESSENTIAL - disk_files
+    if missing_essential:
         warnings.append(
-            f"BOOTSTRAP_FILES entry(s) with no template on disk: "
-            f"{sorted(missing_from_disk)}. "
-            f"Consider removing them or creating the template files."
+            f"Essential template file(s) missing from disk: "
+            f"{sorted(missing_essential)}. "
+            f"These are required for the system to function."
         )
 
     return warnings

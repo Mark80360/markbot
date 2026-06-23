@@ -136,7 +136,11 @@ class TaskTracker:
             registry = self._load_registry()
             for t_dict in registry.tasks:
                 if t_dict.get("id") == task_id:
-                    return Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                    task = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                    # Populate cache on miss so subsequent reads avoid disk I/O
+                    if self._cache is not None:
+                        self._cache[task_id] = task
+                    return task
             return None
 
     def _save_task(self, task: Task) -> None:

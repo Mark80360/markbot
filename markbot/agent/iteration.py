@@ -1105,8 +1105,8 @@ class IterationRunner:
                     self.loop.guardrail_manager.start_guarding(skill_def)
                     logger.info("Guardrail activated for skill: {}", skill_name)
 
-            results = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
-            for gr in results:
+            guardrail_results = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
+            for gr in guardrail_results:
                 for v in gr.violations:
                     logger.warning(
                         "Guardrail violation [{}] {} (tool: {}, skill: {})",

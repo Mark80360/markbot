@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from markbot.session.task_tracker import TaskTracker
     from markbot.skills import SkillRegistry
     from markbot.skills.core.guardrail import SkillGuardrailManager
-    from markbot.tools.memory_tools import MemorySearchTool
+    from markbot.tools.memory import MemorySearchTool
     from markbot.tools.message import MessageTool
     from markbot.tools.question import AskUserQuestionTool
     from markbot.tools.registry import ToolRegistry

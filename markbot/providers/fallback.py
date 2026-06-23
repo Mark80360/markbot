@@ -63,6 +63,7 @@ class FallbackManager:
         self._circuits: dict[str, CircuitState] = {}
         self._circuit_threshold = self.DEFAULT_CIRCUIT_THRESHOLD
         self._circuit_cooldown = self.DEFAULT_CIRCUIT_COOLDOWN
+        self._half_open_probes: set[str] = set()
 
     def _get_circuit(self, provider_name: str) -> CircuitState:
         if provider_name not in self._circuits:
@@ -77,14 +78,21 @@ class FallbackManager:
             elapsed = time.monotonic() - circuit.last_failure_time
             if elapsed >= self._circuit_cooldown:
                 circuit.state = "half-open"
+                self._half_open_probes.discard(provider_name)
                 logger.info("{} half-open (cooldown elapsed)", provider_name)
-                return True
-            logger.warning(
-                "{} circuit open, skipping "
-                "(failures={}, retry in {:.0f}s)",
-                provider_name, circuit.failure_count, self._circuit_cooldown - elapsed,
-            )
+                # fall through to half-open handling below
+            else:
+                logger.warning(
+                    "{} circuit open, skipping "
+                    "(failures={}, retry in {:.0f}s)",
+                    provider_name, circuit.failure_count, self._circuit_cooldown - elapsed,
+                )
+                return False
+        # half-open: allow only one probe request at a time
+        if provider_name in self._half_open_probes:
+            logger.warning("{} circuit half-open, probe in flight, skipping", provider_name)
             return False
+        self._half_open_probes.add(provider_name)
         return True
 
     def _record_success(self, provider_name: str) -> None:
@@ -93,11 +101,13 @@ class FallbackManager:
             logger.info("{} circuit closed (recovered)", provider_name)
         circuit.failure_count = 0
         circuit.state = "closed"
+        self._half_open_probes.discard(provider_name)
 
     def _record_failure(self, provider_name: str) -> None:
         circuit = self._get_circuit(provider_name)
         circuit.failure_count += 1
         circuit.last_failure_time = time.monotonic()
+        self._half_open_probes.discard(provider_name)
         if circuit.failure_count >= self._circuit_threshold:
             circuit.state = "open"
             logger.warning(
@@ -258,7 +268,15 @@ class FallbackManager:
                             model_ref, error_msg,
                         )
                     last_error = Exception(error_msg)
-                    self._record_failure(provider_name)
+                    # TRANSIENT errors (429/5xx/timeout) are temporary and
+                    # should not trip the circuit breaker — only persistent
+                    # failures (UNAVAILABLE/UNKNOWN) indicate a real problem.
+                    if response.error_type != ErrorType.TRANSIENT:
+                        self._record_failure(provider_name)
+                    else:
+                        # Still release the half-open probe so the next
+                        # request can retry this provider.
+                        self._half_open_probes.discard(provider_name)
                     continue
 
                 if response.finish_reason == "content_filter":
@@ -340,7 +358,7 @@ class FallbackManager:
             reasoning: str | None,
             model_messages: list[dict[str, Any]],
         ) -> LLMResponse:
-            return await provider.chat(
+            return await provider.chat_with_retry(
                 messages=model_messages,
                 tools=tools,
                 model=model_config.name,
@@ -371,7 +389,7 @@ class FallbackManager:
             reasoning: str | None,
             model_messages: list[dict[str, Any]],
         ) -> LLMResponse:
-            return await provider.chat_stream(
+            return await provider.chat_stream_with_retry(
                 messages=model_messages,
                 tools=tools,
                 model=model_config.name,

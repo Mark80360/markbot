@@ -194,8 +194,26 @@ class ChannelManager:
     async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send a message with retry on failure using exponential backoff.
 
+        Stream delta/end messages are sent without retry to avoid out-of-order
+        delivery, since they are ordered and must arrive in sequence.
+
         Note: CancelledError is re-raised to allow graceful shutdown.
         """
+        # Stream deltas are ordered; retrying would cause out-of-order delivery.
+        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+            try:
+                await self._send_once(channel, msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    "Stream send to {} failed (no retry): {} - {}",
+                    msg.channel,
+                    type(e).__name__,
+                    e,
+                )
+            return
+
         max_attempts = max(self.config.channels.send_max_retries, 1)
 
         for attempt in range(max_attempts):
@@ -284,6 +302,9 @@ class ChannelManager:
                         self._consecutive_failures[name] = (
                             self._consecutive_failures.get(name, 0) + 1
                         )
+                        failures = self._consecutive_failures[name]
+                        if failures >= self._MAX_CONSECUTIVE_FAILURES:
+                            await self._try_restart_channel(name, channel)
 
                 await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
             except asyncio.CancelledError:

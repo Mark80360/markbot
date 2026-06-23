@@ -164,6 +164,11 @@ def tick(
     runtime_config = load_runtime_config(config, str(ws))
     provider = make_provider(runtime_config)
 
+    # Mirror the agent command: pipe TOOL_PROGRESS events into loguru
+    # so streamed tool output is visible in the log file.
+    from markbot.cli.progress import register_progress_subscriber
+    register_progress_subscriber()
+
     from markbot.agent.loop import AgentLoop
     from markbot.bus.queue import MessageBus
     from markbot.schedule.cron import CronService
@@ -189,6 +194,10 @@ def tick(
         mcp_servers=runtime_config.tools.mcp_servers,
         channels_config=runtime_config.channels,
         timezone=runtime_config.agents.defaults.timezone,
+        compaction_config=runtime_config.compaction,
+        max_budget_usd=runtime_config.budget.max_budget_usd if runtime_config.budget.enabled else None,
+        warn_threshold_usd=runtime_config.budget.warn_threshold_usd,
+        budget_config=runtime_config.budget if runtime_config.budget.enabled else None,
     )
 
     service.bind_agent_loop(agent_loop)

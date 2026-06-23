@@ -681,13 +681,6 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
-        return """## Context Explorer
-
-Dynamically load background info when you need more context:
-1. `explore_context_catalog` → see what's available
-2. `search_context(query)` → find relevant entries
-3. `load_context(entry)` → read full content"""
-
     def _load_file_content(self, filename: str) -> str | None:
         """Load a single workspace file, returning content or None."""
         file_path = self.workspace / filename

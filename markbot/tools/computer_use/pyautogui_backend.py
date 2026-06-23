@@ -299,10 +299,14 @@ class PyAutoGUIBackend(ComputerUseBackend):
     # ── Lifecycle ──────────────────────────────────────────────────
 
     def is_available(self) -> bool:
+        """Check availability WITHOUT side effects.
+
+        The Xvfb DISPLAY probe is read-only — it does not mutate the
+        environment. Setting ``DISPLAY=:99`` is deferred to ``start()`` so
+        that merely asking ``is_enabled`` does not alter process state.
+        """
         if sys.platform == "linux" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-            if _probe_xvfb():
-                os.environ["DISPLAY"] = ":99"
-            else:
+            if not _probe_xvfb():
                 return False
         return _check_pyautogui(force=_PYAUTOGUI_AVAILABLE is False)
 
@@ -320,6 +324,11 @@ class PyAutoGUIBackend(ComputerUseBackend):
     def start(self) -> None:
         if self._started:
             return
+        # Set DISPLAY for headless Xvfb sessions (probed in is_available but
+        # deferred here to avoid mutating env from a predicate function).
+        if sys.platform == "linux" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            if _probe_xvfb():
+                os.environ["DISPLAY"] = ":99"
         import pyautogui
         pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05

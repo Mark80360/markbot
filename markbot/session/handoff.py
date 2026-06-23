@@ -318,7 +318,7 @@ def _extract_preferences_from_memory(memory_manager: Any) -> list[str]:
                 for line in content.splitlines():
                     line = line.strip()
                     if line.startswith("- ") or line.startswith("* "):
-                        prefs.append(line.lstrip("-* ").strip())
+                        prefs.append(line[2:].strip())
     except Exception:
         pass
     return prefs[:10]

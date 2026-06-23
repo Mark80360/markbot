@@ -283,7 +283,10 @@ def build_status_content(
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Recurses into subdirectories (e.g. ``agents/``), preserving structure.
+    """
     from importlib.resources import files as pkg_files
     try:
         tpl = pkg_files("markbot") / "templates"
@@ -301,9 +304,16 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
-    for item in tpl.iterdir():
-        if item.name.endswith(".md") and not item.name.startswith("."):
-            _write(item, workspace / item.name)
+    def _sync_dir(src_dir, dest_dir: Path):
+        for item in src_dir.iterdir():
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                _sync_dir(item, dest_dir / item.name)
+            elif item.is_file() and item.name.endswith(".md"):
+                _write(item, dest_dir / item.name)
+
+    _sync_dir(tpl, workspace)
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:

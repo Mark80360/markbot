@@ -42,6 +42,16 @@ def onboard(
     from markbot.config.loader import get_config_path, load_config, save_config, set_config_path
     from markbot.config.schema import Config
 
+    # Reject mutually-exclusive mode flags so we don't silently run two
+    # different interactive flows back-to-back.
+    selected_modes = [m for m in (wizard, guided, defaults) if m]
+    if len(selected_modes) > 1:
+        console.print(
+            "[red]✗ --wizard, --guided, and --defaults are mutually exclusive.[/red] "
+            "Pick exactly one."
+        )
+        raise typer.Exit(2)
+
     markbot_banner()
     console.print()
 

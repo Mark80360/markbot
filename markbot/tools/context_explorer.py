@@ -90,7 +90,7 @@ class ExploreContextCatalogTool(Tool):
                     sections.append(bootstrap_section)
 
             if source_type in ("all", "memory"):
-                memory_section = self._build_memory_catalog()
+                memory_section = await self._build_memory_catalog()
                 if memory_section:
                     sections.append(memory_section)
 
@@ -146,7 +146,7 @@ class ExploreContextCatalogTool(Tool):
 
         return "\n".join(lines)
 
-    def _build_memory_catalog(self) -> str:
+    async def _build_memory_catalog(self) -> str:
         """Build catalog for memory entries."""
         lines = ["## Memory Entries (Persistent Knowledge)\n"]
         lines.append("Contains user preferences, project history, decisions, and learned facts.\n")
@@ -156,15 +156,15 @@ class ExploreContextCatalogTool(Tool):
             return "\n".join(lines)
 
         try:
-            if hasattr(self._memory_manager, 'list_memory_entries'):
-                entries = self._memory_manager.list_memory_entries()
+            if hasattr(self._memory_manager, 'list_memories'):
+                entries = await self._memory_manager.list_memories(limit=10)
 
                 if entries:
                     for idx, entry in enumerate(entries[:10], 1):
-                        title = entry.get('title', 'Untitled')
+                        title = entry.get('content', 'Untitled')[:60]
                         source = entry.get('source', 'memory')
                         date = entry.get('date', '')
-                        preview = entry.get('preview', '')[:80]
+                        preview = entry.get('content', '')[:80]
 
                         lines.append(f"{idx}. **{title}**")
                         lines.append(f"   - Source: {source}")
@@ -321,6 +321,10 @@ class SearchContextTool(Tool):
                 bootstrap_results = self._search_bootstrap(query, max_results)
                 all_results.extend(bootstrap_results)
 
+            if source in ("all", "workspace"):
+                workspace_results = self._search_workspace(query, max_results)
+                all_results.extend(workspace_results)
+
             if len(all_results) > max_results:
                 all_results = all_results[:max_results]
 
@@ -434,6 +438,60 @@ class SearchContextTool(Tool):
 
         return results
 
+    def _search_workspace(self, query: str, max_results: int) -> list[dict]:
+        """Search workspace files (excluding bootstrap files) for keyword matches."""
+        results = []
+
+        if not self.workspace or not self.workspace.exists():
+            return results
+
+        bootstrap_set = set(self.BOOTSTRAP_FILES)
+        query_lower = query.lower()
+
+        # Search a curated set of workspace text files (README, docs, etc.)
+        # rather than walking the entire tree, which could be expensive.
+        candidate_globs = [
+            "README*",
+            "docs/**/*.md",
+            "*.md",
+        ]
+        seen: set[Path] = set()
+
+        for pattern in candidate_globs:
+            for file_path in self.workspace.glob(pattern):
+                if file_path in seen:
+                    continue
+                seen.add(file_path)
+                if file_path.name in bootstrap_set:
+                    continue
+                if not file_path.is_file():
+                    continue
+                try:
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                except Exception:
+                    continue
+
+                if query_lower in content.lower():
+                    idx = content.lower().find(query_lower)
+                    start = max(0, idx - 50)
+                    end = min(len(content), idx + len(query) + 200)
+                    preview = content[start:end]
+
+                    rel = file_path.relative_to(self.workspace)
+                    results.append({
+                        'id': str(rel).replace('/', '_').replace('.', '_'),
+                        'source': 'workspace',
+                        'title': str(rel),
+                        'preview': preview,
+                        'score': None,
+                        'full_content': content,
+                    })
+
+                    if len(results) >= max_results:
+                        return results
+
+        return results
+
 
 class LoadContextTool(Tool):
     """Load full content from a specific context entry.
@@ -505,6 +563,8 @@ class LoadContextTool(Tool):
                 content, source_type = await self._load_memory(context_id)
             else:
                 content, source_type = self._load_bootstrap(context_id)
+                if content is None:
+                    content, source_type = self._load_workspace(context_id)
 
             if content is None:
                 return f"Error: Context entry '{context_id}' not found or unavailable."
@@ -535,11 +595,14 @@ class LoadContextTool(Tool):
             return None, "memory"
 
         try:
-            if hasattr(self._memory_manager, 'list_memory_entries'):
-                entries = self._memory_manager.list_memory_entries()
-                idx = int(context_id.split('_')[1]) if '_' in context_id else 0
+            if hasattr(self._memory_manager, 'list_memories'):
+                entries = await self._memory_manager.list_memories(limit=100)
+                try:
+                    idx = int(context_id.split('_')[1])
+                except (IndexError, ValueError):
+                    return None, "memory"
 
-                if idx < len(entries):
+                if 0 <= idx < len(entries):
                     entry = entries[idx]
                     return entry.get('content', ''), 'memory'
         except Exception as e:
@@ -588,3 +651,39 @@ class LoadContextTool(Tool):
                 logger.warning("Failed to load bootstrap {}: {}", filename, e)
 
         return None, 'bootstrap'
+
+    def _load_workspace(self, context_id: str) -> tuple[str | None, str]:
+        """Load a workspace file by its encoded ID.
+
+        Workspace IDs are generated as ``str(rel).replace('/', '_').replace('.', '_')``,
+        so ``docs/guide.md`` becomes ``docs_guide_md``. Since this encoding is
+        not reversible (``_`` may come from ``/``, ``.``, or the filename),
+        we re-walk the same candidate files as ``_search_workspace`` and match
+        by regenerated ID.
+        """
+        if not self.workspace or not self.workspace.exists():
+            return None, "workspace"
+
+        bootstrap_set = set(getattr(self, 'BOOTSTRAP_FILES', ()))
+        candidate_globs = ["README*", "docs/**/*.md", "*.md"]
+        seen: set[Path] = set()
+
+        for pattern in candidate_globs:
+            for file_path in self.workspace.glob(pattern):
+                if file_path in seen:
+                    continue
+                seen.add(file_path)
+                if file_path.name in bootstrap_set:
+                    continue
+                if not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(self.workspace)
+                file_id = str(rel).replace('/', '_').replace('.', '_')
+                if file_id == context_id:
+                    try:
+                        return file_path.read_text(encoding='utf-8'), 'workspace'
+                    except Exception as e:
+                        logger.warning("Failed to load workspace {}: {}", file_path, e)
+                        break
+
+        return None, "workspace"

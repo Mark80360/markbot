@@ -246,7 +246,7 @@ class SessionBootstrap:
                 message="MCP servers connected.",
             )
 
-        if self.mcp_manager._mcp_servers:
+        if self.mcp_manager.has_servers:
             return BootstrapCheckResult(
                 name="mcp_connectivity",
                 status="warning",

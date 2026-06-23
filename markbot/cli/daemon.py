@@ -21,7 +21,7 @@ from pathlib import Path
 
 import typer
 
-from markbot.cli.ui import console
+from markbot.cli.ui import console, make_section_helpers
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -167,29 +167,13 @@ def terminate_process(pid: int, force: bool = False) -> bool:
 
 def start_daemon(port: int, workspace: str | None, config_path: str | None, verbose: bool) -> None:
     """Start the gateway as a daemon process (cross-platform)."""
-    from rich.text import Text
-
     from markbot.cli.groups.gateway import run_gateway_foreground
 
     ensure_pid_dir()
     paths = _gateway_paths()
     log_file_path = paths["log_file"]
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 

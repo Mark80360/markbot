@@ -315,7 +315,6 @@ class FeishuChannel(BaseChannel):
             str, str
         ] = {}  # message_id -> reaction_id (guaranteed cleanup)
         self._cleaned_reactions: set[str] = set()  # message_ids whose reaction has been removed
-        self._clock_offset: int = 0  # Clock offset (ms) = server_time - local_time
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
 
@@ -1126,8 +1125,44 @@ class FeishuChannel(BaseChannel):
         # Medium plain text without any formatting → post format
         return "post"
 
-    @classmethod
-    def _markdown_to_post(cls, content: str) -> str:
+    @staticmethod
+    def _build_mention_at_text(mentions: list[str | dict]) -> str:
+        """Build <at> tags string for text/markdown messages.
+
+        mentions: list of open_id strings or {"user_id": "...", "name": "..."} dicts.
+        Use "all" to @everyone.
+        """
+        parts: list[str] = []
+        for m in mentions:
+            if isinstance(m, str):
+                uid, name = m, ""
+            else:
+                uid, name = m.get("user_id", ""), m.get("name", "")
+            if not uid:
+                continue
+            # Escape quotes in name to avoid breaking the attribute
+            safe_name = name.replace('"', "") if name else ""
+            parts.append(f'<at user_id="{uid}">{safe_name}</at>')
+        return " ".join(parts)
+
+    @staticmethod
+    def _build_mention_at_elements(mentions: list[str | dict]) -> list[dict]:
+        """Build at-tag elements for rich text (post) messages."""
+        elements: list[dict] = []
+        for m in mentions:
+            if isinstance(m, str):
+                uid, name = m, ""
+            else:
+                uid, name = m.get("user_id", ""), m.get("name", "")
+            if not uid:
+                continue
+            el: dict = {"tag": "at", "user_id": uid}
+            if name:
+                el["user_name"] = name
+            elements.append(el)
+        return elements
+
+    def _markdown_to_post(self, content: str) -> str:
         """Convert markdown content to Feishu post message JSON.
 
         Handles links ``[text](url)`` as ``a`` tags; everything else as ``text`` tags.
@@ -1140,7 +1175,7 @@ class FeishuChannel(BaseChannel):
             elements: list[dict] = []
             last_end = 0
 
-            for m in cls._MD_LINK_RE.finditer(line):
+            for m in self._MD_LINK_RE.finditer(line):
                 # Text before this link
                 before = line[last_end : m.start()]
                 if before:
@@ -1178,6 +1213,8 @@ class FeishuChannel(BaseChannel):
     _FILE_TYPE_MAP = {
         ".opus": "opus",
         ".mp4": "mp4",
+        ".mov": "mp4",
+        ".avi": "mp4",
         ".pdf": "pdf",
         ".doc": "doc",
         ".docx": "doc",
@@ -1215,23 +1252,30 @@ class FeishuChannel(BaseChannel):
             return None
 
     def _upload_file_sync(self, file_path: str) -> str | None:
-        """Upload a file to Feishu and return the file_key."""
+        """Upload a file to Feishu and return the file_key.
+
+        For video/audio files, attempts to extract duration via ffprobe.
+        """
         from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
 
         ext = os.path.splitext(file_path)[1].lower()
         file_type = self._FILE_TYPE_MAP.get(ext, "stream")
         file_name = os.path.basename(file_path)
+        # For video/audio, duration (ms) improves playback UX.
+        duration = self._probe_media_duration_ms(file_path) if ext in self._VIDEO_EXTS or ext in self._AUDIO_EXTS else None
         try:
             with open(file_path, "rb") as f:
+                builder = (
+                    CreateFileRequestBody.builder()
+                    .file_type(file_type)
+                    .file_name(file_name)
+                    .file(f)
+                )
+                if duration and duration > 0:
+                    builder = builder.duration(duration)
                 request = (
                     CreateFileRequest.builder()
-                    .request_body(
-                        CreateFileRequestBody.builder()
-                        .file_type(file_type)
-                        .file_name(file_name)
-                        .file(f)
-                        .build()
-                    )
+                    .request_body(builder.build())
                     .build()
                 )
                 response = self._client.im.v1.file.create(request)
@@ -1246,6 +1290,35 @@ class FeishuChannel(BaseChannel):
                     return None
         except Exception as e:
             logger.error("Error uploading file {}: {}", file_path, e)
+            return None
+
+    @staticmethod
+    def _probe_media_duration_ms(file_path: str) -> int | None:
+        """Probe media duration in milliseconds using ffprobe (best-effort)."""
+        import shutil
+        import subprocess
+
+        if not shutil.which("ffprobe"):
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            stdout = result.stdout.strip()
+            if not stdout:
+                return None
+            seconds = float(stdout)
+            return int(seconds * 1000) if seconds > 0 else None
+        except Exception:
             return None
 
     def _download_image_sync(
@@ -1584,16 +1657,44 @@ class FeishuChannel(BaseChannel):
                 fmt = self._detect_msg_format(msg.content)
                 logger.info("detected format={}", fmt)
 
+                # Inject @mentions from metadata (group chat @user).
+                # mentions: list[str | dict]; "all" => @everyone.
+                mentions = msg.metadata.get("mentions") or []
+                mention_at_text = self._build_mention_at_text(mentions) if mentions else ""
+
                 if fmt == "text":
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    text = msg.content.strip()
+                    if mention_at_text:
+                        text = f"{mention_at_text} {text}"
+                    text_body = json.dumps({"text": text}, ensure_ascii=False)
                     await loop.run_in_executor(None, _do_send, "text", text_body)
 
                 elif fmt == "post":
                     post_body = self._markdown_to_post(msg.content)
+                    if mention_at_text:
+                        # Prepend @mentions as the first paragraph in post body.
+                        post_obj = json.loads(post_body)
+                        lang_key = "zh_cn" if "zh_cn" in post_obj else next(iter(post_obj), None)
+                        if not lang_key:
+                            lang_key = "zh_cn"
+                            post_obj[lang_key] = {}
+                        lang_block = post_obj[lang_key]
+                        at_elements = self._build_mention_at_elements(mentions)
+                        if at_elements:
+                            lang_block.setdefault("content", []).insert(0, at_elements)
+                        post_body = json.dumps(post_obj, ensure_ascii=False)
                     await loop.run_in_executor(None, _do_send, "post", post_body)
 
                 else:
                     elements = self._build_card_elements(msg.content)
+                    if mention_at_text:
+                        # Prepend @mentions to the first markdown element.
+                        for el in elements:
+                            if el.get("tag") == "markdown":
+                                el["content"] = f"{mention_at_text}\n{el.get('content', '')}"
+                                break
+                        else:
+                            elements.insert(0, {"tag": "markdown", "content": mention_at_text})
                     logger.info("built {} card elements", len(elements))
                     for i, el in enumerate(elements):
                         el_content = (
@@ -1664,7 +1765,7 @@ class FeishuChannel(BaseChannel):
             header = getattr(data, "header", None)
             create_time = getattr(header, "create_time", None) if header else None
             if create_time:
-                now_ms = int(time.time() * 1000) + self._clock_offset
+                now_ms = int(time.time() * 1000)
                 age_ms = now_ms - int(create_time)
                 if age_ms > FEISHU_STALE_MSG_THRESHOLD_MS:
                     logger.debug(
@@ -1824,9 +1925,8 @@ class FeishuChannel(BaseChannel):
             logger.error("Error processing Feishu message: {}", e)
             # On any exception, attempt to clean up pending reaction
             if "message_id" in dir() and message_id and message_id in self._pending_reactions:
-                self._pending_reactions.pop(message_id)
+                rid = self._pending_reactions.pop(message_id) or reaction_id
                 try:
-                    rid = self._pending_reactions.get(message_id) or reaction_id
                     if rid:
                         await self._remove_reaction(message_id, rid)
                 except Exception:

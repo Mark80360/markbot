@@ -153,7 +153,6 @@ def check_all_providers_credentials(cfg: Config) -> list[str]:
 
             spec = find_by_name(field_name)
             is_local = spec.is_local if spec else False
-            is_direct = spec.is_direct if spec else False
             is_oauth = spec.is_oauth if spec else False
 
             if is_oauth or is_local:
@@ -1176,14 +1175,14 @@ def doctor_main(
     if failed:
         console.print(
             Text.from_markup(
-                "  [bold red]✓?Issues found[/bold red] review the FAIL items above"
+                "  [bold red]✗ Issues found[/bold red] review the FAIL items above"
             )
         )
         raise typer.Exit(1)
     else:
         console.print(
             Text.from_markup(
-                "  [bold green]✓?All checks passed[/bold green]"
+                "  [bold green]✓ All checks passed[/bold green]"
             )
         )
 

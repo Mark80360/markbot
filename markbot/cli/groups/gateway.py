@@ -23,7 +23,7 @@ from markbot.cli.daemon import (
     terminate_process,
 )
 from markbot.cli.runtime import make_provider
-from markbot.cli.ui import console, markbot_banner
+from markbot.cli.ui import console, make_section_helpers, markbot_banner
 from markbot.config.paths import get_cron_dir
 from markbot.utils.helpers import sync_workspace_templates
 
@@ -49,6 +49,23 @@ def start(
         console.print(f"[yellow]Gateway is already running (PID: {existing_pid})[/yellow]")
         console.print("Use [cyan]markbot gateway stop[/cyan] to stop it first.")
         raise typer.Exit(1)
+
+    # Pre-flight: detect port conflicts before spawning the daemon so we
+    # don't leave a stale PID file behind.
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        console.print(
+            f"[red]✗ Port {port} is already in use.[/red] "
+            "Stop the other process or use [cyan]--port[/cyan] to pick a different one."
+        )
+        raise typer.Exit(1)
+    finally:
+        probe.close()
 
     if daemon:
         start_daemon(port, workspace, config, verbose)
@@ -305,25 +322,9 @@ def stop(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
 ):
     """Stop the MarkBot gateway service."""
-    from rich.text import Text
-
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -372,26 +373,10 @@ def restart(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
 ):
-    """Restart the MarkBot gateway service."""
-    from rich.text import Text
-
+    """Restart the Markbot gateway service."""
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -513,29 +498,16 @@ def status():
         return f"[green]✓[/green] {count} files ({size_kb:.0f} KB)"
 
     ws_raw = str(workspace)
-    if ws_raw.startswith("/home/marktang/"):
-        ws_str = "~/" + ws_raw[len("/home/marktang/"):]
+    home_str = str(Path.home())
+    if ws_raw.startswith(home_str + "/"):
+        ws_str = "~" + ws_raw[len(home_str):]
     else:
         ws_str = ws_raw
 
     # ── Render ─────────────────────────────────────────────────────────────
     console.print()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     # ─ Process ──────────────────────────────────────────────────────────────
     section("Process", "green" if running else "red")
@@ -545,10 +517,6 @@ def status():
             days, r = divmod(uptime.seconds, 3600)
             hours, minutes = divmod(r, 60)
             uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
-            mem_mb = proc.memory_info().rss / 1024 / 1024
-            cpu_pct_val = proc.cpu_percent(interval=0.1)
-            threads = proc.num_threads()
-            # line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%  |  {threads} threads[/dim]")
             line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}[/dim]")
         except Exception:
             line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  (psutil error)[/dim]")

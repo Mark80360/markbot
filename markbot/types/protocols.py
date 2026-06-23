@@ -160,3 +160,6 @@ class InboundMessageMetadata(TypedDict, total=False):
 class OutboundMessageMetadata(TypedDict, total=False):
     _progress: bool
     _tool_hint: bool
+    # Feishu/DingTalk group @mention: list of open_id strings or
+    # {"user_id": "...", "name": "..."} dicts. Use "all" to @everyone.
+    mentions: list  # list[str | dict[str, str]]

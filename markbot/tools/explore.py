@@ -736,10 +736,7 @@ class ExploreTool(Tool):
     def _find_imports_of_symbol(self, root, symbol, include_patterns):
         imports = []
         escaped = re.escape(symbol)
-        imp_patterns = [
-            re.compile(r'^\s*(?:from|import)\s+.*\b' + escaped + r'\b', re.MULTILINE),
-            re.compile(r'^\s*import\s+.*\b' + escaped + r'\b', re.MULTILINE),
-        ]
+        imp_pattern = re.compile(r'^\s*(?:from|import)\s+.*\b' + escaped + r'\b', re.MULTILINE)
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
@@ -753,11 +750,9 @@ class ExploreTool(Tool):
                 continue
             try:
                 content = path.read_text(encoding="utf-8", errors="ignore")
-                for pat in imp_patterns:
-                    match = pat.search(content)
-                    if match:
-                        imports.append((path, match.group(0).strip()))
-                        break
+                match = imp_pattern.search(content)
+                if match:
+                    imports.append((path, match.group(0).strip()))
             except (UnicodeDecodeError, PermissionError):
                 continue
         return imports
@@ -1016,7 +1011,7 @@ class ExploreTool(Tool):
                             (a.name + (f" as {a.asname}" if a.asname else "")) for a in node.names
                         )
                         level = "." * node.level
-                        imports.append(f"from {level}{module} import {{names}}")
+                        imports.append(f"from {level}{module} import {names}")
             except SyntaxError:
                 pass
         else:
@@ -1036,7 +1031,6 @@ class ExploreTool(Tool):
 
     def _find_related_files(self, file_path, base_path, depth):
         related = []
-        rel_self = file_path.relative_to(base_path)
         stem = file_path.stem
 
         parent = file_path.parent
@@ -1063,53 +1057,7 @@ class ExploreTool(Tool):
         return related
 
     def _build_dependency_graph(self, root, include_patterns, depth):
-        deps = {}
-        stdlib_modules = {
-            "os", "sys", "typing", "dataclasses", "enum", "collections",
-            "functools", "itertools", "contextlib", "abc", "io", "re", "json",
-            "pathlib", "datetime", "logging", "asyncio", "threading",
-            "multiprocessing", "unittest", "pytest", "unittest.mock", "__future__",
-            "warnings", "copy", "math", "random", "hashlib", "time", "tempfile",
-            "subprocess", "textwrap", "string", "struct", "array", "bisect",
-            "heapq", "operator", "pprint", "reprlib", "numbers", "decimal",
-            "fractions", "types", "inspect", "dis", "pickle", "shelve",
-            "sqlite3", "csv", "configparser", "argparse", "getopt", "errno",
-            "ctypes", "socket", "ssl", "select", "signal", "email", "html",
-            "xml", "xmlrpc", "urllib", "http", "ftplib", "poplib", "imaplib",
-            "smtplib", "nntplib", "uuid", "base64", "binascii", "quopri",
-            "uu", "codecs", "mimetypes",
-        }
-
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if any(p in path.parts for p in _IGNORE_DIRS):
-                continue
-            if include_patterns:
-                if not any(path.match(p) for p in include_patterns):
-                    continue
-            ext = path.suffix.lower()
-            if ext != ".py":
-                continue
-            try:
-                content = path.read_text(encoding="utf-8", errors="ignore")
-                tree = ast.parse(content, filename=str(path))
-                imported_modules = set()
-                for node in ast.iter_child_nodes(tree):
-                    if isinstance(node, ast.ImportFrom) and node.module:
-                        mod_parts = node.module.split(".")
-                        if mod_parts[0] not in stdlib_modules:
-                            imported_modules.add(mod_parts[0])
-                    elif isinstance(node, ast.Import):
-                        for alias in node.names:
-                            top = alias.name.split(".")[0]
-                            if top not in stdlib_modules:
-                                imported_modules.add(top)
-                if imported_modules:
-                    rel = path.relative_to(root)
-                    deps[str(rel)] = sorted(imported_modules)
-            except (SyntaxError, UnicodeDecodeError):
-                continue
+        deps = self._collect_internal_deps(root, include_patterns)
 
         if not deps:
             return ""
@@ -1128,21 +1076,165 @@ class ExploreTool(Tool):
         return "\n".join(lines) + "\n"
 
     def _is_local_module(self, root, module_name):
+        module_path = module_name.replace(".", "/")
         candidates = [
-            root / module_name.replace(".", "/"),
-            root / module_name.replace(".", "/") / "__init__.py",
-            root / module_name.replace(".", "/") + ".py",
+            root / module_path,
+            root / module_path / "__init__.py",
+            root / (module_path + ".py"),
         ]
         return any(c.exists() for c in candidates)
 
+    def _collect_internal_deps(self, root, include_patterns):
+        """Collect internal module dependencies as a graph.
+
+        Returns dict mapping module path (str) -> set of imported local
+        module names. Reused by dependency analysis helpers.
+        """
+        stdlib_modules = {
+            "os", "sys", "typing", "dataclasses", "enum", "collections",
+            "functools", "itertools", "contextlib", "abc", "io", "re", "json",
+            "pathlib", "datetime", "logging", "asyncio", "threading",
+            "multiprocessing", "unittest", "pytest", "unittest.mock", "__future__",
+            "warnings", "copy", "math", "random", "hashlib", "time", "tempfile",
+            "subprocess", "textwrap", "string", "struct", "array", "bisect",
+            "heapq", "operator", "pprint", "reprlib", "numbers", "decimal",
+            "fractions", "types", "inspect", "dis", "pickle", "shelve",
+            "sqlite3", "csv", "configparser", "argparse", "getopt", "errno",
+            "ctypes", "socket", "ssl", "select", "signal", "email", "html",
+            "xml", "xmlrpc", "urllib", "http", "ftplib", "poplib", "imaplib",
+            "smtplib", "nntplib", "uuid", "base64", "binascii", "quopri",
+            "uu", "codecs", "mimetypes",
+        }
+        deps: dict[str, set[str]] = {}
+
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(p in path.parts for p in _IGNORE_DIRS):
+                continue
+            if include_patterns:
+                if not any(path.match(p) for p in include_patterns):
+                    continue
+            if path.suffix.lower() != ".py":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                tree = ast.parse(content, filename=str(path))
+                imported_modules = set()
+                for node in ast.iter_child_nodes(tree):
+                    if isinstance(node, ast.ImportFrom) and node.module:
+                        mod_parts = node.module.split(".")
+                        if mod_parts[0] not in stdlib_modules:
+                            imported_modules.add(mod_parts[0])
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            top = alias.name.split(".")[0]
+                            if top not in stdlib_modules:
+                                imported_modules.add(top)
+                if imported_modules:
+                    rel = path.relative_to(root)
+                    deps[str(rel)] = imported_modules
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+        return deps
+
+    def _module_path_to_name(self, module_str: str) -> str:
+        """Convert a file path like 'pkg/mod.py' or 'pkg/mod/__init__.py' to a module name 'pkg.mod'."""
+        cleaned = module_str.replace("\\", "/")
+        if cleaned.endswith("/__init__.py"):
+            cleaned = cleaned[: -len("/__init__.py")]
+        elif cleaned.endswith(".py"):
+            cleaned = cleaned[: -len(".py")]
+        return cleaned.replace("/", ".")
+
     def _detect_circular_deps(self, root, include_patterns):
-        return []
+        """Detect circular dependencies among internal modules via DFS."""
+        deps = self._collect_internal_deps(root, include_patterns)
+        if not deps:
+            return []
+
+        # Build adjacency: module name -> set of module names it depends on
+        graph: dict[str, set[str]] = {}
+        for mod_path, imported in deps.items():
+            mod_name = self._module_path_to_name(mod_path)
+            graph.setdefault(mod_name, set())
+            for dep in imported:
+                if self._is_local_module(root, dep):
+                    graph[mod_name].add(dep)
+
+        cycles: list[list[str]] = []
+        seen_cycles: set[tuple[str, ...]] = set()
+
+        def dfs(node: str, path: list[str], visited: set[str]):
+            if node in path:
+                idx = path.index(node)
+                cycle = path[idx:] + [node]
+                key = tuple(cycle)
+                if key not in seen_cycles:
+                    seen_cycles.add(key)
+                    cycles.append(cycle)
+                return
+            if node in visited:
+                return
+            visited.add(node)
+            for neighbor in graph.get(node, ()):
+                dfs(neighbor, path + [node], visited)
+
+        for start in list(graph.keys()):
+            dfs(start, [], set())
+
+        return cycles
 
     def _identify_core_modules(self, root, include_patterns):
-        return []
+        """Identify core modules by connectivity (in-degree + out-degree)."""
+        deps = self._collect_internal_deps(root, include_patterns)
+        if not deps:
+            return []
+
+        scores: dict[str, int] = {}
+        for mod_path, imported in deps.items():
+            mod_name = self._module_path_to_name(mod_path)
+            scores[mod_name] = scores.get(mod_name, 0) + len(imported)
+            for dep in imported:
+                if self._is_local_module(root, dep):
+                    scores[dep] = scores.get(dep, 0) + 1
+
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        return [(name, score) for name, score in ranked if score > 0]
 
     def _find_orphan_files(self, root, include_patterns):
-        return []
+        """Find Python files that are neither imported by nor import any local module."""
+        deps = self._collect_internal_deps(root, include_patterns)
+        if not deps:
+            return []
+
+        imported_set: set[str] = set()
+        importers_set: set[str] = set(deps.keys())
+
+        for mod_path, imported in deps.items():
+            for dep in imported:
+                if self._is_local_module(root, dep):
+                    imported_set.add(dep)
+
+        orphans = []
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(p in path.parts for p in _IGNORE_DIRS):
+                continue
+            if include_patterns:
+                if not any(path.match(p) for p in include_patterns):
+                    continue
+            if path.suffix.lower() != ".py":
+                continue
+            rel = path.relative_to(root)
+            mod_name = self._module_path_to_name(str(rel))
+            # A file is orphan if it doesn't import any local module AND
+            # no local module imports it.
+            if mod_name not in importers_set and mod_name not in imported_set:
+                orphans.append(path)
+
+        return orphans
 
     @staticmethod
     def _ast_args(func_node):

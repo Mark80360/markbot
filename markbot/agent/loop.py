@@ -176,7 +176,7 @@ class AgentLoop:
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
-        if not self.mcp._mcp_servers:
+        if not self.mcp.has_servers:
             logger.debug("No MCP servers configured, skipping connection")
             return
         _t0 = time.time()

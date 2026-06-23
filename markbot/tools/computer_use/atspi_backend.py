@@ -280,11 +280,11 @@ class AtspiBackend(ComputerUseBackend):
                     continue
                 if child is None:
                     continue
-                # When filtering by app, descend only into matching subtrees.
-                if flt and depth == 0 and not matches_app(node if i == 0 else child):
-                    # At top level, skip whole non-matching applications.
-                    if _is_application(node):
-                        continue
+                # At depth 0, skip children (windows) that don't belong to the
+                # matching app. Deeper levels always descend — we already
+                # filtered at the app root level above.
+                if flt and depth == 0 and not matches_app(child):
+                    continue
                 visit(child, depth + 1)
 
         for app_root in roots:

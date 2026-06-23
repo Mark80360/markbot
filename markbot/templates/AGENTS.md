@@ -10,11 +10,10 @@ read_when:
 
 ## 技术栈
 
-- Python 3.12+
+- Python 3.11+
 - 依赖管理: `pyproject.toml` + pip
 - 测试: pytest
 - Lint: ruff
-- 类型检查: mypy (可选)
 
 ## 启动流程
 
@@ -36,8 +35,7 @@ read_when:
 
 ```
 测试:     pytest tests/ -x -q
-Lint:     ruff check src/
-类型检查:  mypy src/ --strict
+Lint:     ruff check markbot/
 完整验证:  ./init.sh
 ```
 
@@ -51,6 +49,8 @@ Lint:     ruff check src/
 - 验证命令实际运行并通过
 - 证据已记录到 `feature_list.json` 或 `MEMORY.md`
 - 仓库仍可通过 `./init.sh` 干净重启
+
+最终验收前，用 [`evaluator-rubric.md`](evaluator-rubric.md) 做评分检查。
 
 ## 记忆
 
@@ -147,6 +147,12 @@ Skills 提供工具。需要时查看 `SKILL.md`。本地设置记在 `TOOLS.md`
 - `init.sh` — 标准启动和验证路径
 - `session-handoff.md` — 可选的跨会话紧凑交接
 
+参考文档（按需查阅）：
+
+- [`clean-state-checklist.md`](clean-state-checklist.md) — 提交前的干净状态检查清单
+- [`quality-document.md`](quality-document.md) — 产品域和架构层的质量快照
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系统架构与域图
+
 ## 会话结束
 
 结束会话前：
@@ -156,3 +162,5 @@ Skills 提供工具。需要时查看 `SKILL.md`。本地设置记在 `TOOLS.md`
 3. 记录未解决的风险或阻塞项
 4. 一旦工作处于安全状态，提交并附带描述性消息
 5. 留下干净的重启路径 — 下次会话能直接运行 `./init.sh`
+
+用 [`clean-state-checklist.md`](clean-state-checklist.md) 做最终检查。

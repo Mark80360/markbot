@@ -657,7 +657,7 @@ class OpenAICompatProvider(LLMProvider):
         return LLMResponse(
             content=msg,
             finish_reason="error",
-            error_type=ErrorType.UNKNOWN,
+            error_type=classify_error(getattr(e, "status_code", None), repr(e)),
         )
 
     # ------------------------------------------------------------------
