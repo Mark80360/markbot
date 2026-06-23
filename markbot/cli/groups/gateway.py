@@ -246,35 +246,22 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         try:
             await cron.start()
 
+            dream_service = None
             dream_cron = config.tools.memory.dream_cron
-            dream_task: asyncio.Task | None = None
-            if dream_cron:
-                from zoneinfo import ZoneInfo
+            if dream_cron and agent.memory_manager is not None:
+                from markbot.schedule.dream import DreamService
 
-                from croniter import croniter
-
-                async def _dream_loop():
-                    tz = ZoneInfo(config.agents.defaults.timezone)
-                    while True:
-                        try:
-                            now = datetime.now(tz=tz)
-                            cron_iter = croniter(dream_cron, now)
-                            next_ts = cron_iter.get_next(float)
-                            delay = next_ts - now.timestamp()
-                            if delay < 0:
-                                delay = 0
-                            next_dt = datetime.fromtimestamp(next_ts, tz=tz)
-                            logger.info("Next dream at {} (in {:.0f}s)", next_dt, delay)
-                            await asyncio.sleep(delay)
-                            logger.info("Triggering dream-based memory optimization")
-                            await agent.memory_manager.dream()
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            logger.error("Dream optimization failed: {}", e)
-                            await asyncio.sleep(60)
-
-                dream_task = asyncio.create_task(_dream_loop())
+                # Dream is system-triggered only.  The is_busy_fn guard
+                # ensures it never fires while a conversation is in
+                # progress (requirement: no concurrent dream + chat).
+                dream_service = DreamService(
+                    cron_expr=dream_cron,
+                    dream_fn=agent.memory_manager.dream,
+                    state_dir=config.workspace_path,
+                    is_busy_fn=agent.has_active_conversations,
+                    timezone=config.agents.defaults.timezone,
+                )
+                await dream_service.start()
                 console.print(f"[green]✓[/green] Dream: cron={dream_cron}")
 
             await heartbeat.start()
@@ -304,8 +291,8 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            if dream_task:
-                dream_task.cancel()
+            if dream_service:
+                await dream_service.stop()
             if curator:
                 await curator.stop()
             await agent.close_mcp()

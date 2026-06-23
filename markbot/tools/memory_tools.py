@@ -1,7 +1,7 @@
 """Memory management tools for AI self-management.
 
 These tools allow the AI to autonomously manage its long-term memory:
-save, forget, list, and trigger dream optimisation.
+save, forget, and list entries.
 
 Two memory stores:
 - 'memory': agent notes — environment facts, project conventions, tool quirks
@@ -219,35 +219,3 @@ class MemoryListTool(Tool):
             return f"Error listing memories: {e}"
 
 
-class DreamTool(Tool):
-    """Trigger dream-based memory optimisation."""
-
-    def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._memory_manager = memory_manager
-
-    @property
-    def name(self) -> str:
-        return "dream"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Trigger an AI-driven memory optimisation cycle (Dream). "
-            "This reads your memory store, summarises, merges duplicates, "
-            "and cleans outdated entries. Use when you feel your memory "
-            "is cluttered or outdated."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
-
-    async def _legacy_execute(self, **kwargs: Any) -> str:
-        if not self._memory_manager:
-            return "Error: Memory manager is not available."
-        try:
-            result = await self._memory_manager.dream()
-            return f"Dream optimisation completed: {result}" if result else "Dream optimisation completed."
-        except Exception as e:
-            return f"Error during dream optimisation: {e}"

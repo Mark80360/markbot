@@ -208,7 +208,6 @@ class ToolBinder:
         """Register memory search and self-management tools."""
         from markbot.tools.memory import MemorySearchTool
         from markbot.tools.memory_tools import (
-            DreamTool,
             MemoryForgetTool,
             MemoryListTool,
             MemorySaveTool,
@@ -221,7 +220,6 @@ class ToolBinder:
             self._tools.register(MemorySaveTool(memory_manager=self._memory_manager))
             self._tools.register(MemoryForgetTool(memory_manager=self._memory_manager))
             self._tools.register(MemoryListTool(memory_manager=self._memory_manager))
-            self._tools.register(DreamTool(memory_manager=self._memory_manager))
 
         self._question_tool = AskUserQuestionTool(send_callback=self._publish_outbound)
         self._question_tool.set_context("", "")

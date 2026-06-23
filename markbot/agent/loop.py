@@ -406,6 +406,18 @@ class AgentLoop:
     # Idle session management
     # ------------------------------------------------------------------
 
+    def has_active_conversations(self) -> bool:
+        """Return True if any session currently has an in-flight task.
+
+        Used by background services (e.g. DreamService) to avoid running
+        while a conversation is in progress.
+        """
+        for tasks in self._active_tasks.values():
+            for t in tasks:
+                if not t.done():
+                    return True
+        return False
+
     def _check_idle_sessions(self, now: float) -> None:
         """Check and clean up sessions that have exceeded the idle timeout.
 
