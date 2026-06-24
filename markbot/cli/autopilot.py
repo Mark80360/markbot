@@ -159,7 +159,6 @@ def tick(
     from markbot.autopilot.store import AutopilotStore
 
     store = AutopilotStore(ws)
-    service = AutopilotService(store)
 
     runtime_config = load_runtime_config(config, str(ws))
     provider = make_provider(runtime_config)
@@ -200,7 +199,8 @@ def tick(
         budget_config=runtime_config.budget if runtime_config.budget.enabled else None,
     )
 
-    service.bind_agent_loop(agent_loop)
+    from markbot.autopilot.service import AutopilotService
+    service = AutopilotService(store, agent_loop)
 
     async def _run():
         result = await service.tick(model=model, max_turns=max_turns)

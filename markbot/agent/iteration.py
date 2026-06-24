@@ -31,6 +31,7 @@ from markbot.agent.prefix_cache import (
 )
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
+from markbot.bus.events import EventType, make_session_key
 from markbot.session.handoff import build_handoff_from_session
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
@@ -42,6 +43,29 @@ if TYPE_CHECKING:
 # Tag for internal context messages injected after system prompt.
 # These are per-turn and should not be persisted to session history.
 _INTERNAL_CONTEXT_TAG = "[Agent Internal Context"
+
+# 连续失败检测配置
+# 观察窗口：只看最近 N 次 tool call 结果
+_FAILURE_WINDOW = 6
+# 触发阈值：窗口内失败次数 >= 此值时注入反思提示
+_FAILURE_THRESHOLD = 4
+# 反思提示最大注入次数：超过后强制停止，避免无限循环
+_MAX_REFLECTIONS = 2
+
+# 失败标志关键词（小写匹配）
+# 注意：关键词要足够具体，避免误判正常输出。
+# - 不用 "404"（可能出现在文件大小、行号等正常文本中）
+# - 不用 "not found"（过于宽泛，改用更具体的 "command not found" 等）
+# - 不用 "timeout"（可能出现在 "no timeout" 等正常文本中，改用 "connection timed out"）
+_FAILURE_KEYWORDS = (
+    "error:", "traceback", "no module named", "modulenotfounderror",
+    "filenotfounderror", "command not found", "no such file or directory",
+    "connection refused", "connection timed out", "timed out",
+    "permission denied", "access denied", "exit code: 1",
+    "exit code: 2", "exit code: 127", "failed to",
+    "unable to", "cannot ", "can't ", "is not installed",
+    "is not available", "500 internal server error",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +137,11 @@ class LoopState:
     steer_continues: int = 0
     # Cache telemetry (populated by _phase_call_llm).
     last_cache_event: CacheEvent | None = None
+    # 连续失败检测：记录最近 tool call 的成功/失败，用于识别"死胡同"循环。
+    # True=成功，False=失败。只保留最近 _FAILURE_WINDOW 条。
+    recent_tool_results: list = field(default_factory=list)
+    # 反思提示已注入次数：避免无限注入反思，超过阈值后强制停止。
+    reflection_injected_count: int = 0
 
 
 @dataclass
@@ -151,7 +180,7 @@ class IterationRunner:
         self.on_progress = on_progress
         self.on_stream = on_stream
         self.on_stream_end = on_stream_end
-        self.session_key = session_key or f"{channel}:{chat_id}"
+        self.session_key = session_key or make_session_key(channel, chat_id) or ""
         self.on_tool_start = on_tool_start
         self.on_tool_complete = on_tool_complete
         self._stream_filter = StreamFilter(on_stream)
@@ -416,7 +445,7 @@ class IterationRunner:
             # messages on the next turn (metadata markers are stripped
             # by get_history during session save/load).
             if history_archived > 0:
-                session_key = f"{self.channel}:{self.chat_id}"
+                session_key = make_session_key(self.channel, self.chat_id) or ""
                 mm = getattr(self.loop, "memory_manager", None)
                 if mm is not None:
                     old_count = mm.get_archived_count(session_key=session_key)
@@ -561,6 +590,135 @@ class IterationRunner:
                 last_msg.get("role"),
             )
 
+    def _is_tool_result_failure(self, result: Any) -> bool:
+        """判断 tool 执行结果是否为失败。
+
+        判断依据：
+        1. 字符串结果以 "Error:" 开头
+        2. 字符串结果包含失败关键词（exit code 非零、no module named 等）
+        3. BaseException（在 _phase_execute_tools 中已被转为 "Error: ..." 字符串）
+        """
+        if isinstance(result, BaseException):
+            return True
+        if not isinstance(result, str):
+            # dict / multimodal 等结构化结果视为成功
+            return False
+        if result.startswith("Error:"):
+            return True
+        lower = result.lower()
+        return any(kw in lower for kw in _FAILURE_KEYWORDS)
+
+    def _record_tool_result(self, state: LoopState, result: Any) -> None:
+        """记录 tool 结果到滑动窗口，用于连续失败检测。"""
+        is_failure = self._is_tool_result_failure(result)
+        state.recent_tool_results.append(is_failure)
+        # 只保留最近 _FAILURE_WINDOW 条
+        if len(state.recent_tool_results) > _FAILURE_WINDOW:
+            state.recent_tool_results = state.recent_tool_results[-_FAILURE_WINDOW:]
+
+    def _phase_check_failure_loop(self, state: LoopState) -> IterationResult | None:
+        """检测连续失败循环，注入反思提示或强制停止。
+
+        当最近 _FAILURE_WINDOW 次 tool call 中有 >= _FAILURE_THRESHOLD 次失败时：
+        - 若反思次数 < _MAX_REFLECTIONS：注入反思提示，让 LLM 重新评估策略
+        - 若反思次数 >= _MAX_REFLECTIONS：强制停止，避免无限消耗 token
+        """
+        if len(state.recent_tool_results) < _FAILURE_THRESHOLD:
+            return None
+
+        failure_count = sum(1 for f in state.recent_tool_results if f)
+        if failure_count < _FAILURE_THRESHOLD:
+            return None
+
+        # 已达最大反思次数，强制停止
+        if state.reflection_injected_count >= _MAX_REFLECTIONS:
+            logger.warning(
+                "Failure loop detected ({} failures in last {} calls), "
+                "max reflections ({}) exceeded — forcing stop",
+                failure_count, len(state.recent_tool_results),
+                _MAX_REFLECTIONS,
+            )
+            # 清理 guardrail，与 _phase_final_response 行为一致
+            if self.loop.guardrail_manager:
+                for skill_name in list(self.loop.guardrail_manager.active_skills):
+                    result = self.loop.guardrail_manager.stop_guarding(skill_name)
+                    if result and result.violations:
+                        logger.info(
+                            "Guardrail stopped for '{}': {} violation(s)",
+                            skill_name, len(result.violations),
+                        )
+            state.final_content = (
+                "我检测到任务陷入连续失败循环（最近多次 tool 调用均失败），"
+                "已强制停止以避免无谓的 token 消耗。\n\n"
+                "可能的原因：\n"
+                "- 当前环境缺少完成任务所需的依赖（如 ffmpeg、特定 Python 包等）\n"
+                "- 网络限制导致无法安装依赖\n"
+                "- 任务本身在当前条件下不可行\n\n"
+                "建议：\n"
+                "1. 检查上方错误信息，确认缺失的依赖\n"
+                "2. 手动安装所需依赖后重试\n"
+                "3. 或调整任务目标，避开当前环境限制"
+            )
+            state.messages = self.loop.context.add_assistant_message(
+                state.messages,
+                state.final_content,
+            )
+            return IterationResult(should_break=True)
+
+        # 注入反思提示
+        state.reflection_injected_count += 1
+        logger.warning(
+            "Failure loop detected ({} failures in last {} calls), "
+            "injecting reflection #{}",
+            failure_count, len(state.recent_tool_results),
+            state.reflection_injected_count,
+        )
+
+        reflection_text = (
+            "[System Warning — 连续失败检测]\n"
+            f"系统检测到你在最近 {len(state.recent_tool_results)} 次 tool 调用中"
+            f"有 {failure_count} 次失败。这通常意味着当前策略遇到了"
+            "环境或依赖层面的硬性限制，继续用类似方式尝试只会浪费资源。\n\n"
+            "请立即停下来反思：\n"
+            "1. **根因分析**：这些失败的共同原因是什么？"
+            "（缺少依赖？网络限制？权限问题？）\n"
+            "2. **可行性判断**：在当前环境下，这个任务是否真的能完成？"
+            "如果不能，请直接告知用户缺失了什么，而不是继续尝试。\n"
+            "3. **策略调整**：如果可行，换一种完全不同的方法；"
+            "如果不可行，明确告知用户并停止。\n\n"
+            "重要：不要再用相同或类似的方式重试。"
+            "如果任务在当前环境不可行，直接回复用户说明原因。"
+        )
+
+        # 注入到最后一条 tool result 之后（作为 user 消息追加，
+        # 这样 LLM 能在下一轮看到反思提示）
+        last_tool_idx = None
+        for i in range(len(state.messages) - 1, -1, -1):
+            if state.messages[i].get("role") == "tool":
+                last_tool_idx = i
+                break
+
+        if last_tool_idx is not None:
+            existing = state.messages[last_tool_idx].get("content", "")
+            if isinstance(existing, str):
+                state.messages[last_tool_idx]["content"] = (
+                    existing + "\n\n" + reflection_text
+                )
+            elif isinstance(existing, list):
+                state.messages[last_tool_idx]["content"].append(
+                    {"type": "text", "text": reflection_text}
+                )
+        else:
+            # 没有 tool result 时，作为 user 消息追加
+            state.messages.append({
+                "role": "user",
+                "content": reflection_text,
+            })
+
+        # 清空窗口，给反思后的新策略一个干净的计数
+        state.recent_tool_results = []
+        return None
+
     def _phase_memory_sync(self, state: LoopState) -> None:
         memory_manager = getattr(self.loop, "memory_manager", None)
         if memory_manager is None:
@@ -652,8 +810,10 @@ class IterationRunner:
             self._record_canonical_usage(response, attempts)
             # Write to the LLM response cache if the request was cacheable.
             self._maybe_write_response_cache(state, tool_defs, response, attempts)
+            self._emit_model_succeeded(response, attempts)
             return None
         except Exception as llm_exc:
+            self._emit_model_failed(llm_exc)
             return await self._handle_llm_error(state, tool_defs, llm_exc)
 
     def _check_prefix_stability(
@@ -724,6 +884,56 @@ class IterationRunner:
         # Stash the event on the state so the slash command / TUI
         # can surface it without re-running the check.
         state.last_cache_event = event  # type: ignore[attr-defined]
+
+    def _emit(self, event_type: Any, payload: dict[str, Any]) -> None:
+        """Fire-and-forget emit on the global EventEmitter.
+
+        Wraps the emitter lookup so a missing emitter or a subscriber
+        error never breaks the agent loop.  The event is scheduled on
+        the running loop so this stays sync-callable from any phase.
+        """
+        try:
+            from markbot.bus.emitter import get_event_emitter
+
+            emitter = get_event_emitter()
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                emitter.emit(event_type, payload, session_key=self.session_key)
+            )
+        except Exception as e:
+            logger.debug("emit {} failed: {}", getattr(event_type, "name", event_type), e)
+
+    def _emit_model_succeeded(self, response: Any, attempts: list[Any] | None) -> None:
+        """Emit MODEL_SUCCEEDED with a compact payload for observability."""
+        try:
+            from markbot.bus.events import EventType
+
+            usage = getattr(response, "usage", None) or {}
+            model = getattr(response, "model", "") or ""
+            if not model and attempts:
+                model = getattr(attempts[-1], "model", "") or ""
+            self._emit(
+                EventType.MODEL_SUCCEEDED,
+                {
+                    "model": str(model),
+                    "usage": usage if isinstance(usage, dict) else {},
+                    "tool_calls": len(getattr(response, "tool_calls", []) or []),
+                },
+            )
+        except Exception as e:
+            logger.debug("_emit_model_succeeded failed: {}", e)
+
+    def _emit_model_failed(self, error: BaseException) -> None:
+        """Emit MODEL_FAILED so monitors can alert on provider outages."""
+        try:
+            from markbot.bus.events import EventType
+
+            self._emit(
+                EventType.MODEL_FAILED,
+                {"error": type(error).__name__, "message": str(error)[:300]},
+            )
+        except Exception as e:
+            logger.debug("_emit_model_failed failed: {}", e)
 
     def _record_canonical_usage(
         self,
@@ -813,8 +1023,10 @@ class IterationRunner:
                 )
             state.last_response = response
             state.last_attempts = attempts
+            self._emit_model_succeeded(response, attempts)
             return None
         except Exception as retry_exc:
+            self._emit_model_failed(retry_exc)
             logger.error(
                 "LLM call failed after reactive compaction: {}", retry_exc
             )
@@ -1078,7 +1290,7 @@ class IterationRunner:
                     )
                 else:
                     result = await self.loop.tools.execute(tc.name, tc.arguments, context=ToolContext(
-                        session_id=f"{self.channel}:{self.chat_id}",
+                        session_id=make_session_key(self.channel, self.chat_id) or "",
                         workspace=str(self.loop.workspace),
                         permission_mode=PermissionMode.AUTO,
                         tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
@@ -1152,7 +1364,7 @@ class IterationRunner:
                 logger.debug("report_progress emit failed: {}", e)
 
         _tool_ctx = ToolContext(
-            session_id=f"{self.channel}:{self.chat_id}",
+            session_id=make_session_key(self.channel, self.chat_id) or "",
             workspace=str(self.loop.workspace),
             permission_mode=PermissionMode.AUTO,
             tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
@@ -1174,6 +1386,13 @@ class IterationRunner:
                 except Exception as e:
                     logger.debug("on_tool_start callback failed: {}", e)
 
+        # Emit TOOL_CALLED for each tool so monitors can track usage.
+        for tc in response.tool_calls:
+            self._emit(
+                EventType.TOOL_CALLED,
+                {"tool": tc.name, "call_id": tc.id},
+            )
+
         results = await asyncio.gather(
             *(
                 self.loop.tools.execute(tc.name, tc.arguments, context=_tool_ctx)
@@ -1187,6 +1406,11 @@ class IterationRunner:
             if isinstance(result, BaseException):
                 logger.error(
                     "Tool {} failed with exception: {}", tool_call.name, result
+                )
+                self._emit(
+                    EventType.TOOL_FAILED,
+                    {"tool": tool_call.name, "call_id": tool_call.id,
+                     "error": type(result).__name__},
                 )
                 result = f"Error: {type(result).__name__}: {result}"
             elif isinstance(result, dict) and result.get("_multimodal"):
@@ -1243,6 +1467,17 @@ class IterationRunner:
                 state.messages, tool_call.id, tool_call.name, result
             )
 
+            # 记录 tool 结果用于连续失败检测
+            self._record_tool_result(state, result)
+
+            # Emit TOOL_COMPLETED so monitors can track tool latency/usage.
+            is_error = isinstance(result, str) and result.startswith("Error:")
+            self._emit(
+                EventType.TOOL_COMPLETED,
+                {"tool": tool_call.name, "call_id": tool_call.id,
+                 "ok": not is_error},
+            )
+
             if self.on_tool_complete:
                 error_msg = None
                 summary = None
@@ -1261,6 +1496,11 @@ class IterationRunner:
         )
 
         self._inject_pending_steer(state)
+
+        # 连续失败检测：在所有 tool 执行完毕后检查是否陷入失败循环
+        failure_result = self._phase_check_failure_loop(state)
+        if failure_result is not None:
+            return failure_result
 
         return IterationResult(should_continue=True)
 
@@ -1433,6 +1673,13 @@ class IterationRunner:
                 "I've stopped to avoid exceeding the spending limit. "
                 "You can increase the budget or break the task into smaller steps."
             )
+            # 把中断原因作为 assistant 消息追加到 messages，
+            # 这样 save_turn 会把它持久化到 session history，
+            # 下次用户输入"继续"时 LLM 能看到上次中断的上下文。
+            state.messages = self.loop.context.add_assistant_message(
+                state.messages,
+                state.final_content,
+            )
         elif state.final_content is None and state.iteration >= self.loop.max_iterations:
             logger.warning(
                 "Max iterations ({}) reached", self.loop.max_iterations
@@ -1442,6 +1689,28 @@ class IterationRunner:
                 f"({self.loop.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+            # 同样把中断原因写入 history，让下次"继续"能看到上次中断点。
+            state.messages = self.loop.context.add_assistant_message(
+                state.messages,
+                state.final_content,
+            )
+
+        # 统一兜底：如果 final_content 已由其他退出路径（LLM 错误、无效工具、
+        # 内容过滤、失败循环强制停止等）设置，但尚未追加到 messages，
+        # 则在此统一追加，确保 save_turn 能持久化中断原因，让"继续"可见。
+        if state.final_content:
+            last_msg = state.messages[-1] if state.messages else None
+            last_is_final = (
+                last_msg is not None
+                and last_msg.get("role") == "assistant"
+                and isinstance(last_msg.get("content"), str)
+                and last_msg.get("content") == state.final_content
+            )
+            if not last_is_final:
+                state.messages = self.loop.context.add_assistant_message(
+                    state.messages,
+                    state.final_content,
+                )
 
         if self.on_stream and self.on_stream_end and not state.stream_finalized:
             if state.final_content:

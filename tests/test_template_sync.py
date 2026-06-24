@@ -28,15 +28,14 @@ class TestCheckTemplateSync:
         assert isinstance(result, list)
 
     def test_detects_missing_from_constant(self, tmp_path):
-        (tmp_path / "HEARTBEAT.md").write_text("heartbeat content")
-        (tmp_path / "BOOTSTRAP.md").write_text("bootstrap content")
+        (tmp_path / "UNKNOWN.md").write_text("unknown content")
         warnings = check_template_sync(templates_dir=tmp_path)
-        missing = [w for w in warnings if "not in BOOTSTRAP_FILES" in w]
+        missing = [w for w in warnings if "not in known template sets" in w]
         assert len(missing) >= 1
 
     def test_detects_missing_from_disk(self, tmp_path):
         warnings = check_template_sync(templates_dir=tmp_path)
-        missing = [w for w in warnings if "no template on disk" in w]
+        missing = [w for w in warnings if "missing from disk" in w]
         assert len(missing) >= 1
 
     def test_no_warnings_when_perfectly_synced(self, tmp_path):

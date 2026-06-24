@@ -17,6 +17,8 @@ from typing import Any
 
 from loguru import logger
 
+from markbot.bus.events import make_session_key
+
 _MAX_MSG_CONTENT = 3000
 _MAX_TOOL_ARGS = 500
 
@@ -105,7 +107,7 @@ class InteractionLogger:
             chat_id: Chat/session identifier.
             tokens_before: Estimated token count before this call.
         """
-        session_key = f"{channel}:{chat_id}"
+        session_key = make_session_key(channel, chat_id) or ""
         prev_count = self._logged_msg_counts.get(session_key, 0)
         compacted = len(messages) < prev_count
 

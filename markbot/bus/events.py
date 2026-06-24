@@ -51,6 +51,19 @@ class Event:
     session_key: str = ""
 
 
+def make_session_key(channel: str | None, chat_id: str | None) -> str | None:
+    """Build the canonical ``channel:chat_id`` session key.
+
+    Returns ``None`` when either component is missing so callers can use
+    the result directly for optional session-key fields without an extra
+    conditional.  Centralising this avoids ``f"{channel}:{chat_id}"` being
+    duplicated across the codebase with subtly different empty-handling.
+    """
+    if not channel or not chat_id:
+        return None
+    return f"{channel}:{chat_id}"
+
+
 @dataclass
 class InboundMessage:
     """Message received from a chat channel."""
@@ -68,7 +81,7 @@ class InboundMessage:
 
     @property
     def session_key(self) -> str:
-        return self.session_key_override or f"{self.channel}:{self.chat_id}"
+        return self.session_key_override or make_session_key(self.channel, self.chat_id) or ""
 
 
 @dataclass

@@ -7,7 +7,7 @@ import os
 import sys
 
 from markbot import __version__
-from markbot.bus.events import OutboundMessage
+from markbot.bus.events import OutboundMessage, make_session_key
 from markbot.cli.slash_commands.router import CommandContext, CommandRouter
 from markbot.utils.helpers import build_status_content
 
@@ -86,7 +86,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
             messages=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in session.messages if m.get("content")],
         )
     if mm:
-        session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
+        session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
         if session_key:
             mm.set_compressed_summary("", session_key=session_key)
     session.clear()
@@ -114,7 +114,7 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="No messages to compact.",
         )
-    session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
+    session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
     mm.add_async_summary_task(
         messages=history,
     )
@@ -151,7 +151,7 @@ async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="Memory manager is not available.",
         )
-    session_key = f"{ctx.msg.channel}:{ctx.msg.chat_id}" if ctx.msg.channel and ctx.msg.chat_id else None
+    session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
     summary = mm.get_compressed_summary(session_key=session_key)
     if not summary:
         return OutboundMessage(

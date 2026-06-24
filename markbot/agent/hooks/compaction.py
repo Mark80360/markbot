@@ -23,14 +23,21 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from markbot.bus.events import make_session_key
+
 from markbot.agent.tokens import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
     from markbot.memory.base import BaseMemoryManager
 
-MEMORY_COMPACT_KEEP_RECENT = 4
-
+_MEMORY_COMPACT_KEEP_RECENT = 4
 _COMPACTED_MARKER = "_markbot_compacted"
+
+# Exception types that indicate a programming bug (wrong type, missing
+# attribute, undefined name) rather than a transient operational failure.
+# These propagate to the caller so the error is visible instead of being
+# silently swallowed by the broad ``except Exception`` below.
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, ImportError)
 
 
 class MemoryCompactionHook:
@@ -113,7 +120,7 @@ class MemoryCompactionHook:
             if not getattr(self.memory_manager, "_started", False) and not getattr(self.memory_manager, "_memory_store", None):
                 return None
 
-            session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+            session_key = make_session_key(channel, chat_id)
 
             str_token_count = _estimate_tokens(
                 system_prompt
@@ -204,7 +211,7 @@ class MemoryCompactionHook:
 
             if not is_valid:
                 logger.warning("Invalid messages during compaction, adjusting...")
-                keep_length = MEMORY_COMPACT_KEEP_RECENT
+                keep_length = _MEMORY_COMPACT_KEEP_RECENT
                 messages_length = len(messages)
                 while keep_length > 0 and not self._check_valid_messages(
                     messages[max(messages_length - keep_length, 0):]
@@ -322,7 +329,15 @@ class MemoryCompactionHook:
 
             return compact_content
 
+        except _PROGRAMMING_ERRORS:
+            # Programming bugs (TypeError, AttributeError, …) must not be
+            # swallowed — they indicate a real defect that should surface
+            # to the caller instead of degrading silently.
+            raise
         except Exception as e:
+            # Operational failures (LLM timeout, provider error, corrupt
+            # response, …) are recoverable: log and degrade gracefully so
+            # the agent can continue without compaction this turn.
             logger.exception("Failed to compact memory in pre_reasoning hook: {}", e)
             return None
 

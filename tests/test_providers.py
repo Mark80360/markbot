@@ -232,6 +232,7 @@ class TestFallbackManager:
         mgr._circuits = {}
         mgr._circuit_threshold = 3
         mgr._circuit_cooldown = 60.0
+        mgr._half_open_probes = set()
 
         assert mgr._check_circuit("test") is True
         mgr._record_failure("test")

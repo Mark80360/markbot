@@ -19,7 +19,7 @@ from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
 from markbot.agent.stream_scrubber import ScrubberPool
-from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.bus.events import InboundMessage, OutboundMessage, make_session_key
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
@@ -139,6 +139,11 @@ class AgentLoop:
         self.mcp = ctx.mcp
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Serialises mutations to ``_active_tasks`` / ``_session_locks``.
+        # In single-threaded asyncio the individual dict ops are atomic,
+        # but multi-step sequences (track → dispatch → cleanup) benefit
+        # from an explicit guard so future refactors stay safe.
+        self._tasks_lock = asyncio.Lock()
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
@@ -167,10 +172,11 @@ class AgentLoop:
         self._scrubber_pool = ScrubberPool()
 
         # Per-session last-active timestamps for idle timeout detection.
-        # Updated on every inbound message and checked during the 1s poll
-        # gap in ``run()``. A session that has been silent longer than
-        # ``AGENT_IDLE_TIMEOUT_MINUTES`` gets a notification + cleanup.
+        # Updated on every inbound message and checked by a background
+        # ``_idle_check_loop`` task. A session that has been silent longer
+        # than ``AGENT_IDLE_TIMEOUT_MINUTES`` gets a notification + cleanup.
         self._session_last_active: dict[str, float] = {}
+        self._idle_task: asyncio.Task | None = None
 
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
@@ -194,7 +200,7 @@ class AgentLoop:
             self.question_tool.set_context(channel, chat_id)
         if todo_tool := self.tools.get("todo"):
             if hasattr(todo_tool, "set_session"):
-                todo_tool.set_session(f"{channel}:{chat_id}")
+                todo_tool.set_session(make_session_key(channel, chat_id) or "")
         if self._memory_search_tool:
             self._memory_search_tool.set_session_context(channel, chat_id)
 
@@ -234,7 +240,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
-            session_key=f"{channel}:{chat_id}",
+            session_key=make_session_key(channel, chat_id) or "",
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
         )
@@ -356,14 +362,14 @@ class AgentLoop:
             logger.warning("Memory manager start failed: {}", e)
         logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
+        # Background idle-session checker — runs on a 30s cadence so the
+        # main loop can block on ``consume_inbound()`` indefinitely instead
+        # of waking every second just to poll idle state.
+        self._idle_task = asyncio.create_task(self._idle_check_loop())
+
         while self._running:
-            now = time.time()
             try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                # No message in this 1s poll — check for idle sessions.
-                self._check_idle_sessions(now)
-                continue
+                msg = await self.bus.consume_inbound()
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
                 # Only ignore non-task CancelledError signals that may leak from integrations.
@@ -385,22 +391,36 @@ class AgentLoop:
                     await self.bus.publish_outbound(result)
                 continue
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            self._track_task(msg.session_key, task)
+            task.add_done_callback(
+                lambda t, k=msg.session_key: self._untrack_task(k, t)
+            )
 
-            def _cleanup_task(t: asyncio.Task, k: str = msg.session_key) -> None:
-                tasks = self._active_tasks.get(k)
-                if tasks is None:
-                    self._session_locks.pop(k, None)
-                    return
-                try:
-                    tasks.remove(t)
-                except ValueError:
-                    pass
-                if not tasks:
-                    self._active_tasks.pop(k, None)
-                    self._session_locks.pop(k, None)
+    # ------------------------------------------------------------------
+    # Task tracking helpers
+    # ------------------------------------------------------------------
 
-            task.add_done_callback(_cleanup_task)
+    def _track_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Register an in-flight dispatch task under its session key."""
+        self._active_tasks.setdefault(session_key, []).append(task)
+
+    def _untrack_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Remove a completed task; clean up empty session entries."""
+        tasks = self._active_tasks.get(session_key)
+        if tasks is None:
+            self._session_locks.pop(session_key, None)
+            return
+        try:
+            tasks.remove(task)
+        except ValueError:
+            pass
+        if not tasks:
+            self._active_tasks.pop(session_key, None)
+            self._session_locks.pop(session_key, None)
+
+    def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        """Get or create the per-session serial lock."""
+        return self._session_locks.setdefault(session_key, asyncio.Lock())
 
     # ------------------------------------------------------------------
     # Idle session management
@@ -418,11 +438,24 @@ class AgentLoop:
                     return True
         return False
 
+    async def _idle_check_loop(self) -> None:
+        """Background task that periodically checks for idle sessions.
+
+        Runs on a 30-second cadence so the main loop can block on
+        ``consume_inbound()`` indefinitely without waking to poll.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return
+            self._check_idle_sessions(time.time())
+
     def _check_idle_sessions(self, now: float) -> None:
         """Check and clean up sessions that have exceeded the idle timeout.
 
-        Called on each 1-second poll gap. Iterates a snapshot of the
-        session keys so we don't mutate the dict while iterating it.
+        Called by the background ``_idle_check_loop``. Iterates a snapshot
+        of the session keys so we don't mutate the dict while iterating it.
         """
         idle_seconds = AGENT_IDLE_TIMEOUT_MINUTES * 60
         if idle_seconds <= 0:
@@ -534,7 +567,7 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        lock = self._get_session_lock(msg.session_key)
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
@@ -629,6 +662,8 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
         self._scrubber_pool.clear()
         try:
             self.sessions.close()
@@ -695,7 +730,7 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         if msg.channel == "system":
-            key = f"{channel}:{chat_id}"
+            key = make_session_key(channel, chat_id) or ""
 
         pctx = ProcessContext(
             msg=msg,
@@ -798,6 +833,23 @@ class AgentLoop:
             result.metadata.setdefault("message_id", msg.metadata.get("message_id"))
             result.metadata.setdefault("reaction_id", msg.metadata.get("reaction_id"))
             return result
+
+        # 检测"继续"指令：当用户输入"继续"/"continue"等时，注入 resume 引导，
+        # 让 LLM 知道要从上次中断处续接，而不是当作全新请求处理。
+        # 配合 _finalize_loop 中写入 history 的中断原因，agent 能感知上次进度。
+        _resume_triggers = ("继续", "continue", "go on", "resume", "接着", "接着做", "继续做")
+        if raw.lower() in _resume_triggers:
+            resume_hint = (
+                "[System] 用户输入了「继续」。请检查对话历史中是否存在因"
+                "「达到工具调用迭代上限」或「预算超限」而中断的任务。"
+                "如果存在，请从上次中断处续接任务：\n"
+                "1. 先回顾历史中已完成的步骤（已创建的文件、已验证的依赖等），"
+                "不要重复这些步骤；\n"
+                "2. 识别上次中断时正在进行的子任务；\n"
+                "3. 从该子任务继续执行，直到任务完成。\n"
+                "如果历史中没有中断记录，则按正常方式处理用户请求。"
+            )
+            msg.content = resume_hint + "\n\n用户输入：" + raw
 
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):

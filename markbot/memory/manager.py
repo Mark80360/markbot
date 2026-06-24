@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
+from markbot.bus.events import make_session_key
+
 from markbot.utils.constants import (
     MAX_COMPRESSED_SUMMARY_CHARS,
     MAX_PREFETCH_RESULTS,
@@ -945,7 +947,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 pass
 
         # 4. Search session-specific summaries
-        session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+        session_key = make_session_key(channel, chat_id)
         if session_key:
             session_summary = self.get_compressed_summary(session_key=session_key)
             if session_summary and session_summary != self._compressed_summary:

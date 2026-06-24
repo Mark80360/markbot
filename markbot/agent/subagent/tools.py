@@ -53,6 +53,12 @@ class CheckSubagentTool(BaseTool):
         action = params.get("action", "status")
         progress_manager = self._manager.progress_manager
 
+        if progress_manager is None:
+            return (
+                f"Task {task_id}: progress tracking is unavailable (no workspace configured). "
+                "Subagent results are still announced when tasks complete."
+            )
+
         if action == "status":
             progress = progress_manager.get_progress(task_id)
 
@@ -135,7 +141,12 @@ class ListSubagentsTool(BaseTool):
         return PermissionDecision(behavior="allow")
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> str:
-        active_tasks = self._manager.progress_manager.list_active_tasks()
+        progress_manager = self._manager.progress_manager
+
+        if progress_manager is None:
+            return "Progress tracking is unavailable (no workspace configured)."
+
+        active_tasks = progress_manager.list_active_tasks()
 
         if not active_tasks:
             return "No active subagent tasks."

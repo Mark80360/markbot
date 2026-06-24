@@ -154,7 +154,7 @@ class SubagentManager:
         except asyncio.CancelledError:
             error_msg = "Cancelled"
             logger.info("Subagent [{}] {}", task_id, error_msg)
-            await tracker.fail(error_msg)
+            await tracker.cancel()
             progress = tracker.get_progress()
             await self._announce_result(task_id, label, task, error_msg, origin, "cancelled", progress)
             raise
@@ -321,7 +321,15 @@ class SubagentManager:
                 break
 
         if final_result is None:
-            final_result = "Task completed but no final response was generated."
+            final_result = (
+                f"Subagent reached max_iterations ({max_iterations}) without "
+                "producing a final response."
+            )
+            logger.warning("Subagent [{}] exhausted iterations", task_id)
+            await tracker.fail(final_result)
+            progress = tracker.get_progress()
+            await self._announce_result(task_id, label, task, final_result, origin, "error", progress)
+            return
 
         await tracker.complete(final_result)
         logger.info("Subagent [{}] completed successfully", task_id)
@@ -330,15 +338,38 @@ class SubagentManager:
         await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
 
     def _register_subagent_tools(self, tools: ToolRegistry, capability: CapabilityToken) -> None:
-        """Register tools for subagent based on capability token."""
-        from markbot.tools.filesystem import ListDirTool, ReadFileTool
+        """Register tools for subagent based on capability token.
+
+        All tool registration is gated by ``capability.allows()``: a
+        tool is registered only if the capability permits it.  This
+        covers both read-only tools (read_file, glob, …) and
+        write/exec tools (write_file, exec, …).
+        """
+        from markbot.tools.filesystem import (
+            DeleteFileTool,
+            EditFileTool,
+            ListDirTool,
+            ReadFileTool,
+            WriteFileTool,
+        )
         from markbot.tools.search import GlobTool, GrepTool
+        from markbot.tools.shell import ExecTool
         from markbot.tools.web import WebExtractTool, WebFetchTool, WebSearchTool
 
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
 
-        _tool_builders = {
+        fs_backup_dir = (
+            getattr(self.filesystem_config, "backup_dir", None) if self.filesystem_config else None
+        )
+        fs_max_backups = (
+            getattr(self.filesystem_config, "max_backups", None) if self.filesystem_config else None
+        )
+        fs_safe_delete = (
+            getattr(self.filesystem_config, "safe_delete", True) if self.filesystem_config else True
+        )
+
+        _tool_builders: dict[str, Any] = {
             "read_file": lambda: ReadFileTool(
                 workspace=self.workspace,
                 allowed_dir=allowed_dir,
@@ -353,6 +384,32 @@ class SubagentManager:
             "web_search": lambda: WebSearchTool(config=self.web_search_config, proxy=self.web_proxy),
             "web_fetch": lambda: WebFetchTool(proxy=self.web_proxy),
             "web_extract": lambda: WebExtractTool(proxy=self.web_proxy),
+            "write_file": lambda: WriteFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                backup_dir=fs_backup_dir,
+                max_backups=fs_max_backups,
+            ),
+            "edit_file": lambda: EditFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                backup_dir=fs_backup_dir,
+                max_backups=fs_max_backups,
+            ),
+            "delete_file": lambda: DeleteFileTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                backup_dir=fs_backup_dir,
+                max_backups=fs_max_backups,
+                safe_delete=fs_safe_delete,
+            ),
+            "exec": lambda: ExecTool(
+                working_dir=str(self.workspace) if self.workspace else None,
+                timeout=getattr(self.exec_config, "timeout", 60),
+                restrict_to_workspace=getattr(self.exec_config, "restrict_to_workspace", False),
+                path_append=getattr(self.exec_config, "path_append", ""),
+                allowed_internal_ips=getattr(self.exec_config, "allowed_internal_ips", None),
+            ),
         }
 
         for name, builder in _tool_builders.items():
@@ -394,7 +451,11 @@ class SubagentManager:
         """Announce the subagent result to the main agent via the message bus."""
         from markbot.agent.subagent.progress import SubagentProgress
 
-        status_text = "completed successfully" if status == "ok" else "failed"
+        status_text = {
+            "ok": "completed successfully",
+            "cancelled": "was cancelled",
+            "error": "failed",
+        }.get(status, "failed")
 
         # Build progress summary
         progress_info = ""
@@ -433,7 +494,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
-        if self._memory_manager and hasattr(self._memory_manager, "on_delegation"):
+        if status == "ok" and self._memory_manager and hasattr(self._memory_manager, "on_delegation"):
             try:
                 self._memory_manager.on_delegation(
                     task=task,
@@ -461,6 +522,23 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             forbidden_list = "- (none explicitly forbidden by token)"
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
+
+        # Determine the subagent's role based on its capability.
+        _has_write = any(
+            t in capability.allowed_tools
+            for t in ("write_file", "edit_file", "delete_file", "exec")
+        )
+        if _has_write:
+            _role_desc = (
+                "Complete the assigned task using the tools available to you. "
+                "You may read, modify, and execute as permitted by your capability. "
+                "Return a concise summary of what you did as your final response."
+            )
+        else:
+            _role_desc = (
+                "Your ONLY job: gather information and return it as your final response."
+            )
+
         parts = [f"""# Subagent
 
 {time_ctx}
@@ -476,7 +554,7 @@ ALLOWED: {allowed_list}
 FORBIDDEN (violating these is a critical failure):
 {forbidden_list}
 
-Your ONLY job: gather information and return it as your final response.
+{_role_desc}
 
 ## Tool Notes
 - `web_search` for current facts/news/versions

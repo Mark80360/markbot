@@ -325,91 +325,200 @@ class AgentContext:
         """Create a fully initialized AgentContext from the legacy parameter list.
 
         This encapsulates all the component creation that was previously
-        inlined in ``AgentLoop.__init__``.
+        inlined in ``AgentLoop.__init__``.  The body delegates to a series
+        of ``_build_*`` sub-builders so each concern is isolated and
+        individually testable.
         """
-        from markbot.agent.compact import CompactionConfig as _CC
-        from markbot.agent.compact import MultiLevelCompactor as _MLC
-        from markbot.agent.context import ContextBuilder as _CB
-        from markbot.agent.cost import CostTracker as _CT
-        from markbot.agent.cost import ModelPricing as _MP
-        from markbot.agent.cost import PricingTable as _PT
-        from markbot.agent.hooks.bootstrap import BootstrapHook as _BH
-        from markbot.agent.hooks.compaction import MemoryCompactionHook as _MCH
-        from markbot.agent.mcp.manager import McpManager as _MM
-        from markbot.agent.pipeline.engine import MessagePipeline as _MP2
-        from markbot.agent.pipeline.middleware import (
-            MemoryLifecycleMiddleware as _MLM,
-        )
-        from markbot.agent.pipeline.middleware import (
-            QuestionResponseMiddleware as _QRM,
-        )
-        from markbot.agent.services.executor import ToolExecutor as _TE
-        from markbot.agent.services.interaction import InteractionLogger as _IL
-        from markbot.agent.subagent import SubagentManager as _SM
-        from markbot.agent.tool_binder import ToolBinder as _TB
-        from markbot.cli.slash_commands import CommandRouter as _CR
-        from markbot.cli.slash_commands import register_builtin_commands as _rbc
-        from markbot.config.schema import (
-            CodeExecutionConfig as _CEC,
-        )
-        from markbot.config.schema import (
-            ExecToolConfig as _ETC,
-        )
-        from markbot.config.schema import (
-            FilesystemToolConfig as _FTC,
-        )
-        from markbot.config.schema import (
-            MemoryToolsConfig as _MTC,
-        )
-        from markbot.config.schema import (
-            WebSearchConfig as _WSC,
-        )
-        from markbot.memory.daily_log import DailyLogManager as _DLM
-        from markbot.memory.encoder import MemoryEncoder as _ME
-        from markbot.memory.manager import MemoryManager as _HMM
-        from markbot.session.app_state import AppStateProvider as _ASP
-        from markbot.session.bootstrap import SessionBootstrap as _SB
-        from markbot.session.handoff import HandoffManager as _HM
-        from markbot.session.session import SessionManager as _SM2
-        from markbot.session.task_tracker import TaskTracker as _TT
-        from markbot.skills import SkillRegistry as _SR
-        from markbot.skills.core.guardrail import SkillGuardrailManager as _SGM
-        from markbot.tools.registry import ToolRegistry as _TR
-
         _init_start = time.time()
         logger.info("Starting initialization...")
-
         timings: dict[str, float] = {}
 
-        _primary_provider_config = None
+        model, primary_provider_config = cls._resolve_model(config)
+        resolved_configs = cls._resolve_tool_configs(
+            web_search_config, exec_config, filesystem_config, memory_config, config
+        )
+        resolved_configs["web_proxy"] = web_proxy
+        compactor, cost_tracker = cls._build_cost_and_compaction(
+            fallback_manager, compaction_config, budget_config,
+            max_budget_usd, warn_threshold_usd, timings,
+        )
+        tools, skill_registry, guardrail_manager = cls._build_tools_and_skills(
+            workspace, timings,
+        )
+        sessions, subagents, mcp = cls._build_sessions_subagents_mcp(
+            fallback_manager, config, workspace, bus, model,
+            resolved_configs, restrict_to_workspace, cost_tracker,
+            session_manager, mcp_servers, timings,
+        )
+        memory_manager = cls._build_memory(
+            workspace, fallback_manager, model, primary_provider_config,
+            resolved_configs, timezone, timings,
+        )
+        subagents._memory_manager = memory_manager
+        bootstrap_hook, compaction_hook, context_builder = cls._build_hooks_and_context(
+            workspace, memory_manager, resolved_configs["memory"],
+            compaction_config, context_window_tokens,
+            timezone, tools, skill_registry,
+        )
+        binder = cls._build_tool_binder(
+            tools, workspace, restrict_to_workspace, resolved_configs, config,
+            cron_service, subagents, memory_manager, skill_registry, timezone, bus, timings,
+        )
+        logger.info("Agent has {} tools available", len(tools))
+        pipeline, daily_log, interaction_log = cls._build_pipeline(
+            binder, memory_manager, sessions, workspace,
+        )
+        session_ext = cls._build_session_extensions(
+            workspace, memory_manager, mcp, tools, timings,
+        )
+
+        timings["total"] = time.time() - _init_start
+        logger.info("Initialization complete, total took {:.3f}s", timings["total"])
+        logger.info("Timings breakdown:\n{}", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
+
+        return cls(
+            config=config,
+            workspace=workspace,
+            bus=bus,
+            fallback_manager=fallback_manager,
+            model=model,
+            max_iterations=max_iterations,
+            context_window_tokens=context_window_tokens,
+            channels_config=channels_config,
+            web_search_config=resolved_configs["web_search"],
+            web_proxy=web_proxy,
+            exec_config=resolved_configs["exec"],
+            filesystem_config=resolved_configs["filesystem"],
+            memory_config=resolved_configs["memory"],
+            code_execution_config=resolved_configs["code_execution"],
+            cron_service=cron_service,
+            restrict_to_workspace=restrict_to_workspace,
+            timezone=timezone,
+            compaction_config=compaction_config,
+            max_budget_usd=max_budget_usd,
+            warn_threshold_usd=warn_threshold_usd,
+            budget_config=budget_config,
+            mcp_servers=mcp_servers,
+            tools=tools,
+            skill_registry=skill_registry,
+            guardrail_manager=guardrail_manager,
+            sessions=sessions,
+            subagents=subagents,
+            memory_manager=memory_manager,
+            compactor=compactor,
+            cost_tracker=cost_tracker,
+            mcp=mcp,
+            context_builder=context_builder,
+            pipeline=pipeline,
+            commands=session_ext["commands"],
+            tool_executor=session_ext["tool_executor"],
+            bootstrap_hook=bootstrap_hook,
+            compaction_hook=compaction_hook,
+            daily_log=daily_log,
+            interaction_log=interaction_log,
+            memory_search_tool=binder.memory_search_tool,
+            question_tool=binder.question_tool,
+            handoff_manager=session_ext["handoff_manager"],
+            session_bootstrap=session_ext["session_bootstrap"],
+            task_tracker=session_ext["task_tracker"],
+            memory_encoder=session_ext["memory_encoder"],
+            app_state=session_ext["app_state"],
+            # ------------------------------------------------------------------
+            # Cache layer — always construct fresh per process so the
+            # cross-session disk cache in prompt_persist is the only
+            # persistent piece.  See markbot.agent.{prefix_cache,
+            # llm_response_cache, token_estimate_cache}.
+            # ------------------------------------------------------------------
+            prefix_stability=PrefixStabilityManager(),
+            llm_response_cache=LLMResponseCache(),
+            token_estimate_cache=TokenEstimateCache(),
+            _init_timings=timings,
+        )
+
+    # ------------------------------------------------------------------
+    # Sub-builders — each handles one concern so the orchestration
+    # method above stays readable.  Kept as classmethods so they can
+    # be unit-tested in isolation.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_model(config: "Config | None") -> tuple[str, Any]:
+        """Resolve the primary model name and provider config."""
         model = "unknown"
+        primary_provider_config = None
         if config and config.primary_model_ref:
             primary_provider, primary_model = config.resolve_model(config.primary_model_ref)
             model = primary_model.name
-            _primary_provider_config = primary_provider
+            primary_provider_config = primary_provider
+        return model, primary_provider_config
 
-        _web_search_config = web_search_config or _WSC()
-        _exec_config = exec_config or _ETC()
-        _filesystem_config = filesystem_config or _FTC()
-        _resolved_memory_config = memory_config or _MTC()
-        _code_execution_config = getattr(
-            config.tools if config else None, "code_execution", None
-        ) or _CEC()
+    @staticmethod
+    def _resolve_tool_configs(
+        web_search_config: "WebSearchConfig | None",
+        exec_config: "ExecToolConfig | None",
+        filesystem_config: "FilesystemToolConfig | None",
+        memory_config: "MemoryToolsConfig | None",
+        config: "Config | None",
+    ) -> dict[str, Any]:
+        """Resolve tool configs to their defaults when not supplied."""
+        from markbot.config.schema import (
+            CodeExecutionConfig as _CEC,
+            ExecToolConfig as _ETC,
+            FilesystemToolConfig as _FTC,
+            MemoryToolsConfig as _MTC,
+            WebSearchConfig as _WSC,
+        )
+        return {
+            "web_search": web_search_config or _WSC(),
+            "exec": exec_config or _ETC(),
+            "filesystem": filesystem_config or _FTC(),
+            "memory": memory_config or _MTC(),
+            "code_execution": getattr(
+                config.tools if config else None, "code_execution", None
+            ) or _CEC(),
+        }
+
+    @staticmethod
+    def _build_cost_and_compaction(
+        fallback_manager: "FallbackManager",
+        compaction_config: "CompactionConfig | None",
+        budget_config: "BudgetConfig | None",
+        max_budget_usd: float | None,
+        warn_threshold_usd: float,
+        timings: dict[str, float],
+    ) -> tuple[Any, Any]:
+        """Build the MultiLevelCompactor and CostTracker."""
+        from markbot.agent.compact import CompactionConfig as _CC
+        from markbot.agent.compact import MultiLevelCompactor as _MLC
+        from markbot.agent.cost import CostTracker as _CT
+        from markbot.agent.cost import ModelPricing as _MP
+        from markbot.agent.cost import PricingTable as _PT
 
         _t0 = time.time()
         _compaction_cfg = compaction_config or _CC()
         compactor = _MLC(fallback_manager=fallback_manager, config=_compaction_cfg)
         timings["compactor"] = time.time() - _t0
 
-        _pricing: _PT | None = None
+        pricing: _PT | None = None
         if budget_config and getattr(budget_config, "custom_pricing", None):
             _custom = {k: _MP(**v) for k, v in budget_config.custom_pricing.items()}
-            _pricing = _PT(custom=_custom)
+            pricing = _PT(custom=_custom)
         cost_tracker = _CT(
             max_budget_usd=max_budget_usd,
             warn_threshold_usd=warn_threshold_usd,
-            pricing=_pricing,
+            pricing=pricing,
         )
+        return compactor, cost_tracker
+
+    @staticmethod
+    def _build_tools_and_skills(
+        workspace: Path | None,
+        timings: dict[str, float],
+    ) -> tuple[Any, Any, Any]:
+        """Build ToolRegistry, SkillRegistry, and guardrail manager."""
+        from markbot.skills import SkillRegistry as _SR
+        from markbot.skills.core.guardrail import SkillGuardrailManager as _SGM
+        from markbot.tools.registry import ToolRegistry as _TR
 
         _t0 = time.time()
         tools = _TR()
@@ -421,6 +530,26 @@ class AgentContext:
         timings["skill_registry"] = time.time() - _t0
 
         guardrail_manager = _SGM(context="main")
+        return tools, skill_registry, guardrail_manager
+
+    @staticmethod
+    def _build_sessions_subagents_mcp(
+        fallback_manager: "FallbackManager",
+        config: "Config | None",
+        workspace: Path | None,
+        bus: "MessageBus",
+        model: str,
+        resolved_configs: dict[str, Any],
+        restrict_to_workspace: bool,
+        cost_tracker: "CostTracker",
+        session_manager: "SessionManager | None",
+        mcp_servers: dict | None,
+        timings: dict[str, float],
+    ) -> tuple[Any, Any, Any]:
+        """Build SessionManager, SubagentManager, and McpManager."""
+        from markbot.agent.mcp.manager import McpManager as _MM
+        from markbot.agent.subagent import SubagentManager as _SM
+        from markbot.session.session import SessionManager as _SM2
 
         _t0 = time.time()
         sessions = session_manager or _SM2(workspace)
@@ -430,18 +559,32 @@ class AgentContext:
             workspace=workspace,
             bus=bus,
             model=model,
-            web_search_config=_web_search_config,
-            web_proxy=web_proxy,
-            exec_config=_exec_config,
-            filesystem_config=_filesystem_config,
+            web_search_config=resolved_configs["web_search"],
+            web_proxy=resolved_configs.get("web_proxy"),
+            exec_config=resolved_configs["exec"],
+            filesystem_config=resolved_configs["filesystem"],
             restrict_to_workspace=restrict_to_workspace,
             cost_tracker=cost_tracker,
         )
         timings["subagents"] = time.time() - _t0
 
         mcp = _MM(mcp_servers)
+        return sessions, subagents, mcp
 
-        memory_cfg = _resolved_memory_config
+    @staticmethod
+    def _build_memory(
+        workspace: Path | None,
+        fallback_manager: "FallbackManager",
+        model: str,
+        primary_provider_config: Any,
+        resolved_configs: dict[str, Any],
+        timezone: str | None,
+        timings: dict[str, float],
+    ) -> "BaseMemoryManager":
+        """Build the MemoryManager with embedding + LLM configs."""
+        from markbot.memory.manager import MemoryManager as _HMM
+
+        memory_cfg = resolved_configs["memory"]
         embedding_config: dict[str, Any] = {}
         if memory_cfg:
             embedding_config = {
@@ -453,8 +596,8 @@ class AgentContext:
 
         llm_config: dict[str, Any] = {
             "backend": "openai",
-            "api_key": getattr(_primary_provider_config, 'api_key', '') or "",
-            "base_url": getattr(_primary_provider_config, 'api_base', '') or "",
+            "api_key": getattr(primary_provider_config, 'api_key', '') or "",
+            "base_url": getattr(primary_provider_config, 'api_base', '') or "",
             "model_name": model,
         }
 
@@ -489,8 +632,23 @@ class AgentContext:
             provider_config=getattr(memory_cfg, "provider_config", None),
         )
         timings["memory_manager"] = time.time() - _t0
+        return memory_manager
 
-        subagents._memory_manager = memory_manager
+    @staticmethod
+    def _build_hooks_and_context(
+        workspace: Path | None,
+        memory_manager: "BaseMemoryManager",
+        memory_cfg: "MemoryToolsConfig | None",
+        compaction_config: "CompactionConfig | None",
+        context_window_tokens: int,
+        timezone: str | None,
+        tools: "ToolRegistry",
+        skill_registry: "SkillRegistry",
+    ) -> tuple[Any, Any, Any]:
+        """Build BootstrapHook, MemoryCompactionHook, and ContextBuilder."""
+        from markbot.agent.context import ContextBuilder as _CB
+        from markbot.agent.hooks.bootstrap import BootstrapHook as _BH
+        from markbot.agent.hooks.compaction import MemoryCompactionHook as _MCH
 
         bootstrap_hook = _BH(working_dir=workspace, language="zh")
 
@@ -515,6 +673,25 @@ class AgentContext:
             memory_manager=memory_manager,
             system_prompt_token_budget=_system_prompt_token_budget,
         )
+        return bootstrap_hook, compaction_hook, context_builder
+
+    @staticmethod
+    def _build_tool_binder(
+        tools: "ToolRegistry",
+        workspace: Path | None,
+        restrict_to_workspace: bool,
+        resolved_configs: dict[str, Any],
+        config: "Config | None",
+        cron_service: "CronService | None",
+        subagents: "SubagentManager",
+        memory_manager: "BaseMemoryManager",
+        skill_registry: "SkillRegistry",
+        timezone: str | None,
+        bus: "MessageBus",
+        timings: dict[str, float],
+    ) -> Any:
+        """Build and register all tools via ToolBinder."""
+        from markbot.agent.tool_binder import ToolBinder as _TB
 
         _allowed_dir = workspace if restrict_to_workspace else None
         _t0 = time.time()
@@ -522,11 +699,11 @@ class AgentContext:
             tools,
             workspace=workspace,
             allowed_dir=_allowed_dir,
-            web_search_config=_web_search_config,
-            web_proxy=web_proxy,
-            exec_config=_exec_config,
-            filesystem_config=_filesystem_config,
-            code_execution_config=_code_execution_config,
+            web_search_config=resolved_configs["web_search"],
+            web_proxy=resolved_configs.get("web_proxy"),
+            exec_config=resolved_configs["exec"],
+            filesystem_config=resolved_configs["filesystem"],
+            code_execution_config=resolved_configs["code_execution"],
             computer_use_config=getattr(config.tools if config else None, "computer_use", None),
             browser_config=getattr(config.tools if config else None, "browser", None),
             cron_service=cron_service,
@@ -538,17 +715,27 @@ class AgentContext:
         )
         binder.register_all()
         timings["tool_binder"] = time.time() - _t0
+        return binder
 
-        _memory_search_tool = binder.memory_search_tool
+    @staticmethod
+    def _build_pipeline(
+        binder: Any,
+        memory_manager: "BaseMemoryManager",
+        sessions: "SessionManager",
+        workspace: Path | None,
+    ) -> tuple[Any, Any, Any]:
+        """Build the MessagePipeline with middlewares + daily/interaction logs."""
+        from markbot.agent.pipeline.engine import MessagePipeline as _MP2
+        from markbot.agent.pipeline.middleware import (
+            MemoryLifecycleMiddleware as _MLM,
+        )
+        from markbot.agent.pipeline.middleware import (
+            QuestionResponseMiddleware as _QRM,
+        )
+        from markbot.agent.services.interaction import InteractionLogger as _IL
+        from markbot.memory.daily_log import DailyLogManager as _DLM
+
         question_tool = binder.question_tool
-
-        logger.info("Agent has {} tools available", len(tools))
-
-        commands = _CR()
-        _rbc(commands)
-
-        tool_executor = _TE(tools)
-
         pipeline = _MP2()
         pipeline.use(_QRM(get_question_tool=lambda: question_tool))
         daily_log = _DLM(workspace=workspace)
@@ -562,6 +749,26 @@ class AgentContext:
                 session_manager=sessions,
             )
         )
+        return pipeline, daily_log, interaction_log
+
+    @staticmethod
+    def _build_session_extensions(
+        workspace: Path | None,
+        memory_manager: "BaseMemoryManager",
+        mcp: "McpManager",
+        tools: "ToolRegistry",
+        timings: dict[str, float],
+    ) -> dict[str, Any]:
+        """Build handoff, task tracker, memory encoder, bootstrap, commands."""
+        from markbot.cli.slash_commands import CommandRouter as _CR
+        from markbot.cli.slash_commands import register_builtin_commands as _rbc
+        from markbot.agent.services.executor import ToolExecutor as _TE
+        from markbot.memory.encoder import MemoryEncoder as _ME
+        from markbot.session.app_state import AppStateProvider as _ASP
+        from markbot.session.bootstrap import SessionBootstrap as _SB
+        from markbot.session.handoff import HandoffManager as _HM
+        from markbot.session.task_tracker import TaskTracker as _TT
+
         _t0 = time.time()
         handoff_manager = _HM(workspace)
         task_tracker = _TT(workspace)
@@ -573,70 +780,19 @@ class AgentContext:
             mcp_manager=mcp,
             task_tracker=task_tracker,
         )
+        commands = _CR()
+        _rbc(commands)
+        tool_executor = _TE(tools)
         timings["session_extensions"] = time.time() - _t0
-
-        timings["total"] = time.time() - _init_start
-        logger.info("Initialization complete, total took {:.3f}s", timings["total"])
-        logger.info("Timings breakdown:\n{}", "\n".join(f"  {k}: {v:.3f}s" for k, v in sorted(timings.items())))
-
-        return cls(
-            config=config,
-            workspace=workspace,
-            bus=bus,
-            fallback_manager=fallback_manager,
-            model=model,
-            max_iterations=max_iterations,
-            context_window_tokens=context_window_tokens,
-            channels_config=channels_config,
-            web_search_config=_web_search_config,
-            web_proxy=web_proxy,
-            exec_config=_exec_config,
-            filesystem_config=_filesystem_config,
-            memory_config=_resolved_memory_config,
-            code_execution_config=_code_execution_config,
-            cron_service=cron_service,
-            restrict_to_workspace=restrict_to_workspace,
-            timezone=timezone,
-            compaction_config=compaction_config,
-            max_budget_usd=max_budget_usd,
-            warn_threshold_usd=warn_threshold_usd,
-            budget_config=budget_config,
-            mcp_servers=mcp_servers,
-            tools=tools,
-            skill_registry=skill_registry,
-            guardrail_manager=guardrail_manager,
-            sessions=sessions,
-            subagents=subagents,
-            memory_manager=memory_manager,
-            compactor=compactor,
-            cost_tracker=cost_tracker,
-            mcp=mcp,
-            context_builder=context_builder,
-            pipeline=pipeline,
-            commands=commands,
-            tool_executor=tool_executor,
-            bootstrap_hook=bootstrap_hook,
-            compaction_hook=compaction_hook,
-            daily_log=daily_log,
-            interaction_log=interaction_log,
-            memory_search_tool=_memory_search_tool,
-            question_tool=question_tool,
-            handoff_manager=handoff_manager,
-            session_bootstrap=session_bootstrap,
-            task_tracker=task_tracker,
-            memory_encoder=memory_encoder,
-            app_state=app_state,
-            # ------------------------------------------------------------------
-            # Cache layer — always construct fresh per process so the
-            # cross-session disk cache in prompt_persist is the only
-            # persistent piece.  See markbot.agent.{prefix_cache,
-            # llm_response_cache, token_estimate_cache}.
-            # ------------------------------------------------------------------
-            prefix_stability=PrefixStabilityManager(),
-            llm_response_cache=LLMResponseCache(),
-            token_estimate_cache=TokenEstimateCache(),
-            _init_timings=timings,
-        )
+        return {
+            "handoff_manager": handoff_manager,
+            "task_tracker": task_tracker,
+            "memory_encoder": memory_encoder,
+            "app_state": app_state,
+            "session_bootstrap": session_bootstrap,
+            "commands": commands,
+            "tool_executor": tool_executor,
+        }
 
     def record_timing(self, component: str, elapsed_s: float) -> None:
         self._init_timings[component] = elapsed_s
