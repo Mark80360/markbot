@@ -1285,7 +1285,7 @@ class IterationRunner:
             )
             for tc in response.tool_calls:
                 if not self.loop.tools.has(tc.name):
-                    state.messages = self.loop.context.add_tool_result(
+                    state.messages = await self.loop.context.add_tool_result_async(
                         state.messages, tc.id, tc.name, error_msg
                     )
                 else:
@@ -1299,7 +1299,7 @@ class IterationRunner:
                         chat_id=self.chat_id,
                         message_id=self.message_id,
                     ))
-                    state.messages = self.loop.context.add_tool_result(
+                    state.messages = await self.loop.context.add_tool_result_async(
                         state.messages, tc.id, tc.name, result
                     )
             return IterationResult(should_continue=True)
@@ -1463,7 +1463,7 @@ class IterationRunner:
                     logger.info(
                         "Tool {} result: {}", tool_call.name, safe_preview
                     )
-            state.messages = self.loop.context.add_tool_result(
+            state.messages = await self.loop.context.add_tool_result_async(
                 state.messages, tool_call.id, tool_call.name, result
             )
 

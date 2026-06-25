@@ -42,6 +42,10 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    auxiliary_vision: "AuxiliaryVisionConfig" = Field(
+        default_factory=lambda: AuxiliaryVisionConfig(),
+        description="Auxiliary vision model for non-vision primary models",
+    )
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -515,7 +519,17 @@ class BrowserConfig(Base):
 
 
 class AuxiliaryVisionConfig(Base):
-    """Auxiliary vision model configuration for pre-analyzing screenshots."""
+    """Auxiliary vision model configuration for pre-analyzing screenshots.
+
+    When the main model in the model chain cannot process images (e.g.
+    DeepSeek, Groq text-only models), screenshots from ``computer_use`` are
+    sent to the auxiliary vision model for description. The resulting text
+    description is fed back to the main model, preserving visual context
+    without requiring the main model to support image input.
+
+    Set ``provider`` + ``model`` to activate; leave empty to fall back to
+    the tool's text_summary downgrade (lossy).
+    """
 
     force_text_only: bool = Field(
         default=False,
@@ -523,11 +537,19 @@ class AuxiliaryVisionConfig(Base):
     )
     provider: str = Field(
         default="",
-        description="Provider for auxiliary vision model (empty = use same provider as main model)",
+        description=(
+            "Provider ID for the auxiliary vision model (e.g. 'openai', 'anthropic', "
+            "'dashscope'). Must match a configured provider in `providers`. "
+            "Empty = use text_summary fallback when main model lacks vision."
+        ),
     )
     model: str = Field(
         default="",
-        description="Model name for auxiliary vision (empty = use main model)",
+        description=(
+            "Model name for the auxiliary vision call (e.g. 'gpt-4o', 'claude-3-5-sonnet', "
+            "'qwen2.5-vl-72b-instruct'). Must be a vision-capable model. "
+            "Empty = use text_summary fallback."
+        ),
     )
 
 
@@ -697,7 +719,6 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
-    auxiliary_vision: AuxiliaryVisionConfig = Field(default_factory=AuxiliaryVisionConfig)
 
     @property
     def workspace_path(self) -> Path:

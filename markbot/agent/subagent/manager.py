@@ -308,8 +308,8 @@ class SubagentManager:
                         # Unwrap _multimodal tool results (e.g. computer_use
                         # screenshots) so the provider receives a proper content
                         # array / text fallback instead of a raw dict.
-                        from markbot.agent.context import unwrap_multimodal_result
-                        result = unwrap_multimodal_result(result)
+                        from markbot.agent.context import unwrap_multimodal_result_async
+                        result = await unwrap_multimodal_result_async(result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,

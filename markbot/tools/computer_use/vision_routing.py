@@ -89,9 +89,9 @@ def _check_config_override() -> Optional[bool]:
     try:
         from markbot.config.loader import load_config
         config = load_config()
-        if config and hasattr(config, "auxiliary_vision"):
-            av = config.auxiliary_vision
-            if hasattr(av, "force_text_only") and av.force_text_only:
+        if config:
+            av = config.agents.defaults.auxiliary_vision
+            if getattr(av, "force_text_only", False):
                 return True
     except Exception:
         pass
@@ -182,3 +182,115 @@ def should_route_to_text_only(
             return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary vision model — pre-analyze screenshots for non-vision main models
+# ---------------------------------------------------------------------------
+
+def resolve_auxiliary_vision_model() -> tuple[str, str] | None:
+    """Return ``(provider_id, model_name)`` for the auxiliary vision model.
+
+    Reads ``agents.defaults.auxiliary_vision.provider`` / ``.model`` from
+    config. Returns ``None`` when not configured (caller should fall back
+    to the text_summary downgrade).
+    """
+    try:
+        from markbot.config.loader import load_config
+        config = load_config()
+    except Exception:
+        return None
+    if config is None:
+        return None
+    av = config.agents.defaults.auxiliary_vision
+    provider = (getattr(av, "provider", "") or "").strip()
+    model = (getattr(av, "model", "") or "").strip()
+    if not provider or not model:
+        return None
+    return (provider, model)
+
+
+async def describe_image_via_auxiliary(
+    image_b64: str,
+    mime: str,
+    original_summary: str,
+) -> str | None:
+    """Call the auxiliary vision model to describe a screenshot.
+
+    Returns a text description suitable for feeding back to a non-vision
+    main model, or ``None`` if the call failed (caller should fall back
+    to *original_summary*).
+    """
+    ref = resolve_auxiliary_vision_model()
+    if ref is None:
+        return None
+    provider_id, model_name = ref
+
+    try:
+        from markbot.config.loader import load_config
+        from markbot.providers.registry import create_provider, find_by_name
+        config = load_config()
+        provider_cfg = config.providers.get_provider(provider_id)
+        if provider_cfg is None or not provider_cfg.api_key:
+            logger.warning(
+                f"Auxiliary vision provider {provider_id!r} not configured with "
+                f"API key; falling back to text_summary"
+            )
+            return None
+        spec = find_by_name(provider_id)
+        backend = spec.backend if spec else "openai_compat"
+        provider = create_provider(
+            backend=backend,
+            api_key=provider_cfg.api_key,
+            api_base=provider_cfg.api_base,
+            extra_headers=provider_cfg.extra_headers,
+            spec=spec,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to instantiate auxiliary vision provider: {exc}")
+        return None
+
+    user_prompt = (
+        "You are a vision assistant. Describe this screenshot concisely for "
+        "another AI agent that cannot see images. Focus on:\n"
+        "1. Window/app title and active UI state\n"
+        "2. All visible text, buttons, input fields, and their labels\n"
+        "3. Layout structure and element positions (use a numbered list when "
+        "the original summary references element indices)\n"
+        "4. Any error messages, dialogs, or notable visual state\n"
+        "Keep it factual and dense — the downstream agent will use your "
+        "description to decide the next action.\n\n"
+        f"Original tool summary (for context):\n{original_summary}"
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                },
+            ],
+        }
+    ]
+
+    try:
+        response = await provider.chat_with_retry(
+            messages=messages,
+            tools=None,
+            model=model_name,
+            max_tokens=2048,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.warning(f"Auxiliary vision call failed: {exc}")
+        return None
+
+    if response.finish_reason == "error" or not response.content:
+        preview = (response.content or "")[:120]
+        logger.warning(f"Auxiliary vision returned error: {preview}")
+        return None
+
+    return response.content

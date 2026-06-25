@@ -356,67 +356,98 @@ Provider metadata includes `description` and `signup_url` for guided setup wizar
 
 ## Configuration
 
-MarkBot uses a YAML configuration file located at `~/.markbot/config.yaml` by default.
+MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by default.
 
 ### Basic Configuration Example
 
-```yaml
-agents:
-  defaults:
-    model_chain:
-      - anthropic/claude-sonnet-4-5-20250514
-      - openai/gpt-4o
-      - deepseek/deepseek-chat
-    max_tokens: 8192
-    temperature: 0.1
-    timezone: Asia/Shanghai
-    workspace: ~/.markbot/workspace
-
-providers:
-  anthropic:
-    api_key: ${ANTHROPIC_API_KEY}
-    models:
-      - id: claude-sonnet-4-20250514
-        name: claude-sonnet-4-20250514
-        max_tokens: 8192
-        context_window: 200000
-
-channels:
-  dingtalk:
-    enabled: true
-    # ... channel-specific config
-
-tools:
-  web:
-    search:
-      provider: brave
-      api_key: ${BRAVE_API_KEY}
-  exec:
-    enable: true
-    timeout: 60
-  filesystem:
-    backup_dir: ~/.markbot/.markbot_backups
-    safe_delete: true
-  code_execution:
-    enable: true
-    timeout: 60
-    max_memory_mb: 256
-  memory:
-    embedding_backend: openai
-    memory_summary_enabled: true
-    context_compact_enabled: true
-    dream_cron: "0 23 * * *"
-
-compaction:
-  collapse_tool_result_chars: 4000
-  micro_compact_keep_turns: 6
-  auto_compact_keep_recent: 5
-  threshold_ratio: 0.85
-
-budget:
-  enabled: true
-  max_budget_usd: null
-  warn_threshold_usd: 0.5
+```json
+{
+  "agents": {
+    "defaults": {
+      "model_chain": [
+        "anthropic/claude-sonnet-4-5-20250514",
+        "openai/gpt-4o",
+        "deepseek/deepseek-chat"
+      ],
+      "max_tokens": 8192,
+      "temperature": 0.1,
+      "timezone": "Asia/Shanghai",
+      "workspace": "~/.markbot/workspace",
+      "auxiliaryVision": {
+        "forceTextOnly": false,
+        "provider": "openai",
+        "model": "gpt-4o"
+      }
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "api_key": "${ANTHROPIC_API_KEY}",
+      "models": [
+        {
+          "id": "claude-sonnet-4-20250514",
+          "name": "claude-sonnet-4-20250514",
+          "max_tokens": 8192,
+          "context_window": 200000,
+          "capabilities": ["image"]
+        }
+      ]
+    },
+    "deepseek": {
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "deepseek-chat",
+          "capabilities": []
+        }
+      ]
+    }
+  },
+  "channels": {
+    "dingtalk": {
+      "enabled": true
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "brave",
+        "api_key": "${BRAVE_API_KEY}"
+      }
+    },
+    "exec": {
+      "enable": true,
+      "timeout": 60
+    },
+    "filesystem": {
+      "backup_dir": "~/.markbot/.markbot_backups",
+      "safe_delete": true
+    },
+    "code_execution": {
+      "enable": true,
+      "timeout": 60,
+      "max_memory_mb": 256
+    },
+    "memory": {
+      "embedding_backend": "openai",
+      "memory_summary_enabled": true,
+      "context_compact_enabled": true,
+      "dream_cron": "0 23 * * *"
+    }
+  },
+  "compaction": {
+    "collapse_tool_result_chars": 4000,
+    "micro_compact_keep_turns": 6,
+    "auto_compact_keep_recent": 5,
+    "threshold_ratio": 0.85
+  },
+  "budget": {
+    "enabled": true,
+    "max_budget_usd": null,
+    "warn_threshold_usd": 0.5
+  }
+}
 ```
 
 ### Environment Variables
@@ -633,46 +664,55 @@ MarkBot supports pluggable memory providers through the `MemoryProvider` ABC. Ex
 2. **Naming Convention**: Installed packages matching `markbot_memory_*` or `markbot-memory-*`
 3. **Manual Registration**: Via `MemoryPluginDiscovery.register()`
 
-Configuration in `config.yaml`:
+Configuration in `config.json`:
 
-```yaml
-tools:
-  memory:
-    provider: chroma          # External provider name
-    provider_config:          # Provider-specific configuration
-      host: localhost
-      port: 8000
+```json
+{
+  "tools": {
+    "memory": {
+      "provider": "chroma",
+      "provider_config": {
+        "host": "localhost",
+        "port": 8000
+      }
+    }
+  }
+}
 ```
 
 The built-in ChromaDB provider (`markbot.memory.providers.chroma`) supports both local persistent and remote HTTP modes. Install with `pip install -e ".[chroma]"`.
 
 ### Configuration
 
-```yaml
-tools:
-  memory:
-    embedding_backend: openai  # or "ollama" for local models
-    embedding_api_key: ""
-    embedding_base_url: ""
-    embedding_model_name: ""
-    memory_compact_threshold: 0  # 0 = auto (75% of context window)
-    memory_compact_reserve: 10000
-    memory_summary_enabled: true
-    context_compact_enabled: true
-    dream_cron: "0 23 * * *"  # Cron expression for dream optimization
-
-compaction:
-  collapse_tool_result_chars: 4000
-  collapse_head_chars: 900
-  collapse_tail_chars: 500
-  micro_compact_keep_turns: 6
-  auto_compact_keep_recent: 5
-  snip_keep_messages: 10
-  threshold_ratio: 0.85
-  max_compact_output_tokens: 4000
-  tool_output_inline_chars: 16000
-  tool_output_preview_chars: 3000
-  system_prompt_token_budget: 16000
+```json
+{
+  "tools": {
+    "memory": {
+      "embedding_backend": "openai",
+      "embedding_api_key": "",
+      "embedding_base_url": "",
+      "embedding_model_name": "",
+      "memory_compact_threshold": 0,
+      "memory_compact_reserve": 10000,
+      "memory_summary_enabled": true,
+      "context_compact_enabled": true,
+      "dream_cron": "0 23 * * *"
+    }
+  },
+  "compaction": {
+    "collapse_tool_result_chars": 4000,
+    "collapse_head_chars": 900,
+    "collapse_tail_chars": 500,
+    "micro_compact_keep_turns": 6,
+    "auto_compact_keep_recent": 5,
+    "snip_keep_messages": 10,
+    "threshold_ratio": 0.85,
+    "max_compact_output_tokens": 4000,
+    "tool_output_inline_chars": 16000,
+    "tool_output_preview_chars": 3000,
+    "system_prompt_token_budget": 16000
+  }
+}
 ```
 
 ## Computer Use & Browser Automation
@@ -767,22 +807,108 @@ sudo pacman -S tk python-xlib scrot at-spi2-core wmctrl xdotool
   window) and only supports coordinate-based targeting; SOM overlays and
   element indexing are unavailable.
 
-**Configuration** in `config.yaml`:
+**Configuration** in `config.json`:
 
-```yaml
-tools:
-  computer_use:
-    enable: true
-    backend: cua                    # 'cua' (macOS), 'pyautogui' (cross-platform), or 'noop' (testing)
-    capture_after_actions: true     # Auto-screenshot after each action
-    max_elements: 200               # Max AX elements in SOM capture (10-1000)
-    blocked_key_combos:             # Always-blocked key combinations
-      - "cmd+shift+backspace"
-      - "cmd+option+escape"
-    blocked_type_patterns:          # Always-blocked type patterns
-      - "sudo rm -rf /"
-      - "rm -rf ~"
+```json
+{
+  "tools": {
+    "computer_use": {
+      "enable": true,
+      "backend": "cua",
+      "capture_after_actions": true,
+      "max_elements": 200,
+      "blocked_key_combos": ["cmd+shift+backspace", "cmd+option+escape"],
+      "blocked_type_patterns": ["sudo rm -rf /", "rm -rf ~"]
+    }
+  }
+}
 ```
+
+#### Vision Routing & Auxiliary Vision Model
+
+Computer Use and Browser tools return screenshots as multimodal content
+(text + image blocks). When the primary model in `model_chain` **cannot**
+process images (e.g. DeepSeek, Groq text-only models), MarkBot must
+downgrade the screenshot to text-only to avoid provider errors.
+
+Three strategies are available, applied in priority order:
+
+1. **Auxiliary vision model** (recommended) — the screenshot is sent to a
+   separate vision-capable model for description, and the resulting text is
+   fed back to the primary model. This preserves visual information without
+   requiring the primary model to support image input.
+
+2. **`text_summary` fallback** (default) — the tool's built-in text summary
+   (element list, coordinates, active window title) is used as a lossy
+   substitute. No extra model call is made.
+
+3. **`force_text_only`** — explicitly disable image passing for all models,
+   even vision-capable ones. Useful for debugging or cost control.
+
+**How the primary model's vision capability is detected** (in order):
+
+- Per-model `capabilities` declaration in `config.json` (preferred — see below)
+- Built-in provider/model pattern tables (e.g. `anthropic` → vision, `groq` → no vision)
+- Default: assume vision is supported
+
+**Configure an auxiliary vision model** under `agents.defaults` in `config.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "auxiliaryVision": {
+        "forceTextOnly": false,
+        "provider": "openai",
+        "model": "gpt-4o"
+      }
+    }
+  }
+}
+```
+
+**Declare per-model capabilities** so MarkBot knows whether the primary
+model can ingest images directly:
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "deepseek-chat",
+          "capabilities": []
+        },
+        {
+          "id": "deepseek-vl",
+          "name": "deepseek-vl",
+          "capabilities": ["image"]
+        }
+      ]
+    }
+  }
+}
+```
+
+When the primary model lacks the `image` capability and an auxiliary vision
+model is configured, the flow is:
+
+```
+tool returns screenshot
+    ↓
+primary model supports image? ──yes──→ pass image to primary model
+    ↓ no
+auxiliary vision configured? ──no───→ use text_summary (lossy fallback)
+    ↓ yes
+auxiliary model describes image ────→ feed text description to primary model
+```
+
+> **Tip**: Pair a fast, cheap vision model (e.g. `gpt-4o-mini`,
+> `qwen2.5-vl-72b-instruct`) as the auxiliary with a strong reasoning model
+> (e.g. `deepseek-chat`, `groq/llama-3.3-70b`) as the primary to keep costs
+> low while preserving visual context.
 
 ### Browser Automation
 
@@ -803,19 +929,23 @@ pip install playwright
 playwright install chromium
 ```
 
-**Configuration** in `config.yaml`:
+**Configuration** in `config.json`:
 
-```yaml
-tools:
-  browser:
-    enable: true
-    backend: playwright             # 'playwright' (local) or 'browserbase' (cloud)
-    headless: true                  # Run browser in headless mode
-    record_session: false           # Record sessions as .webm files
-    default_timeout: 30             # Navigation/action timeout in seconds
-    snapshot_max_chars: 8000        # Max chars for accessibility snapshot
-    blocked_domains: []             # Blocked domains (glob patterns)
-    allowed_domains: []             # If non-empty, only these domains are allowed
+```json
+{
+  "tools": {
+    "browser": {
+      "enable": true,
+      "backend": "playwright",
+      "headless": true,
+      "record_session": false,
+      "default_timeout": 30,
+      "snapshot_max_chars": 8000,
+      "blocked_domains": [],
+      "allowed_domains": []
+    }
+  }
+}
 ```
 
 ## Monitoring & Diagnostics
@@ -857,7 +987,7 @@ Checks include:
 ## Deployment
 
 MarkBot can be run in three modes, depending on the use case. All three
-read the same `~/.markbot/config.yaml`, so you can switch modes without
+read the same `~/.markbot/config.json`, so you can switch modes without
 touching your model/key configuration.
 
 ### 1. Interactive CLI (REPL)
@@ -916,7 +1046,7 @@ but exposes a SPA over a WebSocket channel plus a small REST surface
 pip install -e ".[web]"            # install FastAPI + uvicorn
 markbot web                        # default: http://127.0.0.1:9120
 markbot web --host 0.0.0.0 --port 8080
-markbot web --config /etc/markbot/config.yaml --workspace /srv/markbot
+markbot web --config /etc/markbot/config.json --workspace /srv/markbot
 ```
 
 Authentication is a single session token that the server generates at
@@ -944,15 +1074,15 @@ ExecStart=/usr/local/bin/markbot gateway start --foreground
 Restart=on-failure
 User=markbot
 WorkingDirectory=/var/lib/markbot
-Environment=MARKBOT_CONFIG=/etc/markbot/config.yaml
+Environment=MARKBOT_CONFIG=/etc/markbot/config.json
 ```
 
 ```dockerfile
 # minimal Dockerfile
 FROM python:3.12-slim
 RUN pip install markbot[web,desktop-linux,chroma]
-COPY config.yaml /etc/markbot/config.yaml
-ENV MARKBOT_CONFIG=/etc/markbot/config.yaml
+COPY config.json /etc/markbot/config.json
+ENV MARKBOT_CONFIG=/etc/markbot/config.json
 EXPOSE 9120
 CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120"]
 ```
@@ -961,11 +1091,12 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120"]
 
 | Variable | Effect |
 |----------|--------|
-| `MARKBOT_CONFIG` | Override the config file path (default `~/.markbot/config.yaml`) |
+| `MARKBOT_CONFIG` | Override the config file path (default `~/.markbot/config.json`) |
 | `MARKBOT_WORKSPACE` | Override the workspace directory |
 | `MARKBOT_COMPUTER_USE_BACKEND` | Force `cua` / `atspi` / `pyautogui` / `noop` |
 | `MARKBOT_CUA_DRIVER_CMD` | Path to a pre-installed `cua-driver` binary |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.yaml`) |
+| `MARKBOT_VISION_FORCE_TEXT_ONLY` | `1`/`true` = force all multimodal tool results to text-only (skip images); `0`/`false` = allow images. Overrides `agents.defaults.auxiliaryVision.forceTextOnly` |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.json`) |
 
 ## Development
 

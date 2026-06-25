@@ -92,6 +92,83 @@ def unwrap_multimodal_result(result: Any) -> str | list[dict[str, Any]]:
     return result if isinstance(result, str) else str(result)
 
 
+async def unwrap_multimodal_result_async(result: Any) -> str | list[dict[str, Any]]:
+    """Async variant that uses an auxiliary vision model when available.
+
+    When the main model cannot process images but an auxiliary vision model
+    is configured (``agents.defaults.auxiliary_vision.provider`` /
+    ``.model``), the screenshot is sent to that model and replaced with its
+    text description — preserving visual information for the non-vision
+    main model.
+
+    Falls back to the synchronous :func:`unwrap_multimodal_result` behaviour
+    when no auxiliary model is configured or the auxiliary call fails.
+    """
+    if not (isinstance(result, dict) and result.get("_multimodal")):
+        return unwrap_multimodal_result(result)
+
+    from markbot.tools.computer_use.vision_routing import (
+        describe_image_via_auxiliary,
+        resolve_auxiliary_vision_model,
+        should_route_to_text_only,
+    )
+
+    # Resolve the primary model's provider/model so that per-model
+    # ``capabilities`` declarations and the built-in provider/model tables
+    # are actually consulted. Without these arguments should_route_to_text_only
+    # defaults to False (allow images) even for non-vision models.
+    primary_provider_id: str | None = None
+    primary_model_name: str | None = None
+    try:
+        from markbot.config.loader import load_config
+        config = load_config()
+        if config and config.primary_model_ref:
+            ref = config.primary_model_ref
+            # ref is "providerId/modelId" — split to get the provider id
+            # (ProviderConfig has no .id attribute, so we parse the ref).
+            if "/" in ref:
+                primary_provider_id = ref.split("/", 1)[0]
+            _, model_cfg = config.resolve_model(ref)
+            primary_model_name = model_cfg.name or model_cfg.id
+    except Exception:
+        pass
+
+    # Main model supports images — pass through unchanged.
+    if not should_route_to_text_only(
+        provider=primary_provider_id, model=primary_model_name
+    ):
+        return result.get("content") or result.get("text_summary", "")
+
+    text_summary = result.get("text_summary") or ""
+
+    # No auxiliary model configured — fall back to text_summary.
+    if resolve_auxiliary_vision_model() is None:
+        return text_summary or json.dumps(result, default=str)
+
+    # Extract the image block for the auxiliary model.
+    image_b64: str | None = None
+    mime: str = "image/png"
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "image_url":
+            url = (block.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                # data:image/png;base64,<b64>
+                header, _, data = url.partition(",")
+                if ";" in header and "base64" in header:
+                    mime = header.split(":")[1].split(";")[0]
+                image_b64 = data
+            break
+
+    if not image_b64:
+        return text_summary or json.dumps(result, default=str)
+
+    description = await describe_image_via_auxiliary(image_b64, mime, text_summary)
+    if description:
+        return f"[Vision via auxiliary model]\n{description}"
+    # Auxiliary call failed — degrade to text_summary.
+    return text_summary or json.dumps(result, default=str)
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent.
     - Separates system context and user context
@@ -875,6 +952,32 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
         # is normalised exactly once regardless of producer. Multimodal
         # content blocks (lists) are already provider-structured and pass
         # through untouched.
+        if isinstance(content, str):
+            from markbot.agent.tool_output import sanitize_tool_output
+
+            content = sanitize_tool_output(content)
+
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content}
+        )
+        return messages
+
+    async def add_tool_result_async(
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any,
+    ) -> list[dict[str, Any]]:
+        """Async variant of :meth:`add_tool_result`.
+
+        Uses :func:`unwrap_multimodal_result_async` so that when the main
+        model cannot process images but an auxiliary vision model is
+        configured, the screenshot is described by the auxiliary model
+        instead of being discarded.
+        """
+        content = await unwrap_multimodal_result_async(result)
+
         if isinstance(content, str):
             from markbot.agent.tool_output import sanitize_tool_output
 
