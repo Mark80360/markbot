@@ -390,7 +390,7 @@ class SessionManager:
                 try:
                     temp_path.unlink()
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up temp file during session write: {}", temp_path)
             raise
 
     def _append_write(self, session: Session, path: Path, new_messages: list[dict[str, Any]]) -> None:

@@ -31,6 +31,10 @@ class ModelUsage:
     cache_read_input_tokens: int = 0
     api_calls: int = 0
     cost_usd: float = 0.0
+    # Snapshot of cache_read_input_tokens from the most recent add_usage
+    # call.  Used by last_turn_cache_savings to report per-turn savings
+    # rather than the cumulative total.
+    last_call_cache_read_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -72,9 +76,9 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "claude-3-5-sonnet": ModelPricing(0.003, 0.015, 0.0003, 0.00375),
     "claude-3-5-haiku": ModelPricing(0.00025, 0.00125, 0.000025, 0.0003125),
     "claude-3-opus": ModelPricing(0.015, 0.075, 0.0015, 0.018),
-    "gpt-4o": ModelPricing(0.0025, 0.01, 0.00125, 0.00125),
-    "gpt-4o-mini": ModelPricing(0.00015, 0.0006, 0.000075, 0.000075),
-    "gpt-4-turbo": ModelPricing(0.01, 0.03, 0.005, 0.005),
+    "gpt-4o": ModelPricing(0.0025, 0.01, 0.00125, 0.0025),
+    "gpt-4o-mini": ModelPricing(0.00015, 0.0006, 0.000075, 0.00015),
+    "gpt-4-turbo": ModelPricing(0.01, 0.03, 0.005, 0.01),
     "deepseek-chat": ModelPricing(0.00014, 0.00028, 0.0, 0.0),
     "deepseek-reasoner": ModelPricing(0.00055, 0.00219, 0.0, 0.0),
 }
@@ -184,6 +188,9 @@ class CostTracker:
         mu.cache_read_input_tokens += cache_read_input_tokens
         mu.api_calls += 1
         mu.cost_usd += cost
+        # Per-call snapshot so last_turn_cache_savings can compute the
+        # most recent turn's savings rather than the cumulative total.
+        mu.last_call_cache_read_tokens = cache_read_input_tokens
 
         self.state.total_cost_usd += cost
         self.state.total_api_calls += 1
@@ -266,27 +273,33 @@ class CostTracker:
     def last_turn_cache_savings(self, model: str | None = None) -> Optional[float]:
         """Estimate USD saved by the *most recent* call's cache reads.
 
-        The most-recent call is approximated by the last record in
-        ``state.model_usage[model].api_calls``; we look up the model
-        that was most recently updated.  Returns ``None`` if there
-        is no data.
+        Uses ``ModelUsage.last_call_cache_read_tokens`` — a per-call
+        snapshot updated on every :meth:`add_usage` — so the returned
+        value reflects only the most recent call, not the cumulative
+        session total.
+
+        When ``model`` is ``None`` we pick the most recently *added*
+        model in :attr:`CostState.model_usage` (insertion order is
+        preserved in Python 3.7+ dicts).  Returns ``None`` if there
+        is no data or the most recent call had no cache reads.
         """
         if not self.state.model_usage:
             return None
         target_model = model
         if target_model is None:
-            # Pick the model with the most recent increment.
+            # Pick the most recently added model.  Dicts preserve
+            # insertion order; reversed() walks from newest to oldest.
             for name in reversed(list(self.state.model_usage.keys())):
                 target_model = name
                 break
         if target_model is None:
             return None
         mu = self.state.model_usage.get(target_model)
-        if mu is None or mu.cache_read_input_tokens == 0:
+        if mu is None or mu.last_call_cache_read_tokens == 0:
             return None
         price = self.pricing.get(target_model)
-        # Saved cost = (miss_rate - hit_rate) * tokens
-        saved = (mu.cache_read_input_tokens / 1000.0) * (
+        # Per-call savings = (input price - cache_read price) * cached tokens.
+        saved = (mu.last_call_cache_read_tokens / 1000.0) * (
             price.input_per_1k - price.cache_read_per_1k
         )
         return round(max(0.0, saved), 6)

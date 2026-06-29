@@ -177,6 +177,17 @@ class SessionBootstrap:
 
         report.context_summary = self._build_context_summary(report)
 
+        # If the gateway just restarted via the sentinel path, append
+        # an advisory hint so the agent is aware the previous session
+        # may have been interrupted mid-task.  The hint is metadata,
+        # not an instruction — the agent decides whether to resume.
+        restart_hint = self._recent_restart_hint()
+        if restart_hint:
+            if report.context_summary:
+                report.context_summary = f"{report.context_summary} | {restart_hint}"
+            else:
+                report.context_summary = restart_hint
+
         return report
 
     def _check_handoff_freshness(self, handoff: SessionHandoff | None) -> BootstrapCheckResult:
@@ -389,3 +400,30 @@ class SessionBootstrap:
             parts.append(f"Warnings: {'; '.join(report.warnings)}")
 
         return " | ".join(parts) if parts else ""
+
+    def _recent_restart_hint(self) -> str | None:
+        """If the gateway recently restarted via the sentinel path, return
+        a short hint string to inject into the session context.
+
+        Returns None when no recent restart is recorded.  The hint is
+        advisory — the agent decides whether to resume the prior task.
+        """
+        import os
+        from markbot.cli.daemon import RESTART_MARKER_FRESH_S
+
+        ts = os.environ.get("MARKBOT_LAST_RESTART_AT")
+        if not ts:
+            return None
+        try:
+            age = time.time() - float(ts)
+        except (TypeError, ValueError):
+            return None
+        if age < 0 or age > RESTART_MARKER_FRESH_S:
+            return None
+        reason = os.environ.get("MARKBOT_LAST_RESTART_REASON") or "unspecified"
+        return (
+            f"Gateway restarted ~{int(age)}s ago (reason: {reason}). "
+            "The previous session may have been interrupted mid-task; "
+            "consider confirming with the user whether to resume the "
+            "prior work using the loaded handoff context."
+        )

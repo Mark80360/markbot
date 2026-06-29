@@ -94,7 +94,7 @@ def _check_config_override() -> Optional[bool]:
             if getattr(av, "force_text_only", False):
                 return True
     except Exception:
-        pass
+        logger.debug("Failed to load config for vision routing override", exc_info=True)
 
     return None
 

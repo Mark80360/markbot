@@ -171,7 +171,7 @@ class TaskTracker:
                     if tid:
                         self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
                 except Exception:
-                    pass
+                    logger.opt(exception=True).warning("Failed to hydrate task from registry entry: {}", t_dict.get("id"))
 
     def create_task(
         self,
@@ -277,7 +277,7 @@ class TaskTracker:
                 try:
                     tasks.append(Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__}))
                 except Exception:
-                    pass
+                    logger.opt(exception=True).warning("Failed to hydrate task from registry entry while listing: {}", t_dict.get("id"))
             return sorted(tasks, key=lambda t: (-t.priority, -t.updated_at))
 
     def list_active(self) -> list[Task]:
@@ -329,6 +329,6 @@ class TaskTracker:
                         if tid:
                             self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
                     except Exception:
-                        pass
+                        logger.opt(exception=True).warning("Failed to hydrate task from registry entry after cleanup: {}", t_dict.get("id"))
                 logger.info("Cleaned up {} completed tasks", removed)
             return removed

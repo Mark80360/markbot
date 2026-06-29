@@ -170,10 +170,39 @@ def _get_token_usage_from_message(message: dict[str, Any]) -> Optional[TokenUsag
 
 
 def token_count_with_estimation(messages: list[dict[str, Any]]) -> int:
-    """Calculate current context size with estimation.
+    """Estimate the current context size in tokens.
 
-    Uses the last API response's token count plus estimates for
-    any messages added since.
+    The returned number is a *mixed* estimate that combines two
+    sources of data with different semantics:
+
+    1. **Exact, API-reported total** — from the most recent message
+       that carries a ``usage`` block (i.e. an assistant response we
+       actually sent to the provider).  ``usage.total_tokens`` is the
+       provider's authoritative count for *that* request, including
+       input, output, cached, and (for Anthropic) cache-creation
+       tokens.  We treat it as the floor of the estimate.
+
+    2. **Padded heuristic** for everything appended *after* that
+       response — user/tool messages we have not yet billed.  These
+       are run through :func:`estimate_messages_tokens`, which applies
+       a conservative 4/3 padding factor on top of the tiktoken
+       character estimate to over- rather than under-count.
+
+    The two are summed: ``exact_total + padded_new``.  The result is
+    intentionally biased high so the auto-compactor trips *before*
+    the provider rejects the request for being too long, rather than
+    after.
+
+    .. note::
+       The two terms have different units in a strict sense — the
+       API total includes the response's *output* tokens, while the
+       estimate only covers input-side message bytes — but in
+       practice the assistant's output is also persisted into the
+       next request's input, so the previous total is a reasonable
+       proxy for "where the context window sits now".  When precise
+       accounting is required (e.g. for cost reporting), read
+       :class:`markbot.agent.cost.CostTracker` directly instead of
+       this function.
     """
     last_usage_index = -1
     last_usage = None

@@ -426,7 +426,7 @@ class PyAutoGUIBackend(ComputerUseBackend):
                         try:
                             pag.keyUp(m)
                         except Exception:
-                            pass
+                            logger.debug("Failed to release modifier key '%s' after click", m, exc_info=True)
             else:
                 pyautogui.click(x=lx, y=ly, button=button, clicks=click_count)
             return ActionResult(ok=True, action="click", message=f"Clicked at ({x},{y}) -> logical ({lx},{ly}) button={button} clicks={click_count}")

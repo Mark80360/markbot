@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,12 +16,21 @@ import typer
 
 from markbot import __logo__
 from markbot.cli.daemon import (
+    RESTART_MARKER_FRESH_S,
+    RESTART_POLL_INTERVAL_S,
     _gateway_paths,
+    consume_restart_marker,
+    consume_restart_sentinel,
     is_process_running,
     read_pid,
+    read_restart_sentinel,
     remove_pid,
+    sentinel_path,
+    spawn_detached_restarter,
     start_daemon,
     terminate_process,
+    write_gateway_params,
+    write_restart_marker,
 )
 from markbot.cli.runtime import make_provider
 from markbot.cli.ui import console, make_section_helpers, markbot_banner
@@ -75,6 +85,8 @@ def start(
 
 def run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
     """Run the gateway in foreground mode."""
+    import sys
+
     from loguru import logger
 
     from markbot.agent.loop import AgentLoop
@@ -86,12 +98,56 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
 
-    setup_logging(verbose=verbose, log_file=_gateway_paths()["log_file"])
+    # Detect daemon mode: stderr has been redirected to the log file
+    # (via os.dup2 on Unix or subprocess redirection on Windows).  In
+    # this mode we use stderr as the sole loguru sink and disable Rich
+    # colour output so no raw ANSI codes leak into the log file.
+    stderr_is_log = not sys.stderr.isatty()
+    if stderr_is_log:
+        console.no_color = True
 
+    setup_logging(
+        verbose=verbose,
+        log_file=_gateway_paths()["log_file"],
+        stderr_is_log=stderr_is_log,
+    )
+
+    config_path_str = config
     config_path = Path(config) if config else None
     config = load_config(config_path)
     if workspace:
         config.agents.defaults.workspace = workspace
+
+    # Persist startup params so the detached restarter (used during
+    # agent self-restart) can relaunch the gateway with the same
+    # arguments.  See markbot.cli.daemon.spawn_detached_restarter.
+    write_gateway_params(
+        port=port,
+        workspace=workspace,
+        config=config_path_str,
+        verbose=verbose,
+    )
+
+    # If the previous gateway instance left a restart marker (i.e. it
+    # shut down via the sentinel path), record the timestamp so the
+    # bootstrap layer can inject a "you were restarted mid-task" hint
+    # into the next session's context.  We use an environment variable
+    # rather than a module-level flag so the value is visible to the
+    # ``SessionBootstrap`` instance owned by ``AgentLoop`` without
+    # introducing a new import-time dependency between those layers.
+    marker = consume_restart_marker()
+    if marker and "written_at" in marker:
+        import os as _os
+        _os.environ["MARKBOT_LAST_RESTART_AT"] = str(marker["written_at"])
+        if marker.get("reason"):
+            _os.environ["MARKBOT_LAST_RESTART_REASON"] = str(marker["reason"])
+        logger.info(
+            "Gateway restarted (marker reason={}, age={:.1f}s); "
+            "bootstrap will inject resume hint for fresh sessions within {}s",
+            marker.get("reason") or "unspecified",
+            time.time() - float(marker["written_at"]),
+            RESTART_MARKER_FRESH_S,
+        )
 
     console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
 
@@ -243,6 +299,12 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        # Top-level task handles; initialised to None so the finally
+        # block below can safely reference them even if setup fails
+        # before they're created.
+        sentinel_task = None
+        agent_task = None
+        channels_task = None
         try:
             await cron.start()
 
@@ -280,10 +342,72 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
                 await curator.start()
                 console.print("[green]✓[/green] Skill curator: interval=6h")
 
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+            # Clear any stale sentinel from a previous run before
+            # starting the watcher — otherwise a leftover sentinel
+            # would trigger an immediate self-restart loop.
+            consume_restart_sentinel()
+
+            async def _sentinel_watcher():
+                """Poll for a restart sentinel and trigger graceful shutdown."""
+                while True:
+                    await asyncio.sleep(RESTART_POLL_INTERVAL_S)
+                    payload = read_restart_sentinel()
+                    if payload is not None:
+                        return payload
+
+            sentinel_task = asyncio.create_task(_sentinel_watcher())
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+
+            # Race the main loop against the sentinel watcher.  Whoever
+            # finishes first wins; if it's the sentinel, we trigger the
+            # graceful shutdown sequence (spawn detached restarter, then
+            # let the agent finish current work before cancelling).
+            done, pending = await asyncio.wait(
+                [agent_task, channels_task, sentinel_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if sentinel_task in done and not sentinel_task.cancelled():
+                payload = sentinel_task.result()
+                if payload:
+                    mode = payload.get("mode", "restart")
+                    reason = payload.get("reason") or "unspecified"
+                    old_pid = read_pid()
+                    restarter_pid = None
+                    if mode == "restart":
+                        restarter_pid = spawn_detached_restarter(payload, old_pid)
+                        # Drop a marker so the new gateway instance
+                        # knows it followed a restart and can inject
+                        # a resume hint into the next session.
+                        try:
+                            write_restart_marker(reason=reason)
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Restart sentinel detected (reason={}); detached "
+                            "restarter spawned (pid={}), initiating graceful shutdown",
+                            reason,
+                            restarter_pid,
+                        )
+                    else:
+                        logger.info(
+                            "Stop sentinel detected (reason={}); initiating "
+                            "graceful shutdown (no restarter will be spawned)",
+                            reason,
+                        )
+                    # Signal the agent loop to stop accepting new work.
+                    # In-flight dispatches will continue to run; the
+                    # main ``while self._running`` loop will exit on its
+                    # next iteration.
+                    agent.stop()
+                    # Give the current iteration a brief window to
+                    # finish naturally so handoff/session state has a
+                    # chance to be persisted.
+                    try:
+                        await asyncio.wait_for(agent_task, timeout=10.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        pass
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:
@@ -291,6 +415,18 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
+            # Cancel any still-running top-level tasks so the finally
+            # block below can drain services cleanly.
+            for t in [sentinel_task, agent_task, channels_task]:
+                if t is not None and not t.done():
+                    t.cancel()
+            for t in [sentinel_task, agent_task, channels_task]:
+                if t is None or t.done():
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
             if dream_service:
                 await dream_service.stop()
             if curator:

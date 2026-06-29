@@ -39,6 +39,7 @@ _KV_SECRET_KEYS = (
     "api_key", "apikey", "api-key",
     "token",
     "access_token", "accesstoken", "access-token",
+    "access_key", "accesskey", "access-key",
     "refresh_token", "refreshtoken", "refresh-token",
     "secret", "secret_key", "secretkey", "secret-key",
     "client_secret", "clientsecret", "client-secret",

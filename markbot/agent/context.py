@@ -386,6 +386,26 @@ You have browser tools for web page interaction. Use them when you need to inter
                     content=self._BROWSER_GUIDANCE, name="browser", priority=3,
                 ))
 
+        # Priority 3: Coding context (project facts — language, package
+        # manager, verify/lint/typecheck commands). Baked into the system
+        # prompt so the model knows up-front how to verify its work in
+        # this project, instead of discovering `pytest` / `npm test` by
+        # trial and error. Byte-stable → lands in the prompt cache prefix.
+        # Mirrors Hermes's coding_context.detect_project_facts.
+        try:
+            from markbot.agent.coding_context import (
+                detect_project_facts,
+                render_coding_context_section,
+            )
+            coding_facts = detect_project_facts(self.workspace)
+            coding_section = render_coding_context_section(coding_facts)
+            if coding_section:
+                sections.append(PromptSection(
+                    content=coding_section, name="coding_context", priority=3,
+                ))
+        except Exception as exc:
+            logger.debug("Failed to inject coding context: {}", exc)
+
         # Priority 4: Reference docs (TOOLS.md, ARCHITECTURE.md)
         reference = self._load_reference_bootstrap()
         if reference:

@@ -211,7 +211,7 @@ class CodeExecutionTool(Tool):
                     try:
                         report_progress(line, None)
                     except Exception:
-                        pass
+                        logger.opt(exception=True).debug("Failed to report code execution progress line")
 
             result = await sandbox.run(
                 script=script_path,

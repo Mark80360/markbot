@@ -144,6 +144,15 @@ def collapse_text_head_tail(
     """
     if len(text) <= limit:
         return text
+    # If the configured head+tail exceeds the limit, collapsing would
+    # produce output *longer* than just truncating to `limit`.  Shrink
+    # head/tail proportionally so the collapsed result still fits.
+    if head_chars + tail_chars >= limit:
+        # Reserve a small slot for the collapse marker itself.
+        marker_overhead = 40
+        budget = max(1, limit - marker_overhead)
+        head_chars = max(1, budget // 2)
+        tail_chars = max(1, budget - head_chars)
     omitted = len(text) - head_chars - tail_chars
     head = text[:head_chars].rstrip()
     tail = text[-tail_chars:].lstrip()
@@ -407,6 +416,7 @@ class MultiLevelCompactor:
         fallback_manager=None,
         config: CompactionConfig | None = None,
         on_progress: CompactProgressCallback | None = None,
+        todo_tool: Any = None,
     ):
         self.fallback_manager = fallback_manager
         self.config = config or CompactionConfig()
@@ -414,6 +424,14 @@ class MultiLevelCompactor:
         self._total_tokens_saved = 0
         self._consecutive_failures = 0
         self._on_progress = on_progress
+        # Optional TodoTool reference — when present, its active items are
+        # re-injected as a standalone user message after auto-compaction so
+        # the model does not lose the plan across context compression.
+        self._todo_tool = todo_tool
+
+    def set_todo_tool(self, todo_tool: Any) -> None:
+        """Attach (or replace) the todo tool used for post-compaction re-injection."""
+        self._todo_tool = todo_tool
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -471,7 +489,21 @@ class MultiLevelCompactor:
             (messages, CompactResult) — messages may be modified in-place or replaced.
         """
         cfg = self.config
+        # Guard against small context windows where reserved_output_tokens
+        # + auto_compact_buffer would otherwise push effective_max negative.
+        # A negative threshold makes `current_tokens < threshold` always
+        # False, which forces compaction on every turn and burns through
+        # `_consecutive_failures` without doing anything useful.
         effective_max = max_tokens - cfg.reserved_output_tokens - cfg.auto_compact_buffer
+        if effective_max <= 0:
+            # Fall back to half the window — still leaves room for output
+            # but avoids the spurious-compaction death spiral.
+            logger.warning(
+                "Compaction buffers (reserved_output={} + auto_compact_buffer={}) "
+                "exceed max_tokens={}; falling back to max_tokens//2 as effective_max",
+                cfg.reserved_output_tokens, cfg.auto_compact_buffer, max_tokens,
+            )
+            effective_max = max(1, max_tokens // 2)
         threshold = effective_max * cfg.threshold_ratio
 
         if current_tokens < threshold:
@@ -841,7 +873,34 @@ class MultiLevelCompactor:
             "Auto-compacted: {} old messages summarized, {} recent kept",
             len(messages_to_compact), len(recent_messages),
         )
-        return [compact_msg] + recent_messages, formatted
+        new_messages = [compact_msg] + recent_messages
+
+        # Re-inject the active todo list as a standalone user message so the
+        # model sees the remaining plan verbatim after compaction, instead of
+        # relying on the LLM summariser to preserve it. Mirrors Hermes's
+        # ``TodoStore.format_for_injection`` post-compaction injection.
+        # The todo tool is optional; skip silently if absent.
+        todo_tool = getattr(self, "_todo_tool", None)
+        if todo_tool is not None and hasattr(todo_tool, "format_for_injection"):
+            try:
+                snapshot = todo_tool.format_for_injection()
+                if snapshot:
+                    new_messages.insert(1, {
+                        "role": "user",
+                        "content": snapshot,
+                        # Marker so downstream consumers can identify it
+                        # as a synthetic re-injection (not a real user turn).
+                        "_todo_reinjection": True,
+                    })
+                    logger.debug(
+                        "Re-injected active todo snapshot after auto-compaction"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to re-inject todo snapshot after compaction: {}", exc
+                )
+
+        return new_messages, formatted
 
     # ------------------------------------------------------------------
     # Level 4: History Snip — force drop oldest messages (last resort)

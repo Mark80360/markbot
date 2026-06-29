@@ -215,7 +215,7 @@ class ExploreContextCatalogTool(Tool):
                     for line in result.stdout.strip().split('\n')[:5]:
                         lines.append(f"  - {line}")
             except Exception:
-                pass
+                logger.opt(exception=True).debug("Failed to gather recent git commits for context catalog")
 
         skills_dir = self.workspace / "skills"
         if skills_dir.exists() and skills_dir.is_dir():

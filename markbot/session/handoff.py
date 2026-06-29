@@ -57,6 +57,11 @@ class SessionHandoff:
     user_preferences_noted: list[str] = field(default_factory=list)
     cost_this_session_usd: float = 0.0
     tool_calls_this_session: int = 0
+    # Structured reason why the last turn ended (see TurnExitReason in
+    # markbot.agent.iteration). Empty string when not recorded. Lets the
+    # next session / "继续" know whether the prior turn completed normally,
+    # hit max_iterations, was force-stopped on a failure loop, etc.
+    last_exit_reason: str = ""
 
     def to_markdown(self) -> str:
         lines = [f"# Session Handoff: {self.timestamp}", ""]
@@ -106,6 +111,11 @@ class SessionHandoff:
                 lines.append(f"- Tool calls: {self.tool_calls_this_session}")
             lines.append("")
 
+        if self.last_exit_reason:
+            lines.append("## Last Turn Exit Reason")
+            lines.append(f"`{self.last_exit_reason}`")
+            lines.append("")
+
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +137,7 @@ class SessionHandoff:
             user_preferences_noted=data.get("user_preferences_noted", []),
             cost_this_session_usd=data.get("cost_this_session_usd", 0.0),
             tool_calls_this_session=data.get("tool_calls_this_session", 0),
+            last_exit_reason=data.get("last_exit_reason", ""),
         )
 
 
@@ -212,6 +223,7 @@ def build_handoff_from_session(
     cost_usd: float,
     task_tracker: Any | None = None,
     memory_manager: Any | None = None,
+    last_exit_reason: str = "",
 ) -> SessionHandoff:
     """Build a SessionHandoff by extracting structured data from the
     completed session.
@@ -272,6 +284,7 @@ def build_handoff_from_session(
         user_preferences_noted=user_preferences,
         cost_this_session_usd=round(cost_usd, 4),
         tool_calls_this_session=len(tools_used),
+        last_exit_reason=last_exit_reason,
     )
 
 
@@ -320,5 +333,5 @@ def _extract_preferences_from_memory(memory_manager: Any) -> list[str]:
                     if line.startswith("- ") or line.startswith("* "):
                         prefs.append(line[2:].strip())
     except Exception:
-        pass
+        logger.opt(exception=True).debug("Failed to extract preferences from memory profile")
     return prefs[:10]

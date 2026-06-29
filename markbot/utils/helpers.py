@@ -79,13 +79,14 @@ def normalize_timezone(tz: str | None) -> str:
     if not tz:
         return "UTC"
 
+    from loguru import logger
     from zoneinfo import ZoneInfo
 
     try:
         ZoneInfo(tz)
         return tz
     except (KeyError, Exception):
-        pass
+        logger.opt(exception=True).debug("Timezone '{}' is not a valid IANA name, trying offset map", tz)
 
     _OFFSET_MAP: dict[str, str] = {
         "UTC-12": "Etc/GMT+12", "UTC-11": "Pacific/Pago_Pago",
@@ -115,9 +116,8 @@ def normalize_timezone(tz: str | None) -> str:
             ZoneInfo(normalized)
             return normalized
         except (KeyError, Exception):
-            pass
+            logger.opt(exception=True).debug("Timezone '{}' offset-mapped name '{}' failed to validate", tz, normalized)
 
-    from loguru import logger
     logger.warning("Unrecognised timezone '{}', falling back to UTC", tz)
     return "UTC"
 

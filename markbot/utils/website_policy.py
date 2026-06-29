@@ -42,7 +42,7 @@ def _load_policy_from_config() -> dict[str, Any]:
                 "allowed_domains": getattr(br, "allowed_domains", []),
             }
     except Exception:
-        pass
+        logger.warning("Failed to load website policy from config; blocklist disabled", exc_info=True)
     return {"blocked_domains": [], "allowed_domains": []}
 
 

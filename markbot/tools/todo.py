@@ -134,6 +134,44 @@ class _TodoStore:
             self._save()
             return [dict(r) for r in removed]
 
+    def format_for_injection(self, session_id: str | None = None) -> str | None:
+        """Render the active todo list for post-compression re-injection.
+
+        Only pending / in_progress items are emitted — completed/cancelled
+        items would mislead the model into re-doing finished work after
+        compaction. Returns ``None`` when there are no active items so
+        callers can skip appending an empty message.
+
+        Mirrors Hermes's ``TodoStore.format_for_injection``: the snapshot
+        is appended as a standalone user message after the compaction
+        summary, so the model sees the active plan verbatim instead of
+        relying on the LLM summariser to preserve it.
+        """
+        with self._lock:
+            items = self._items
+            if session_id:
+                items = [i for i in items if i.get("session_id") == session_id]
+            active = [
+                i for i in items
+                if i.get("status") in ("pending", "in_progress")
+            ]
+        if not active:
+            return None
+        # Sort: in_progress first, then by priority
+        active.sort(key=lambda i: (
+            0 if i.get("status") == "in_progress" else 1,
+            _PRIORITY_ORDER.get(i.get("priority", "medium"), 99),
+        ))
+        lines = ["[Your active task list was preserved across context compression]"]
+        for item in active:
+            status = item.get("status", "pending")
+            marker = "[>]" if status == "in_progress" else "[ ]"
+            item_id = item.get("id", "?")
+            content = item.get("content", "")
+            priority = item.get("priority", "medium")
+            lines.append(f"  - {marker} [{item_id}] {content} (status={status}, priority={priority})")
+        return "\n".join(lines)
+
 
 class TodoTool(Tool):
     """Structured task tracking tool.
@@ -159,6 +197,17 @@ class TodoTool(Tool):
     def set_session(self, session_id: str | None) -> None:
         self._session_id = session_id
 
+    def format_for_injection(self, session_id: str | None = None) -> str | None:
+        """Render the active todo list for post-compression re-injection.
+
+        Delegates to the underlying store. Returns ``None`` when there
+        are no active items, so the caller (compaction hook) can skip
+        emitting an empty message.
+        """
+        return self._get_store().format_for_injection(
+            session_id or self._session_id
+        )
+
     def is_read_only(self, params: dict[str, Any]) -> bool:
         return params.get("action") == "list"
 
@@ -171,9 +220,9 @@ class TodoTool(Tool):
         return (
             "Structured task tracking tool for managing todo items. "
             "WHEN to use:\n"
-            "- User explicitly asks to record, track, or list tasks/todos\n"
             "- A task requires 3+ steps with dependencies between them\n"
             "- You need to persist progress across multiple tool-call turns\n"
+            "- User explicitly asks to record, track, or list tasks/todos\n"
             "- Tracking steps within the current work session\n"
             "WHEN NOT to use:\n"
             "- Single-step operations or simple Q&A\n"
@@ -181,6 +230,17 @@ class TodoTool(Tool):
             "- Scheduled/future reminders (use `cron` instead)\n"
             "- Autonomous task execution with verification "
             "(use `autopilot_intake` instead)\n"
+            "OPERATIONAL DISCIPLINE (important):\n"
+            "- Keep only ONE item in_progress at a time. Mark it completed "
+            "before starting the next.\n"
+            "- Mark items completed *immediately* after the corresponding "
+            "step is done, not at the end.\n"
+            "- If a step fails twice, mark it failed/cancelled and add a "
+            "revised item describing the alternative approach — do not keep "
+            "retrying under the same entry.\n"
+            "- Write the plan *before* starting execution; update it as "
+            "you go. The list survives context compression, so it is your "
+            "source of truth for what remains.\n"
             "Actions:\n"
             "- write: create new items or update existing ones (provide id to update)\n"
             "- list: query items with optional filters (status, priority)\n"

@@ -284,7 +284,7 @@ class CronService:
                 try:
                     temp_path.unlink()
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up cron temp file: {}", temp_path)
             raise
 
     async def start(self) -> None:

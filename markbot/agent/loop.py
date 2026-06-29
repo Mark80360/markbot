@@ -178,6 +178,16 @@ class AgentLoop:
         self._session_last_active: dict[str, float] = {}
         self._idle_task: asyncio.Task | None = None
 
+        # Per-session failure-loop state that survives across loop instances
+        # (compact, "继续" 等都会重建 IterationRunner → LoopState)。
+        # 关键：反思次数和失败方法黑名单必须跨 loop 边界持久化，
+        # 否则每次 compact 后 reflection_injected_count 归零，
+        # 强制停止机制在整个任务尺度上完全失效（见 logs/2026-06-27.log
+        # 中 4 次强制停止后 LLM 仍能继续撞墙的案例）。
+        # 仅在用户**新请求**（非"继续"指令）时重置，避免一次失败任务
+        # 的反思次数永远卡住后续新任务。
+        self._session_failure_state: dict[str, dict] = {}
+
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     async def _connect_mcp(self) -> None:
@@ -201,6 +211,13 @@ class AgentLoop:
         if todo_tool := self.tools.get("todo"):
             if hasattr(todo_tool, "set_session"):
                 todo_tool.set_session(make_session_key(channel, chat_id) or "")
+            # Wire the todo tool into the compactor so active items get
+            # re-injected as a standalone user message after auto-compaction.
+            # Done here (not at construction) because the compactor is built
+            # before the tool registry in the container.
+            compactor = getattr(self, "compactor", None)
+            if compactor is not None and hasattr(compactor, "set_todo_tool"):
+                compactor.set_todo_tool(todo_tool)
         if self._memory_search_tool:
             self._memory_search_tool.set_session_context(channel, chat_id)
 
@@ -423,6 +440,43 @@ class AgentLoop:
         return self._session_locks.setdefault(session_key, asyncio.Lock())
 
     # ------------------------------------------------------------------
+    # Per-session failure-loop state (survives compact / "继续" / handoff)
+    # ------------------------------------------------------------------
+
+    def get_failure_state(self, session_key: str) -> dict:
+        """Get (or create) the per-session failure-loop state.
+
+        Returns a dict with keys:
+        - ``reflection_injected_count``: int — 累计注入的反思次数，跨 loop 不归零
+        - ``failed_methods``: list[str] — 已尝试且失败的方法黑名单（去重）
+        - ``forced_stop_count``: int — 已触发强制停止的次数
+
+        这个状态在 IterationRunner.run() 启动时被读取并填入 LoopState，
+        在 _phase_check_failure_loop / _record_tool_result 中被写回。
+        仅在用户**新请求**（非"继续"指令）时由 reset_failure_state 清零。
+        """
+        return self._session_failure_state.setdefault(
+            session_key,
+            {
+                "reflection_injected_count": 0,
+                "failed_methods": [],
+                "forced_stop_count": 0,
+            },
+        )
+
+    def reset_failure_state(self, session_key: str) -> None:
+        """重置指定 session 的失败循环状态。
+
+        仅在用户输入**新请求**时调用（非"继续"/compact/handoff 续接）。
+        这样一次失败任务的反思次数不会永远卡住后续新任务。
+        """
+        self._session_failure_state[session_key] = {
+            "reflection_injected_count": 0,
+            "failed_methods": [],
+            "forced_stop_count": 0,
+        }
+
+    # ------------------------------------------------------------------
     # Idle session management
     # ------------------------------------------------------------------
 
@@ -562,6 +616,12 @@ class AgentLoop:
         # Clear steer and idle tracking.
         self._pending_steer.pop(session_key, None)
         self._session_last_active.pop(session_key, None)
+
+        # Clear per-session failure-loop state to avoid memory leak
+        # across many idle sessions. Next message from this session
+        # will be treated as a new request and reset_failure_state
+        # is called anyway, but clearing here keeps state bounded.
+        self._session_failure_state.pop(session_key, None)
 
         logger.info("Cleaned up state for idle session {}", session_key)
 
@@ -838,7 +898,8 @@ class AgentLoop:
         # 让 LLM 知道要从上次中断处续接，而不是当作全新请求处理。
         # 配合 _finalize_loop 中写入 history 的中断原因，agent 能感知上次进度。
         _resume_triggers = ("继续", "continue", "go on", "resume", "接着", "接着做", "继续做")
-        if raw.lower() in _resume_triggers:
+        is_resume = raw.lower() in _resume_triggers
+        if is_resume:
             resume_hint = (
                 "[System] 用户输入了「继续」。请检查对话历史中是否存在因"
                 "「达到工具调用迭代上限」或「预算超限」而中断的任务。"
@@ -850,6 +911,12 @@ class AgentLoop:
                 "如果历史中没有中断记录，则按正常方式处理用户请求。"
             )
             msg.content = resume_hint + "\n\n用户输入：" + raw
+        else:
+            # 新请求：重置该 session 的失败循环状态。
+            # 关键：失败反思次数和失败方法黑名单只在同一任务内累积；
+            # 用户开新话题时应清零，避免上次任务的反思次数卡住新任务。
+            # "继续"指令和 compact 内部触发都不重置（它们是同一任务的延续）。
+            self.reset_failure_state(key)
 
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):

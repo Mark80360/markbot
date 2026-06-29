@@ -178,7 +178,7 @@ def reset_backend_for_tests() -> None:
             try:
                 _backend.stop()
             except Exception:
-                pass
+                logger.debug("Failed to stop computer_use backend during test reset", exc_info=True)
         _backend = None
 
 

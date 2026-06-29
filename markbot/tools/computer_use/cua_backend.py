@@ -102,7 +102,7 @@ class _AsyncBridge:
                 try:
                     self._loop.close()
                 except Exception:
-                    pass
+                    logger.debug("Failed to close cua-driver asyncio loop", exc_info=True)
 
         self._thread = threading.Thread(target=_run, daemon=True, name="cua-driver-loop")
         self._thread.start()
@@ -288,7 +288,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 h = int.from_bytes(raw[20:24], 'big')
                 return w, h
         except Exception:
-            pass
+            logger.debug("Failed to parse image dimensions from base64 capture", exc_info=True)
         return 0, 0
 
     def _action(self, name: str, args: dict[str, Any]) -> ActionResult:

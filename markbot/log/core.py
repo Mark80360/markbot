@@ -37,6 +37,32 @@ class InterceptHandler(logging.Handler):
         )
 
 
+_NOISY_THIRD_PARTY_LOGGERS = (
+    "websockets",
+    "urllib3",
+    "httpcore",
+    "httpx",
+    "asyncio",
+    "lark",
+    "lark_oapi",
+    "openai",
+)
+
+
+def _silence_noisy_third_party() -> None:
+    """Raise chatty third-party stdlib loggers to WARNING level.
+
+    These libraries emit large volumes of DEBUG traffic (raw HTTP
+    frames, websocket binary dumps, selector events, connection
+    lifecycle) that, when bridged into loguru via
+    :class:`InterceptHandler`, flood the log with meaningless
+    ``logging:callHandlers`` lines.  Genuine warnings and errors
+    still surface.
+    """
+    for name in _NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def setup_logging(
     *,
     level: str = "INFO",
@@ -44,6 +70,7 @@ def setup_logging(
     log_file: Optional[Path] = None,
     verbose: bool = False,
     install_exception_hooks: bool = True,
+    stderr_is_log: bool = False,
 ) -> None:
     """Initialise the unified logging subsystem.
 
@@ -63,11 +90,18 @@ def setup_logging(
     log_file:
         Optional path for the file sink.  When provided a second sink is
         added with ``level="DEBUG"`` and file-rotation settings.
+        Ignored when *stderr_is_log* is ``True``.
     verbose:
         Shortcut for ``level="DEBUG"``.
     install_exception_hooks:
         Whether to install ``sys.excepthook`` / ``threading.excepthook``
         so that unhandled exceptions are captured by loguru.
+    stderr_is_log:
+        Set to ``True`` when stderr has already been redirected to the
+        intended log file (e.g. daemon mode via ``os.dup2``).  In this
+        mode a single no-color sink is attached to stderr and the
+        separate file sink is skipped — writing to the same file through
+        two independent buffers causes interleaved and garbled output.
     """
     logger.remove()
 
@@ -78,10 +112,22 @@ def setup_logging(
     else:
         effective_level = level
 
-    # Only add console sink when stderr is a real TTY.
-    # In daemon mode, stderr is redirected to a file; adding a
-    # colorized console sink would dump raw ANSI codes into the log.
-    if sys.stderr.isatty():
+    if stderr_is_log:
+        # Daemon mode: stderr is already redirected to the log file.
+        # Use it as the sole sink with the plain file format so loguru
+        # and direct library writes share the same fd / buffer.
+        logger.add(
+            sys.stderr,
+            level="DEBUG",
+            format=file_format,
+            colorize=False,
+            backtrace=True,
+            diagnose=True,
+            catch=True,
+            filter=default_filter,
+        )
+    elif sys.stderr.isatty():
+        # Foreground mode: coloured console sink for the terminal.
         logger.add(
             sys.stderr,
             level=effective_level,
@@ -93,7 +139,7 @@ def setup_logging(
             filter=default_filter,
         )
 
-    if log_file is not None:
+    if log_file is not None and not stderr_is_log:
         logger.add(
             log_file,
             level="DEBUG",
@@ -108,6 +154,7 @@ def setup_logging(
             filter=default_filter,
         )
 
+    _silence_noisy_third_party()
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
 
     if install_exception_hooks:

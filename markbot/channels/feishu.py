@@ -1899,7 +1899,7 @@ class FeishuChannel(BaseChannel):
                     try:
                         await self._remove_reaction(message_id, reaction_id)
                     except Exception:
-                        pass
+                        logger.opt(exception=True).debug("Failed to clean up pending reaction {} for message {}", reaction_id, message_id)
                 return
 
             reply_to = chat_id if chat_type == "group" else sender_id
@@ -1930,7 +1930,7 @@ class FeishuChannel(BaseChannel):
                     if rid:
                         await self._remove_reaction(message_id, rid)
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up pending reaction {} for message {} during error handling", rid, message_id)
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""
