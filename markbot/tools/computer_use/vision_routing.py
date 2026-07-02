@@ -224,7 +224,7 @@ async def describe_image_via_auxiliary(
     ref = resolve_auxiliary_vision_model()
     if ref is None:
         return None
-    provider_id, model_name = ref
+    provider_id, model_ref = ref
 
     try:
         from markbot.config.loader import load_config
@@ -237,6 +237,12 @@ async def describe_image_via_auxiliary(
                 f"API key; falling back to text_summary"
             )
             return None
+
+        # Resolve model_ref (may be either a model id or an API model name).
+        # If it matches a configured model id, use that model's `name` (the
+        # actual string the provider API expects); otherwise pass through.
+        model_cfg = provider_cfg.get_model(model_ref) if model_ref else None
+        model_name = model_cfg.name if model_cfg else model_ref
         spec = find_by_name(provider_id)
         backend = spec.backend if spec else "openai_compat"
         provider = create_provider(

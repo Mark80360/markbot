@@ -130,6 +130,13 @@ _NO_VERIFY_EXTENSIONS: frozenset[str] = frozenset({
 # without verifying, we let it (the user can see the warning footer).
 _MAX_VERIFY_NUDGES = 2
 
+# Channels where verify-on-stop is active. On messaging channels
+# (feishu/qq/weixin/dingtalk/email/telegram/discord), the verify nudge
+# is noise — users can't see terminal output and running pytest in a
+# chat context doesn't make sense. Mirrors Hermes's surface-aware
+# toggle: local programming surfaces ON, messaging OFF.
+_VERIFY_ON_STOP_SURFACES: frozenset[str] = frozenset({"cli", "web"})
+
 # Keywords in the LLM's final response that signal a file-completion claim.
 # When these appear but no mutating tool succeeded this turn, the verifier
 # footer is appended to surface the mismatch.
@@ -1257,6 +1264,9 @@ class IterationRunner:
         """Decide whether to inject a verify-on-stop nudge.
 
         Conditions (all must hold):
+        0. The current channel is a local/programming surface (cli/web).
+           Messaging channels (feishu/qq/weixin/...) are skipped — the
+           verify nudge is noise there.
         1. The model edited at least one non-doc file this turn
            (``file_mutations`` has non-doc entries).
         2. The model has NOT called any verification tool this turn
@@ -1265,6 +1275,8 @@ class IterationRunner:
 
         Returns ``True`` when a nudge should be injected.
         """
+        if self.channel not in _VERIFY_ON_STOP_SURFACES:
+            return False
         if state.verification_done:
             return False
         if state.verify_nudges >= _MAX_VERIFY_NUDGES:
