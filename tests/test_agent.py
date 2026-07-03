@@ -303,6 +303,7 @@ class TestIdleTimeout:
         loop._active_tasks = {}
         loop._session_locks = {}
         loop._pending_steer = {}
+        loop._session_failure_state = {}
         loop._scrubber_pool = type("FakeScrubberPool", (), {
             "reset": lambda self, _: None,
         })()
