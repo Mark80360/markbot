@@ -41,22 +41,71 @@ def _message_content_hash(m: dict) -> str:
     the skip logic is robust to insertion/deletion between turns (unlike
     a positional count, which drifts when MultiLevelCompactor snips
     messages or the history is reloaded with different framing).
+
+    Includes ``tool_calls`` (OpenAI-style top-level field) and
+    ``tool_use`` / ``tool_result`` content blocks so two assistant
+    messages with empty text but distinct tool calls don't collide.
+    Without this, every ``{"role":"assistant","content":"","tool_calls":[...]}``
+    would hash to ``sha256("assistant:")`` and ``_skip_archived_by_tail``
+    could match an early false positive, skipping un-archived messages
+    in the middle (data loss).
     """
     import hashlib
     role = m.get("role", "")
     content = m.get("content", "")
+
+    # Normalise content (string or list of blocks) into a single string.
     if isinstance(content, list):
-        parts = []
+        parts: list[str] = []
         for b in content:
-            if isinstance(b, dict):
-                if b.get("type") == "text":
-                    parts.append(b.get("text", ""))
-                elif b.get("type") == "tool_use":
-                    parts.append(f"[tool:{b.get('name', '')}]")
-        content = chr(10).join(parts)
-    elif not isinstance(content, str):
-        content = str(content or "")
-    return hashlib.sha256(f"{role}:{content}".encode("utf-8")).hexdigest()[:32]
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                parts.append(b.get("text", ""))
+            elif btype == "tool_use":
+                # Include id + name + arguments so two tool_use blocks
+                # with the same name but different args don't collide.
+                parts.append(
+                    "[tool_use:{id}:{name}:{args}]".format(
+                        id=b.get("id", ""),
+                        name=b.get("name", ""),
+                        args=b.get("input", b.get("arguments", "")),
+                    )
+                )
+            elif btype == "tool_result":
+                parts.append(
+                    "[tool_result:{id}]".format(id=b.get("tool_use_id", ""))
+                )
+        content_str = chr(10).join(parts)
+    elif isinstance(content, str):
+        content_str = content
+    else:
+        content_str = str(content or "")
+
+    # OpenAI-style top-level tool_calls (assistant messages). build_assistant_message
+    # emits this shape; without it, empty-content tool-call messages collide.
+    tool_calls_str = ""
+    tc = m.get("tool_calls")
+    if isinstance(tc, list):
+        tc_parts: list[str] = []
+        for call in tc:
+            if not isinstance(call, dict):
+                continue
+            cid = call.get("id", "")
+            fn = call.get("function")
+            if isinstance(fn, dict):
+                fname = fn.get("name", "")
+                fargs = fn.get("arguments", "")
+            else:
+                fname = call.get("name", "")
+                fargs = call.get("arguments", "")
+            tc_parts.append("{id}:{name}:{args}".format(id=cid, name=fname, args=fargs))
+        tool_calls_str = "|".join(tc_parts)
+
+    return hashlib.sha256(
+        f"{role}:{content_str}:{tool_calls_str}".encode("utf-8")
+    ).hexdigest()[:32]
 
 
 def _skip_archived_by_tail(

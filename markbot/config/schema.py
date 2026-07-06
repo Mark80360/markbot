@@ -43,13 +43,19 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     default_permission_mode: Literal["default", "plan", "accept_edits", "auto", "bypass_permissions"] = Field(
-        "default",
+        "auto",
         description=(
             "Permission mode applied to AppStateProvider at gateway startup. "
             "Interactive ``/mode`` commands still override this at runtime, but "
-            "the value here is what unattended interactive turns fall back to "
-            "after a restart. Note: cron / autopilot / heartbeat paths force "
-            "AUTO via process_direct(permission_mode=...) and are unaffected."
+            "the value here is what interactive turns fall back to after a "
+            "restart. Note: cron / autopilot / heartbeat paths force AUTO via "
+            "process_direct(permission_mode=...) and are unaffected. "
+            "The default is ``auto`` because the iteration→registry path has "
+            "no interactive confirmation dialog yet: in ``default`` mode "
+            "non-read-only tools would return 'Permission required' and the "
+            "agent could not mutate files or run shell commands. Switch to "
+            "``default`` only after wiring a UI confirmation handler for the "
+            "``ask`` permission decision."
         ),
     )
     auxiliary_vision: "AuxiliaryVisionConfig" = Field(

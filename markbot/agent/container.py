@@ -779,8 +779,13 @@ class AgentContext:
         memory_encoder = _ME(workspace, memory_store=getattr(memory_manager, "_memory_store", None))
         app_state = _ASP.initialize()
         # Apply the configured default permission mode so interactive turns
-        # don't fall back to DEFAULT after a restart. ``/mode`` still overrides
-        # at runtime; cron/autopilot/heartbeat force AUTO via process_direct.
+        # start in the mode the user chose (schema default is ``auto`` so
+        # mutating tools work out of the box). ``/mode`` still overrides at
+        # runtime; cron/autopilot/heartbeat force AUTO via process_direct.
+        # The ``!= "default"`` skip avoids a redundant call when the user
+        # explicitly opts into ``default`` (which leaves AppStateProvider at
+        # its own DEFAULT — they take responsibility for wiring a UI
+        # confirmation handler for the ``ask`` permission decision).
         configured_mode = None
         try:
             configured_mode = config.agents.defaults.default_permission_mode if config else None

@@ -373,7 +373,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
       "max_tokens": 8192,
       "temperature": 0.1,
       "timezone": "Asia/Shanghai",
-      "defaultPermissionMode": "default",
+      "defaultPermissionMode": "auto",
       "workspace": "~/.markbot/workspace",
       "auxiliaryVision": {
         "forceTextOnly": false,
@@ -623,27 +623,28 @@ below.
 
 | Mode | Description | Read-only tools | Destructive/exec tools |
 |------|-------------|----------------|----------------------|
-| `default` | Confirm before destructive operations (recommended) | Auto-allow | **Ask before executing** |
+| `default` | Confirm before destructive operations (needs UI handler) | Auto-allow | **Ask — returns "Permission required" without a UI handler** |
 | `plan` | Read-only only, blocks all mutations | Auto-allow | **Deny** |
 | `accept_edits` | Allow file edits, still confirm destructive ops | Auto-allow | Edits allow; destructive **ask** |
-| `auto` | Allow all tools without confirmation | Auto-allow | Auto-allow |
+| `auto` | Allow all tools without confirmation (recommended) | Auto-allow | Auto-allow |
 | `bypass` | Bypass all permission checks | Auto-allow | Auto-allow |
 
-> **Important**: In `default` mode (the new default), destructive tools are **not**
-> silently executed. The agent loop reads the current app-state permission mode for
-> every tool call, rather than hardcoding `auto` as in previous versions. This means
-> shell commands, file writes, file deletes, browser clicks, and computer control
-> actions return a "Permission required" message that the model must surface to the
-> user. Use `/mode auto` to switch to fully autonomous operation when you trust the
-> task and the workspace boundaries.
+> **Important**: The schema default is `auto` so the agent works out of the box.
+> The agent loop reads the current app-state permission mode for every tool call,
+> rather than hardcoding `auto` as in previous versions. In `default` mode the
+> iteration → registry path has no interactive confirmation dialog yet, so
+> non-read-only tools return a "Permission required" message — the model must
+> surface it to the user. Switch to `default` only after wiring a UI confirmation
+> handler for the `ask` decision; until then prefer `auto` (or `accept_edits`
+> for software development).
 
 ```
 # In a chat session:
 /mode              # Show current mode
-/mode default      # Switch to confirmation-first (recommended)
+/mode default      # Confirmation-first (needs UI handler — otherwise deny)
 /mode plan         # Read-only only (analysis, code review)
 /mode accept_edits # Allow file edits (software development)
-/mode auto         # Fully autonomous
+/mode auto         # Fully autonomous (recommended out of the box)
 /mode bypass       # Bypass all checks (dangerous, debugging only)
 ```
 
@@ -682,7 +683,11 @@ channels) start in after a restart.
 ```
 
 Allowed values: `default` | `plan` | `accept_edits` | `auto` | `bypass_permissions`.
-Defaults to `default` when unset.
+Defaults to `auto` when unset — the agent iteration → tool registry path has
+no interactive confirmation dialog yet, so in `default` mode non-read-only
+tools would return `Permission required` and the agent could not mutate files
+or run shell commands. Switch to `default` only after wiring a UI confirmation
+handler for the `ask` permission decision.
 
 `/mode` runtime switches also persist to this field, so you rarely need to edit
 it by hand — set it once via `/mode auto` and it sticks across restarts. Edit

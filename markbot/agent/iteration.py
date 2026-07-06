@@ -1039,13 +1039,11 @@ class IterationRunner:
         # Determine which messages are compacted and whether they were
         # history (loaded from session) or new (produced this turn).
         history_archived = 0
-        last_compacted_msg: dict | None = None
         kept: list[dict] = []
         for i, m in enumerate(state.messages):
             if _is_compactable(m):
                 if i < original_new_msg_start:
                     history_archived += 1
-                last_compacted_msg = m
             else:
                 kept.append(m)
         state.messages = kept
@@ -1088,13 +1086,13 @@ class IterationRunner:
                         old_count + history_archived,
                         session_key=session_key,
                     )
-                    # Content-addressed high-water mark for drift-safe skip.
-                    if last_compacted_msg is not None and hasattr(mm, "set_archived_tail_hash"):
-                        from markbot.agent.hooks.compaction import _message_content_hash
-                        mm.set_archived_tail_hash(
-                            _message_content_hash(last_compacted_msg),
-                            session_key=session_key,
-                        )
+                    # Note: the archived_tail_hash is set by the compaction
+                    # hook itself (on messages_to_compact[-1] after marking).
+                    # We don't re-set it here — the hook has the authoritative
+                    # last-archived message reference, and re-deriving it from
+                    # state.messages would either match the same message (no-op)
+                    # or, if the hook skipped context compaction, set a stale
+                    # value that overrides the hook's own skip logic next turn.
 
             logger.info(
                 "Memory compaction applied to current context: "
@@ -1635,10 +1633,15 @@ class IterationRunner:
         - verify (status/ps/curl/logs/tests): set ``verification_done``
           and clear ``side_effect_pending`` — the model checked the
           post-condition.
-        - neutral (unrecognized): preserve existing behavior (set
-          ``verification_done``) to avoid regressing the file-edit verify
-          path, since most exec calls in a coding session ARE verification
-          (pytest, npm test, etc.).
+        - neutral (unrecognized): set ``verification_done`` (so the file-
+          edit nudge path treats it as verification — most exec calls in
+          a coding session ARE verification like pytest) but do NOT clear
+          ``side_effect_pending``. ``_should_inject_verify_nudge`` checks
+          ``side_effect_pending`` BEFORE the ``verification_done`` short-
+          circuit, so a neutral command (echo/python/node/...) run after
+          an action does NOT satisfy the action-verify gate — only a true
+          verify command does. This preserves the file-edit path's lenient
+          behavior while keeping the action path strict.
 
         The action/verify split prevents the 'false completion' failure
         mode where ``systemctl restart X`` is treated as verification,
@@ -1667,8 +1670,15 @@ class IterationRunner:
             state.verification_done = True
             state.side_effect_pending = False
         else:
-            # Neutral: preserve existing behavior. Defaulting to
-            # verification_done avoids regressing the file-edit nudge path.
+            # Neutral (unrecognised command): set verification_done so the
+            # file-edit nudge path treats it as verification (most exec
+            # calls in a coding session ARE verification like pytest).
+            # Intentionally do NOT clear side_effect_pending — only a true
+            # verify command (status/is-active/ps/logs) should clear it.
+            # _should_inject_verify_nudge checks side_effect_pending BEFORE
+            # the verification_done short-circuit, so a neutral command
+            # after an action does NOT silently satisfy the action-verify
+            # gate.
             state.verification_done = True
 
     def _should_inject_verify_nudge(self, state: LoopState) -> bool:
@@ -1678,23 +1688,38 @@ class IterationRunner:
         0. The current channel is a local/programming surface (cli/web).
            Messaging channels (feishu/qq/weixin/...) are skipped — the
            verify nudge is noise there.
-        1. The model edited at least one non-doc file this turn
-           (``file_mutations`` has non-doc entries), OR ran a side-effect
-           action command (restart/install/pull/kill) without a follow-up
-           verify (``side_effect_pending`` is True).
-        2. The model has NOT called any verification tool this turn
-           (``verification_done`` is False).
-        3. We have not already injected ``_MAX_VERIFY_NUDGES`` nudges.
+        1. We have not already injected ``_MAX_VERIFY_NUDGES`` nudges.
+        2. EITHER:
+           a. The model ran a side-effect action command (restart/install/
+              pull/kill) without a follow-up verify (``side_effect_pending``
+              is True) — checked BEFORE the ``verification_done`` short-
+              circuit so that a neutral command (echo/python/node/...) run
+              after the action doesn't accidentally satisfy the gate. Only
+              a true verify command (status/is-active/ps/logs) clears
+              ``side_effect_pending`` via ``_record_verification_call``.
+           b. The model edited at least one non-doc file this turn
+              (``file_mutations`` has non-doc entries) AND has NOT called
+              any verification tool this turn (``verification_done`` is
+              False). The ``verification_done`` short-circuit applies to
+              the file-edit path only — a pytest run after edits clears
+              the nudge as expected.
 
         Returns ``True`` when a nudge should be injected.
         """
         if self.channel not in _VERIFY_ON_STOP_SURFACES:
             return False
-        if state.verification_done:
-            return False
         if state.verify_nudges >= _MAX_VERIFY_NUDGES:
             return False
-        # Condition 1a: at least one non-doc file mutation.
+        # Condition 2a: pending side-effect action awaiting verification.
+        # Checked BEFORE the verification_done short-circuit so neutral
+        # commands (echo/python/node/...) don't accidentally clear the gate —
+        # only a true verify command clears side_effect_pending.
+        if state.side_effect_pending:
+            return True
+        # Condition 2b: file-edit path. The verification_done short-circuit
+        # applies here: a pytest/eslint run after edits clears the nudge.
+        if state.verification_done:
+            return False
         for mut in state.file_mutations:
             path = mut.get("path", "")
             ext = ""
@@ -1702,9 +1727,6 @@ class IterationRunner:
                 ext = "." + path.rsplit(".", 1)[-1].lower()
             if ext not in _NO_VERIFY_EXTENSIONS:
                 return True
-        # Condition 1b: pending side-effect action awaiting verification.
-        if state.side_effect_pending:
-            return True
         return False
 
     def _build_verify_nudge(self, state: LoopState) -> str:
@@ -1783,7 +1805,12 @@ class IterationRunner:
            successful mutating tool call this turn.
         2. Action-completion claim (restarted/installed/pulled) without a
            follow-up verify command confirming the post-condition
-           (``side_effect_pending`` still True, ``verification_done`` False).
+           (``side_effect_pending`` still True). ``side_effect_pending`` is
+           the authoritative signal: a neutral command (echo/python/node/...)
+           sets ``verification_done`` but does NOT clear
+           ``side_effect_pending``, so the footer still fires — only a true
+           verify command (status/is-active/ps/logs) clears it via
+           ``_record_verification_call``.
 
         Either mismatch appends a verifier footer so the user (and next-
         turn LLM) sees that the completion claim is unverified.
@@ -1818,8 +1845,9 @@ class IterationRunner:
             )
 
         # Check 2: action-completion claim without post-condition verification.
+        # side_effect_pending is the authoritative signal — see docstring.
         has_action_claim = any(p in content_lower for p in _ACTION_COMPLETION_CLAIM_PATTERNS)
-        if has_action_claim and state.side_effect_pending and not state.verification_done:
+        if has_action_claim and state.side_effect_pending:
             logger.warning(
                 "Action-verification verifier: LLM claims action completion "
                 "but no verify command confirmed the post-condition — injecting footer"

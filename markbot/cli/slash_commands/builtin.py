@@ -267,9 +267,9 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
 
     Usage:
       /mode            — show current mode
-      /mode default    — confirm before destructive tools (recommended)
+      /mode default    — confirm before destructive tools (needs UI handler)
       /mode plan       — read-only only, no mutations
-      /mode auto       — allow all tools without confirmation
+      /mode auto       — allow all tools without confirmation (recommended)
       /mode bypass     — bypass all permission checks (dangerous)
     """
     loop = ctx.loop
@@ -285,10 +285,10 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
         current = app_state.get_permission_mode()
         lines = [
             "Permission modes:",
-            "  default    — confirm before destructive tools (current default)",
+            "  default    — confirm before destructive tools (needs UI handler; otherwise deny)",
             "  plan       — read-only only, blocks all mutations",
             "  accept_edits — allow file edits, still confirm destructive ops",
-            "  auto       — allow all tools without confirmation",
+            "  auto       — allow all tools without confirmation (schema default, recommended)",
             "  bypass     — bypass all permission checks (dangerous)",
             "",
             f"Current mode: {current.value}",

@@ -32,7 +32,7 @@ class TestAgentDefaults:
         assert ad.temperature == 0.1
         assert ad.max_tool_iterations == 40
         assert ad.timezone == "UTC"
-        assert ad.default_permission_mode == "default"
+        assert ad.default_permission_mode == "auto"
 
     def test_custom_values(self):
         ad = AgentDefaults(max_tokens=4096, temperature=0.5)
@@ -354,12 +354,12 @@ class TestUpdateConfigValue:
         cfg.write_text("{}", encoding="utf-8")
         # Prime the cache
         load_config(cfg)
-        assert loader_mod._current_config.agents.defaults.default_permission_mode == "default"
+        assert loader_mod._current_config.agents.defaults.default_permission_mode == "auto"
         update_config_value(
-            ["agents", "defaults", "defaultPermissionMode"], "auto",
+            ["agents", "defaults", "defaultPermissionMode"], "default",
             config_path=cfg,
         )
-        assert loader_mod._current_config.agents.defaults.default_permission_mode == "auto"
+        assert loader_mod._current_config.agents.defaults.default_permission_mode == "default"
         # Reset global cache so other tests get a fresh load
         loader_mod._current_config = None
         loader_mod._current_config_path = None

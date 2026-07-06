@@ -191,11 +191,29 @@ class TestSessionExtensionsPermissionMode:
         assert ext["app_state"].get().permission_mode is PermissionMode.ACCEPT_EDITS
 
     def test_config_default_keeps_default(self, tmp_path):
+        # Explicit "default" config leaves AppStateProvider at its own
+        # DEFAULT — the user takes responsibility for wiring a UI
+        # confirmation handler for the ``ask`` permission decision.
         from markbot.types.permission import PermissionMode
         ext = self._build(tmp_path, "default")
         assert ext["app_state"].get().permission_mode is PermissionMode.DEFAULT
 
-    def test_no_config_keeps_default(self, tmp_path):
+    def test_no_config_applies_schema_default_auto(self, tmp_path):
+        # When config is absent, the schema default ("auto") is used.
+        from markbot.types.permission import PermissionMode
+        from markbot.agent.container import AgentContext
+        from markbot.config.schema import Config
+        from unittest.mock import MagicMock
+        self._reset_app_state_singleton()
+        config = Config()  # schema defaults — default_permission_mode="auto"
+        ext = AgentContext._build_session_extensions(
+            tmp_path, MagicMock(), MagicMock(), MagicMock(), {}, config,
+        )
+        assert ext["app_state"].get().permission_mode is PermissionMode.AUTO
+
+    def test_no_config_object_keeps_app_state_default(self, tmp_path):
+        # Defensive: when config object itself is None, AppStateProvider
+        # stays at its built-in DEFAULT (callers should pass a Config).
         from markbot.types.permission import PermissionMode
         from markbot.agent.container import AgentContext
         from unittest.mock import MagicMock
