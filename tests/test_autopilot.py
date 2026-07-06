@@ -69,6 +69,7 @@ class FakeAgentLoop:
         session_key: str = "",
         channel: str = "",
         chat_id: str = "",
+        permission_mode: Any = None,
     ) -> _FakeResponse:
         self.calls.append(
             {
@@ -76,6 +77,7 @@ class FakeAgentLoop:
                 "session_key": session_key,
                 "channel": channel,
                 "chat_id": chat_id,
+                "permission_mode": permission_mode,
             }
         )
         return _FakeResponse(self.content)
@@ -980,6 +982,12 @@ class TestAutopilotService:
         assert result.attempt_count == 1
         assert result.assistant_summary == "done"
         assert agent.calls
+        # Unattended paths (autopilot/cron/heartbeat) must force AUTO mode so
+        # they don't depend on a user having run `/mode auto` interactively.
+        # See logs/2026-07-05.log — cron cleanup was blocked by DEFAULT mode
+        # even after `/mode auto` was set, because mode is in-memory only.
+        from markbot.types.permission import PermissionMode as _PM
+        assert agent.calls[0]["permission_mode"] is _PM.AUTO
 
     async def test_run_next_retries_then_fails(
         self, store: AutopilotStore, monkeypatch: pytest.MonkeyPatch,

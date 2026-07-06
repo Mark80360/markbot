@@ -221,11 +221,13 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         force_max_results: int = 1,
         force_min_score: float = 0.3,
         tool_result_retention_days: int = 5,
+        daily_log_retention_days: int = 30,
         max_input_length: int = 131072,
         # -- Long-term (vector) memory -------------------------------------
         long_term_enabled: bool = True,
         vector_backend: str = "sqlite",
         vector_max_records: int = 50_000,
+        vector_max_scan_records: int = 20_000,
         vector_min_content_chars: int = 12,
         vector_top_k_multiplier: int = 2,
         vector_min_score: float = 0.15,
@@ -256,12 +258,18 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self.force_max_results = force_max_results
         self.force_min_score = force_min_score
         self.tool_result_retention_days = tool_result_retention_days
+        self._daily_log_retention_days = daily_log_retention_days
         self.max_input_length = max_input_length
 
         self._started = False
         self._compressed_summary: str = ""
         self._session_summaries: dict[str, str] = {}
         self._session_archived_counts: dict[str, int] = {}
+        # Content-addressed high-water mark for archived messages.
+        # Stores a sha256 of the last-archived message content per session
+        # so the compaction hook can skip already-archived messages by
+        # content match rather than by fragile positional count.
+        self._session_archived_tail_hashes: dict[str, str] = {}
 
         self._memory_store: MemoryStore | None = None
         self._daily_log: DailyLogManager | None = None
@@ -272,6 +280,16 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         self._prefetch_query: str = ""
         self._prefetch_session_key: str | None = None
+
+        # Per-turn vector-search cache.  Within a single turn, prefetch()
+        # and forced_context / memory_search may issue vector searches for
+        # the same (or textually identical) query.  Caching the result for
+        # a short TTL avoids a redundant embed + cosine scan.  Cleared at
+        # turn boundaries (sync_turn / queue_prefetch).
+        self._vector_cache: dict[tuple, tuple[list, float]] = {}
+        self._vector_cache_ttl: float = 10.0
+        import threading
+        self._vector_cache_lock = threading.RLock()
 
         # -- Long-term (vector) memory wiring -----------------------------
         self._long_term_enabled = long_term_enabled
@@ -296,6 +314,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             self._init_long_term_memory(
                 vector_backend=vector_backend,
                 vector_max_records=vector_max_records,
+                vector_max_scan_records=vector_max_scan_records,
                 vector_min_content_chars=vector_min_content_chars,
                 vector_top_k_multiplier=vector_top_k_multiplier,
                 consolidation_dedup_threshold=consolidation_dedup_threshold,
@@ -311,6 +330,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         *,
         vector_backend: str,
         vector_max_records: int,
+        vector_max_scan_records: int,
         vector_min_content_chars: int,
         vector_top_k_multiplier: int,
         consolidation_dedup_threshold: float,
@@ -332,6 +352,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             vs_config = {
                 "vector_backend": vector_backend,
                 "vector_max_records": vector_max_records,
+                "vector_max_scan_records": vector_max_scan_records,
                 "provider_config": provider_config or {},
             }
             embedder = build_embedder(self._embedding_config)
@@ -382,7 +403,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # AgentContext.from_legacy_params or tests) — only construct a default
         # DailyLogManager when one was not provided. Mirrors start() behavior.
         if self._daily_log is None:
-            self._daily_log = DailyLogManager(workspace=Path(working_dir))
+            self._daily_log = DailyLogManager(workspace=Path(working_dir), retention_days=self._daily_log_retention_days)
         self._compressed_summary = self._load_compressed_summary()
         logger.info("Initialized for session: {}", session_id)
 
@@ -393,6 +414,47 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             if ctx:
                 return ctx
         return ""
+
+    def _cached_vector_search(
+        self,
+        query: str,
+        *,
+        max_results: int,
+        min_score: float,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> list[dict]:
+        """Vector search with a short-TTL per-turn cache.
+
+        Within one turn, prefetch() and forced_context/memory_search may
+        issue vector searches for the same query.  The embed + cosine
+        scan is the expensive part; caching its result for a few seconds
+        eliminates the redundant second scan.  The cache is cleared at
+        turn boundaries (sync_turn / queue_prefetch).
+        """
+        if self._longterm is None:
+            return []
+        import time
+        key = (query, max_results, round(min_score, 4), channel, chat_id)
+        now = time.time()
+        with self._vector_cache_lock:
+            cached = self._vector_cache.get(key)
+            if cached is not None and now - cached[1] < self._vector_cache_ttl:
+                return cached[0]
+        try:
+            results = self._longterm.search(
+                query,
+                max_results=max_results,
+                min_score=min_score,
+                channel=channel,
+                chat_id=chat_id,
+            )
+        except Exception as e:
+            logger.debug("Vector search failed: {}", e)
+            return []
+        with self._vector_cache_lock:
+            self._vector_cache[key] = (results, now)
+        return results
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
@@ -420,7 +482,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         Returns:
             Formatted, fence-tagged context string, or empty string.
         """
-        search_query = self._prefetch_query or query
+        # Prefer the current user message.  A queued query is only a fallback
+        # for providers that precompute recall between turns; using it first
+        # makes automatic recall lag one turn behind the user's actual ask.
+        search_query = query or self._prefetch_query
         if not search_query:
             return ""
 
@@ -447,7 +512,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 # from the agent loop's first iteration, so we must not block
                 # the event loop indefinitely.
                 future = self._prefetch_executor.submit(
-                    lambda: self._longterm.search(
+                    lambda: self._cached_vector_search(
                         search_query,
                         max_results=MAX_PREFETCH_RESULTS,
                         min_score=self._vector_min_score,
@@ -519,6 +584,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             return
         self._prefetch_query = query
         self._prefetch_session_key = session_id
+        # Turn boundary — drop stale vector-search cache.
+        with self._vector_cache_lock:
+            self._vector_cache.clear()
 
     def sync_turn(
         self,
@@ -528,6 +596,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         session_id: str = "",
     ) -> None:
         """Persist a completed turn."""
+        # Turn boundary — drop stale vector-search cache so the next
+        # turn's queries don't reuse this turn's (possibly different) results.
+        with self._vector_cache_lock:
+            self._vector_cache.clear()
         if self._daily_log:
             channel = ""
             chat_id = ""
@@ -635,7 +707,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # Preserve externally-set daily_log (e.g. from AgentContext.from_legacy_params)
         # instead of overwriting it with a new instance.
         if self._daily_log is None:
-            self._daily_log = DailyLogManager(workspace=Path(self.working_dir))
+            self._daily_log = DailyLogManager(workspace=Path(self.working_dir), retention_days=self._daily_log_retention_days)
         self._compressed_summary = self._load_compressed_summary()
         self._started = True
         logger.info("Started")
@@ -842,11 +914,24 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                         )
                         failures: list[str] = []
                         for chunk in chunks:
-                            result = self._memory_store.add("memory", chunk)
+                            # Tag summary-derived entries so the eviction
+                            # path can distinguish them from manual writes.
+                            tagged = chunk
+                            if "[auto-summary]" not in tagged:
+                                tagged = f"{chunk}  [auto-summary]"
+                            result = self._memory_store.add("memory", tagged)
                             if not result.get("success", False):
-                                failures.append(result.get("message", "unknown"))
-                                if "limit" in (failures[-1] or "").lower():
-                                    break
+                                # Budget full — try evicting old auto-summary
+                                # entries to make room, then retry once.
+                                if "limit" in (result.get("message", "") or "").lower():
+                                    self._memory_store.evict_oldest_matching(
+                                        "memory", "[auto-summary]", len(tagged) + 100,
+                                    )
+                                    result = self._memory_store.add("memory", tagged)
+                                if not result.get("success", False):
+                                    failures.append(result.get("message", "unknown"))
+                                    if "limit" in (failures[-1] or "").lower():
+                                        break
                         if failures:
                             logger.warning(
                                 "Some summary chunks failed to write: {}",
@@ -864,7 +949,15 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if compact_summary:
             if self._memory_store:
                 try:
-                    self._memory_store.add("memory", compact_summary)
+                    tagged = compact_summary
+                    if "[auto-summary]" not in tagged:
+                        tagged = f"{compact_summary}  [auto-summary]"
+                    result = self._memory_store.add("memory", tagged)
+                    if not result.get("success", False) and "limit" in (result.get("message", "") or "").lower():
+                        self._memory_store.evict_oldest_matching(
+                            "memory", "[auto-summary]", len(tagged) + 100,
+                        )
+                        self._memory_store.add("memory", tagged)
                 except Exception as e:
                     logger.warning("Failed to write compact summary to MemoryStore: {}", e)
             return compact_summary
@@ -974,10 +1067,15 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 import asyncio
                 vec = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._longterm.search(
+                    lambda: self._cached_vector_search(
                         query,
                         max_results=max_results,
-                        min_score=max(min_score, self._vector_min_score),
+                        # Use a low pre-fusion floor so weak semantic matches
+                        # still reach RRF.  The caller's min_score gates the
+                        # *keyword* scale (hit-ratio 0..1), not cosine; mixing
+                        # the two scales was dropping borderline vector hits
+                        # before they could be boosted by keyword agreement.
+                        min_score=min(self._vector_min_score, 0.05),
                         channel=channel,
                         chat_id=chat_id,
                     ),
@@ -1327,6 +1425,27 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         else:
             self._archived_count = count
 
+    def get_archived_tail_hash(self, *, session_key: str | None = None) -> str:
+        """Return the content hash of the last-archived message.
+
+        Used by the compaction hook to skip already-archived messages by
+        content match, which is robust to message insertion/deletion
+        between turns (unlike the positional archived_count).
+        """
+        if session_key:
+            if session_key not in self._session_archived_tail_hashes:
+                self._session_archived_tail_hashes[session_key] = self._load_archived_tail_hash(session_key)
+            return self._session_archived_tail_hashes.get(session_key, "")
+        return getattr(self, "_archived_tail_hash", "")
+
+    def set_archived_tail_hash(self, tail_hash: str, *, session_key: str | None = None) -> None:
+        """Update the content hash of the last-archived message."""
+        if session_key:
+            self._session_archived_tail_hashes[session_key] = tail_hash
+            self._save_archived_tail_hash(session_key, tail_hash)
+        else:
+            self._archived_tail_hash = tail_hash
+
     def evict_session_cache(self, session_key: str) -> None:
         """Evict in-memory caches for a session to free memory.
 
@@ -1342,6 +1461,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             removed += 1
         if session_key in self._session_archived_counts:
             del self._session_archived_counts[session_key]
+            removed += 1
+        if session_key in self._session_archived_tail_hashes:
+            del self._session_archived_tail_hashes[session_key]
             removed += 1
         if removed:
             logger.debug("Evicted session cache for {}: {} entries", session_key, removed)
@@ -1370,6 +1492,30 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         safe_key = session_key.replace(":", "_").replace("/", "_")
         return Path(self.working_dir) / "memory" / f".archive_count_{safe_key}"
 
+
+    def _load_archived_tail_hash(self, session_key: str) -> str:
+        """Load per-session archived tail hash from disk."""
+        path = self._archived_tail_hash_path(session_key)
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        return ""
+
+    def _save_archived_tail_hash(self, session_key: str, tail_hash: str) -> None:
+        """Save per-session archived tail hash to disk."""
+        path = self._archived_tail_hash_path(session_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(tail_hash, encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to save archived tail hash: {}", e)
+
+    def _archived_tail_hash_path(self, session_key: str) -> Path:
+        """Get path for per-session archived tail hash file."""
+        safe_key = session_key.replace(":", "_").replace("/", "_")
+        return Path(self.working_dir) / "memory" / f".archive_tail_{safe_key}"
     def get_memory_context(self, query: str | None = None, *, session_key: str | None = None) -> str:
         """Get formatted memory context for system prompt injection.
 

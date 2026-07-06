@@ -28,6 +28,8 @@ class ExploreContextCatalogTool(Tool):
     """View available context sources catalog.
 
     Returns a lightweight directory/table-of-contents for all available
+
+    _is_read_only = True
     context sources (memory, bootstrap files, workspace info, etc.).
     This is like looking at a book's table of contents before reading.
     """
@@ -248,6 +250,8 @@ class SearchContextTool(Tool):
     """Search within context sources.
 
     Searches across memory, bootstrap files, and other context sources
+
+    _is_read_only = True
     for relevant information based on keywords or semantic query.
     Returns summarized results with IDs that can be used with load_context.
     """
@@ -496,6 +500,8 @@ class SearchContextTool(Tool):
 class LoadContextTool(Tool):
     """Load full content from a specific context entry.
 
+
+    _is_read_only = True
     Loads the complete content of a specific context entry identified
     by its ID from search_context results.
     This is like opening a book to read a specific chapter in detail.

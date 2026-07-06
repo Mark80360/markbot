@@ -101,7 +101,14 @@ class BaseTool(ABC):
         if tool_name in ctx.always_ask:
             return PermissionDecision(behavior="ask")
 
-        # AUTO mode: allow all tools but log destructive ones
+        if context.permission_mode == PermissionMode.PLAN:
+            return PermissionDecision(
+                behavior="deny",
+                reason="Plan mode only permits read-only tools",
+            )
+
+        # AUTO mode: allow all tools. This mode should only be selected by an
+        # explicit user/profile decision; DEFAULT remains confirmation-first.
         if context.permission_mode == PermissionMode.AUTO:
             return PermissionDecision(behavior="allow", reason="AUTO mode")
 

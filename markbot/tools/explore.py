@@ -37,6 +37,8 @@ class ExploreTool(Tool):
 
     _is_heavy_tool = True
 
+    _is_read_only = True
+
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir

@@ -33,6 +33,53 @@ if TYPE_CHECKING:
 _MEMORY_COMPACT_KEEP_RECENT = 4
 _COMPACTED_MARKER = "_markbot_compacted"
 
+
+def _message_content_hash(m: dict) -> str:
+    """Stable short hash of a message's textual content.
+
+    Used as a content-addressed high-water mark for archived messages so
+    the skip logic is robust to insertion/deletion between turns (unlike
+    a positional count, which drifts when MultiLevelCompactor snips
+    messages or the history is reloaded with different framing).
+    """
+    import hashlib
+    role = m.get("role", "")
+    content = m.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+                elif b.get("type") == "tool_use":
+                    parts.append(f"[tool:{b.get('name', '')}]")
+        content = chr(10).join(parts)
+    elif not isinstance(content, str):
+        content = str(content or "")
+    return hashlib.sha256(f"{role}:{content}".encode("utf-8")).hexdigest()[:32]
+
+
+def _skip_archived_by_tail(
+    messages: list[dict],
+    archived_tail: str,
+) -> tuple[list[dict], int, bool]:
+    """Skip already-archived prefix if the tail hash is found.
+
+    If the tail hash cannot be found, return the original messages.  That
+    conservatively re-compacts some history, but avoids the dangerous failure
+    mode of dropping all candidates because the old tail was snipped or the
+    history was reloaded with different framing.
+    """
+    if not archived_tail:
+        return messages, 0, False
+
+    for idx, m in enumerate(messages):
+        if not isinstance(m, dict) or m.get("role") == "system":
+            continue
+        if _message_content_hash(m) == archived_tail:
+            return messages[idx + 1 :], idx + 1, True
+    return messages, 0, False
+
 # Exception types that indicate a programming bug (wrong type, missing
 # attribute, undefined name) rather than a transient operational failure.
 # These propagate to the caller so the error is visible instead of being
@@ -184,30 +231,30 @@ class MemoryCompactionHook:
 
             # Skip messages that were archived in previous turns.
             # The _markbot_compacted metadata marker does not survive
-            # session save/load (get_history strips metadata), so we
-            # track the archived count per session as a durable record.
-            archived_count = self.memory_manager.get_archived_count(session_key=session_key)
-            if archived_count > 0:
-                skipped = 0
-                filtered: list[dict] = []
-                for m in messages_to_compact:
-                    if (
-                        skipped < archived_count
-                        and isinstance(m, dict)
-                        and m.get("role") != "system"
-                    ):
-                        skipped += 1
-                        continue
-                    filtered.append(m)
+            # session save/load (get_history strips metadata), so we use
+            # a content-addressed high-water mark: the hash of the last
+            # message archived in the previous compaction.  This is
+            # robust to message insertion/deletion between turns, unlike
+            # a positional count which drifts when messages are snipped.
+            archived_tail = self.memory_manager.get_archived_tail_hash(session_key=session_key)
+            if archived_tail:
+                filtered, skipped, found_tail = _skip_archived_by_tail(
+                    messages_to_compact, archived_tail,
+                )
+                if not found_tail:
+                    logger.info(
+                        "Archived tail {} not found; re-compacting from available history",
+                        archived_tail[:8],
+                    )
+                messages_to_compact = filtered
                 if not filtered:
                     logger.info(
-                        "All compactable messages already archived (count={})",
-                        archived_count,
+                        "All compactable messages already archived (tail={})",
+                        archived_tail[:8],
                     )
                     return None
                 if skipped > 0:
-                    logger.info("Skipped {} already-archived messages", skipped)
-                messages_to_compact = filtered
+                    logger.info("Skipped {} already-archived messages (tail match={})", skipped, found_tail)
 
             if not is_valid:
                 logger.warning("Invalid messages during compaction, adjusting...")
@@ -231,26 +278,23 @@ class MemoryCompactionHook:
                 logger.info("All messages already compacted after adjustment, skipping")
                 return None
 
-            # Re-apply archived-count skip after is_valid adjustment
+            # Re-apply tail-hash skip after is_valid adjustment
             # (the adjustment may have reset messages_to_compact).
-            if archived_count > 0:
-                skipped = 0
-                filtered = []
-                for m in messages_to_compact:
-                    if (
-                        skipped < archived_count
-                        and isinstance(m, dict)
-                        and m.get("role") != "system"
-                    ):
-                        skipped += 1
-                        continue
-                    filtered.append(m)
+            if archived_tail:
+                filtered, skipped, found_tail = _skip_archived_by_tail(
+                    messages_to_compact, archived_tail,
+                )
+                if not found_tail:
+                    logger.info(
+                        "Archived tail {} not found after adjustment; re-compacting from available history",
+                        archived_tail[:8],
+                    )
+                messages_to_compact = filtered
                 if not filtered:
                     logger.info(
                         "All compactable messages already archived after adjustment"
                     )
                     return None
-                messages_to_compact = filtered
 
             # Phase 1: Context compaction (skip if MultiLevelCompactor
             # already handled it).  We run this BEFORE the async summary
@@ -315,6 +359,15 @@ class MemoryCompactionHook:
                         self.memory_manager.set_compressed_summary(
                             compact_content, session_key=session_key,
                         )
+                        # Persist a content-addressed high-water mark so
+                        # the next turn can skip these messages by content
+                        # match rather than by fragile positional count.
+                        last_msg = messages_to_compact[-1] if messages_to_compact else None
+                        if isinstance(last_msg, dict):
+                            self.memory_manager.set_archived_tail_hash(
+                                _message_content_hash(last_msg),
+                                session_key=session_key,
+                            )
                 else:
                     logger.info("Context compaction skipped")
 
@@ -364,4 +417,3 @@ class MemoryCompactionHook:
         return all(
             isinstance(m, dict) and "role" in m for m in messages
         )
-

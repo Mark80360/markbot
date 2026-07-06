@@ -21,6 +21,7 @@ Enhanced features (inspired by OpenHarness):
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -47,6 +48,14 @@ MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 DEFAULT_TOOL_OUTPUT_INLINE_CHARS = 16_000
 DEFAULT_TOOL_OUTPUT_PREVIEW_CHARS = 3_000
 PTL_RETRY_MARKER = "[earlier conversation truncated for compaction retry]"
+# Cooldown window (wall-clock seconds) after consecutive failures reach the
+# threshold. Compaction is skipped while in cooldown. Persisted to
+# ``workspace/compactor_state.json`` so the cooldown survives daemon restarts
+# — otherwise a compaction death-spiral resumes immediately after restart
+# (the root cause of the "feishu connected but unresponsive" outage on
+# 2026-06-29, where the daemon repeatedly entered compaction failure loops
+# after each restart).
+_COMPACTION_COOLDOWN_SECONDS = 300.0
 
 _PTL_ERROR_PATTERNS = (
     "prompt too long",
@@ -428,6 +437,93 @@ class MultiLevelCompactor:
         # re-injected as a standalone user message after auto-compaction so
         # the model does not lose the plan across context compression.
         self._todo_tool = todo_tool
+        # Persistent failure cooldown — wall-clock timestamp (time.time()) at
+        # which the cooldown expires. Loaded from disk so a daemon restart
+        # does not immediately re-enter a compaction death-spiral.
+        self._cooldown_until: float = 0.0
+        self._state_path = self._resolve_state_path()
+        self._load_persistent_state()
+
+    @staticmethod
+    def _resolve_state_path() -> Path | None:
+        """Locate the persistent state file under the workspace.
+
+        Returns ``None`` if the workspace path cannot be resolved (e.g.
+        during unit tests without a configured workspace). In that case the
+        cooldown falls back to in-memory only.
+        """
+        try:
+            from markbot.config.paths import get_workspace_path
+            return get_workspace_path() / "compactor_state.json"
+        except Exception:
+            return None
+
+    def _load_persistent_state(self) -> None:
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            self._consecutive_failures = int(data.get("consecutive_failures", 0))
+            self._cooldown_until = float(data.get("cooldown_until", 0.0))
+            if self._consecutive_failures and self._cooldown_until <= time.time():
+                # Cooldown elapsed since the last failure — reset now so the
+                # next compaction attempt starts fresh, and persist so the
+                # state file reflects reality rather than a stale failure.
+                logger.info(
+                    "Resumed compactor state: consecutive_failures={}, "
+                    "cooldown elapsed — resetting",
+                    self._consecutive_failures,
+                )
+                self._consecutive_failures = 0
+                self._cooldown_until = 0.0
+                self._save_persistent_state()
+            elif self._consecutive_failures or self._cooldown_until:
+                logger.info(
+                    "Resumed compactor state: consecutive_failures={}, "
+                    "cooldown_remaining={:.0f}s",
+                    self._consecutive_failures,
+                    max(0.0, self._cooldown_until - time.time()),
+                )
+        except Exception as exc:
+            logger.warning("Failed to load compactor state: {}", exc)
+            self._consecutive_failures = 0
+            self._cooldown_until = 0.0
+
+    def _save_persistent_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            data = {
+                "consecutive_failures": self._consecutive_failures,
+                "cooldown_until": self._cooldown_until,
+            }
+            tmp = self._state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(self._state_path)
+        except Exception as exc:
+            logger.debug("Failed to save compactor state: {}", exc)
+
+    def _mark_compaction_success(self) -> None:
+        """Reset failure counter and clear cooldown on a successful compaction.
+
+        No-op when already at zero to avoid pointless disk writes.
+        """
+        if self._consecutive_failures or self._cooldown_until:
+            self._consecutive_failures = 0
+            self._cooldown_until = 0.0
+            self._save_persistent_state()
+
+    def _record_compaction_failure(self) -> None:
+        """Increment failure counter and (re)arm the cooldown window.
+
+        Each failure pushes ``cooldown_until`` forward by
+        ``_COMPACTION_COOLDOWN_SECONDS`` from now, so a streak of failures
+        keeps the cooldown armed until the window elapses with no new
+        failures.
+        """
+        self._consecutive_failures += 1
+        self._cooldown_until = time.time() + _COMPACTION_COOLDOWN_SECONDS
+        self._save_persistent_state()
 
     def set_todo_tool(self, todo_tool: Any) -> None:
         """Attach (or replace) the todo tool used for post-compaction re-injection."""
@@ -445,6 +541,8 @@ class MultiLevelCompactor:
         self._compaction_count = 0
         self._total_tokens_saved = 0
         self._consecutive_failures = 0
+        self._cooldown_until = 0.0
+        self._save_persistent_state()
 
     async def _emit_progress(
         self,
@@ -516,17 +614,29 @@ class MultiLevelCompactor:
             )
 
         if self._consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
-            logger.warning(
-                "Skipping compaction: {} consecutive failures reached",
-                self._consecutive_failures,
+            now = time.time()
+            if now < self._cooldown_until:
+                remaining = self._cooldown_until - now
+                logger.warning(
+                    "Skipping compaction: in cooldown ({:.0f}s remaining, "
+                    "consecutive_failures={})",
+                    remaining, self._consecutive_failures,
+                )
+                return messages, CompactResult(
+                    action=CompactAction.NONE,
+                    messages_before=len(messages),
+                    messages_after=len(messages),
+                    tokens_before=current_tokens,
+                    tokens_after=current_tokens,
+                )
+            # Cooldown elapsed — reset and persist so the next attempt starts
+            # fresh rather than re-tripping the threshold immediately.
+            logger.info(
+                "Compaction cooldown elapsed, resetting failure counter"
             )
-            return messages, CompactResult(
-                action=CompactAction.NONE,
-                messages_before=len(messages),
-                messages_after=len(messages),
-                tokens_before=current_tokens,
-                tokens_after=current_tokens,
-            )
+            self._consecutive_failures = 0
+            self._cooldown_until = 0.0
+            self._save_persistent_state()
 
         logger.info(
             "Tokens {} / {} (threshold {}), starting multi-level compaction",
@@ -548,7 +658,7 @@ class MultiLevelCompactor:
         logger.debug("After collapse: {} tokens (saved {})", tokens_after_collapse, tokens_before - tokens_after_collapse)
 
         if tokens_after_collapse < threshold:
-            self._consecutive_failures = 0
+            self._mark_compaction_success()
             self._record_savings(tokens_before, tokens_after_collapse)
             await self._emit_progress("compaction_end", "Context collapse completed", {
                 "action": "collapse",
@@ -568,7 +678,7 @@ class MultiLevelCompactor:
         logger.debug("After micro-compact: {} tokens (saved {})", tokens_after_micro, tokens_before - tokens_after_micro)
 
         if tokens_after_micro < threshold:
-            self._consecutive_failures = 0
+            self._mark_compaction_success()
             self._record_savings(tokens_before, tokens_after_micro)
             await self._emit_progress("compaction_end", "Micro-compact completed", {
                 "action": "micro_compact",
@@ -592,7 +702,7 @@ class MultiLevelCompactor:
         logger.debug("After auto-compaction: {} tokens (saved {})", tokens_after_auto, tokens_before - tokens_after_auto)
 
         if tokens_after_auto < threshold:
-            self._consecutive_failures = 0
+            self._mark_compaction_success()
             self._record_savings(tokens_before, tokens_after_auto)
             messages = self._inject_attachments(messages, attachments)
             await self._emit_progress("compaction_end", "Auto-compaction completed", {
@@ -609,7 +719,7 @@ class MultiLevelCompactor:
                 attachments=attachments,
             )
 
-        self._consecutive_failures += 1
+        self._record_compaction_failure()
         messages = self._apply_history_snip(messages, task_context=task_context)
         tokens_after_snip = _estimate_messages_tokens(messages)
         self._record_savings(tokens_before, tokens_after_snip)
@@ -846,7 +956,7 @@ class MultiLevelCompactor:
             summary = await self._generate_summary(conversation_text)
         except Exception as e:
             logger.error("Auto-compaction LLM failed: {}", e)
-            self._consecutive_failures += 1
+            self._record_compaction_failure()
             summary = self._simple_truncation_summary(messages_to_compact)
             if not summary:
                 return messages, ""
@@ -877,7 +987,7 @@ class MultiLevelCompactor:
 
         # Re-inject the active todo list as a standalone user message so the
         # model sees the remaining plan verbatim after compaction, instead of
-        # relying on the LLM summariser to preserve it. Mirrors Hermes's
+        # relying on the LLM summariser to preserve it. Mirrors agent's
         # ``TodoStore.format_for_injection`` post-compaction injection.
         # The todo tool is optional; skip silently if absent.
         todo_tool = getattr(self, "_todo_tool", None)

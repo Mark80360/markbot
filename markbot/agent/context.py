@@ -391,7 +391,7 @@ You have browser tools for web page interaction. Use them when you need to inter
         # prompt so the model knows up-front how to verify its work in
         # this project, instead of discovering `pytest` / `npm test` by
         # trial and error. Byte-stable → lands in the prompt cache prefix.
-        # Mirrors Hermes's coding_context.detect_project_facts.
+        # Mirrors agent's coding_context.detect_project_facts.
         try:
             from markbot.agent.coding_context import (
                 detect_project_facts,

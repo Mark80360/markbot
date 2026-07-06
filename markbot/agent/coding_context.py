@@ -6,7 +6,7 @@ section. The section is baked into the system prompt so the model knows
 *up front* how to verify its work in this project, instead of having to
 discover `pytest` / `npm test` / `make test` by trial and error.
 
-Mirrors Hermes's ``coding_context.detect_project_facts``: byte-stable so
+Mirrors agent's ``coding_context.detect_project_facts``: byte-stable so
 it lands in the prompt cache prefix, and the verify commands are written
 to the model itself so it internalises "done = edited + verified"
 without per-prompt enforcement.

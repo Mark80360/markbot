@@ -156,6 +156,8 @@ class MemoryForgetTool(Tool):
 class MemoryListTool(Tool):
     """List recent long-term memory entries."""
 
+
+    _is_read_only = True
     def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._memory_manager = memory_manager

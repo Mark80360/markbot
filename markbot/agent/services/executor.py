@@ -78,6 +78,95 @@ class ToolExecutor:
 
         return filtered
 
+    @staticmethod
+    def _is_internal_control_message(entry: dict) -> bool:
+        """Return True for per-turn control scaffolding that must not persist."""
+        return bool(
+            entry.get("_verify_stop_nudge")
+            or entry.get("_verify_stop_candidate")
+            or entry.get("_todo_reinjection")
+            or entry.get("_markbot_internal_control")
+        )
+
+    def _sanitize_for_session(self, message: dict) -> dict | None:
+        """Prepare one message for durable session history.
+
+        The loop may carry synthetic user/system messages that are useful only
+        inside the current turn.  This method is the single persistence filter
+        used by both end-of-turn and incremental saves.
+        """
+        entry = dict(message)
+        role, content = entry.get("role"), entry.get("content")
+
+        if self._is_internal_control_message(entry):
+            return None
+
+        # Never persist system-prompt messages (incl. compaction summaries).
+        if role == "system":
+            return None
+
+        if role == "assistant" and not content and not entry.get("tool_calls"):
+            return None
+
+        if role == "tool":
+            tool_name = entry.get("name")
+            max_chars = self.get_truncation_limit(tool_name)
+            if isinstance(content, str):
+                content = strip_ansi(content)
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "\n... (truncated)"
+                entry["content"] = content
+            elif isinstance(content, list):
+                filtered = self.sanitize_blocks(
+                    content, truncate_text=True, tool_name=tool_name
+                )
+                if not filtered:
+                    return None
+                entry["content"] = filtered
+
+        elif role == "user":
+            # Skip per-turn internal context messages (memory prefetch,
+            # session bootstrap, etc.) — they must not leak into history.
+            if isinstance(content, str) and content.startswith(
+                _INTERNAL_CONTEXT_TAG
+            ):
+                return None
+            if isinstance(content, str) and content.startswith(
+                ContextBuilder._RUNTIME_CONTEXT_TAG
+            ):
+                boundary = ContextBuilder._CONTENT_BOUNDARY
+                idx = content.find(boundary)
+                if idx >= 0:
+                    remaining = content[idx + len(boundary) :].strip()
+                else:
+                    parts = content.split("\n\n", 1)
+                    remaining = parts[1].strip() if len(parts) > 1 else ""
+                if remaining:
+                    entry["content"] = strip_ansi(remaining)
+                else:
+                    return None
+            if isinstance(content, list):
+                filtered = self.sanitize_blocks(content, drop_runtime=True)
+                if not filtered:
+                    return None
+                entry["content"] = filtered
+
+        entry.setdefault("timestamp", datetime.now().isoformat())
+        return entry
+
+    def save_messages(self, session: Session, messages: list[dict]) -> int:
+        """Persist an exact message slice and return the number saved."""
+        saved = 0
+        for message in messages:
+            entry = self._sanitize_for_session(message)
+            if entry is None:
+                continue
+            session.messages.append(entry)
+            saved += 1
+        if saved:
+            session.updated_at = datetime.now()
+        return saved
+
     def save_turn(
         self,
         session: Session,
@@ -95,61 +184,4 @@ class ToolExecutor:
         # ``get_history()`` on the *next* turn returns what the user
         # actually asked, not only assistant replies and tool results.
         _start = max(0, skip - 1)
-        for m in messages[_start:]:
-            entry = dict(m)
-            role, content = entry.get("role"), entry.get("content")
-
-            # Never persist system-prompt messages (incl. compaction summaries).
-            if role == "system":
-                continue
-
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue
-
-            if role == "tool":
-                tool_name = entry.get("name")
-                max_chars = self.get_truncation_limit(tool_name)
-                if isinstance(content, str):
-                    content = strip_ansi(content)
-                    if len(content) > max_chars:
-                        content = content[:max_chars] + "\n... (truncated)"
-                    entry["content"] = content
-                elif isinstance(content, list):
-                    filtered = self.sanitize_blocks(
-                        content, truncate_text=True, tool_name=tool_name
-                    )
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-
-            elif role == "user":
-                # Skip per-turn internal context messages (memory prefetch,
-                # session bootstrap, etc.) — they must not leak into history.
-                if isinstance(content, str) and content.startswith(
-                    _INTERNAL_CONTEXT_TAG
-                ):
-                    continue
-                if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
-                ):
-                    boundary = ContextBuilder._CONTENT_BOUNDARY
-                    idx = content.find(boundary)
-                    if idx >= 0:
-                        remaining = content[idx + len(boundary) :].strip()
-                    else:
-                        parts = content.split("\n\n", 1)
-                        remaining = parts[1].strip() if len(parts) > 1 else ""
-                    if remaining:
-                        entry["content"] = strip_ansi(remaining)
-                    else:
-                        continue
-                if isinstance(content, list):
-                    filtered = self.sanitize_blocks(content, drop_runtime=True)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-
-            entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
-
-        session.updated_at = datetime.now()
+        self.save_messages(session, messages[_start:])

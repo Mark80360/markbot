@@ -28,6 +28,7 @@ from markbot.autopilot.verification import (
     run_verification_steps,
     verification_passed,
 )
+from markbot.types.permission import PermissionMode
 
 if TYPE_CHECKING:
     from markbot.agent.loop import AgentLoop
@@ -221,6 +222,7 @@ class AutopilotService:
                     session_key=f"autopilot:{card.id}",
                     channel="autopilot",
                     chat_id=card.id,
+                    permission_mode=PermissionMode.AUTO,
                 )
                 assistant_summary = response.content if response else ""
             except Exception as exc:

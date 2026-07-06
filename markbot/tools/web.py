@@ -163,6 +163,8 @@ def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
 class WebSearchTool(Tool):
     """Search the web using configured provider. Returns structured JSON results."""
 
+    _is_read_only = True
+
     name = "web_search"
     description = "Search the web for information on any topic. Returns up to 5 relevant results with titles, URLs, and descriptions. Use this for current facts, news, versions, or any information you don't know. Returns structured JSON data with search metadata."
     parameters = {
@@ -326,6 +328,8 @@ class WebSearchTool(Tool):
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL."""
+
+    _is_read_only = True
 
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
@@ -644,6 +648,8 @@ class WebExtractTool(Tool):
     """Extract content from web page URLs with optional LLM-powered summarization."""
 
     name = "web_extract"
+
+    _is_read_only = True
     description = """Extract content from web page URLs. Returns page content in markdown format. 
 Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. 
 Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. 

@@ -363,3 +363,135 @@ class TestIdleTimeout:
         loop._check_idle_sessions(time.time())
         # The session should still be tracked (no cleanup happened)
         assert "x:y" in loop._session_last_active
+
+
+class TestToolResultFailureClassifier:
+    """Verify _is_tool_result_failure classifies all failure shapes.
+
+    This classifier is the single source of truth for both the guardrail's
+    failure steering AND the TOOL_COMPLETED event's ``ok`` field (and the
+    on_tool_complete callback's error_msg vs summary decision). A mismatch
+    between the two caused tools returning ``{"error": "..."}`` JSON strings
+    to be flagged as failure for steering but reported as success to the UI.
+    """
+
+    @pytest.fixture
+    def runner(self):
+        # Bypass __init__ — _is_tool_result_failure only uses the staticmethod
+        # _dict_has_error, so no instance state is needed.
+        from markbot.agent.iteration import IterationRunner
+        return IterationRunner.__new__(IterationRunner)
+
+    @pytest.mark.parametrize("result", [
+        'Error: something went wrong',
+        '{"error": "fetch failed (timeout)"}',
+        '{"errors": ["validation failed"]}',
+        '{"error_code": "AUTH_FAILED"}',
+        '{"status": 404, "body": "not found"}',
+        '{"status_code": 500}',
+        '{"ok": false, "reason": "rate limited"}',
+        '{"success": false}',
+        '{"errcode": 40001}',
+        '{"ok": false}',
+        '  {"error": "leading whitespace"}',
+        # Any JSON string containing '"error":' is treated as failure —
+        # the keyword is conservative by design (if a tool's response
+        # includes an error field at all, treat it as a failure signal).
+        '{"error": null, "data": "ok"}',
+        '{"error": "", "result": "fine"}',
+        RuntimeError("boom"),
+        ValueError("bad input"),
+        "traceback (most recent call last):",
+        "ModuleNotFoundError: No module named 'foo'",
+        "fetch failed: connection refused",
+        "exit code: 1",
+        "exit code: 127",
+    ])
+    def test_classifies_as_failure(self, runner, result):
+        assert runner._is_tool_result_failure(result) is True
+
+    @pytest.mark.parametrize("result", [
+        "operation completed successfully",
+        '{"result": "ok", "data": [1, 2, 3]}',
+        '{"status": 200, "body": "ok"}',
+        '{"ok": true}',
+        '{"success": true}',
+        '{"data": "no error field here"}',
+        "[1, 2, 3]",
+        "",
+        "   ",
+        42,
+        ["list", "of", "items"],
+        {"key": "value"},
+        None,
+    ])
+    def test_classifies_as_success(self, runner, result):
+        assert runner._is_tool_result_failure(result) is False
+
+
+class TestPermissionModeOverride:
+    """``IterationRunner._current_permission_context`` must let unattended
+    callers (cron / autopilot / heartbeat) force a mode via
+    ``process_direct(permission_mode=...)`` so they don't depend on the
+    global ``app_state`` mode being set by a prior ``/mode`` command.
+
+    Regression for logs/2026-07-05.log: cron cleanup at 04:00 was blocked
+    by DEFAULT mode even though ``/mode auto`` had been set the evening
+    before — the in-memory mode reset on restart, and cron had no way to
+    opt in itself.
+    """
+
+    def _make_runner(self, override=None, app_state_mode=None):
+        from markbot.agent.iteration import IterationRunner
+        from markbot.session.types import AppState
+        from markbot.types.permission import (
+            PermissionMode,
+            ToolPermissionContext,
+        )
+
+        runner = IterationRunner.__new__(IterationRunner)
+        runner.permission_mode_override = override
+
+        class _FakeCtx:
+            pass
+
+        class _FakeProvider:
+            def get(self):
+                return AppState(
+                    permission_mode=app_state_mode or PermissionMode.DEFAULT,
+                    tool_permission_context=ToolPermissionContext(
+                        mode=app_state_mode or PermissionMode.DEFAULT
+                    ),
+                )
+
+        class _FakeLoop:
+            ctx = _FakeCtx()
+
+        _FakeCtx.app_state = _FakeProvider()
+        runner.loop = _FakeLoop()
+        return runner
+
+    def test_override_takes_precedence_over_app_state(self):
+        from markbot.types.permission import PermissionMode
+        runner = self._make_runner(
+            override=PermissionMode.AUTO,
+            app_state_mode=PermissionMode.DEFAULT,
+        )
+        mode, tool_ctx = runner._current_permission_context()
+        assert mode is PermissionMode.AUTO
+        assert tool_ctx.mode is PermissionMode.AUTO
+
+    def test_no_override_falls_back_to_app_state(self):
+        from markbot.types.permission import PermissionMode
+        runner = self._make_runner(
+            override=None,
+            app_state_mode=PermissionMode.AUTO,
+        )
+        mode, _ = runner._current_permission_context()
+        assert mode is PermissionMode.AUTO
+
+    def test_no_override_no_app_state_falls_back_to_default(self):
+        from markbot.types.permission import PermissionMode
+        runner = self._make_runner(override=None, app_state_mode=None)
+        mode, _ = runner._current_permission_context()
+        assert mode is PermissionMode.DEFAULT

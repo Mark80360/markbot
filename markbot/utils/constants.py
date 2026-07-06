@@ -202,8 +202,14 @@ GUIDANCE_INJECTION_TTL: float = 3600.0
 # Maximum characters for git status in system context
 MAX_GIT_STATUS_CHARS: int = 2000
 
-# Maximum characters for compressed summary before truncation
-MAX_COMPRESSED_SUMMARY_CHARS: int = 200_000
+# Maximum characters for compressed summary before truncation.
+# Kept modest so the summary stays a *compressed* handoff, not a second
+# context window.  At ~4 chars/token this is ~5k tokens — enough for a
+# structured multi-section summary while leaving the model context window
+# for live conversation.  A larger value lets the summary grow until it
+# dominates the context budget and starves the very compaction that
+# produces it (positive feedback loop).
+MAX_COMPRESSED_SUMMARY_CHARS: int = 20_000
 
 # Maximum characters for MEMORY.md before section-based truncation
 # Should be >= DEFAULT_MEMORY_CHAR_LIMIT from memory.tool (the write limit)

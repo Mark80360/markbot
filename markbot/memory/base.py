@@ -161,6 +161,24 @@ class BaseMemoryManager(ABC):
         """
         self._archived_count = count
 
+    def get_archived_tail_hash(self, *, session_key: str | None = None) -> str:
+        """Return the content hash of the last archived message.
+
+        Implementations may override to add per-session persistence.  The
+        default keeps compatibility for custom memory managers that have not
+        yet adopted content-addressed compaction tracking.
+        """
+        return getattr(self, "_archived_tail_hash", "")
+
+    def set_archived_tail_hash(
+        self,
+        tail_hash: str,
+        *,
+        session_key: str | None = None,
+    ) -> None:
+        """Update the content hash of the last archived message."""
+        self._archived_tail_hash = tail_hash
+
     # -- Background summary worker (serial FIFO queue) -----------------------
 
     async def _summarize_worker(self) -> None:
@@ -390,4 +408,3 @@ class BaseMemoryManager(ABC):
             Formatted memory context string, or empty string.
         """
         return ""
-

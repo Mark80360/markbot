@@ -142,7 +142,7 @@ class _TodoStore:
         compaction. Returns ``None`` when there are no active items so
         callers can skip appending an empty message.
 
-        Mirrors Hermes's ``TodoStore.format_for_injection``: the snapshot
+        Mirrors agent's ``TodoStore.format_for_injection``: the snapshot
         is appended as a standalone user message after the compaction
         summary, so the model sees the active plan verbatim instead of
         relying on the LLM summariser to preserve it.

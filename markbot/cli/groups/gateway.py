@@ -35,6 +35,7 @@ from markbot.cli.daemon import (
 from markbot.cli.runtime import make_provider
 from markbot.cli.ui import console, make_section_helpers, markbot_banner
 from markbot.config.paths import get_cron_dir
+from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -204,6 +205,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                permission_mode=PermissionMode.AUTO,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -259,6 +261,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            permission_mode=PermissionMode.AUTO,
         )
 
         session = agent.sessions.get_or_create("heartbeat")

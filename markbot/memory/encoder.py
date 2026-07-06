@@ -76,6 +76,12 @@ _CORRECTION_PATTERNS = [
 
 _DETECTION_COOLDOWN_SECONDS = 300
 
+#: Minimum confidence (number of independent sightings within the scan
+#: window) before a detected preference is written to the curated store.
+#: Requiring 2+ sightings filters out casual one-off remarks ("I prefer
+#: tea" in passing) that would otherwise pollute PROFILE.md / MEMORY.md.
+_MIN_ENCODE_CONFIDENCE = 2
+
 
 class MemoryEncoder:
     """Detect and persist user preferences from conversation patterns.
@@ -196,7 +202,13 @@ class MemoryEncoder:
         for match in matches:
             key = match.content.lower().strip()
             if key in self._recent_detections:
-                if now - self._recent_detections[key] < _DETECTION_COOLDOWN_SECONDS:
+                # A repeat strong enough to cross the write threshold should
+                # be allowed through even inside the cooldown window.  The
+                # cooldown only suppresses repeated *first sightings*.
+                if (
+                    match.confidence < _MIN_ENCODE_CONFIDENCE
+                    and now - self._recent_detections[key] < _DETECTION_COOLDOWN_SECONDS
+                ):
                     continue
 
             existing = self._read_existing_preferences()
@@ -207,6 +219,14 @@ class MemoryEncoder:
 
             if already_exists:
                 self._increment_confidence(match.content)
+                self._recent_detections[key] = now
+                continue
+
+            # Gate: only persist once the preference has been seen
+            # _MIN_ENCODE_CONFIDENCE times.  First sightings are recorded
+            # in the detection log so a repeat can promote them later,
+            # but they do NOT enter the curated store yet.
+            if match.confidence < _MIN_ENCODE_CONFIDENCE:
                 self._recent_detections[key] = now
                 continue
 

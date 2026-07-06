@@ -274,6 +274,7 @@ markbot doctor fix
 | `/stop` | Cancel all active tasks and subagents |
 | `/steer` | Inject mid-task instruction into running agent |
 | `/status` | Show session status, token usage, and statistics |
+| `/mode [mode]` | Show or set permission mode (default/plan/accept_edits/auto/bypass) |
 | `/restart` | Restart the agent process |
 | `/help` | Show available slash commands |
 
@@ -327,7 +328,7 @@ flows via the `oauth-cli-kit` package — no API key is stored on disk.
 ### Direct / Bring-Your-Own Endpoint
 
 `custom` is registered as `is_direct=true` — the user supplies the
-`api_base` (and optionally an `api_key`) themselves. It is the recommended
+`api_base` (and optionally an `apiKey`) themselves. It is the recommended
 choice when you have an OpenAI-compatible HTTP endpoint that does not
 match any of the named providers above. Aliases: `custom`, `ollama`,
 `local`, `vllm`, `llamacpp`.
@@ -372,6 +373,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
       "max_tokens": 8192,
       "temperature": 0.1,
       "timezone": "Asia/Shanghai",
+      "defaultPermissionMode": "default",
       "workspace": "~/.markbot/workspace",
       "auxiliaryVision": {
         "forceTextOnly": false,
@@ -382,7 +384,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
   },
   "providers": {
     "anthropic": {
-      "api_key": "${ANTHROPIC_API_KEY}",
+      "apiKey": "${ANTHROPIC_apiKey}",
       "models": [
         {
           "id": "claude-sonnet-4-20250514",
@@ -394,7 +396,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
       ]
     },
     "deepseek": {
-      "api_key": "${DEEPSEEK_API_KEY}",
+      "apiKey": "${DEEPSEEK_apiKey}",
       "models": [
         {
           "id": "deepseek-chat",
@@ -413,7 +415,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
     "web": {
       "search": {
         "provider": "brave",
-        "api_key": "${BRAVE_API_KEY}"
+        "apiKey": "${BRAVE_apiKey}"
       }
     },
     "exec": {
@@ -422,30 +424,30 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
     },
     "filesystem": {
       "backup_dir": "~/.markbot/.markbot_backups",
-      "safe_delete": true
+      "safeDelete": true
     },
     "code_execution": {
       "enable": true,
       "timeout": 60,
-      "max_memory_mb": 256
+      "maxMemoryMb": 256
     },
     "memory": {
       "embedding_backend": "openai",
-      "memory_summary_enabled": true,
-      "context_compact_enabled": true,
-      "dream_cron": "0 23 * * *"
+      "memorySummaryEnabled": true,
+      "contextCompactEnabled": true,
+      "dreamCron": "0 23 * * *"
     }
   },
   "compaction": {
-    "collapse_tool_result_chars": 4000,
-    "micro_compact_keep_turns": 6,
-    "auto_compact_keep_recent": 5,
-    "threshold_ratio": 0.85
+    "collapseToolResultChars": 4000,
+    "microCompactKeepTurns": 6,
+    "autoCompactKeepRecent": 5,
+    "thresholdRatio": 0.85
   },
   "budget": {
     "enabled": true,
-    "max_budget_usd": null,
-    "warn_threshold_usd": 0.5
+    "maxBudgetUsd": null,
+    "warnThresholdUsd": 0.5
   }
 }
 ```
@@ -482,6 +484,24 @@ Most sensitive configuration values can be provided via environment variables us
 |------|------|-------------|
 | **Shell** | `exec` | Command execution with timeout, rate limiting, and safety controls |
 | **Run Code** | `run_code` | Sandboxed Python code execution with security scanning |
+
+Shell and code execution respect `restrictToWorkspace` (default `true`). When enabled,
+commands referencing paths outside the workspace directory are blocked. Use the
+`allowedInternalIps` list to permit specific internal addresses for SSRF-restricted
+commands like `curl` and `wget`.
+
+```json
+{
+  "tools": {
+    "exec": {
+      "enable": true,
+      "timeout": 60,
+      "restrictToWorkspace": true,
+      "allowedInternalIps": ["127.0.0.1"]
+    }
+  }
+}
+```
 
 ### Memory & Context
 
@@ -587,21 +607,147 @@ The Autopilot system provides automated task execution with intelligence:
 
 ## Permission System
 
-Granular control over agent actions through configurable permission modes:
+Granular control over agent actions through configurable permission modes.
+The permission system works in two layers: **static capability** (config.json) controls
+which tools are registered and visible to the model, and **runtime mode** (`/mode` command)
+controls whether a registered tool can execute without confirmation.
 
-### Modes
+### Runtime Modes
 
-| Mode | Description |
-|------|-------------|
-| `default` | Ask for confirmation on sensitive operations |
-| `plan` | Show plan before execution |
-| `accept_edits` | Auto-accept file edits |
-| `bypass` | Skip all confirmations |
-| `auto` | Fully autonomous operation |
+Use `/mode` during a chat session to show or switch the active permission mode.
+The mode is stored in app state and consulted by every tool execution, so it takes
+effect immediately for the next tool call. The choice is also persisted to
+`agents.defaults.default_permission_mode` in `config.json`, so it survives
+restarts — see [Default Permission Mode](#default-permission-mode-in-configjson)
+below.
+
+| Mode | Description | Read-only tools | Destructive/exec tools |
+|------|-------------|----------------|----------------------|
+| `default` | Confirm before destructive operations (recommended) | Auto-allow | **Ask before executing** |
+| `plan` | Read-only only, blocks all mutations | Auto-allow | **Deny** |
+| `accept_edits` | Allow file edits, still confirm destructive ops | Auto-allow | Edits allow; destructive **ask** |
+| `auto` | Allow all tools without confirmation | Auto-allow | Auto-allow |
+| `bypass` | Bypass all permission checks | Auto-allow | Auto-allow |
+
+> **Important**: In `default` mode (the new default), destructive tools are **not**
+> silently executed. The agent loop reads the current app-state permission mode for
+> every tool call, rather than hardcoding `auto` as in previous versions. This means
+> shell commands, file writes, file deletes, browser clicks, and computer control
+> actions return a "Permission required" message that the model must surface to the
+> user. Use `/mode auto` to switch to fully autonomous operation when you trust the
+> task and the workspace boundaries.
+
+```
+# In a chat session:
+/mode              # Show current mode
+/mode default      # Switch to confirmation-first (recommended)
+/mode plan         # Read-only only (analysis, code review)
+/mode accept_edits # Allow file edits (software development)
+/mode auto         # Fully autonomous
+/mode bypass       # Bypass all checks (dangerous, debugging only)
+```
+
+### Safe Defaults in config.json
+
+The following configuration defaults changed from permissive to conservative.
+Existing `config.json` files with explicit values are preserved; unset fields
+adopt the new safe defaults automatically.
+
+| Field | Old default | New default | Effect |
+|------|------------|-------------|--------|
+| `gateway.host` | `"0.0.0.0"` | `"127.0.0.1"` | Only listen on localhost |
+| `tools.exec.restrictToWorkspace` | _(absent)_ | `true` | Block shell commands referencing paths outside workspace |
+| `tools.restrictToWorkspace` | `false` | `true` | Restrict filesystem tools to workspace directory |
 
 ### Tool-Level Policies
 
-Each tool can have individual allow/deny/ask policies for fine-grained control.
+Each tool can have individual allow/deny/ask policies in `ToolPermissionContext`
+for fine-grained, programmatic control. These are checked before the mode-level
+decision and take priority.
+
+### Default Permission Mode in config.json
+
+The `agents.defaults.defaultPermissionMode` field sets the permission mode
+applied at gateway startup. This is the mode interactive turns (CLI / web / chat
+channels) start in after a restart.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "defaultPermissionMode": "auto"
+    }
+  }
+}
+```
+
+Allowed values: `default` | `plan` | `accept_edits` | `auto` | `bypass_permissions`.
+Defaults to `default` when unset.
+
+`/mode` runtime switches also persist to this field, so you rarely need to edit
+it by hand — set it once via `/mode auto` and it sticks across restarts. Edit
+the field directly when you want to pin a mode without running the gateway first
+(e.g. provisioning a fresh install).
+
+**Unattended paths (cron / autopilot / heartbeat) always run in `auto` mode**
+regardless of this field — they have no interactive user to confirm tool calls,
+so they force `PermissionMode.AUTO` via `process_direct(permission_mode=...)`.
+This field only governs interactive turns.
+
+### Permission Mode vs config.json — How They Work Together
+
+`config.json` controls **whether a tool is registered** (e.g. `"exec": {"enable": false}`
+means the shell tool is not available at all). `/mode` controls **whether a registered
+tool can run without confirmation** (e.g. in `default` mode, shell is registered but
+blocked until confirmed). This two-layer design lets you safely expose powerful tools
+while keeping a human gate on their execution.
+
+**Safe chat mode** (read-only, no local machine access):
+
+```json
+{
+  "tools": {
+    "exec": { "enable": false },
+    "codeExecution": { "enable": false },
+    "computerUse": { "enable": false },
+    "browser": { "enable": false },
+    "restrictToWorkspace": true
+  }
+}
+```
+
+Run with `/mode default` (or `plan` for strict read-only).
+
+**Local dev assistant** (write code, run tests, workspace-bound):
+
+```json
+{
+  "tools": {
+    "exec": { "enable": true, "restrictToWorkspace": true },
+    "codeExecution": { "enable": true },
+    "computerUse": { "enable": false },
+    "browser": { "enable": false },
+    "restrictToWorkspace": true
+  }
+}
+```
+
+Run with `/mode accept_edits` or `/mode auto`.
+
+**Full desktop control** (trusted tasks, agent operates the computer):
+
+```json
+{
+  "tools": {
+    "exec": { "enable": true, "restrictToWorkspace": false },
+    "computerUse": { "enable": true },
+    "browser": { "enable": true },
+    "restrictToWorkspace": false
+  }
+}
+```
+
+Run with `/mode auto` or `/mode bypass`.
 
 ## Memory System
 
@@ -689,7 +835,7 @@ The built-in ChromaDB provider (`markbot.memory.providers.chroma`) supports both
   "tools": {
     "memory": {
       "embedding_backend": "openai",
-      "embedding_api_key": "",
+      "embedding_apiKey": "",
       "embedding_base_url": "",
       "embedding_model_name": "",
       "memory_compact_threshold": 0,
@@ -874,7 +1020,7 @@ model can ingest images directly:
 {
   "providers": {
     "deepseek": {
-      "api_key": "${DEEPSEEK_API_KEY}",
+      "apiKey": "${DEEPSEEK_apiKey}",
       "models": [
         {
           "id": "deepseek-chat",
@@ -1096,7 +1242,7 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120"]
 | `MARKBOT_COMPUTER_USE_BACKEND` | Force `cua` / `atspi` / `pyautogui` / `noop` |
 | `MARKBOT_CUA_DRIVER_CMD` | Path to a pre-installed `cua-driver` binary |
 | `MARKBOT_VISION_FORCE_TEXT_ONLY` | `1`/`true` = force all multimodal tool results to text-only (skip images); `0`/`false` = allow images. Overrides `agents.defaults.auxiliaryVision.forceTextOnly` |
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.json`) |
+| `ANTHROPIC_apiKey` / `OPENAI_apiKey` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.json`) |
 
 ## Development
 

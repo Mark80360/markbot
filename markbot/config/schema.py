@@ -42,6 +42,16 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    default_permission_mode: Literal["default", "plan", "accept_edits", "auto", "bypass_permissions"] = Field(
+        "default",
+        description=(
+            "Permission mode applied to AppStateProvider at gateway startup. "
+            "Interactive ``/mode`` commands still override this at runtime, but "
+            "the value here is what unattended interactive turns fall back to "
+            "after a restart. Note: cron / autopilot / heartbeat paths force "
+            "AUTO via process_direct(permission_mode=...) and are unaffected."
+        ),
+    )
     auxiliary_vision: "AuxiliaryVisionConfig" = Field(
         default_factory=lambda: AuxiliaryVisionConfig(),
         description="Auxiliary vision model for non-vision primary models",
@@ -227,7 +237,7 @@ class HeartbeatConfig(Base):
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
@@ -255,6 +265,10 @@ class ExecToolConfig(Base):
 
     enable: bool = True
     timeout: int = 60
+    restrict_to_workspace: bool = Field(
+        default=True,
+        description="If true, block shell commands that reference paths outside the working directory",
+    )
     path_append: str = ""
     allowed_internal_ips: list[str] = Field(
         default_factory=list,
@@ -358,6 +372,11 @@ class MemoryToolsConfig(Base):
         ge=100,
         description="Hard cap on stored vectors; oldest low-importance records are evicted (LRU) past this."
     )
+    vector_max_scan_records: int = Field(
+        default=20_000,
+        ge=100,
+        description="Maximum vectors loaded into RAM for one SQLite vector query. Use Chroma for larger corpora."
+    )
     vector_min_content_chars: int = Field(
         default=12,
         description="Minimum content length (chars) to index as a vector; shorter text is skipped."
@@ -408,6 +427,11 @@ class MemoryToolsConfig(Base):
         default=0.3,
         ge=0.0,
         description="Minimum score for forced memory search injection."
+    )
+    daily_log_retention_days: int = Field(
+        default=30,
+        ge=0,
+        description="Days to retain raw memory/daily interaction logs; 0 disables pruning."
     )
     # -- Compaction ratios (previously orphaned getattr defaults) ---------
     memory_compact_ratio: float = Field(
@@ -563,7 +587,7 @@ class ToolsConfig(Base):
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    restrict_to_workspace: bool = True  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 

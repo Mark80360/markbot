@@ -40,6 +40,7 @@ from markbot.utils.helpers import strip_think
 
 if TYPE_CHECKING:
     from markbot.agent.loop import AgentLoop
+    from markbot.session.session import Session
 
 # Tag for internal context messages injected after system prompt.
 # These are per-turn and should not be persisted to session history.
@@ -55,7 +56,7 @@ class TurnExitReason(str, Enum):
 
     Set on ``LoopState.exit_reason`` at every exit point and consumed by
     ``_finalize_loop`` for logging, handoff documentation, and metrics.
-    Inspired by hermes-agent's ``_turn_exit_reason`` design, this replaces
+    Inspired by agent's ``_turn_exit_reason`` design, this replaces
     ad-hoc log-only exit reporting with a queryable enum that flows into
     session handoffs so the next turn / "继续" knows why the last turn stopped.
     """
@@ -109,7 +110,7 @@ MUTATING_TOOL_NAMES: frozenset[str] = frozenset({
 # model edits files and then tries to end its turn *without* having called
 # one of these, we inject a nudge asking it to run the project's verify
 # command (tests / linter / type-checker) before declaring done. Mirrors
-# Hermes's verify-on-stop: "completion requires both done AND verified".
+# agent's verify-on-stop: "completion requires both done AND verified".
 VERIFICATION_TOOL_NAMES: frozenset[str] = frozenset({
     "exec",          # shell — runs pytest, npm test, make, etc.
     "shell",
@@ -133,7 +134,7 @@ _MAX_VERIFY_NUDGES = 2
 # Channels where verify-on-stop is active. On messaging channels
 # (feishu/qq/weixin/dingtalk/email/telegram/discord), the verify nudge
 # is noise — users can't see terminal output and running pytest in a
-# chat context doesn't make sense. Mirrors Hermes's surface-aware
+# chat context doesn't make sense. Mirrors agent's surface-aware
 # toggle: local programming surfaces ON, messaging OFF.
 _VERIFY_ON_STOP_SURFACES: frozenset[str] = frozenset({"cli", "web"})
 
@@ -158,6 +159,166 @@ _FILE_COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
     "文件已修改", "文件已保存", "文件已写入",
 )
 
+# Keywords signalling a side-effect action completion claim (restart /
+# start / stop / install / pull / kill). When these appear but no verify
+# command confirmed the post-condition, the verifier footer is appended.
+# Separate from _FILE_COMPLETION_CLAIM_PATTERNS because file mutations
+# are tracked via mutating tools (write_file/edit_file), while action
+# effects are tracked via the side_effect_pending flag.
+_ACTION_COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
+    # English
+    "restarted", "restart completed", "restart succeeded",
+    "started the service", "started the gateway",
+    "stopped the service",
+    "service is running", "service is up", "service is active",
+    "gateway is running",
+    "installed", "installation complete", "installation succeeded",
+    "pulled the latest", "pulled latest", "git pull complete",
+    "killed the process", "process killed",
+    "launched", "launched successfully",
+    # Chinese
+    "已重启", "已启动", "已停止", "已安装", "已拉取", "已更新到最新",
+    "已更新代码", "已杀掉进程", "已结束进程",
+    "重启完成", "启动完成", "停止完成", "安装完成",
+    "拉取完成", "更新完成",
+    "服务已启动", "服务已重启", "服务已停止",
+    "gateway 已启动",
+    "飞书已连接", "已连接飞书", "websocket 已连接",
+)
+
+# Shell command classification: distinguish actions that produce side
+# effects (restart/install/pull/kill) from verifies that read state
+# (status/ps/curl/logs). Conflating them causes the "false completion"
+# failure mode where 'systemctl restart X' is treated as verification
+# when it is actually the thing needing verification.
+#
+# (first_token, second_token) pairs. Empty second token ("") matches any
+# second token. Matching is on the first segment of a chained command
+# (before && || ; |) and after stripping env prefixes (VAR=val, sudo).
+# Conservative: unrecognized commands default to "neutral".
+_SHELL_ACTION_PREFIXES: frozenset[tuple[str, str]] = frozenset({
+    ("systemctl", "restart"), ("systemctl", "start"), ("systemctl", "stop"),
+    ("systemctl", "reload"), ("systemctl", "try-restart"),
+    ("service", "restart"), ("service", "start"), ("service", "stop"),
+    ("service", "reload"),
+    ("launchctl", "kickstart"), ("launchctl", "load"), ("launchctl", "unload"),
+    ("pip", "install"), ("pip3", "install"),
+    ("npm", "install"), ("npm", "i"), ("npm", "add"),
+    ("pnpm", "add"), ("pnpm", "install"), ("pnpm", "i"),
+    ("yarn", "add"), ("yarn", "install"),
+    ("bun", "add"), ("bun", "install"),
+    ("brew", "install"), ("brew", "remove"), ("brew", "upgrade"),
+    ("apt", "install"), ("apt-get", "install"),
+    ("apt", "remove"), ("apt-get", "remove"),
+    ("yum", "install"), ("dnf", "install"),
+    ("git", "pull"), ("git", "push"), ("git", "checkout"),
+    ("git", "merge"), ("git", "reset"), ("git", "rebase"),
+    ("docker", "restart"), ("docker", "start"), ("docker", "stop"),
+    ("docker", "rm"), ("docker", "kill"),
+    ("pkill", ""), ("killall", ""),
+    ("rm", ""), ("mv", ""), ("chmod", ""), ("chown", ""),
+})
+
+_SHELL_VERIFY_PREFIXES: frozenset[tuple[str, str]] = frozenset({
+    ("systemctl", "is-active"), ("systemctl", "status"), ("systemctl", "is-enabled"),
+    ("service", "status"),
+    ("launchctl", "list"), ("launchctl", "print"),
+    ("ps", ""), ("pgrep", ""), ("pidof", ""),
+    ("ss", ""), ("netstat", ""), ("lsof", ""),
+    ("curl", ""), ("wget", ""),
+    ("journalctl", ""),
+    ("docker", "ps"), ("docker", "logs"), ("docker", "inspect"), ("docker", "stats"),
+    ("git", "log"), ("git", "status"), ("git", "diff"), ("git", "show"),
+    ("pip", "show"), ("pip3", "show"),
+    ("npm", "list"), ("npm", "ls"), ("npm", "info"),
+    ("pnpm", "list"), ("pnpm", "ls"),
+    ("cat", ""), ("head", ""), ("tail", ""), ("less", ""),
+    ("ls", ""), ("find", ""), ("tree", ""),
+    ("grep", ""), ("rg", ""),
+    ("test", ""),
+    ("pytest", ""), ("tox", ""), ("nox", ""),
+    ("ruff", ""), ("flake8", ""), ("mypy", ""), ("pyright", ""),
+    ("eslint", ""), ("tsc", ""),
+    ("make", "test"), ("make", "check"), ("make", "verify"), ("make", "lint"),
+    ("cargo", "test"), ("cargo", "check"), ("cargo", "clippy"),
+    ("go", "test"), ("go", "vet"),
+})
+
+# Verify tools that may appear as a subcommand (e.g. `python -m pytest`,
+# `python -m mypy`). When any of these appears as a token, the command is
+# classified as verify. This is conservative — false-verify (marking a
+# neutral command as verify) only sets verification_done=True, which is
+# safe; false-action would be the dangerous case, and this set does not
+# affect action classification.
+_KNOWN_VERIFY_TOOLS: frozenset[str] = frozenset({
+    "pytest", "tox", "nox", "unittest",
+    "ruff", "flake8", "mypy", "pyright", "pylint", "isort", "black",
+    "eslint", "tsc", "prettier",
+    "jest", "vitest", "mocha", "karma",
+})
+
+
+def _classify_shell_command(command: str) -> str:
+    """Classify a shell command as 'action', 'verify', or 'neutral'.
+
+    Used by ``_record_verification_call`` to avoid treating action commands
+    (restart/install/pull/kill) as verification. Treating an action as
+    verification is the 'false completion' failure mode: the model runs
+    ``systemctl restart X`` and the loop marks ``verification_done=True``,
+    so the verify-on-stop nudge never fires even though nobody confirmed
+    the service actually came up.
+
+    Conservative: unrecognized commands return 'neutral' (neither flag is
+    set in the caller's neutral branch, which preserves the existing
+    ``verification_done = True`` behavior to avoid regressing the
+    file-edit verify path — most exec calls in a coding session ARE
+    verification like pytest).
+    """
+    if not command or not isinstance(command, str):
+        return "neutral"
+    cmd = command.strip()
+    # Classify the first segment only (before && || ; |) — a chained
+    # command is classified by its leading action.
+    for sep in ("&&", "||", ";", "|"):
+        if sep in cmd:
+            cmd = cmd.split(sep, 1)[0].strip()
+    tokens = cmd.split()
+    # Strip leading env assignments: VAR=val cmd ...
+    while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+        tokens = tokens[1:]
+    # Strip command prefixes: sudo / env / time / noglob
+    while tokens and tokens[0] in ("sudo", "env", "time", "noglob"):
+        tokens = tokens[1:]
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return "neutral"
+    first = tokens[0]
+    second = tokens[1] if len(tokens) > 1 else ""
+
+    # `service` 命令格式是 `service <name> <action>`，action 在第三个
+    # token（与 systemctl <action> <name> 相反）。特殊处理。
+    if first == "service" and len(tokens) >= 3:
+        third = tokens[2]
+        if third in ("restart", "start", "stop", "reload", "force-reload"):
+            return "action"
+        if third in ("status",):
+            return "verify"
+
+    if (first, second) in _SHELL_ACTION_PREFIXES or (first, "") in _SHELL_ACTION_PREFIXES:
+        return "action"
+    if (first, second) in _SHELL_VERIFY_PREFIXES or (first, "") in _SHELL_VERIFY_PREFIXES:
+        return "verify"
+
+    # 已知 verify 工具作为子命令出现（如 `python -m pytest`、
+    # `python -m mypy`）。保守判定：误判 neutral 为 verify 只会设
+    # verification_done=True，是安全的；不会误判为 action。
+    if any(t in _KNOWN_VERIFY_TOOLS for t in tokens):
+        return "verify"
+
+    return "neutral"
+
+
 # 连续失败检测配置
 # 观察窗口：只看最近 N 次 tool call 结果
 _FAILURE_WINDOW = 6
@@ -169,12 +330,12 @@ _MAX_REFLECTIONS = 2
 _TOOL_FAILURE_STREAK_THRESHOLD = 3
 # Exact-failure 阈值：同一工具 + 相同参数签名连续失败 N 次时，注入
 # "换个方法"提示。比 _TOOL_FAILURE_STREAK_THRESHOLD 更早触发（2 次），
-# 因为相同参数重复失败几乎一定是死路。Mirrors Hermes's
+# 因为相同参数重复失败几乎一定是死路。Mirrors agent's
 # exact_failure_warn_after=2.
 _EXACT_FAILURE_WARN_THRESHOLD = 2
 # No-progress 阈值：幂等工具返回完全相同结果 N 次时，注入"无进展"提示。
 # 适用于 read_file / search_files / glob 等只读工具——返回相同内容说明
-# LLM 在原地踏步。Mirrors Hermes's no_progress_warn_after=2.
+# LLM 在原地踏步。Mirrors agent's no_progress_warn_after=2.
 _NO_PROGRESS_WARN_THRESHOLD = 2
 # 幂等/只读工具集合——对这些工具做 no-progress 检测。
 # 写工具（write_file/edit_file）即使参数相同也可能合法重试（修复后重写），
@@ -183,6 +344,12 @@ _IDEMPOTENT_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_directory", "glob", "grep", "search_files",
     "search_codebase", "find", "list", "todo",
 })
+# Todo 主动 reinjection 间隔（iteration 数）。
+# markbot 只在 compact 后 reinject todo（见 compact.py:_apply_auto_compaction），
+# 长任务若不 compact，todo 长期不在上下文里，模型可能忘记 plan 或重复
+# 已完成步骤。每 N 轮主动注入一次活跃 todo 快照作为 system message，
+# 让模型始终能看到剩余任务。compact 触发时同步更新计数避免重复注入。
+_TODO_REINJECT_INTERVAL = 8
 
 # 失败标志关键词（小写匹配）
 # 注意：关键词要足够具体，避免误判正常输出。
@@ -277,6 +444,7 @@ class LoopState:
     tools_used: list[str] = field(default_factory=list)
     budget_exceeded: bool = False
     new_msg_start: int = 0
+    persisted_upto: int = 0
     stream_finalized: bool = False
     current_tokens: int = 0
     last_response: Any = None
@@ -332,6 +500,17 @@ class LoopState:
     # 本轮是否已调用过验证类工具（exec/shell/code_execution）。
     # 用于 verify-on-stop 判定：如果已验证过，则不再注入 nudge。
     verification_done: bool = False
+    # 本轮是否执行了副作用动作命令（restart/install/pull/kill 等）
+    # 但尚未运行验证命令确认其效果。与 verification_done 互补：
+    # action 命令置 True，verify 命令清除它。用于 verify-on-stop
+    # 覆盖"跑了动作就宣告完成"的假完成模式——systemctl restart 不是
+    # 验证，是需要被验证的动作。
+    side_effect_pending: bool = False
+    # 上次主动 reinject todo 的 iteration 编号（per-loop，不持久化）。
+    # compact 内部已 reinject todo 时由 _phase_compact 同步更新为本轮 iteration，
+    # 否则由 _phase_maybe_reinject_todo 在间隔 _TODO_REINJECT_INTERVAL 轮后
+    # 主动注入并更新。初始 -1 让首轮若未触发 compact 也能尽快注入。
+    last_todo_reinject_iter: int = -1
 
 
 @dataclass
@@ -362,8 +541,10 @@ class IterationRunner:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         session_key: str | None = None,
+        session: Session | None = None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        permission_mode_override: PermissionMode | None = None,
     ) -> None:
         self.loop = loop
         self.channel = channel
@@ -373,10 +554,140 @@ class IterationRunner:
         self.on_stream = on_stream
         self.on_stream_end = on_stream_end
         self.session_key = session_key or make_session_key(channel, chat_id) or ""
+        self.session = session
         self.on_tool_start = on_tool_start
         self.on_tool_complete = on_tool_complete
         self._stream_filter = StreamFilter(on_stream)
         self._bootstrap_report: Any | None = None
+        self.permission_mode_override = permission_mode_override
+
+    def _durable_turn_enabled(self) -> bool:
+        return self.session is not None
+
+    def _flush_messages(self, state: LoopState, start: int | None = None) -> None:
+        """Append newly produced turn messages to durable session history."""
+        if self.session is None:
+            return
+        start_idx = state.persisted_upto if start is None else start
+        start_idx = max(0, min(start_idx, len(state.messages)))
+        if start_idx >= len(state.messages):
+            state.persisted_upto = max(state.persisted_upto, len(state.messages))
+            return
+        try:
+            saved = self.loop.tool_executor.save_messages(
+                self.session, state.messages[start_idx:]
+            )
+            self.loop.sessions.save(self.session)
+            state.persisted_upto = len(state.messages)
+            logger.debug(
+                "Incremental turn persistence flushed {} message(s), cursor={}",
+                saved,
+                state.persisted_upto,
+            )
+        except Exception as exc:
+            logger.warning("Incremental turn persistence failed: {}", exc)
+
+    def _flush_current_inbound(self, state: LoopState) -> None:
+        """Persist the inbound message before model/tool side effects begin."""
+        if self.session is None or state.persisted_upto:
+            return
+        current_idx = state.new_msg_start - 1
+        if 0 <= current_idx < len(state.messages):
+            self._flush_messages(state, current_idx)
+
+    @staticmethod
+    def _account_insert(state: LoopState, index: int, count: int = 1) -> None:
+        """Keep persistence and save-boundary cursors valid after insertion."""
+        if index <= state.new_msg_start:
+            state.new_msg_start += count
+        if index <= state.persisted_upto:
+            state.persisted_upto += count
+
+    def _current_permission_context(self) -> tuple[PermissionMode, ToolPermissionContext]:
+        """Return the active permission mode and tool context for this turn.
+
+        Priority:
+        1. ``permission_mode_override`` — set by unattended callers (cron /
+           autopilot / heartbeat) via ``process_direct`` so they don't depend
+           on the global app_state mode being set by a user.
+        2. Global ``app_state.permission_mode`` — the single place slash
+           commands / UI code change the active mode for interactive turns.
+        3. ``PermissionMode.DEFAULT`` fallback.
+        """
+        if self.permission_mode_override is not None:
+            return self.permission_mode_override, ToolPermissionContext(
+                mode=self.permission_mode_override
+            )
+        provider = getattr(getattr(self.loop, "ctx", None), "app_state", None)
+        try:
+            state = provider.get() if provider is not None else None
+            mode = getattr(state, "permission_mode", None)
+            tool_ctx = getattr(state, "tool_permission_context", None)
+            if isinstance(mode, PermissionMode) and isinstance(tool_ctx, ToolPermissionContext):
+                return mode, tool_ctx
+        except Exception as exc:
+            logger.debug("Failed to read app permission state: {}", exc)
+        return PermissionMode.DEFAULT, ToolPermissionContext(mode=PermissionMode.DEFAULT)
+
+    def _is_read_only_call(self, name: str, params: Any) -> bool:
+        """Conservatively classify a tool call as read-only for batching.
+
+        Defaults to serial (False) for unknown tools or any tool that reports
+        side effects, so destructive/interactive/external tools never race.
+        """
+        tool = self.loop.tools.get(name)
+        if tool is None:
+            return False
+        try:
+            return bool(tool.is_read_only(params or {}))
+        except Exception:
+            return False
+
+    def _plan_tool_batches(
+        self, tool_calls: list[Any]
+    ) -> list[list[int]]:
+        """Group tool-call indices into sequential execution batches.
+
+        Consecutive read-only calls are collapsed into one concurrent batch;
+        every other call is its own serial batch. Byte order is preserved, so
+        appended results stay in the original tool-call order.
+        """
+        batches: list[list[int]] = []
+        for i, tc in enumerate(tool_calls):
+            readonly = self._is_read_only_call(tc.name, tc.arguments)
+            if readonly and batches:
+                last = batches[-1]
+                if len(last) >= 1 and self._is_read_only_call(
+                    tool_calls[last[-1]].name, tool_calls[last[-1]].arguments
+                ):
+                    last.append(i)
+                    continue
+            batches.append([i])
+        return batches
+
+    async def _execute_tool_calls_safely(
+        self, tool_calls: list[Any], ctx: ToolContext
+    ) -> list[Any]:
+        """Execute tool calls in safe batches, preserving call order."""
+        out: list[Any] = [None] * len(tool_calls)
+        for batch in self._plan_tool_batches(tool_calls):
+            if len(batch) == 1:
+                idx = batch[0]
+                tc = tool_calls[idx]
+                out[idx] = await self.loop.tools.execute(
+                    tc.name, tc.arguments, context=ctx
+                )
+            else:
+                gathered = await asyncio.gather(
+                    *(
+                        self.loop.tools.execute(tool_calls[i].name, tool_calls[i].arguments, context=ctx)
+                        for i in batch
+                    ),
+                    return_exceptions=True,
+                )
+                for i, res in zip(batch, gathered):
+                    out[i] = res
+        return out
 
     async def run(
         self,
@@ -386,7 +697,10 @@ class IterationRunner:
             messages=initial_messages,
             initial_count=len(initial_messages),
             new_msg_start=len(initial_messages),
+            persisted_upto=0,
         )
+
+        self._flush_current_inbound(state)
 
         # 从 AgentLoop 加载跨 loop 持久化的失败循环状态。
         # 关键：reflection_injected_count / failed_methods / forced_stop_count
@@ -447,7 +761,8 @@ class IterationRunner:
 
         await self._finalize_loop(state)
 
-        return state.final_content, state.tools_used, state.messages, state.new_msg_start
+        save_start = len(state.messages) + 1 if self._durable_turn_enabled() else state.new_msg_start
+        return state.final_content, state.tools_used, state.messages, save_start
 
     async def _run_one_iteration(self, state: LoopState) -> IterationResult:
         # Bump the messages revision so the token estimate cache
@@ -459,6 +774,8 @@ class IterationRunner:
         logger.debug("Estimated context tokens: {}", state.current_tokens)
 
         await self._phase_compact(state)
+        state.persisted_upto = max(state.new_msg_start, min(state.persisted_upto, len(state.messages)))
+        await self._phase_maybe_reinject_todo(state)
         if state.iteration == 1:
             await self._phase_inject_memory_context(state)
             await self._phase_session_bootstrap(state)
@@ -546,10 +863,64 @@ class IterationRunner:
                     else:
                         break
                 state.messages.insert(insert_idx, blacklist_msg)
+                self._account_insert(state, insert_idx)
                 logger.info(
                     "Injected failure blacklist ({} entries) after compact ({}) at idx {}",
                     len(recent), compact_result.action.value, insert_idx,
                 )
+            # compact 内部已 reinject todo（见 compact.py:_apply_auto_compaction
+            # 末尾的 todo_tool.format_for_injection 调用），同步更新计数避免
+            # 本轮 _phase_maybe_reinject_todo 重复注入。其他 tier（COLLAPSE /
+            # MICRO_COMPACT / HISTORY_SNIP）虽然没在 compactor 内部 reinject
+            # todo，但既然发生了 compact 说明上下文已被重写，下一轮主动 reinject
+            # 时机由 _TODO_REINJECT_INTERVAL 自然延后即可，不会漏。
+            state.last_todo_reinject_iter = state.iteration
+
+    async def _phase_maybe_reinject_todo(self, state: LoopState) -> None:
+        """主动 reinject 活跃 todo 快照，避免长任务中 plan 失踪。
+
+        markbot 原先只在 compact 后 reinject todo（compact.py 内部），
+        但长任务若一直没触发 compact，todo 长期不在上下文里，模型可能
+        忘记剩余 plan 或重复已完成步骤。每 ``_TODO_REINJECT_INTERVAL``
+        轮主动注入一次，作为 system message 插到开头连续 system 消息之后
+        （与 failure blacklist 注入位置一致，保证不破坏 system prompt 首位）。
+
+        compact 触发的那一轮由 ``_phase_compact`` 同步更新计数，本方法
+        在间隔不足时直接返回，不会重复注入。
+        """
+        if state.iteration - state.last_todo_reinject_iter < _TODO_REINJECT_INTERVAL:
+            return
+        todo_tool = self.loop.tools.get("todo")
+        if todo_tool is None or not hasattr(todo_tool, "format_for_injection"):
+            return
+        try:
+            snapshot = todo_tool.format_for_injection()
+        except Exception as exc:
+            logger.debug("Failed to format todo for reinjection: {}", exc)
+            return
+        if not snapshot:
+            # 没有活跃 todo —— 也更新计数，避免每轮都重试 format_for_injection。
+            state.last_todo_reinject_iter = state.iteration
+            return
+        insert_idx = 0
+        for i, m in enumerate(state.messages):
+            if m.get("role") == "system":
+                insert_idx = i + 1
+            else:
+                break
+        state.messages.insert(insert_idx, {
+            "role": "system",
+            "content": snapshot,
+            # Marker so downstream consumers can identify it as a synthetic
+            # re-injection (not part of the original system prompt).
+            "_todo_reinjection": True,
+        })
+        self._account_insert(state, insert_idx)
+        state.last_todo_reinject_iter = state.iteration
+        logger.info(
+            "Re-injected active todo snapshot at iteration {} (idx={})",
+            state.iteration, insert_idx,
+        )
 
     async def _phase_inject_memory_context(self, state: LoopState) -> None:
         mem_tool = self.loop._memory_search_tool
@@ -668,11 +1039,13 @@ class IterationRunner:
         # Determine which messages are compacted and whether they were
         # history (loaded from session) or new (produced this turn).
         history_archived = 0
+        last_compacted_msg: dict | None = None
         kept: list[dict] = []
         for i, m in enumerate(state.messages):
             if _is_compactable(m):
                 if i < original_new_msg_start:
                     history_archived += 1
+                last_compacted_msg = m
             else:
                 kept.append(m)
         state.messages = kept
@@ -700,6 +1073,7 @@ class IterationRunner:
             state.new_msg_start = self.loop._recalc_new_msg_start_after_compact(
                 state.messages, state.initial_count, state.new_msg_start,
             )
+            state.persisted_upto = max(state.new_msg_start, min(state.persisted_upto, len(state.messages)))
             state.current_tokens = self._estimate_tokens(state)
 
             # Persist the archived count so the hook can skip these
@@ -714,6 +1088,13 @@ class IterationRunner:
                         old_count + history_archived,
                         session_key=session_key,
                     )
+                    # Content-addressed high-water mark for drift-safe skip.
+                    if last_compacted_msg is not None and hasattr(mm, "set_archived_tail_hash"):
+                        from markbot.agent.hooks.compaction import _message_content_hash
+                        mm.set_archived_tail_hash(
+                            _message_content_hash(last_compacted_msg),
+                            session_key=session_key,
+                        )
 
             logger.info(
                 "Memory compaction applied to current context: "
@@ -770,9 +1151,8 @@ class IterationRunner:
         except Exception as e:
             logger.debug("Active memory encoding failed: {}", e)
 
-    @staticmethod
     def _inject_internal_context(
-        state: LoopState, sys_idx: int, context_block: str,
+        self, state: LoopState, sys_idx: int, context_block: str,
     ) -> None:
         """Append *context_block* into the internal-context user message after system.
 
@@ -808,7 +1188,7 @@ class IterationRunner:
             ),
         }
         state.messages.insert(sys_idx + 1, runtime_msg)
-        state.new_msg_start += 1
+        self._account_insert(state, sys_idx + 1)
 
     def _inject_pending_steer(self, state: LoopState) -> None:
         steer_text = self.loop.drain_steer(self.session_key)
@@ -925,7 +1305,7 @@ class IterationRunner:
         黑名单（去重），并同步回 AgentLoop 的持久化状态，供 compact summary
         和反思提示引用，避免 LLM compact 后失忆式重复撞墙。
 
-        同时执行三层 guardrail 检测（mirrors Hermes's tool_guardrails）:
+        同时执行三层 guardrail 检测（mirrors agent's tool_guardrails）:
         1. 单工具连续失败（_TOOL_FAILURE_STREAK_THRESHOLD）→ 禁用提示
         2. Exact-failure：同一工具+相同参数签名连续失败 → "换方法"提示
         3. No-progress：幂等工具相同参数返回相同结果 → "无进展"提示
@@ -1228,10 +1608,11 @@ class IterationRunner:
         lookup_name = self.loop.tools.resolve_sanitised_name(tool_call.name)
         if lookup_name not in MUTATING_TOOL_NAMES:
             return
-        # Skip error results — only successful mutations count.
-        if isinstance(result, str) and result.startswith("Error:"):
-            return
-        if isinstance(result, BaseException):
+        # Skip error results — only successful mutations count. Mirror
+        # _is_tool_result_failure so JSON-error results (e.g. write_file
+        # returning ``{"error": "permission denied"}``) don't get recorded
+        # as successful mutations and suppress the verify-on-stop nudge.
+        if self._is_tool_result_failure(result):
             return
         path = ""
         if isinstance(tool_call.arguments, dict):
@@ -1245,20 +1626,50 @@ class IterationRunner:
     def _record_verification_call(
         self, state: LoopState, tool_call: Any, result: Any
     ) -> None:
-        """Mark that the model ran a verification tool this turn.
+        """Track shell/exec commands for the verify-on-stop nudge.
 
-        Used by the verify-on-stop nudge: if the model edited files and then
-        called ``exec``/``shell``/``code_execution`` (even with errors), we
-        consider verification attempted and do not nag again. The point is
-        to catch the "edited file → immediately declared done" failure mode,
-        not to police whether the tests passed.
+        Distinguishes action commands from verify commands:
+        - action (restart/install/pull/kill): set ``side_effect_pending``,
+          do NOT set ``verification_done`` — the action itself is what
+          needs verifying, not a verification of something else.
+        - verify (status/ps/curl/logs/tests): set ``verification_done``
+          and clear ``side_effect_pending`` — the model checked the
+          post-condition.
+        - neutral (unrecognized): preserve existing behavior (set
+          ``verification_done``) to avoid regressing the file-edit verify
+          path, since most exec calls in a coding session ARE verification
+          (pytest, npm test, etc.).
+
+        The action/verify split prevents the 'false completion' failure
+        mode where ``systemctl restart X`` is treated as verification,
+        letting the model declare done without confirming the service
+        actually came up.
         """
         lookup_name = self.loop.tools.resolve_sanitised_name(tool_call.name)
         if lookup_name not in VERIFICATION_TOOL_NAMES:
             return
-        # Even a failed exec counts as "verification attempted" — the model
-        # tried; we do not want to loop forever on a broken test suite.
-        state.verification_done = True
+        # code_execution is in-process Python (ad-hoc checks, not ops
+        # actions) — always counts as verification.
+        if lookup_name == "code_execution":
+            state.verification_done = True
+            state.side_effect_pending = False
+            return
+        # exec/shell: classify the actual command.
+        command = ""
+        if isinstance(tool_call.arguments, dict):
+            command = str(tool_call.arguments.get("command") or "")
+        kind = _classify_shell_command(command)
+        if kind == "action":
+            state.side_effect_pending = True
+            # Do NOT set verification_done — the action needs a follow-up
+            # verify command (status/is-active/ps/logs) to confirm it.
+        elif kind == "verify":
+            state.verification_done = True
+            state.side_effect_pending = False
+        else:
+            # Neutral: preserve existing behavior. Defaulting to
+            # verification_done avoids regressing the file-edit nudge path.
+            state.verification_done = True
 
     def _should_inject_verify_nudge(self, state: LoopState) -> bool:
         """Decide whether to inject a verify-on-stop nudge.
@@ -1268,7 +1679,9 @@ class IterationRunner:
            Messaging channels (feishu/qq/weixin/...) are skipped — the
            verify nudge is noise there.
         1. The model edited at least one non-doc file this turn
-           (``file_mutations`` has non-doc entries).
+           (``file_mutations`` has non-doc entries), OR ran a side-effect
+           action command (restart/install/pull/kill) without a follow-up
+           verify (``side_effect_pending`` is True).
         2. The model has NOT called any verification tool this turn
            (``verification_done`` is False).
         3. We have not already injected ``_MAX_VERIFY_NUDGES`` nudges.
@@ -1281,7 +1694,7 @@ class IterationRunner:
             return False
         if state.verify_nudges >= _MAX_VERIFY_NUDGES:
             return False
-        # Look for at least one non-doc mutation.
+        # Condition 1a: at least one non-doc file mutation.
         for mut in state.file_mutations:
             path = mut.get("path", "")
             ext = ""
@@ -1289,13 +1702,17 @@ class IterationRunner:
                 ext = "." + path.rsplit(".", 1)[-1].lower()
             if ext not in _NO_VERIFY_EXTENSIONS:
                 return True
+        # Condition 1b: pending side-effect action awaiting verification.
+        if state.side_effect_pending:
+            return True
         return False
 
     def _build_verify_nudge(self, state: LoopState) -> str:
         """Build the verify-on-stop nudge text.
 
-        Mentions the edited paths so the model knows what was changed, and
-        suggests common verify commands (tests / linter / type-checker).
+        Adapts to what the model did this turn:
+        - file edits: suggest the project's verify command (tests/lint).
+        - side-effect action: suggest a post-condition check (status/ps).
         """
         state.verify_nudges += 1
         attempt = state.verify_nudges
@@ -1313,6 +1730,29 @@ class IterationRunner:
             edited.append(path)
             if len(edited) >= 5:
                 break
+
+        # Side-effect action path: nudge for post-condition verification.
+        if state.side_effect_pending and not edited:
+            return (
+                f"[System — verification required before completion, attempt {attempt}/{_MAX_VERIFY_NUDGES}]\n"
+                "You ran a side-effecting command this turn (restart/install/pull/kill "
+                "or similar) but have not verified it took effect. Completion requires "
+                "BOTH done AND verified.\n\n"
+                "Before declaring done, confirm the action succeeded by checking its "
+                "post-condition, e.g.:\n"
+                "  - After `systemctl restart X`: `systemctl is-active X && journalctl -u X -n 30 --no-pager`\n"
+                "  - After `service X restart`: `service X status`\n"
+                "  - After `pip install X`: `pip show X`\n"
+                "  - After `git pull`: `git log -1 --oneline`\n"
+                "  - After `pkill -f X` / `kill <pid>`: `ps aux | grep X` to confirm it stopped\n"
+                "  - After `docker restart X`: `docker ps --filter name=X`\n\n"
+                "If the check shows the action failed, fix it and re-run; do not declare done.\n"
+                "If the action has no meaningful post-condition, briefly state so and proceed.\n\n"
+                "（系统提示：本轮执行了副作用命令但未验证结果。完成 = 执行 + 验证生效。"
+                "请先确认动作生效再结束。）"
+            )
+
+        # File-edit path (existing): nudge for project verify command.
         paths_text = "\n".join(f"  - {p}" for p in edited) if edited else "  (paths unavailable)"
         return (
             f"[System — verification required before completion, attempt {attempt}/{_MAX_VERIFY_NUDGES}]\n"
@@ -1334,54 +1774,69 @@ class IterationRunner:
     def _maybe_inject_mutation_verifier_footer(
         self, state: LoopState, final_content: str
     ) -> str | None:
-        """Detect file-completion claims without matching mutations; append footer.
+        """Detect completion claims without matching evidence; append footer.
 
         Returns the footer text to inject, or ``None`` if no mismatch was
-        detected.
+        detected. Two checks:
 
-        Heuristic:
-        1. Scan ``final_content`` for file-completion claim patterns.
-        2. If claims found but ``state.file_mutations`` is empty, the LLM
-           is reporting file work that never landed — append a verifier
-           footer so the user (and next-turn LLM) sees the truth.
-        3. If mutations exist, no footer is needed — the claim is backed
-           by real tool calls.
+        1. File-completion claim (created/updated/modified) without a
+           successful mutating tool call this turn.
+        2. Action-completion claim (restarted/installed/pulled) without a
+           follow-up verify command confirming the post-condition
+           (``side_effect_pending`` still True, ``verification_done`` False).
 
-        Known limitation: ``state.file_mutations`` is per-turn (reset on
-        each new ``LoopState``). If the LLM did file work in a *previous*
-        turn and the current turn's final response references it (e.g.
-        a summary like "I've updated the file as requested"), the verifier
-        will false-positive because no mutation happened *this* turn. This
-        is acceptable — the footer says "may be inaccurate — verify", which
-        is reasonable advice even in the false-positive case, and the user
-        can dismiss it after checking.
+        Either mismatch appends a verifier footer so the user (and next-
+        turn LLM) sees that the completion claim is unverified.
+
+        Known limitation: ``state.file_mutations`` and
+        ``side_effect_pending`` are per-turn (reset on each new
+        ``LoopState``). If the LLM did work in a *previous* turn and the
+        current turn's final response references it, the verifier may
+        false-positive. This is acceptable — the footer says "may be
+        inaccurate — verify", which is reasonable advice even then.
         """
         if not final_content:
             return None
         content_lower = final_content.lower()
-        has_claim = any(p in content_lower for p in _FILE_COMPLETION_CLAIM_PATTERNS)
-        if not has_claim:
-            return None
-        if state.file_mutations:
-            # Mutations exist — claim is backed by real tool calls.
-            return None
-        # Mismatch detected: LLM claims file completion but no mutating
-        # tool succeeded this turn. Inject a verifier footer.
-        footer = (
-            "[System Verifier — file-mutation check]\n"
-            "The assistant's response above claims file work was completed "
-            "(created/updated/modified/deleted), but no successful "
-            "write_file / edit_file / delete_file tool call was recorded "
-            "in this turn. The claim may be inaccurate — verify the actual "
-            "file system state before relying on this response.\n"
-            "（系统校验：上方回复声称完成了文件操作，但本轮未记录到成功的"
-            "文件写入/编辑/删除工具调用，请核查实际文件状态。）"
-        )
-        logger.warning(
-            "File-mutation verifier: LLM claims file completion but "
-            "no mutating tool succeeded this turn — injecting footer"
-        )
-        return footer
+
+        # Check 1: file-completion claim without file mutation.
+        has_file_claim = any(p in content_lower for p in _FILE_COMPLETION_CLAIM_PATTERNS)
+        if has_file_claim and not state.file_mutations:
+            logger.warning(
+                "File-mutation verifier: LLM claims file completion but "
+                "no mutating tool succeeded this turn — injecting footer"
+            )
+            return (
+                "[System Verifier — file-mutation check]\n"
+                "The assistant's response above claims file work was completed "
+                "(created/updated/modified/deleted), but no successful "
+                "write_file / edit_file / delete_file tool call was recorded "
+                "in this turn. The claim may be inaccurate — verify the actual "
+                "file system state before relying on this response.\n"
+                "（系统校验：上方回复声称完成了文件操作，但本轮未记录到成功的"
+                "文件写入/编辑/删除工具调用，请核查实际文件状态。）"
+            )
+
+        # Check 2: action-completion claim without post-condition verification.
+        has_action_claim = any(p in content_lower for p in _ACTION_COMPLETION_CLAIM_PATTERNS)
+        if has_action_claim and state.side_effect_pending and not state.verification_done:
+            logger.warning(
+                "Action-verification verifier: LLM claims action completion "
+                "but no verify command confirmed the post-condition — injecting footer"
+            )
+            return (
+                "[System Verifier — action-verification check]\n"
+                "The assistant's response above claims a side-effecting action "
+                "(restart/start/install/pull/kill) succeeded, but no follow-up "
+                "verify command (status/is-active/ps/logs/curl) was run to "
+                "confirm the post-condition. The claim may be inaccurate — "
+                "verify the actual service/process state before relying on "
+                "this response.\n"
+                "（系统校验：上方回复声称副作用动作已完成，但本轮未运行验证"
+                "命令确认结果，请核查实际服务/进程状态。）"
+            )
+
+        return None
 
     def _persist_failure_state(self, state: LoopState) -> None:
         """把当前的失败循环状态同步回 AgentLoop 的 per-session 持久化存储。"""
@@ -2146,6 +2601,7 @@ class IterationRunner:
             "Added assistant message with tool calls, total messages: {}",
             len(state.messages),
         )
+        self._flush_messages(state)
 
         for tc in response.tool_calls:
             state.tools_used.append(tc.name)
@@ -2183,6 +2639,7 @@ class IterationRunner:
                 f"Available tools: {available}. "
                 f"Please use only the tools listed above."
             )
+            permission_mode, permission_context = self._current_permission_context()
             for tc in response.tool_calls:
                 if not self.loop.tools.has(tc.name):
                     state.messages = await self.loop.context.add_tool_result_async(
@@ -2192,8 +2649,8 @@ class IterationRunner:
                     result = await self.loop.tools.execute(tc.name, tc.arguments, context=ToolContext(
                         session_id=make_session_key(self.channel, self.chat_id) or "",
                         workspace=str(self.loop.workspace),
-                        permission_mode=PermissionMode.AUTO,
-                        tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
+                        permission_mode=permission_mode,
+                        tool_permission_context=permission_context,
                         is_non_interactive=False,
                         channel=self.channel,
                         chat_id=self.chat_id,
@@ -2214,6 +2671,7 @@ class IterationRunner:
                     # recent_tool_results). Without this, the recovery path
                     # would be a blind spot for failure-loop detection.
                     self._record_tool_result(state, result, tc.name, tc)
+            self._flush_messages(state)
             return IterationResult(
                 should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
             )
@@ -2277,11 +2735,12 @@ class IterationRunner:
             except Exception as e:
                 logger.debug("report_progress emit failed: {}", e)
 
+        permission_mode, permission_context = self._current_permission_context()
         _tool_ctx = ToolContext(
             session_id=make_session_key(self.channel, self.chat_id) or "",
             workspace=str(self.loop.workspace),
-            permission_mode=PermissionMode.AUTO,
-            tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
+            permission_mode=permission_mode,
+            tool_permission_context=permission_context,
             is_non_interactive=False,
             channel=self.channel,
             chat_id=self.chat_id,
@@ -2307,13 +2766,7 @@ class IterationRunner:
                 {"tool": tc.name, "call_id": tc.id},
             )
 
-        results = await asyncio.gather(
-            *(
-                self.loop.tools.execute(tc.name, tc.arguments, context=_tool_ctx)
-                for tc in response.tool_calls
-            ),
-            return_exceptions=True,
-        )
+        results = await self._execute_tool_calls_safely(response.tool_calls, _tool_ctx)
         logger.info("Tool execution completed, {} results", len(results))
 
         for idx, (tool_call, result) in enumerate(zip(response.tool_calls, results)):
@@ -2397,7 +2850,11 @@ class IterationRunner:
             self._record_verification_call(state, tool_call, result)
 
             # Emit TOOL_COMPLETED so monitors can track tool latency/usage.
-            is_error = isinstance(result, str) and result.startswith("Error:")
+            # Mirror _is_tool_result_failure so the event's `ok` field
+            # agrees with the guardrail's failure classifier — a tool
+            # returning ``{"error": "..."}`` (JSON string) would otherwise
+            # be flagged as failure for steering but reported as success here.
+            is_error = self._is_tool_result_failure(result)
             self._emit(
                 EventType.TOOL_COMPLETED,
                 {"tool": tool_call.name, "call_id": tool_call.id,
@@ -2407,15 +2864,15 @@ class IterationRunner:
             if self.on_tool_complete:
                 error_msg = None
                 summary = None
-                if isinstance(result, str):
-                    if result.startswith("Error:"):
-                        error_msg = result
-                    else:
-                        summary = result[:200] if len(result) > 200 else result
+                if is_error:
+                    error_msg = result if isinstance(result, str) else str(result)
+                elif isinstance(result, str):
+                    summary = result[:200] if len(result) > 200 else result
                 try:
                     await self.on_tool_complete(tool_call.id, tool_call.name, summary, error_msg)
                 except Exception as e:
                     logger.debug("on_tool_complete callback failed: {}", e)
+            self._flush_messages(state)
         logger.info(
             "Added {} tool results to messages, continue to next iteration",
             len(results),
@@ -2509,7 +2966,7 @@ class IterationRunner:
         # Verify-on-stop nudge: if the model edited files this turn but
         # tries to end without calling any verification tool (exec/shell/
         # code_execution), inject a nudge and continue the loop instead of
-        # accepting the final response. Mirrors Hermes's verify-on-stop:
+        # accepting the final response. Mirrors agent's verify-on-stop:
         # "completion requires both done AND verified". Capped at
         # _MAX_VERIFY_NUDGES per turn to avoid infinite loops. Skipped for
         # doc-only edits (.md/.txt/.rst) since they have no verify surface.
@@ -2535,9 +2992,12 @@ class IterationRunner:
                 "_verify_stop_nudge": True,
             })
             state.new_msg_start += 2
-            # Wipe file_mutations so the nudge does not re-fire immediately
-            # on the next final-response attempt without new edits. The
-            # model must edit again (or call verification) to clear the gate.
+            self._flush_messages(state)
+            # Wipe file_mutations so the file-edit nudge does not re-fire
+            # immediately without new edits. NOTE: side_effect_pending is
+            # intentionally NOT cleared — the model must run a verify command
+            # (status/is-active/ps) to clear it, not just attempt completion
+            # again. This forces a real post-condition check after actions.
             state.file_mutations = []
             return IterationResult(
                 should_continue=True,
@@ -2560,6 +3020,7 @@ class IterationRunner:
         )
         state.final_content = saved_content
         logger.info("Final response captured, length={}", len(saved_content or ""))
+        self._flush_messages(state)
 
         steer_text = self.loop.drain_steer(self.session_key)
         if steer_text and state.steer_continues < 3:
@@ -2724,6 +3185,7 @@ class IterationRunner:
                     state.messages,
                     state.final_content,
                 )
+        self._flush_messages(state)
 
         if self.on_stream and self.on_stream_end and not state.stream_finalized:
             if state.final_content:

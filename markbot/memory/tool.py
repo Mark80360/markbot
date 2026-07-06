@@ -290,6 +290,46 @@ class MemoryStore:
             self._persist(target)
             self._build_snapshot()
 
+    def evict_oldest_matching(self, target: str, marker: str, needed_chars: int) -> int:
+        """Evict the oldest entries containing *marker* to free >= needed_chars.
+
+        Used by summary_memory to make room for new auto-summary chunks
+        without crowding out manually-saved entries.  Only entries that
+        contain the marker substring are eligible for eviction; manual
+        entries (without the marker) are never touched.
+
+        Args:
+            target: "memory" or "user".
+            marker: Substring that identifies evictable entries.
+            needed_chars: Minimum total chars to free.
+
+        Returns:
+            Number of entries evicted.
+        """
+        with self._state_lock:
+            if target == "memory":
+                entries = self.memory_entries
+            else:
+                entries = self.user_entries
+            freed = 0
+            evicted = 0
+            i = 0
+            while i < len(entries) and freed < needed_chars:
+                if marker in entries[i]:
+                    freed += len(entries[i]) + len(ENTRY_DELIMITER)
+                    entries.pop(i)
+                    evicted += 1
+                else:
+                    i += 1
+            if evicted:
+                self._persist(target)
+                self._build_snapshot()
+                logger.info(
+                    "Evicted {} auto-summary entries (freed ~{} chars)",
+                    evicted, freed,
+                )
+            return evicted
+
     # -- Internal ------------------------------------------------------------
 
     def _load_all(self) -> None:

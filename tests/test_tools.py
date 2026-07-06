@@ -161,6 +161,17 @@ class TestBaseTool:
         assert decision.behavior == "allow"
 
     @pytest.mark.asyncio
+    async def test_permission_plan_mode_blocks_destructive(self):
+        tool = DestructiveTool()
+        ctx = ToolContext(
+            session_id="s1",
+            workspace="/tmp",
+            permission_mode=PermissionMode.PLAN,
+            tool_permission_context=ToolPermissionContext(mode=PermissionMode.PLAN),
+        )
+        decision = await tool.check_permission({}, ctx)
+        assert decision.behavior == "deny"
+    @pytest.mark.asyncio
     async def test_permission_default_ask(self):
         tool = DestructiveTool()
         ctx = ToolContext(
@@ -171,7 +182,6 @@ class TestBaseTool:
         )
         decision = await tool.check_permission({}, ctx)
         assert decision.behavior == "ask"
-
     @pytest.mark.asyncio
     async def test_permission_bypass_mode(self):
         tool = DestructiveTool()
@@ -220,6 +230,32 @@ class TestBaseTool:
         )
         decision = await tool.check_permission({}, ctx)
         assert decision.behavior == "allow"
+
+class TestRegistryPermissionGate:
+    """The registry must turn ``ask`` into a hard stop, not a silent allow."""
+
+    @pytest.mark.asyncio
+    async def test_ask_blocks_execution(self):
+        reg = ToolRegistry()
+        tool = DestructiveTool()
+        reg.register(tool)
+        ctx = ToolContext(
+            session_id="s1",
+            workspace="/tmp",
+            permission_mode=PermissionMode.DEFAULT,
+            tool_permission_context=ToolPermissionContext(mode=PermissionMode.DEFAULT),
+        )
+        result = await reg.execute("delete_file", {"path": "x"}, context=ctx)
+        assert "Permission required" in result
+
+    @pytest.mark.asyncio
+    async def test_default_context_blocks_destructive(self):
+        """When no context is provided the registry must use DEFAULT, not AUTO."""
+        reg = ToolRegistry()
+        reg.register(DestructiveTool())
+        result = await reg.execute("delete_file", {"path": "x"})
+        assert "Permission required" in result
+
 
 class TestToolRegistry:
     def test_register_and_get(self):

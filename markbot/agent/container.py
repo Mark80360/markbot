@@ -369,7 +369,7 @@ class AgentContext:
             binder, memory_manager, sessions, workspace,
         )
         session_ext = cls._build_session_extensions(
-            workspace, memory_manager, mcp, tools, timings,
+            workspace, memory_manager, mcp, tools, timings, config,
         )
 
         timings["total"] = time.time() - _init_start
@@ -622,9 +622,11 @@ class AgentContext:
             long_term_enabled=getattr(memory_cfg, "long_term_enabled", True),
             vector_backend=getattr(memory_cfg, "vector_backend", "sqlite"),
             vector_max_records=getattr(memory_cfg, "vector_max_records", 50_000),
+            vector_max_scan_records=getattr(memory_cfg, "vector_max_scan_records", 20_000),
             vector_min_content_chars=getattr(memory_cfg, "vector_min_content_chars", 12),
             vector_top_k_multiplier=getattr(memory_cfg, "vector_top_k_multiplier", 2),
             vector_min_score=getattr(memory_cfg, "vector_min_score", 0.15),
+            daily_log_retention_days=getattr(memory_cfg, "daily_log_retention_days", 30),
             consolidation_enabled=getattr(memory_cfg, "consolidation_enabled", True),
             consolidation_dedup_threshold=getattr(memory_cfg, "consolidation_dedup_threshold", 0.95),
             consolidation_age_decay_days=getattr(memory_cfg, "consolidation_age_decay_days", 90.0),
@@ -758,6 +760,7 @@ class AgentContext:
         mcp: "McpManager",
         tools: "ToolRegistry",
         timings: dict[str, float],
+        config: "Config | None" = None,
     ) -> dict[str, Any]:
         """Build handoff, task tracker, memory encoder, bootstrap, commands."""
         from markbot.cli.slash_commands import CommandRouter as _CR
@@ -768,12 +771,23 @@ class AgentContext:
         from markbot.session.bootstrap import SessionBootstrap as _SB
         from markbot.session.handoff import HandoffManager as _HM
         from markbot.session.task_tracker import TaskTracker as _TT
+        from markbot.types.permission import PermissionMode as _PM
 
         _t0 = time.time()
         handoff_manager = _HM(workspace)
         task_tracker = _TT(workspace)
         memory_encoder = _ME(workspace, memory_store=getattr(memory_manager, "_memory_store", None))
         app_state = _ASP.initialize()
+        # Apply the configured default permission mode so interactive turns
+        # don't fall back to DEFAULT after a restart. ``/mode`` still overrides
+        # at runtime; cron/autopilot/heartbeat force AUTO via process_direct.
+        configured_mode = None
+        try:
+            configured_mode = config.agents.defaults.default_permission_mode if config else None
+        except AttributeError:
+            configured_mode = None
+        if configured_mode and configured_mode != "default":
+            app_state.set_permission_mode(_PM(configured_mode))
         session_bootstrap = _SB(
             workspace,
             handoff_manager=handoff_manager,
@@ -805,4 +819,3 @@ class AgentContext:
         total = sum(self._init_timings.values())
         lines.append(f"  TOTAL: {total:.3f}s")
         return "\n".join(lines)
-

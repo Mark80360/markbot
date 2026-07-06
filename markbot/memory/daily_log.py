@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,11 @@ from loguru import logger
 from markbot.utils.constants import MAX_DAILY_LOG_RESULT_CHARS
 
 _DEFAULT_MAX_CONTENT_LENGTH = 2000
+
+#: Days to retain daily log files.  Older files are pruned on startup so
+#: the workspace does not accumulate raw conversation transcripts forever
+#: (privacy + disk).  Mirrors the InteractionLogger retention policy.
+_DEFAULT_DAILY_LOG_RETENTION_DAYS = 30
 
 # CJK Unified Ideographs — basic block (U+4E00..U+9FFF).
 # Single-char matches miss most search queries like "用户喜欢Python" (the
@@ -72,14 +77,56 @@ class DailyLogManager:
         self,
         workspace: Path,
         max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
+        retention_days: int = _DEFAULT_DAILY_LOG_RETENTION_DAYS,
     ):
         self._daily_dir: Path = Path(workspace) / "memory" / "daily"
         self._daily_dir.mkdir(parents=True, exist_ok=True)
         self._max_content_length = max_content_length
+        self._retention_days = max(0, retention_days)
+        if self._retention_days:
+            self.prune_old_logs()
 
     @property
     def daily_dir(self) -> Path:
         return self._daily_dir
+
+    def prune_old_logs(self) -> int:
+        """Delete daily log files older than retention_days.
+
+        Returns the number of files removed.  Safe to call repeatedly;
+        missing files or parse errors are logged and skipped.
+        """
+        if self._retention_days <= 0:
+            return 0
+        import time
+        date_cutoff = datetime.now().date() - timedelta(days=self._retention_days)
+        cutoff = time.time() - (self._retention_days * 86400)
+        pruned = 0
+        try:
+            for f in self._daily_dir.iterdir():
+                if not f.is_file() or not f.name.endswith(".md"):
+                    continue
+                try:
+                    stale = False
+                    try:
+                        file_date = datetime.strptime(f.stem, "%Y-%m-%d").date()
+                        stale = file_date < date_cutoff
+                    except ValueError:
+                        # Non-date files fall back to mtime pruning.
+                        stale = f.stat().st_mtime < cutoff
+                    if stale:
+                        f.unlink()
+                        pruned += 1
+                except OSError:
+                    continue
+        except OSError as e:
+            logger.debug("Daily log pruning failed: {}", e)
+        if pruned:
+            logger.info(
+                "Pruned {} daily log files older than {} days",
+                pruned, self._retention_days,
+            )
+        return pruned
 
     def append_turn(
         self,

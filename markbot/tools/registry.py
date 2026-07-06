@@ -190,8 +190,8 @@ class ToolRegistry:
             context = ToolContext(
                 session_id="default",
                 workspace=".",
-                permission_mode=PermissionMode.AUTO,
-                tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
+                permission_mode=PermissionMode.DEFAULT,
+                tool_permission_context=ToolPermissionContext(mode=PermissionMode.DEFAULT),
                 is_non_interactive=True,
             )
 
@@ -201,10 +201,13 @@ class ToolRegistry:
         if decision.behavior == "deny":
             return f"Error: Tool '{name}' execution denied."
 
-        if decision.behavior == "ask" and not context.is_non_interactive:
-            # In interactive mode, we would show a permission dialog
-            # For now, we'll allow it (the UI layer should handle this)
-            pass
+        if decision.behavior == "ask":
+            reason = f" Reason: {decision.reason}" if decision.reason else ""
+            return (
+                f"Permission required: Tool '{name}' was not executed.{reason} "
+                "Ask the user for explicit approval, or switch to a mode/profile "
+                "that permits this tool."
+            )
 
         # Update params if modified by permission check
         if decision.updated_input:

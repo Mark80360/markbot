@@ -130,6 +130,8 @@ def _get_task_id(context: ToolContext) -> str:
 class BrowserNavigateTool(Tool):
     """Navigate to a URL in the browser."""
 
+    _is_read_only = True
+
     @property
     def name(self) -> str:
         return "browser_navigate"
@@ -400,6 +402,8 @@ class BrowserTypeTool(Tool):
 class BrowserScrollTool(Tool):
     """Scroll the page."""
 
+    _is_read_only = True
+
     @property
     def name(self) -> str:
         return "browser_scroll"
@@ -487,6 +491,8 @@ class BrowserPressTool(Tool):
 
 class BrowserBackTool(Tool):
     """Navigate back in browser history."""
+
+    _is_read_only = True
 
     @property
     def name(self) -> str:

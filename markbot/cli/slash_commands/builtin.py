@@ -11,6 +11,7 @@ from loguru import logger
 from markbot import __version__
 from markbot.bus.events import OutboundMessage, make_session_key
 from markbot.cli.slash_commands.router import CommandContext, CommandRouter
+from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import build_status_content
 
 
@@ -238,6 +239,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/stop — Cancel all active tasks and subagents",
         "/steer <text> — Inject mid-task instruction into running agent",
         "/status — Show session status, token usage, and statistics",
+        "/mode [mode] — Show or set permission mode (default/plan/auto/bypass)",
         "/restart — Restart the agent process",
         "/help — Show available slash commands",
     ]
@@ -246,6 +248,81 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         chat_id=ctx.msg.chat_id,
         content="\n".join(lines),
         metadata={"render_as": "text"},
+    )
+
+
+_MODE_ALIASES = {
+    "default": PermissionMode.DEFAULT,
+    "plan": PermissionMode.PLAN,
+    "accept_edits": PermissionMode.ACCEPT_EDITS,
+    "accept": PermissionMode.ACCEPT_EDITS,
+    "auto": PermissionMode.AUTO,
+    "bypass": PermissionMode.BYPASS,
+    "bypass_permissions": PermissionMode.BYPASS,
+}
+
+
+async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
+    """Switch the active permission mode for tool execution.
+
+    Usage:
+      /mode            — show current mode
+      /mode default    — confirm before destructive tools (recommended)
+      /mode plan       — read-only only, no mutations
+      /mode auto       — allow all tools without confirmation
+      /mode bypass     — bypass all permission checks (dangerous)
+    """
+    loop = ctx.loop
+    app_state = getattr(getattr(loop, "ctx", None), "app_state", None)
+    if app_state is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="App state provider is not available.",
+        )
+
+    arg = (ctx.args or "").strip().lower()
+    if not arg:
+        current = app_state.get_permission_mode()
+        lines = [
+            "Permission modes:",
+            "  default    — confirm before destructive tools (current default)",
+            "  plan       — read-only only, blocks all mutations",
+            "  accept_edits — allow file edits, still confirm destructive ops",
+            "  auto       — allow all tools without confirmation",
+            "  bypass     — bypass all permission checks (dangerous)",
+            "",
+            f"Current mode: {current.value}",
+            "Use: /mode <mode> to switch.",
+        ]
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="\n".join(lines),
+            metadata={"render_as": "text"},
+        )
+
+    mode = _MODE_ALIASES.get(arg)
+    if mode is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=f"Unknown mode '{arg}'. Valid: {', '.join(sorted(_MODE_ALIASES))}.",
+        )
+
+    app_state.set_permission_mode(mode)
+    # Persist to config.json so the choice survives restarts. Best-effort:
+    # the in-memory switch above already took effect, so a failed write
+    # only means the user will need to /mode again after next restart.
+    # Key path uses camelCase to match the JSON alias (schema Base uses
+    # to_camel alias_generator), not the snake_case Python field name.
+    from markbot.config.loader import update_config_value
+    persisted = update_config_value(
+        ["agents", "defaults", "defaultPermissionMode"], mode.value,
+    )
+    content = f"Permission mode set to: {mode.value}"
+    if not persisted:
+        content += " (warning: failed to persist to config.json — mode will reset on restart)"
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=content,
     )
 
 
@@ -258,5 +335,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/compact", cmd_compact)
     router.exact("/compact_str", cmd_compact_str)
+    router.exact("/mode", cmd_mode)
     router.exact("/clear", cmd_clear)
     router.exact("/help", cmd_help)

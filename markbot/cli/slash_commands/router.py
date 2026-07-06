@@ -82,6 +82,14 @@ class CommandRouter:
         if handler := self._exact.get(cmd):
             return await handler(ctx)
 
+        # Exact command with space/tab-separated args (e.g. "/mode auto").
+        # Mirrors dispatch_priority's arg parsing so exact commands can
+        # accept arguments without being registered as prefixes.
+        for exact_cmd, handler in self._exact.items():
+            if cmd.startswith(exact_cmd + " ") or cmd.startswith(exact_cmd + "\t"):
+                ctx.args = ctx.raw[len(exact_cmd):].strip()
+                return await handler(ctx)
+
         for pfx, handler in self._prefix:
             if cmd.startswith(pfx):
                 ctx.args = ctx.raw[len(pfx):]

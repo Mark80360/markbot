@@ -12,6 +12,8 @@ from typing import Any
 
 from starlette.routing import WebSocketRoute
 
+from markbot.types.permission import PermissionMode
+
 _log = logging.getLogger(__name__)
 
 WEB_DIST = Path(__file__).parent / "static"
@@ -124,6 +126,7 @@ def _build_app():
                     session_key=f"cron:{job.id}",
                     channel=job.payload.channel or "web",
                     chat_id=job.payload.to or "direct",
+                    permission_mode=PermissionMode.AUTO,
                 )
             finally:
                 if isinstance(cron_tool, CronTool) and cron_token is not None:

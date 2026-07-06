@@ -41,6 +41,13 @@ class ConsolidationConfig:
     promote_access: int = 5
     #: Skip dedup when the index is smaller than this — not worth the scan.
     min_records_for_dedup: int = 100
+    #: Hard cap on records processed by the dedup pass.  The full pairwise
+    #: similarity scan is O(n) in memory when blockwise (see _dedup_pass),
+    #: but capping keeps wall-clock time bounded for very large stores.
+    dedup_max_records: int = 10_000
+    #: Row-block size for the blockwise similarity scan.  Each block
+    #: allocates a (block x n) matrix; 512 x 50k x 4B = 100 MB — safe.
+    dedup_block_size: int = 512
 
 
 @dataclass
@@ -119,16 +126,19 @@ class Consolidator:
     # -- dedup ---------------------------------------------------------------
 
     def _dedup_pass(self) -> int:
-        """Merge near-duplicate records. Returns count removed."""
+        """Merge near-duplicate records. Returns count removed.
+
+        Uses a **blockwise** similarity scan so peak memory is
+        O(block_size x n) rather than O(n^2).  A hard cap
+        (dedup_max_records) bounds wall-clock time for very large
+        stores; beyond the cap only the most-recently-accessed records
+        are compared (the working set most likely to accumulate dups).
+        """
         if self._store.count() < self.config.min_records_for_dedup:
             return 0
         records = self._store.iter_all()
         if len(records) < 2:
             return 0
-        # Load vectors for comparison. iter_all() returns empty vectors
-        # for efficiency, so we fetch full records in batches.
-        # For SQLite this is fine; for Chroma we skip dedup (vectors not
-        # returned by iter_all) — the store's own LRU handles growth.
         try:
             import numpy as np
         except ImportError:
@@ -141,42 +151,58 @@ class Consolidator:
             got = self._store.get(rec.id)
             if got is not None and got.vector:
                 full.append(got)
+
+        # Cap the working set to bound time.  Prefer frequently-accessed,
+        # recent records because they are most likely to affect recall and
+        # accumulate duplicate writes.
+        cap = self.config.dedup_max_records
+        if len(full) > cap:
+            logger.info(
+                "Consolidation dedup capped to {} of {} records",
+                cap, len(full),
+            )
+            full.sort(key=lambda r: (r.access_count, r.created_at), reverse=True)
+            full = full[:cap]
         if len(full) < 2:
             return 0
 
         mat = np.vstack([np.asarray(r.vector, dtype=np.float32) for r in full])
         mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
-        # Pairwise cosine.
-        sim = mat @ mat.T
-        np.fill_diagonal(sim, -1.0)  # ignore self
 
         removed = 0
         survivors: set[int] = set(range(len(full)))
-        # Greedy: for each pair above threshold, drop the older one.
-        for i in range(len(full)):
-            if i not in survivors:
-                continue
-            for j in range(i + 1, len(full)):
-                if j not in survivors:
+        block = self.config.dedup_block_size
+        # Blockwise: for each row-block, compute sim against the FULL
+        # matrix (block x n), then only examine pairs (i, j) with j in
+        # the block and i < j.  Peak alloc is block x n, not n x n.
+        for start in range(0, len(full), block):
+            end = min(start + block, len(full))
+            block_mat = mat[start:end]            # (b, dim)
+            sims = block_mat @ mat.T              # (b, n)
+            for bi in range(end - start):
+                gi = start + bi                   # global index
+                if gi not in survivors:
                     continue
-                if sim[i, j] < self.config.dedup_threshold:
-                    continue
-                # Keep the one with higher access_count; tie-break on recency.
-                ri, rj = full[i], full[j]
-                keep, drop = (i, j) if ri.access_count >= rj.access_count else (j, i)
-                if ri.access_count == rj.access_count:
-                    keep, drop = (i, j) if ri.created_at >= rj.created_at else (j, i)
-                # Fold the dropped record's access into the keeper.
-                keeper = full[keep]
-                keeper.access_count += full[drop].access_count
-                try:
-                    # Re-upsert keeper with merged access count.
-                    self._store.upsert(keeper)
-                    self._store.delete(full[drop].id)
-                    survivors.discard(drop)
-                    removed += 1
-                except Exception as exc:
-                    logger.debug("Consolidation dedup delete failed: {}", exc)
+                row = sims[bi]
+                # Only look at j > gi to avoid double-counting pairs.
+                for gj in range(gi + 1, len(full)):
+                    if gj not in survivors:
+                        continue
+                    if row[gj] < self.config.dedup_threshold:
+                        continue
+                    ri, rj = full[gi], full[gj]
+                    keep, drop = (gi, gj) if ri.access_count >= rj.access_count else (gj, gi)
+                    if ri.access_count == rj.access_count:
+                        keep, drop = (gi, gj) if ri.created_at >= rj.created_at else (gj, gi)
+                    keeper = full[keep]
+                    keeper.access_count += full[drop].access_count
+                    try:
+                        self._store.upsert(keeper)
+                        self._store.delete(full[drop].id)
+                        survivors.discard(drop)
+                        removed += 1
+                    except Exception as exc:
+                        logger.debug("Consolidation dedup delete failed: {}", exc)
         return removed
 
     # -- promotion -----------------------------------------------------------

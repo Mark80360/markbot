@@ -62,7 +62,7 @@ class CanonicalUsage:
     output_tokens: Optional[int] = None
 
     # ------------------------------------------------------------------
-    # Cache buckets (5-bucket model, inspired by Hermes)
+    # Cache buckets (5-bucket model)
     # ------------------------------------------------------------------
     #: Tokens served from the server-side prefix cache (cheap).
     cache_read_tokens: Optional[int] = None

@@ -23,6 +23,7 @@ from markbot.bus.events import InboundMessage, OutboundMessage, make_session_key
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
+from markbot.types.permission import PermissionMode
 
 
 class AgentLoop:
@@ -244,8 +245,10 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        session=None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        permission_mode_override: PermissionMode | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
         from markbot.agent.iteration import IterationRunner
 
@@ -258,8 +261,10 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             session_key=make_session_key(channel, chat_id) or "",
+            session=session,
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
+            permission_mode_override=permission_mode_override,
         )
         return await runner.run(initial_messages)
 
@@ -779,6 +784,7 @@ class AgentLoop:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
+        permission_mode_override: PermissionMode | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         channel = msg.channel
@@ -797,6 +803,7 @@ class AgentLoop:
             session_key=key,
             channel=channel,
             chat_id=chat_id,
+            permission_mode_override=permission_mode_override,
         )
 
         async def _handler(ctx: ProcessContext) -> OutboundMessage | None:
@@ -855,8 +862,10 @@ class AgentLoop:
                     channel=channel,
                     chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
+                    session=session,
                     on_tool_start=on_tool_start,
                     on_tool_complete=on_tool_complete,
+                    permission_mode_override=ctx.permission_mode_override,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
                 self.sessions.save(session)
@@ -976,8 +985,10 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                session=session,
                 on_tool_start=on_tool_start,
                 on_tool_complete=on_tool_complete,
+                permission_mode_override=ctx.permission_mode_override,
             )
 
             logger.info(
@@ -1031,8 +1042,15 @@ class AgentLoop:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
+        permission_mode: PermissionMode | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        ``permission_mode`` lets unattended callers (cron / autopilot /
+        heartbeat) force a mode without relying on the global ``app_state``
+        being set by a prior ``/mode`` command — those paths run before any
+        interactive user can approve tool calls, so they must opt in here.
+        """
         _direct_start = time.time()
         logger.info("process_direct starting...")
         await self._connect_mcp()
@@ -1057,4 +1075,5 @@ class AgentLoop:
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
             on_outbound_message=on_outbound_message,
+            permission_mode_override=permission_mode,
         )
