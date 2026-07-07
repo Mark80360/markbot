@@ -65,54 +65,61 @@ class FallbackManager:
         self._circuit_cooldown = self.DEFAULT_CIRCUIT_COOLDOWN
         self._half_open_probes: set[str] = set()
 
-    def _get_circuit(self, provider_name: str) -> CircuitState:
-        if provider_name not in self._circuits:
-            self._circuits[provider_name] = CircuitState()
-        return self._circuits[provider_name]
+    # The circuit breaker is keyed by the full ``model_ref`` (e.g.
+    # ``custom/deepseek-v4-flash``), NOT by provider name. Keying by
+    # provider name would make every model on the same provider share
+    # one circuit — a run of failures on one model would take down
+    # every other model on that provider, defeating the redundancy
+    # the fallback chain is supposed to provide.
 
-    def _check_circuit(self, provider_name: str) -> bool:
-        circuit = self._get_circuit(provider_name)
+    def _get_circuit(self, circuit_key: str) -> CircuitState:
+        if circuit_key not in self._circuits:
+            self._circuits[circuit_key] = CircuitState()
+        return self._circuits[circuit_key]
+
+    def _check_circuit(self, circuit_key: str) -> bool:
+        circuit = self._get_circuit(circuit_key)
         if circuit.state == "closed":
             return True
         if circuit.state == "open":
             elapsed = time.monotonic() - circuit.last_failure_time
             if elapsed >= self._circuit_cooldown:
                 circuit.state = "half-open"
-                self._half_open_probes.discard(provider_name)
-                logger.info("{} half-open (cooldown elapsed)", provider_name)
+                self._half_open_probes.discard(circuit_key)
+                logger.info("{} half-open (cooldown elapsed)", circuit_key)
                 # fall through to half-open handling below
             else:
                 logger.warning(
                     "{} circuit open, skipping "
                     "(failures={}, retry in {:.0f}s)",
-                    provider_name, circuit.failure_count, self._circuit_cooldown - elapsed,
+                    circuit_key, circuit.failure_count, self._circuit_cooldown - elapsed,
                 )
                 return False
         # half-open: allow only one probe request at a time
-        if provider_name in self._half_open_probes:
-            logger.warning("{} circuit half-open, probe in flight, skipping", provider_name)
+        if circuit_key in self._half_open_probes:
+            logger.warning("{} circuit half-open, probe in flight, skipping", circuit_key)
             return False
-        self._half_open_probes.add(provider_name)
+        self._half_open_probes.add(circuit_key)
         return True
 
-    def _record_success(self, provider_name: str) -> None:
-        circuit = self._get_circuit(provider_name)
+    def _record_success(self, circuit_key: str) -> None:
+        circuit = self._get_circuit(circuit_key)
         if circuit.state != "closed":
-            logger.info("{} circuit closed (recovered)", provider_name)
+            logger.info("{} circuit closed (recovered)", circuit_key)
         circuit.failure_count = 0
         circuit.state = "closed"
-        self._half_open_probes.discard(provider_name)
+        self._half_open_probes.discard(circuit_key)
 
-    def _record_failure(self, provider_name: str) -> None:
-        circuit = self._get_circuit(provider_name)
+    def _record_failure(self, circuit_key: str) -> None:
+        circuit = self._get_circuit(circuit_key)
         circuit.failure_count += 1
         circuit.last_failure_time = time.monotonic()
-        self._half_open_probes.discard(provider_name)
+        self._half_open_probes.discard(circuit_key)
         if circuit.failure_count >= self._circuit_threshold:
             circuit.state = "open"
             logger.warning(
                 "{} circuit OPEN ({} consecutive failures)",
-                provider_name, circuit.failure_count,
+                circuit_key, circuit.failure_count,
             )
 
     def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
@@ -203,7 +210,7 @@ class FallbackManager:
             model_config: ModelConfig | None = None
             provider_name = model_ref.split("/")[0]
 
-            if not self._check_circuit(provider_name):
+            if not self._check_circuit(model_ref):
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
                     provider=provider_config,
@@ -272,11 +279,11 @@ class FallbackManager:
                     # should not trip the circuit breaker — only persistent
                     # failures (UNAVAILABLE/UNKNOWN) indicate a real problem.
                     if response.error_type != ErrorType.TRANSIENT:
-                        self._record_failure(provider_name)
+                        self._record_failure(model_ref)
                     else:
                         # Still release the half-open probe so the next
                         # request can retry this provider.
-                        self._half_open_probes.discard(provider_name)
+                        self._half_open_probes.discard(model_ref)
                     continue
 
                 if response.finish_reason == "content_filter":
@@ -293,10 +300,19 @@ class FallbackManager:
                     )
                     attempts.append(attempt)
                     last_error = Exception("content_filter")
-                    self._record_failure(provider_name)
+                    # content_filter is a content-specific refusal, not a
+                    # provider outage — the same provider serves other
+                    # requests fine. Recording it as a failure would open
+                    # the circuit on a healthy provider and take down
+                    # every model that shares it. But we MUST still release
+                    # the half-open probe so the next request gets a chance
+                    # to probe this model — otherwise a single content_filter
+                    # during a half-open probe would permanently lock the
+                    # model out of the chain.
+                    self._half_open_probes.discard(model_ref)
                     continue
 
-                self._record_success(provider_name)
+                self._record_success(model_ref)
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
                     provider=provider_config,
@@ -331,7 +347,7 @@ class FallbackManager:
                 else:
                     logger.error("Model {} failed (non-retryable): {}. Trying next...", model_ref, e)
                 last_error = e
-                self._record_failure(provider_name)
+                self._record_failure(model_ref)
                 continue
 
         raise AllModelsFailedError(

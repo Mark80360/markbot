@@ -87,6 +87,45 @@ class TestClassifyErrorMessages:
         assert classify_error(401, "rate limit") == ErrorType.UNAVAILABLE
 
 
+class TestBodyMarkerPrecedence:
+    """Permanent body markers must win over 5xx status codes.
+
+    Aggregators (new_api / one-api) often return 503 with a body that
+    reveals the failure is permanent (model_not_found, no available
+    channel). These must be classified UNAVAILABLE, not TRANSIENT —
+    otherwise the fallback chain retries each dead model 3 times.
+    """
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "model_not_found",
+            "model not found",
+            "No available channel for model mimo-v2.5-pro under group default",
+            "no available channel",
+            "quota exceeded",
+            "unauthorized",
+            "insufficient_quota",
+        ],
+    )
+    def test_permanent_body_marker_over_5xx(self, msg: str) -> None:
+        assert classify_error(503, msg) == ErrorType.UNAVAILABLE
+
+    def test_permanent_body_marker_over_500(self) -> None:
+        assert classify_error(500, "model_not_found") == ErrorType.UNAVAILABLE
+
+    def test_transient_body_marker_with_5xx_stays_transient(self) -> None:
+        # "service unavailable" is a transient body marker and must NOT
+        # be misclassified as UNAVAILABLE just because "unavailable"
+        # appears as a substring of "service unavailable".
+        assert classify_error(503, "service unavailable") == ErrorType.TRANSIENT
+
+    def test_no_available_channel_does_not_match_temporarily_unavailable(self) -> None:
+        # Guard against the "no available channel" marker accidentally
+        # matching "temporarily unavailable" (which is transient).
+        assert classify_error(None, "temporarily unavailable") == ErrorType.TRANSIENT
+
+
 class TestClassifyErrorEdgeCases:
     def test_none_status_with_empty_message(self) -> None:
         assert classify_error(None, "") == ErrorType.UNKNOWN

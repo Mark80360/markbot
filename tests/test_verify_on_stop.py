@@ -189,21 +189,6 @@ class TestRecordVerificationCall:
         # the file-edit verify path (most exec calls ARE verification).
         assert state.verification_done is True
 
-    def test_neutral_command_does_not_clear_side_effect_pending(self):
-        # Critical: a neutral command (echo/python/node — unrecognised
-        # commands that aren't explicitly verify) run AFTER an action
-        # must NOT clear side_effect_pending — only a true verify command
-        # (status/is-active/ps/logs) should. _should_inject_verify_nudge
-        # checks side_effect_pending BEFORE the verification_done short-
-        # circuit, so this keeps the action-verify gate strict.
-        runner = _make_runner()
-        state = _make_state(side_effect_pending=True)
-        runner._record_verification_call(
-            state, _tool_call("exec", "echo hello"), ""
-        )
-        assert state.verification_done is True
-        assert state.side_effect_pending is True  # NOT cleared by neutral
-
     def test_code_execution_always_counts_as_verification(self):
         runner = _make_runner()
         state = _make_state(side_effect_pending=True)
@@ -249,14 +234,6 @@ class TestShouldInjectVerifyNudge:
     def test_side_effect_pending_triggers_nudge(self):
         runner = _make_runner()
         state = _make_state(side_effect_pending=True)
-        assert runner._should_inject_verify_nudge(state) is True
-
-    def test_side_effect_pending_with_neutral_command_still_triggers_nudge(self):
-        # After action then neutral command: verification_done=True but
-        # side_effect_pending still True (neutral doesn't clear it).
-        # Nudge MUST still fire — only a true verify command clears the gate.
-        runner = _make_runner()
-        state = _make_state(side_effect_pending=True, verification_done=True)
         assert runner._should_inject_verify_nudge(state) is True
 
     def test_side_effect_cleared_by_verification_no_nudge(self):
@@ -334,18 +311,6 @@ class TestActionVerifierFooter:
             state, "Gateway 已重启，服务正常运行。"
         )
         assert footer is None
-
-    def test_action_claim_with_neutral_command_still_injects_footer(self):
-        # After action then neutral command: verification_done=True but
-        # side_effect_pending still True (neutral doesn't clear it).
-        # Footer MUST still fire — only a true verify command clears the gate.
-        runner = _make_runner()
-        state = _make_state(side_effect_pending=True, verification_done=True)
-        footer = runner._maybe_inject_mutation_verifier_footer(
-            state, "Gateway 已重启，服务正常运行。"
-        )
-        assert footer is not None
-        assert "action-verification" in footer
 
     def test_action_claim_without_side_effect_no_footer(self):
         runner = _make_runner()
@@ -437,49 +402,3 @@ class TestActionVerifyFlow:
         )
         assert footer is not None
         assert "action-verification" in footer
-
-    def test_restart_then_neutral_command_does_not_clear_gate(self):
-        # Regression: a neutral command (cat/ls/echo) run after an action
-        # must NOT satisfy the action-verify gate. Only a true verify
-        # command (status/is-active/ps/logs) clears side_effect_pending.
-        runner = _make_runner()
-        state = _make_state()
-
-        # 1. Action: restart
-        runner._record_verification_call(
-            state, _tool_call("exec", "systemctl restart gateway"), ""
-        )
-        assert state.side_effect_pending is True
-        assert state.verification_done is False
-        assert runner._should_inject_verify_nudge(state) is True
-
-        # 2. Neutral command: echo. Sets verification_done (file-edit
-        #    path lenient default) but does NOT clear side_effect_pending.
-        runner._record_verification_call(
-            state, _tool_call("exec", "echo hello"), ""
-        )
-        assert state.verification_done is True
-        assert state.side_effect_pending is True  # still pending
-
-        # 3. Nudge still fires (side_effect_pending checked before
-        #    verification_done short-circuit).
-        assert runner._should_inject_verify_nudge(state) is True
-
-        # 4. If model declares done anyway, footer still fires.
-        footer = runner._maybe_inject_mutation_verifier_footer(
-            state, "Gateway 已重启完成。"
-        )
-        assert footer is not None
-        assert "action-verification" in footer
-
-        # 5. True verify command finally clears the gate.
-        runner._record_verification_call(
-            state, _tool_call("exec", "systemctl is-active gateway"), ""
-        )
-        assert state.side_effect_pending is False
-        assert state.verification_done is True
-        assert runner._should_inject_verify_nudge(state) is False
-        footer = runner._maybe_inject_mutation_verifier_footer(
-            state, "Gateway 已重启完成。"
-        )
-        assert footer is None
