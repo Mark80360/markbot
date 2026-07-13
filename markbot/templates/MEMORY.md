@@ -1,26 +1,9 @@
+# Agent Memory
+
+- Prefer `memory_search` before answering questions about prior work, decisions, or user preferences
+- Record durable preferences, project decisions, and lessons learned as short standalone entries
+- Do not store temporary task progress, secrets, or one-off session chatter here
+
 ---
-summary: "长期记忆 — 工具设置与经验教训"
-read_when:
-  - 手动引导工作区
----
 
-## 工具设置
-
-记录你的具体配置 — SSH 主机、skill 相关的用户设置等。
-
-### SSH
-
-- *（如：home-server → 192.168.1.100，用户：admin）*
-
-### 其他设置
-
--
-
-## 经验教训
-
-_犯错后的反思、发现的技巧、用户的偏好。_
-
--
-## 其他
-- 遇事不决先查 memory 
-- 遇到解决不了的问题、不确定的决策，或用户提到之前说过的话，优先 `memory_search` 查记忆，不要凭感觉回答。
+- Keep this file curated and short; raw history belongs in memory/daily logs

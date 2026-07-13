@@ -111,6 +111,11 @@ class Consolidator:
         report = ConsolidationReport(starting_count=self._store.count())
         try:
             report.deduped = self._dedup_pass()
+            # Best-effort forget of very low-importance turn noise before
+            # promotion so the working set stays high-signal.
+            forgotten = self._forget_low_importance_pass()
+            if forgotten:
+                logger.info("Consolidation forgot {} low-importance records", forgotten)
             report.promoted = self._promotion_pass(promote_cb)
         except Exception as exc:
             logger.warning("Consolidation sweep failed: {}", exc)
@@ -227,6 +232,34 @@ class Consolidator:
             except Exception as exc:
                 logger.debug("Consolidation promote_cb failed: {}", exc)
         return promoted
+
+    # -- forget / decay -----------------------------------------------------
+
+    def _forget_low_importance_pass(self) -> int:
+        """Delete stale low-importance turn noise.
+
+        Curated sources (memory/*, summary/*, user/profile) are never
+        auto-forgotten here. Only rarely-accessed turn/delegation records
+        older than one half-life can be removed.
+        """
+        now = time.time()
+        half_life_s = max(self.config.age_decay_days, 1.0) * 86400.0
+        removed = 0
+        for rec in list(self._store.iter_all()):
+            src = (rec.source or "").lower()
+            if src.startswith(("memory/", "summary/", "user", "profile")):
+                continue
+            if not src.startswith(("turn/", "delegation/")):
+                continue
+            score = self.importance(rec, now=now)
+            age_s = max(0.0, now - float(rec.created_at or 0.0))
+            if score < 0.08 and age_s >= half_life_s and rec.access_count <= 1:
+                try:
+                    if self._store.delete(rec.id):
+                        removed += 1
+                except Exception as exc:
+                    logger.debug("Consolidation forget failed: {}", exc)
+        return removed
 
     # -- importance (informational) -----------------------------------------
 

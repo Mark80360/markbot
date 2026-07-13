@@ -48,7 +48,12 @@ class QuestionResponseMiddleware(Middleware):
 
         if isinstance(tool, _HasHandleResponse):
             logger.debug("Handling response to question {}", question_id)
-            tool.handle_response(question_id, ctx.msg.content)
+            reply = ctx.msg.content or ""
+            # Users may echo the whole prompt including the [Q:...] marker;
+            # strip it so option matching stays clean.
+            if "[Q:" in reply:
+                reply = reply.split("[Q:", 1)[0].strip()
+            tool.handle_response(question_id, reply)
             return OutboundMessage(
                 channel=ctx.channel,
                 chat_id=ctx.chat_id,
@@ -143,6 +148,10 @@ class MemoryLifecycleMiddleware(Middleware):
             and count >= self._auto_summary_interval
             and count % self._auto_summary_interval == 0
         ):
+            # Honour memory_summary_enabled so operators can disable the
+            # background archival path entirely.
+            if not getattr(self._memory, "memory_summary_enabled", True):
+                return response
             try:
                 history = []
                 if ctx.session and hasattr(ctx.session, 'get_history'):

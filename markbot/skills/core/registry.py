@@ -36,6 +36,8 @@ class SkillRegistry:
         workspace: Path,
         tool_registry: Optional["ToolRegistry"] = None,
         available_tool_names: Optional[list[str]] = None,
+        min_score: float = 0.0,
+        hide_stale: bool = True,
     ):
         self.workspace = workspace
         self.tool_registry = tool_registry
@@ -45,6 +47,9 @@ class SkillRegistry:
         self._usage_store = SkillUsageStore(workspace)
         self._skills: dict[str, SkillDefinition] = {}
         self._config_cache: dict[str, dict[str, str]] = {}
+        self._min_score = float(min_score or 0.0)
+        self._hide_stale = bool(hide_stale)
+        self._quality_scores: dict[str, float] = {}
 
     def load_all(self) -> None:
         """Load all skills from workspace and builtin."""
@@ -88,6 +93,25 @@ class SkillRegistry:
         skill.use_count = usage.use_count
         skill.last_activity_at = usage.last_activity_at
         skill.state = usage.state
+
+        # Quality / lifecycle gate for non-builtin skills.
+        if not skill.is_builtin:
+            if self._hide_stale and skill.state in {
+                SkillState.STALE, SkillState.ARCHIVED, "stale", "archived"
+            }:
+                logger.info(
+                    "Skill '{}' skipped (state={})", skill.name, skill.state,
+                )
+                return False
+            if self._min_score > 0:
+                score = self._score_skill(skill)
+                self._quality_scores[skill.name] = score
+                if score < self._min_score:
+                    logger.info(
+                        "Skill '{}' skipped (score={:.2f} < min_score={:.2f})",
+                        skill.name, score, self._min_score,
+                    )
+                    return False
 
         # Replace any previously-loaded version so edits take effect.
         self._skills[skill.name] = skill
@@ -186,6 +210,35 @@ class SkillRegistry:
                 )
                 self.tool_registry.register(tool)
                 logger.debug("Registered skill tool: {}", tool.definition.name)
+
+    def _score_skill(self, skill: SkillDefinition) -> float:
+        """Best-effort quality score for gating low-quality skills.
+
+        Uses SkillImprover heuristics, but neutralizes the usage component for
+        brand-new skills so first-time installs are not rejected solely for
+        having zero views/uses.
+        """
+        try:
+            from markbot.skills.improve import SkillImprover
+
+            improver = SkillImprover(self.workspace)
+            result = improver.run_eval(skill.name, skill)
+            clarity = float(getattr(result, "description_clarity", 0.0) or 0.0)
+            completeness = float(getattr(result, "completeness", 0.0) or 0.0)
+            usage = float(getattr(result, "usage_engagement", 0.0) or 0.0)
+            # New / never-used skills: treat usage as neutral (0.5) so the
+            # gate mostly reflects content quality, not popularity.
+            if getattr(skill, "use_count", 0) == 0 and getattr(skill, "view_count", 0) == 0:
+                usage = 0.5
+            return 0.3 * clarity + 0.4 * completeness + 0.3 * usage
+        except Exception as exc:
+            logger.debug("Skill score failed for {}: {}", skill.name, exc)
+            # Fail open for scoring errors so a broken improver does not
+            # wipe the skill surface; lifecycle/state gate still applies.
+            return 1.0
+
+    def get_quality_score(self, name: str) -> float | None:
+        return self._quality_scores.get(name)
 
     def get(self, name: str) -> Optional[SkillDefinition]:
         """Get a skill by name."""

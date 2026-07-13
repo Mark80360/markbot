@@ -248,19 +248,29 @@ class TestCJKTokenize:
 
 
 class TestSummaryMemorySplitting:
-    def test_oversized_summary_split_into_chunks(self, tmp_path: Path):
+    def test_oversized_summary_split_into_chunks_when_curated_enabled(self, tmp_path: Path):
         mgr = _make_manager(tmp_path)
-        mgr._memory_store = None
         mgr._started = True
         mgr._memory_store = _MemoryStoreSentinel(tmp_path)  # type: ignore[assignment]
+        mgr.auto_summary_to_curated = True
 
         huge = "bullet " * 1000  # ~6000 chars
         mgr._fallback_manager = _FakeFallback(reply=huge)
 
         _run(mgr.summary_memory(messages=[{"role": "user", "content": "hi"}]))
 
-        # The single LLM reply should have been split into multiple entries.
+        # Only when curated writes are explicitly enabled should the single
+        # LLM reply be split into multiple MEMORY.md entries.
         assert len(mgr._memory_store.added) >= 2
+
+    def test_summary_defaults_to_non_curated(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        mgr._started = True
+        mgr._memory_store = _MemoryStoreSentinel(tmp_path)  # type: ignore[assignment]
+        mgr.auto_summary_to_curated = False
+        mgr._fallback_manager = _FakeFallback(reply="durable fact about postgres")
+        _run(mgr.summary_memory(messages=[{"role": "user", "content": "hi"}]))
+        assert mgr._memory_store.added == []
 
 
 class _MemoryStoreSentinel:

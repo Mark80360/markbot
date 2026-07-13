@@ -17,11 +17,16 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from markbot.tools.base import Tool
-from markbot.utils.constants import BOOTSTRAP_FILES, MEMORY_FILENAME, USER_FILENAME
+from markbot.utils.constants import BOOTSTRAP_FILES, MEMORY_FILENAME, USER_FILENAME, is_main_memory_session
 from markbot.utils.helpers import format_time
 
 if TYPE_CHECKING:
     from ..memory.base import BaseMemoryManager
+
+
+def _session_allows_curated(channel: str | None) -> bool:
+    """Whether curated MEMORY/PROFILE may be listed/loaded for this channel."""
+    return is_main_memory_session(channel)
 
 
 class ExploreContextCatalogTool(Tool):
@@ -75,8 +80,13 @@ class ExploreContextCatalogTool(Tool):
         super().__init__(**kwargs)
         self.workspace = workspace
         self._memory_manager = memory_manager
-
+        self._channel: str | None = None
+        self._chat_id: str | None = None
         self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     async def _legacy_execute(
         self,
@@ -126,7 +136,10 @@ class ExploreContextCatalogTool(Tool):
         lines.append("These configuration files define your identity, preferences, and guidelines.\n")
 
         has_files = False
+        allow_curated = _session_allows_curated(getattr(self, '_channel', None))
         for filename in self.BOOTSTRAP_FILES:
+            if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not allow_curated:
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
                 has_files = True
@@ -153,13 +166,23 @@ class ExploreContextCatalogTool(Tool):
         lines = ["## Memory Entries (Persistent Knowledge)\n"]
         lines.append("Contains user preferences, project history, decisions, and learned facts.\n")
 
+        if not _session_allows_curated(getattr(self, '_channel', None)):
+            lines.append(
+                "*Curated MEMORY.md / PROFILE.md catalog is unavailable on shared channels. "
+                "Use memory_search for this conversation's logs/summaries.*"
+            )
+            return "\n".join(lines)
+
         if not self._memory_manager:
             lines.append("*Memory manager not enabled*")
             return "\n".join(lines)
 
         try:
             if hasattr(self._memory_manager, 'list_memories'):
-                entries = await self._memory_manager.list_memories(limit=10)
+                entries = await self._memory_manager.list_memories(
+                    limit=10,
+                    channel=getattr(self, '_channel', None),
+                )
 
                 if entries:
                     for idx, entry in enumerate(entries[:10], 1):
@@ -305,7 +328,13 @@ class SearchContextTool(Tool):
         super().__init__(**kwargs)
         self.workspace = workspace
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
         self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     async def _legacy_execute(
         self,
@@ -369,6 +398,8 @@ class SearchContextTool(Tool):
                     query=query,
                     max_results=max_results,
                     min_score=0.1,
+                    channel=getattr(self, '_channel', None),
+                    chat_id=getattr(self, '_chat_id', None),
                 )
 
                 for idx, r in enumerate(search_results):
@@ -380,7 +411,7 @@ class SearchContextTool(Tool):
                         'score': r.get('score'),
                         'full_content': r.get('content', ''),
                     })
-            else:
+            elif _session_allows_curated(getattr(self, '_channel', None)):
                 memory_file = self.workspace / MEMORY_FILENAME
                 if memory_file.exists():
                     content = memory_file.read_text(encoding='utf-8')
@@ -411,7 +442,10 @@ class SearchContextTool(Tool):
         if not self.workspace or not self.workspace.exists():
             return results
 
+        allow_curated = _session_allows_curated(getattr(self, '_channel', None))
         for filename in self.BOOTSTRAP_FILES:
+            if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not allow_curated:
+                continue
             file_path = self.workspace / filename
             if not file_path.exists():
                 continue
@@ -553,7 +587,13 @@ class LoadContextTool(Tool):
         super().__init__(**kwargs)
         self.workspace = workspace
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
         self._search_cache: dict[str, dict] = {}
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     async def _legacy_execute(
         self,
@@ -597,12 +637,21 @@ class LoadContextTool(Tool):
 
     async def _load_memory(self, context_id: str) -> tuple[str | None, str]:
         """Load memory entry."""
+        if not _session_allows_curated(getattr(self, '_channel', None)):
+            return (
+                "Curated MEMORY.md entries are unavailable on shared channels. "
+                "Use memory_search for this conversation's logs/summaries.",
+                "memory",
+            )
         if not self._memory_manager:
             return None, "memory"
 
         try:
             if hasattr(self._memory_manager, 'list_memories'):
-                entries = await self._memory_manager.list_memories(limit=100)
+                entries = await self._memory_manager.list_memories(
+                    limit=100,
+                    channel=getattr(self, '_channel', None),
+                )
                 try:
                     idx = int(context_id.split('_')[1])
                 except (IndexError, ValueError):
@@ -614,9 +663,10 @@ class LoadContextTool(Tool):
         except Exception as e:
             logger.warning("Failed to load memory {}: {}", context_id, e)
 
-        memory_file = self.workspace / MEMORY_FILENAME
-        if memory_file.exists():
-            return memory_file.read_text(encoding='utf-8'), 'memory'
+        if _session_allows_curated(getattr(self, '_channel', None)):
+            memory_file = self.workspace / MEMORY_FILENAME
+            if memory_file.exists():
+                return memory_file.read_text(encoding='utf-8'), 'memory'
 
         return None, "memory"
 
@@ -639,6 +689,14 @@ class LoadContextTool(Tool):
         }
 
         filename = filename_map.get(context_id, context_id.replace('_', '.'))
+
+        if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not _session_allows_curated(
+            getattr(self, '_channel', None)
+        ):
+            return (
+                f"*{filename} is unavailable on shared channels.*",
+                'bootstrap',
+            )
 
         if filename == MEMORY_FILENAME:
             hint = (

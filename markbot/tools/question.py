@@ -110,8 +110,10 @@ class AskUserQuestionTool(Tool):
         # Generate unique question ID
         question_id = str(uuid.uuid4())
 
-        # Format message based on channel capabilities
-        content = self._format_question(question, options)
+        # Format message based on channel capabilities. Always embed the
+        # question id in content so replies can be correlated even when the
+        # channel cannot round-trip metadata.
+        content = self._format_question(question, options, question_id=question_id)
 
         # Send question
         msg = OutboundMessage(
@@ -152,7 +154,12 @@ class AskUserQuestionTool(Tool):
                 self._pending_questions.pop(question_id, None)
                 return f"Error waiting for response: {str(e)}"
 
-    def _format_question(self, question: str, options: list[dict[str, str]]) -> str:
+    def _format_question(
+        self,
+        question: str,
+        options: list[dict[str, str]],
+        question_id: str | None = None,
+    ) -> str:
         """Format question based on channel capabilities."""
 
         # For channels with interactive capabilities (feishu, dingtalk)
@@ -170,5 +177,7 @@ class AskUserQuestionTool(Tool):
 
         lines.append("")
         lines.append("Please reply with the number or label of your choice.")
+        if question_id:
+            lines.append(f"[Q:{question_id}]")
 
         return "\n".join(lines)

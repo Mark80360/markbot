@@ -239,7 +239,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/stop — Cancel all active tasks and subagents",
         "/steer <text> — Inject mid-task instruction into running agent",
         "/status — Show session status, token usage, and statistics",
-        "/mode [mode] — Show or set permission mode (default/plan/auto/bypass)",
+        "/mode [mode] — Show or set permission mode (default/plan/auto/bypass)\n/profile [name] — Show or set runtime profile (coding/assistant/unattended)",
         "/restart — Restart the agent process",
         "/help — Show available slash commands",
     ]
@@ -267,7 +267,7 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
 
     Usage:
       /mode            — show current mode
-      /mode default    — confirm before destructive tools (needs UI handler)
+      /mode default    — confirm before destructive tools (interactive approval)
       /mode plan       — read-only only, no mutations
       /mode auto       — allow all tools without confirmation (recommended)
       /mode bypass     — bypass all permission checks (dangerous)
@@ -285,10 +285,10 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
         current = app_state.get_permission_mode()
         lines = [
             "Permission modes:",
-            "  default    — confirm before destructive tools (needs UI handler; otherwise deny)",
+            "  default    — confirm before destructive tools (interactive approval)",
             "  plan       — read-only only, blocks all mutations",
             "  accept_edits — allow file edits, still confirm destructive ops",
-            "  auto       — allow all tools without confirmation (schema default, recommended)",
+            "  auto       — allow all tools without confirmation",
             "  bypass     — bypass all permission checks (dangerous)",
             "",
             f"Current mode: {current.value}",
@@ -326,6 +326,74 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+
+async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
+    """Show or persist the runtime profile.
+
+    Usage:
+      /profile              — show current profile
+      /profile coding       — software development defaults
+      /profile assistant    — interactive personal assistant
+      /profile unattended   — cron/heartbeat defaults
+    """
+    from markbot.config.profile import get_profile, list_profiles
+
+    loop = ctx.loop
+    config = getattr(loop, "config", None)
+    current = "coding"
+    try:
+        current = config.agents.defaults.profile if config else "coding"
+    except Exception:
+        current = getattr(getattr(loop, "ctx", None), "profile", None)
+        current = getattr(current, "name", None) or "coding"
+
+    arg = (ctx.args or "").strip().lower()
+    if not arg:
+        lines = ["Runtime profiles:"]
+        for name in list_profiles():
+            p = get_profile(name)
+            mark = " (current)" if name == current else ""
+            lines.append(f"  {name}{mark} — {p.description}")
+            lines.append(
+                f"    permission={p.permission_mode}, "
+                f"desktop={p.enable_desktop}, browser={p.enable_browser}, "
+                f"autopilot={p.enable_autopilot}, min_skill_score={p.min_skill_score}"
+            )
+        lines.append("")
+        lines.append("Use: /profile <name> to persist (takes effect on next restart).")
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="\n".join(lines),
+            metadata={"render_as": "text"},
+        )
+
+    if arg not in list_profiles():
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=f"Unknown profile '{arg}'. Valid: {', '.join(list_profiles())}.",
+        )
+
+    from markbot.config.loader import update_config_value
+    persisted = update_config_value(["agents", "defaults", "profile"], arg)
+    profile = get_profile(arg)
+    # Also switch permission mode immediately for this process.
+    app_state = getattr(getattr(loop, "ctx", None), "app_state", None)
+    if app_state is not None:
+        try:
+            app_state.set_permission_mode(PermissionMode(profile.permission_mode))
+        except Exception:
+            pass
+    content = (
+        f"Profile set to: {arg} (permission default: {profile.permission_mode}). "
+        "Tool surface changes apply on next gateway restart."
+    )
+    if not persisted:
+        content += " (warning: failed to persist to config.json)"
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
+    )
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
@@ -336,5 +404,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/compact", cmd_compact)
     router.exact("/compact_str", cmd_compact_str)
     router.exact("/mode", cmd_mode)
+    router.exact("/profile", cmd_profile)
     router.exact("/clear", cmd_clear)
     router.exact("/help", cmd_help)

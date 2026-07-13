@@ -26,11 +26,14 @@ from loguru import logger
 from markbot.bus.events import make_session_key
 
 from markbot.utils.constants import (
+    DEFAULT_CONSOLIDATION_PROMOTE_ACCESS,
     MAX_COMPRESSED_SUMMARY_CHARS,
     MAX_PREFETCH_RESULTS,
+    MEMORY_AUTO_SUMMARY_TO_CURATED,
     MEMORY_FILENAME,
     MIN_PREFETCH_SCORE,
     USER_FILENAME,
+    is_main_memory_session,
 )
 
 from .base import BaseMemoryManager
@@ -234,7 +237,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         consolidation_enabled: bool = True,
         consolidation_dedup_threshold: float = 0.95,
         consolidation_age_decay_days: float = 90.0,
-        consolidation_promote_access: int = 5,
+        consolidation_promote_access: int = DEFAULT_CONSOLIDATION_PROMOTE_ACCESS,
         provider_config: dict | None = None,
     ):
         import time
@@ -254,6 +257,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self.memory_reserve_ratio = memory_reserve_ratio
         self.compact_with_thinking_block = compact_with_thinking_block
         self.memory_summary_enabled = memory_summary_enabled
+        # Curated MEMORY.md is high-signal only. Automatic summaries default
+        # to daily-log + vector index unless explicitly enabled.
+        self.auto_summary_to_curated = MEMORY_AUTO_SUMMARY_TO_CURATED
         self.force_memory_search = force_memory_search
         self.force_max_results = force_max_results
         self.force_min_score = force_min_score
@@ -408,12 +414,38 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         logger.info("Initialized for session: {}", session_id)
 
     def system_prompt_block(self) -> str:
-        """Return static text for the system prompt."""
-        if self._memory_store:
-            ctx = self._memory_store.get_memory_context()
-            if ctx:
-                return ctx
+        """Return static text for the system prompt.
+
+        Curated MEMORY.md is injected once by ContextBuilder bootstrap for
+        main sessions. Returning the MemoryStore snapshot here would recreate
+        the dual-injection bug, so this provider hook stays empty.
+        """
         return ""
+
+    @staticmethod
+    def _parse_session_parts(session_id: str | None) -> tuple[str, str]:
+        """Parse ``channel`` / ``chat_id`` from a session key.
+
+        Supports both ``channel:chat_id`` keys and bare channel names so
+        shared-channel privacy gates still fire when chat_id is omitted.
+        """
+        if not session_id:
+            return "", ""
+        raw = str(session_id).strip()
+        if not raw:
+            return "", ""
+        if ":" in raw:
+            channel, chat_id = raw.split(":", 1)
+            return channel.strip(), chat_id.strip()
+        return raw, ""
+
+    def allow_curated_memory(self, channel: str | None = None, *, session_id: str | None = None) -> bool:
+        """Whether curated MEMORY/PROFILE may be read for this session."""
+        ch = channel
+        if ch is None and session_id:
+            ch, _ = self._parse_session_parts(session_id)
+        return is_main_memory_session(ch)
+
 
     def _cached_vector_search(
         self,
@@ -423,6 +455,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         min_score: float,
         channel: str | None = None,
         chat_id: str | None = None,
+        include_curated: bool = True,
     ) -> list[dict]:
         """Vector search with a short-TTL per-turn cache.
 
@@ -435,7 +468,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if self._longterm is None:
             return []
         import time
-        key = (query, max_results, round(min_score, 4), channel, chat_id)
+        key = (query, max_results, round(min_score, 4), channel, chat_id, include_curated)
         now = time.time()
         with self._vector_cache_lock:
             cached = self._vector_cache.get(key)
@@ -448,6 +481,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 min_score=min_score,
                 channel=channel,
                 chat_id=chat_id,
+                include_curated=include_curated,
             )
         except Exception as e:
             logger.debug("Vector search failed: {}", e)
@@ -490,10 +524,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             return ""
 
         # Parse channel/chat_id from session_id for session-scoped recall.
-        channel = ""
-        chat_id = ""
-        if session_id and ":" in session_id:
-            channel, chat_id = session_id.split(":", 1)
+        channel, chat_id = self._parse_session_parts(session_id)
+
+        # Shared messaging channels must not auto-inject curated private
+        # MEMORY.md facts. They may still recall same-session turn history.
+        allow_curated_auto = self.allow_curated_memory(channel or None)
 
         # De-dup by content so the same memory from two recall paths
         # (vector vs keyword) isn't shown twice.
@@ -518,6 +553,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                         min_score=self._vector_min_score,
                         channel=channel or None,
                         chat_id=chat_id or None,
+                        include_curated=allow_curated_auto,
                     )
                 )
                 try:
@@ -535,6 +571,18 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                     score = r.get("score", 0)
                     if not content or content in seen_content:
                         continue
+                    source = str(r.get("source", "")).lower()
+                    # On shared channels, skip curated/private memory sources
+                    # in automatic injection. Explicit memory_search remains
+                    # available for intentional recall.
+                    if not allow_curated_auto and (
+                        source.startswith("vector/memory/")
+                        or source.startswith("vector/summary/")
+                        or "/memory/" in source
+                        or source.endswith("memory.md")
+                        or source.endswith("profile.md")
+                    ):
+                        continue
                     seen_content.add(content)
                     # Vector results carry the semantic score (0..1); boost
                     # their sort weight so semantic matches rank first.
@@ -543,10 +591,14 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 logger.debug("Prefetch vector recall failed: {}", e)
 
         # 2. Keyword recall (supplement) — daily-log token search.
+        # Prefer same-session logs when channel/chat_id are known so shared
+        # channels do not auto-surface other conversations.
         try:
             log_results = self._search_daily_logs(
                 query=search_query,
                 max_results=MAX_PREFETCH_RESULTS,
+                channel=channel or None,
+                chat_id=chat_id or None,
             )
             for r in log_results:
                 content = r.get("content", "")
@@ -601,10 +653,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         with self._vector_cache_lock:
             self._vector_cache.clear()
         if self._daily_log:
-            channel = ""
-            chat_id = ""
-            if session_id and ":" in session_id:
-                channel, chat_id = session_id.split(":", 1)
+            channel, chat_id = self._parse_session_parts(session_id)
             self._daily_log.append_turn(
                 user_content=user_content,
                 assistant_content=assistant_content,
@@ -613,10 +662,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             )
         # Index into long-term vector memory (fire-and-forget).
         if self._longterm is not None and (user_content or assistant_content):
-            channel = ""
-            chat_id = ""
-            if session_id and ":" in session_id:
-                channel, chat_id = session_id.split(":", 1)
+            channel, chat_id = self._parse_session_parts(session_id)
             meta = {"channel": channel, "chat_id": chat_id} if channel else {}
             if user_content:
                 self._longterm.index_async(user_content, "turn/user", meta)
@@ -864,7 +910,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
     async def summary_memory(
         self, messages: list, *, compact_summary: str = "", **kwargs
     ) -> str:
-        """Extract durable facts and write to MEMORY.md.
+        """Extract durable facts for long-term recall (vector + daily log).
 
         If ``compact_summary`` is provided (from ``compact_memory``), uses it
         as input instead of re-summarising raw messages — this avoids a
@@ -902,64 +948,25 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 summary = response.content or ""
                 summary = redact_sensitive_text(summary)
 
-                if summary and self._memory_store:
-                    try:
-                        from markbot.utils.constants import SINGLE_ENTRY_SOFT_LIMIT
-
-                        # Split the summary into reasonably-sized chunks
-                        # so a single LLM response cannot fill the entire
-                        # MEMORY.md budget in one entry.
-                        chunks = self._split_oversized_entry(
-                            summary, SINGLE_ENTRY_SOFT_LIMIT,
-                        )
-                        failures: list[str] = []
-                        for chunk in chunks:
-                            # Tag summary-derived entries so the eviction
-                            # path can distinguish them from manual writes.
-                            tagged = chunk
-                            if "[auto-summary]" not in tagged:
-                                tagged = f"{chunk}  [auto-summary]"
-                            result = self._memory_store.add("memory", tagged)
-                            if not result.get("success", False):
-                                # Budget full — try evicting old auto-summary
-                                # entries to make room, then retry once.
-                                if "limit" in (result.get("message", "") or "").lower():
-                                    self._memory_store.evict_oldest_matching(
-                                        "memory", "[auto-summary]", len(tagged) + 100,
-                                    )
-                                    result = self._memory_store.add("memory", tagged)
-                                if not result.get("success", False):
-                                    failures.append(result.get("message", "unknown"))
-                                    if "limit" in (failures[-1] or "").lower():
-                                        break
-                        if failures:
-                            logger.warning(
-                                "Some summary chunks failed to write: {}",
-                                failures,
-                            )
-                    except Exception as e:
-                        logger.warning("Failed to write summary to MemoryStore: {}", e)
+                if summary:
+                    # Durable facts extracted from conversation are indexed for
+                    # semantic recall and daily-log search. They are NOT written
+                    # into curated MEMORY.md by default — that store is reserved
+                    # for explicit memory_save / dream promotion / high-confidence
+                    # encoder entries so always-on context stays high-signal.
+                    self._persist_summary_facts(summary, to_curated=self.auto_summary_to_curated)
 
                 return summary
             except Exception as e:
                 logger.warning("summary_memory LLM failed: {}", e)
 
-        # Fallback: if we have a compact summary, write it directly;
+        # Fallback: if we have a compact summary, index it for recall;
         # otherwise truncate raw messages.
         if compact_summary:
-            if self._memory_store:
-                try:
-                    tagged = compact_summary
-                    if "[auto-summary]" not in tagged:
-                        tagged = f"{compact_summary}  [auto-summary]"
-                    result = self._memory_store.add("memory", tagged)
-                    if not result.get("success", False) and "limit" in (result.get("message", "") or "").lower():
-                        self._memory_store.evict_oldest_matching(
-                            "memory", "[auto-summary]", len(tagged) + 100,
-                        )
-                        self._memory_store.add("memory", tagged)
-                except Exception as e:
-                    logger.warning("Failed to write compact summary to MemoryStore: {}", e)
+            self._persist_summary_facts(
+                compact_summary,
+                to_curated=self.auto_summary_to_curated,
+            )
             return compact_summary
         return self._simple_truncation(messages, "")
 
@@ -988,8 +995,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             List of result dicts, or empty list.
         """
         results: list[dict] = []
+        # Shared messaging channels must not surface private curated memory
+        # (MEMORY.md / PROFILE.md) or the global main-session summary.
+        allow_curated = is_main_memory_session(channel)
 
-        # 1. Search daily logs
+        # 1. Search daily logs (session-scoped when channel/chat_id provided)
         if self._daily_log:
             try:
                 log_results = self._daily_log.search(
@@ -1002,8 +1012,8 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             except Exception as e:
                 logger.debug("Daily log search failed: {}", e)
 
-        # 2. Search MemoryStore entries
-        if self._memory_store:
+        # 2. Search MemoryStore entries (main/private sessions only)
+        if allow_curated and self._memory_store:
             try:
                 query_tokens = set(tokenize_for_search(query))
 
@@ -1025,8 +1035,8 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             except Exception as e:
                 logger.debug("MemoryStore search failed: {}", e)
 
-        # 3. Search compressed summary (global)
-        if self._compressed_summary:
+        # 3. Search compressed summary (global, main/private only)
+        if allow_curated and self._compressed_summary:
             try:
                 query_tokens = set(tokenize_for_search(query))
                 summary_tokens = set(tokenize_for_search(self._compressed_summary))
@@ -1043,7 +1053,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         session_key = make_session_key(channel, chat_id)
         if session_key:
             session_summary = self.get_compressed_summary(session_key=session_key)
-            if session_summary and session_summary != self._compressed_summary:
+            # Shared channels may only see their own per-session summary, never
+            # a fallback alias of the global main-session summary.
+            if session_summary and (
+                allow_curated or session_summary != self._compressed_summary
+            ):
                 try:
                     query_tokens = set(tokenize_for_search(query))
                     summary_tokens = set(tokenize_for_search(session_summary))
@@ -1078,6 +1092,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                         min_score=min(self._vector_min_score, 0.05),
                         channel=channel,
                         chat_id=chat_id,
+                        include_curated=allow_curated,
                     ),
                 )
                 vector_results = vec or []
@@ -1117,16 +1132,27 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         result = self._memory_store.add(target, content)
         return result.get("success", False)
 
-    async def delete_memory(self, memory_id: str, target: str = "memory") -> bool:
+    async def delete_memory(
+        self,
+        memory_id: str,
+        target: str = "memory",
+        *,
+        channel: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
         """Delete a memory entry (for MemoryForgetTool compatibility).
 
         Args:
             memory_id: ID or text identifying the entry to delete.
             target: 'memory' or 'user'.
+            channel: Optional channel for privacy gating.
+            session_id: Optional session key used when channel is omitted.
 
         Returns:
             True if successful.
         """
+        if not self.allow_curated_memory(channel, session_id=session_id):
+            return False
         if not self._memory_store:
             return False
         if target not in ("memory", "user"):
@@ -1134,16 +1160,27 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         result = self._memory_store.remove(target, memory_id)
         return result.get("success", False)
 
-    async def list_memories(self, limit: int = 20, target: str = "memory") -> list[dict]:
+    async def list_memories(
+        self,
+        limit: int = 20,
+        target: str = "memory",
+        *,
+        channel: str | None = None,
+        session_id: str | None = None,
+    ) -> list[dict]:
         """List recent memory entries (for MemoryListTool compatibility).
 
         Args:
             limit: Maximum number of entries.
             target: 'memory' or 'user'.
+            channel: Optional channel for privacy gating.
+            session_id: Optional session key used when channel is omitted.
 
         Returns:
             List of dicts with id, content, tags keys.
         """
+        if not self.allow_curated_memory(channel, session_id=session_id):
+            return []
         if not self._memory_store:
             return []
         if target not in ("memory", "user"):
@@ -1516,11 +1553,24 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         """Get path for per-session archived tail hash file."""
         safe_key = session_key.replace(":", "_").replace("/", "_")
         return Path(self.working_dir) / "memory" / f".archive_tail_{safe_key}"
-    def get_memory_context(self, query: str | None = None, *, session_key: str | None = None) -> str:
-        """Get formatted memory context for system prompt injection.
+    def get_memory_context(
+        self,
+        query: str | None = None,
+        *,
+        session_key: str | None = None,
+        channel: str | None = None,
+        include_curated: bool = False,
+    ) -> str:
+        """Get formatted memory context for per-turn injection.
 
-        Combines compressed summary and MemoryStore entries into a single
-        fenced block for consistent context isolation.
+        Default behaviour injects only the *session compressed summary*.
+        Curated MEMORY.md is loaded once via ContextBuilder bootstrap for
+        main sessions, so re-injecting the MemoryStore snapshot here would
+        duplicate always-on facts and waste tokens.
+
+        Set ``include_curated=True`` only for callers that intentionally
+        need a live MemoryStore snapshot (tests / specialized tools).
+        Shared messaging channels never receive curated always-on memory.
 
         Returns:
             Fenced context string, or empty string.
@@ -1528,15 +1578,30 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         parts: list[str] = []
 
         summary = self.get_compressed_summary(session_key=session_key)
+        # Only fall back to the global compressed summary on main/private
+        # sessions. Shared messaging channels must not inherit private
+        # main-session handoff notes.
         if not summary and session_key:
-            summary = self._compressed_summary
+            ch = channel
+            if ch is None and ":" in session_key:
+                ch = session_key.split(":", 1)[0]
+            if is_main_memory_session(ch):
+                summary = self._compressed_summary
         if summary:
             parts.append(f"## Compressed Summary\n\n{summary}")
 
-        # Use the raw snapshot (not the pre-fenced get_memory_context)
-        # so we can wrap everything in a single consistent fence.
-        if self._memory_store and self._memory_store.system_prompt_snapshot:
-            parts.append(self._memory_store.system_prompt_snapshot)
+        if include_curated and self._memory_store is not None:
+            ch = channel
+            if ch is None and session_key and ":" in session_key:
+                ch = session_key.split(":", 1)[0]
+            if is_main_memory_session(ch):
+                # Live snapshot (refreshed on writes) — not the raw file.
+                snap = self._memory_store.format_memory_prompt_block(
+                    include_memory=True,
+                    include_user=False,  # PROFILE.md is already essential bootstrap
+                )
+                if snap:
+                    parts.append(snap)
 
         if not parts:
             return ""
@@ -1657,6 +1722,64 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         return items
 
+
+    def _persist_summary_facts(self, summary: str, *, to_curated: bool = False) -> None:
+        """Persist durable-summary text without polluting curated MEMORY.md.
+
+        Always:
+          - index into long-term vector memory (source=summary/durable)
+          - append a short daily-log note for keyword recall
+        Optionally (to_curated=True only):
+          - write chunked [auto-summary] entries into MEMORY.md
+        """
+        text = (summary or "").strip()
+        if not text:
+            return
+
+        # 1) Vector index for semantic recall.
+        if self._longterm is not None:
+            try:
+                self._longterm.index_async(text, "summary/durable", {"kind": "auto_summary"})
+            except Exception as e:
+                logger.debug("summary vector index failed: {}", e)
+
+        # 2) Daily log for keyword search / audit trail.
+        if self._daily_log is not None:
+            try:
+                self._daily_log.append_turn(
+                    user_content="[Auto Summary]",
+                    assistant_content=text[:1500],
+                    channel="memory_summary",
+                    chat_id="auto",
+                )
+            except Exception as e:
+                logger.debug("summary daily log failed: {}", e)
+
+        if not to_curated or self._memory_store is None:
+            return
+
+        try:
+            from markbot.utils.constants import SINGLE_ENTRY_SOFT_LIMIT
+
+            chunks = self._split_oversized_entry(text, SINGLE_ENTRY_SOFT_LIMIT)
+            for chunk in chunks:
+                tagged = chunk if "[auto-summary]" in chunk else f"{chunk}  [auto-summary]"
+                result = self._memory_store.add("memory", tagged)
+                if not result.get("success", False):
+                    if "limit" in (result.get("message", "") or "").lower():
+                        self._memory_store.evict_oldest_matching(
+                            "memory", "[auto-summary]", len(tagged) + 100,
+                        )
+                        result = self._memory_store.add("memory", tagged)
+                    if not result.get("success", False):
+                        logger.warning(
+                            "auto-summary curated write failed: {}",
+                            result.get("message", "unknown"),
+                        )
+                        break
+        except Exception as e:
+            logger.warning("Failed to write summary to MemoryStore: {}", e)
+
     def consolidate_long_term(self) -> dict:
         """Run a consolidation sweep (dedup + promotion) on the vector index.
 
@@ -1668,14 +1791,26 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         embedder = self._longterm.embedder
 
         def _promote(content: str, source: str) -> None:
-            # Promote frequently-recalled content into curated MEMORY.md
-            # so it becomes part of the always-injected system prompt.
-            if self._memory_store is not None and content:
-                try:
-                    tagged = f"{content}  [auto-promoted from {source}]"
-                    self._memory_store.add("memory", tagged)
-                except Exception as e:
-                    logger.debug("Auto-promote to MEMORY.md failed: {}", e)
+            # Promote only high-signal sources into curated MEMORY.md.
+            # Turn transcripts and raw delegations stay in the vector index.
+            if self._memory_store is None or not content:
+                return
+            src = (source or "").lower()
+            if not (
+                src.startswith("memory/")
+                or src.startswith("summary/")
+                or src.startswith("profile")
+                or src.startswith("user")
+            ):
+                return
+            # Avoid promoting already-tagged process noise.
+            if "[auto-summary]" in content or "[auto-promoted" in content:
+                return
+            try:
+                tagged = f"{content.strip()}  [auto-promoted from {source}]"
+                self._memory_store.add("memory", tagged)
+            except Exception as e:
+                logger.debug("Auto-promote to MEMORY.md failed: {}", e)
 
         try:
             report = self._consolidator.run(embedder, promote_cb=_promote)
@@ -1780,11 +1915,19 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         self,
         query: str,
         max_results: int = 5,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> list[dict]:
-        """Search daily log files by keyword."""
+        """Search daily log files by keyword with optional session filter."""
         if not self._daily_log:
             return []
-        return self._daily_log.search(query=query, max_results=max_results)
+        return self._daily_log.search(
+            query=query,
+            max_results=max_results,
+            channel=channel,
+            chat_id=chat_id,
+        )
 
     # -- Compressed summary persistence -------------------------------------
 

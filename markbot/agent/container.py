@@ -142,6 +142,8 @@ class AgentContext:
     task_tracker: "TaskTracker | None" = None
     memory_encoder: "MemoryEncoder | None" = None
     app_state: "AppStateProvider | None" = None
+    profile: Any = None
+    permission_approver: Any = None
 
     # ------------------------------------------------------------------
     # Cache layer (see markbot.agent.{prefix_cache,llm_response_cache,
@@ -342,8 +344,9 @@ class AgentContext:
             fallback_manager, compaction_config, budget_config,
             max_budget_usd, warn_threshold_usd, timings,
         )
+        profile = cls._resolve_profile(config)
         tools, skill_registry, guardrail_manager = cls._build_tools_and_skills(
-            workspace, timings,
+            workspace, timings, profile=profile, config=config,
         )
         sessions, subagents, mcp = cls._build_sessions_subagents_mcp(
             fallback_manager, config, workspace, bus, model,
@@ -363,13 +366,15 @@ class AgentContext:
         binder = cls._build_tool_binder(
             tools, workspace, restrict_to_workspace, resolved_configs, config,
             cron_service, subagents, memory_manager, skill_registry, timezone, bus, timings,
+            profile=profile,
         )
         logger.info("Agent has {} tools available", len(tools))
         pipeline, daily_log, interaction_log = cls._build_pipeline(
             binder, memory_manager, sessions, workspace,
         )
         session_ext = cls._build_session_extensions(
-            workspace, memory_manager, mcp, tools, timings, config,
+            workspace, memory_manager, mcp, tools, timings, config, profile=profile,
+            question_tool=binder.question_tool, bus=bus,
         )
 
         timings["total"] = time.time() - _init_start
@@ -423,6 +428,8 @@ class AgentContext:
             task_tracker=session_ext["task_tracker"],
             memory_encoder=session_ext["memory_encoder"],
             app_state=session_ext["app_state"],
+            profile=profile,
+            permission_approver=session_ext.get("permission_approver"),
             # ------------------------------------------------------------------
             # Cache layer — always construct fresh per process so the
             # cross-session disk cache in prompt_persist is the only
@@ -511,9 +518,23 @@ class AgentContext:
         return compactor, cost_tracker
 
     @staticmethod
+    def _resolve_profile(config: "Config | None") -> Any:
+        """Resolve the runtime profile from config (default: coding)."""
+        from markbot.config.profile import get_profile
+
+        name = None
+        try:
+            name = config.agents.defaults.profile if config else None
+        except AttributeError:
+            name = None
+        return get_profile(name)
+
+    @staticmethod
     def _build_tools_and_skills(
         workspace: Path | None,
         timings: dict[str, float],
+        profile: Any = None,
+        config: "Config | None" = None,
     ) -> tuple[Any, Any, Any]:
         """Build ToolRegistry, SkillRegistry, and guardrail manager."""
         from markbot.skills import SkillRegistry as _SR
@@ -525,7 +546,26 @@ class AgentContext:
         timings["tools"] = time.time() - _t0
 
         _t0 = time.time()
-        skill_registry = _SR(workspace, tool_registry=tools)
+        min_score = 0.0
+        hide_stale = True
+        try:
+            skills_cfg = getattr(config.tools, "skills", None) if config else None
+            if skills_cfg is not None:
+                min_score = float(getattr(skills_cfg, "min_score", 0.0) or 0.0)
+                hide_stale = bool(getattr(skills_cfg, "hide_stale", True))
+        except Exception:
+            pass
+        if profile is not None:
+            min_score = max(min_score, float(getattr(profile, "min_skill_score", 0.0) or 0.0))
+            if getattr(profile, "hide_stale_skills", False):
+                hide_stale = True
+
+        skill_registry = _SR(
+            workspace,
+            tool_registry=tools,
+            min_score=min_score,
+            hide_stale=hide_stale,
+        )
         skill_registry.load_all()
         timings["skill_registry"] = time.time() - _t0
 
@@ -630,9 +670,14 @@ class AgentContext:
             consolidation_enabled=getattr(memory_cfg, "consolidation_enabled", True),
             consolidation_dedup_threshold=getattr(memory_cfg, "consolidation_dedup_threshold", 0.95),
             consolidation_age_decay_days=getattr(memory_cfg, "consolidation_age_decay_days", 90.0),
-            consolidation_promote_access=getattr(memory_cfg, "consolidation_promote_access", 5),
+            consolidation_promote_access=getattr(memory_cfg, "consolidation_promote_access", 8),
             provider_config=getattr(memory_cfg, "provider_config", None),
         )
+        # Optional override: allow auto summaries into curated MEMORY.md.
+        if hasattr(memory_manager, "auto_summary_to_curated"):
+            memory_manager.auto_summary_to_curated = bool(
+                getattr(memory_cfg, "auto_summary_to_curated", False)
+            )
         timings["memory_manager"] = time.time() - _t0
         return memory_manager
 
@@ -691,6 +736,7 @@ class AgentContext:
         timezone: str | None,
         bus: "MessageBus",
         timings: dict[str, float],
+        profile: Any = None,
     ) -> Any:
         """Build and register all tools via ToolBinder."""
         from markbot.agent.tool_binder import ToolBinder as _TB
@@ -714,6 +760,7 @@ class AgentContext:
             skill_registry=skill_registry,
             timezone=timezone,
             publish_outbound=bus.publish_outbound,
+            profile=profile,
         )
         binder.register_all()
         timings["tool_binder"] = time.time() - _t0
@@ -761,8 +808,12 @@ class AgentContext:
         tools: "ToolRegistry",
         timings: dict[str, float],
         config: "Config | None" = None,
+        profile: Any = None,
+        question_tool: Any = None,
+        bus: "MessageBus | None" = None,
     ) -> dict[str, Any]:
         """Build handoff, task tracker, memory encoder, bootstrap, commands."""
+        from markbot.agent.permission_approval import PermissionApprover as _PA
         from markbot.cli.slash_commands import CommandRouter as _CR
         from markbot.cli.slash_commands import register_builtin_commands as _rbc
         from markbot.agent.services.executor import ToolExecutor as _TE
@@ -778,21 +829,34 @@ class AgentContext:
         task_tracker = _TT(workspace)
         memory_encoder = _ME(workspace, memory_store=getattr(memory_manager, "_memory_store", None))
         app_state = _ASP.initialize()
-        # Apply the configured default permission mode so interactive turns
-        # start in the mode the user chose (schema default is ``auto`` so
-        # mutating tools work out of the box). ``/mode`` still overrides at
-        # runtime; cron/autopilot/heartbeat force AUTO via process_direct.
-        # The ``!= "default"`` skip avoids a redundant call when the user
-        # explicitly opts into ``default`` (which leaves AppStateProvider at
-        # its own DEFAULT — they take responsibility for wiring a UI
-        # confirmation handler for the ``ask`` permission decision).
+
+        # Permission mode precedence:
+        # 1) explicit agents.defaults.default_permission_mode
+        # 2) profile.permission_mode
+        # 3) AppState DEFAULT
         configured_mode = None
         try:
             configured_mode = config.agents.defaults.default_permission_mode if config else None
         except AttributeError:
             configured_mode = None
-        if configured_mode and configured_mode != "default":
-            app_state.set_permission_mode(_PM(configured_mode))
+        if not configured_mode and profile is not None:
+            configured_mode = getattr(profile, "permission_mode", None)
+        if configured_mode:
+            try:
+                app_state.set_permission_mode(_PM(configured_mode))
+            except Exception:
+                # Accept both enum values and string aliases.
+                try:
+                    app_state.set_permission_mode(_PM(str(configured_mode)))
+                except Exception as exc:
+                    logger.warning("Invalid permission mode {!r}: {}", configured_mode, exc)
+
+        # Wire interactive permission approver for DEFAULT/ask mode.
+        send_cb = bus.publish_outbound if bus is not None else None
+        permission_approver = _PA(send_callback=send_cb, question_tool=question_tool)
+        if hasattr(tools, "set_permission_approver"):
+            tools.set_permission_approver(permission_approver)
+
         session_bootstrap = _SB(
             workspace,
             handoff_manager=handoff_manager,
@@ -811,6 +875,7 @@ class AgentContext:
             "session_bootstrap": session_bootstrap,
             "commands": commands,
             "tool_executor": tool_executor,
+            "permission_approver": permission_approver,
         }
 
     def record_timing(self, component: str, elapsed_s: float) -> None:

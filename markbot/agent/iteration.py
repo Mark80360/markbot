@@ -629,6 +629,10 @@ class IterationRunner:
             logger.debug("Failed to read app permission state: {}", exc)
         return PermissionMode.DEFAULT, ToolPermissionContext(mode=PermissionMode.DEFAULT)
 
+    def _is_non_interactive(self) -> bool:
+        """Unattended callers pass permission_mode_override and should not block on ask."""
+        return self.permission_mode_override is not None
+
     def _is_read_only_call(self, name: str, params: Any) -> bool:
         """Conservatively classify a tool call as read-only for batching.
 
@@ -955,26 +959,49 @@ class IterationRunner:
             return
 
         context_parts: list[str] = []
+        seen_snippets: set[str] = set()
+
+        def _remember_snippet(text: str) -> None:
+            # Track coarse fingerprints so prefetch / summary / forced search
+            # do not inject the same fact three times in one turn.
+            for line in text.splitlines():
+                s = line.strip().lower()
+                if len(s) >= 24:
+                    seen_snippets.add(s[:240])
+
+        def _is_duplicate_block(text: str) -> bool:
+            lines = [ln.strip().lower() for ln in text.splitlines() if len(ln.strip()) >= 24]
+            if not lines:
+                return False
+            hits = sum(1 for ln in lines if ln[:240] in seen_snippets)
+            return hits >= max(1, len(lines) // 2)
 
         if memory_manager and hasattr(memory_manager, "prefetch"):
             try:
                 session_id = self.session_key or ""
                 prefetch_ctx = memory_manager.prefetch(user_text, session_id=session_id)
-                if prefetch_ctx and prefetch_ctx.strip():
+                if prefetch_ctx and prefetch_ctx.strip() and not _is_duplicate_block(prefetch_ctx):
                     context_parts.append(prefetch_ctx)
+                    _remember_snippet(prefetch_ctx)
                     logger.info("Memory prefetch context assembled")
             except Exception as e:
                 logger.warning("Memory prefetch failed: {}", e)
 
         if memory_manager and hasattr(memory_manager, "get_memory_context"):
             try:
+                # Curated MEMORY.md is bootstrap-only for main sessions.
+                # Here we only inject the session compressed summary to
+                # avoid double-loading MEMORY.md every turn.
                 memory_ctx = memory_manager.get_memory_context(
                     query=user_text,
                     session_key=self.session_key,
+                    channel=self.channel,
+                    include_curated=False,
                 )
-                if memory_ctx and memory_ctx.strip():
+                if memory_ctx and memory_ctx.strip() and not _is_duplicate_block(memory_ctx):
                     context_parts.append(memory_ctx)
-                    logger.info("Memory context assembled (summary + store)")
+                    _remember_snippet(memory_ctx)
+                    logger.info("Memory context assembled (session summary)")
             except Exception as e:
                 logger.warning("Memory context injection failed: {}", e)
 
@@ -982,8 +1009,9 @@ class IterationRunner:
             try:
                 if user_text:
                     forced_ctx = await mem_tool.get_forced_context(user_text)
-                    if forced_ctx:
+                    if forced_ctx and not _is_duplicate_block(forced_ctx):
                         context_parts.append(forced_ctx)
+                        _remember_snippet(forced_ctx)
                         logger.info("Forced memory search context assembled")
             except Exception as e:
                 logger.warning("Forced memory search failed: {}", e)
@@ -2679,7 +2707,7 @@ class IterationRunner:
                         workspace=str(self.loop.workspace),
                         permission_mode=permission_mode,
                         tool_permission_context=permission_context,
-                        is_non_interactive=False,
+                        is_non_interactive=self._is_non_interactive(),
                         channel=self.channel,
                         chat_id=self.chat_id,
                         message_id=self.message_id,
@@ -2769,7 +2797,7 @@ class IterationRunner:
             workspace=str(self.loop.workspace),
             permission_mode=permission_mode,
             tool_permission_context=permission_context,
-            is_non_interactive=False,
+            is_non_interactive=self._is_non_interactive(),
             channel=self.channel,
             chat_id=self.chat_id,
             message_id=self.message_id,

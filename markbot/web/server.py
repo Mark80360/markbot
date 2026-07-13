@@ -77,7 +77,13 @@ def _build_app():
         provider = make_provider(config)
 
         cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-        cron = CronService(cron_store_path)
+        reliability = getattr(config, "reliability", None)
+        cron = CronService(
+            cron_store_path,
+            max_retries=getattr(reliability, "cron_max_retries", 2),
+            retry_delay_s=getattr(reliability, "cron_retry_delay_s", 5.0),
+            dead_letter_keep=getattr(reliability, "dead_letter_keep", 50),
+        )
 
         session_manager = SessionManager(config.workspace_path)
 
@@ -131,9 +137,24 @@ def _build_app():
             finally:
                 if isinstance(cron_tool, CronTool) and cron_token is not None:
                     cron_tool.reset_cron_context(cron_token)
-            return resp.content if resp else ""
+            response = (resp.content if resp else "") or ""
+            lowered = response.lower()
+            if (
+                response.startswith("Sorry, I encountered an error")
+                or "models in chain failed" in lowered
+                or "error calling the ai model" in lowered
+                or "budget exceeded" in lowered
+            ):
+                raise RuntimeError(f"cron agent failure: {response[:500]}")
+            return response
+
+        async def _on_cron_failure(job: CronJob, error: str) -> None:
+            if reliability is not None and not getattr(reliability, "notify_on_failure", True):
+                return
+            _log.warning("Cron job '{}' failed after retries: {}", job.name, error)
 
         cron.on_job = _on_cron_job
+        cron.on_failure = _on_cron_failure
 
         # Start the cron timer so scheduled jobs actually fire in web mode
         await cron.start()

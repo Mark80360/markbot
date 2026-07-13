@@ -32,7 +32,8 @@ class TestAgentDefaults:
         assert ad.temperature == 0.1
         assert ad.max_tool_iterations == 40
         assert ad.timezone == "UTC"
-        assert ad.default_permission_mode == "default"
+        assert ad.default_permission_mode is None  # inherit from profile
+        assert ad.profile == "coding"
 
     def test_custom_values(self):
         ad = AgentDefaults(max_tokens=4096, temperature=0.5)
@@ -175,6 +176,9 @@ class TestExecToolConfig:
         assert etc.timeout == 60
         assert etc.allowed_internal_ips == []
         assert etc.restrict_to_workspace is True
+        assert etc.require_allowlist is False
+        assert etc.allow_patterns == []
+        assert etc.deny_patterns == []
 
 
 class TestFilesystemToolConfig:
@@ -354,7 +358,7 @@ class TestUpdateConfigValue:
         cfg.write_text("{}", encoding="utf-8")
         # Prime the cache
         load_config(cfg)
-        assert loader_mod._current_config.agents.defaults.default_permission_mode == "default"
+        assert loader_mod._current_config.agents.defaults.default_permission_mode is None
         update_config_value(
             ["agents", "defaults", "defaultPermissionMode"], "auto",
             config_path=cfg,

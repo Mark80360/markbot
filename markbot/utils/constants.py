@@ -7,12 +7,36 @@ search, filesystem, explore, and other tools.
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Memory file constants (canonical definitions 鈥?import from here)
+# Memory file constants (canonical definitions — import from here)
 # ---------------------------------------------------------------------------
 MEMORY_FILENAME: str = "MEMORY.md"
 USER_FILENAME: str = "PROFILE.md"
 DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
 DEFAULT_USER_CHAR_LIMIT: int = 2000
+
+# Channels where curated MEMORY.md may be auto-loaded into the system prompt.
+# Shared / messaging channels must not receive private long-term memory.
+MAIN_MEMORY_CHANNELS: frozenset[str] = frozenset({
+    "cli",
+    "web",
+    "api",
+    "test",
+    "local",
+})
+
+# Messaging / shared channels where MEMORY.md always-on injection is forbidden.
+SHARED_MEMORY_CHANNELS: frozenset[str] = frozenset({
+    "dingtalk",
+    "feishu",
+    "qq",
+    "weixin",
+    "wechat",
+    "email",
+    "telegram",
+    "discord",
+    "slack",
+    "group",
+})
 
 # Standard directories to ignore in file operations (comprehensive list)
 IGNORE_DIRS = frozenset({
@@ -226,25 +250,25 @@ DEFAULT_COMPACTION_THRESHOLD: float = 0.75
 
 # -- Memory system constants ------------------------------------------------
 
-# Default character limits for MemoryStore entries
-DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
-DEFAULT_USER_CHAR_LIMIT: int = 2000
-
 # Maximum prefetch results per turn
 MAX_PREFETCH_RESULTS: int = 3
 
 # Minimum relevance score for prefetch recall
 MIN_PREFETCH_SCORE: float = 0.15
 
-# Maximum entries in MemoryStore before cleanup hint
+# Maximum entries in MemoryStore before cleanup / rejection
 MAX_MEMORY_ENTRIES: int = 100
 MAX_USER_ENTRIES: int = 50
+
+# Access-count threshold for promoting vector hits into curated MEMORY.md.
+# Higher than historical default (5) so process noise does not leak in.
+DEFAULT_CONSOLIDATION_PROMOTE_ACCESS: int = 8
 
 # Memory security scanner cooldown (seconds) between same-pattern detections
 MEMORY_SCANNER_COOLDOWN: int = 300
 
-# Frozen snapshot refresh interval (turns)
-MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 10
+# Frozen snapshot refresh interval (successful curated writes)
+MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 1
 
 # Context fencing tags
 MEMORY_CONTEXT_TAG_OPEN: str = "<memory-context>"
@@ -259,8 +283,35 @@ DREAM_BACKUP_KEEP: int = 5
 # entire MemoryStore budget.
 SINGLE_ENTRY_SOFT_LIMIT: int = 1500
 
+# Whether automatic conversation summaries may write into curated MEMORY.md.
+# Default False: summaries go to daily logs + vector index; only explicit
+# memory_save / dream promotion / high-confidence encoder writes land in
+# MEMORY.md.
+MEMORY_AUTO_SUMMARY_TO_CURATED: bool = False
+
 # Agent idle timeout in minutes. When no inbound message is received for
 # any session within this window, a timeout notification is sent back and
 # the session's resources (active tasks, locks, scrubber state) are
 # cleaned up. Set to 0 to disable idle timeout.
 AGENT_IDLE_TIMEOUT_MINUTES: int = 30
+
+
+def is_main_memory_session(channel: str | None) -> bool:
+    """Return True when curated MEMORY.md may be always-on injected.
+
+    Main/local surfaces (cli/web/api/test/local) are trusted private sessions.
+    Explicit shared/messaging channels are rejected. Empty/None channels default
+    to main-session behaviour for local tooling compatibility. Any other
+    unrecognized channel name fails closed (no curated always-on / search).
+    """
+    if not channel:
+        return True
+    name = str(channel).strip().lower()
+    if not name:
+        return True
+    if name in SHARED_MEMORY_CHANNELS:
+        return False
+    if name in MAIN_MEMORY_CHANNELS:
+        return True
+    # Unrecognized names are treated as shared/untrusted.
+    return False

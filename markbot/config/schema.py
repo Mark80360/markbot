@@ -42,20 +42,21 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
-    default_permission_mode: Literal["default", "plan", "accept_edits", "auto", "bypass_permissions"] = Field(
-        "auto",
+    profile: Literal["coding", "assistant", "unattended"] = Field(
+        "coding",
+        description=(
+            "Runtime profile controlling default tool surface, permission mode, "
+            "and skill quality filters. coding=dev workflows; assistant=interactive "
+            "personal assistant with confirmation; unattended=cron/heartbeat/autopilot."
+        ),
+    )
+    default_permission_mode: Literal["default", "plan", "accept_edits", "auto", "bypass_permissions"] | None = Field(
+        None,
         description=(
             "Permission mode applied to AppStateProvider at gateway startup. "
-            "Interactive ``/mode`` commands still override this at runtime, but "
-            "the value here is what interactive turns fall back to after a "
-            "restart. Note: cron / autopilot / heartbeat paths force AUTO via "
-            "process_direct(permission_mode=...) and are unaffected. "
-            "The default is ``auto`` because the iteration→registry path has "
-            "no interactive confirmation dialog yet: in ``default`` mode "
-            "non-read-only tools would return 'Permission required' and the "
-            "agent could not mutate files or run shell commands. Switch to "
-            "``default`` only after wiring a UI confirmation handler for the "
-            "``ask`` permission decision."
+            "None inherits the selected profile default (coding/unattended→auto, "
+            "assistant→default). Interactive ``/mode`` still overrides at runtime. "
+            "Cron/autopilot/heartbeat force AUTO via process_direct."
         ),
     )
     auxiliary_vision: "AuxiliaryVisionConfig" = Field(
@@ -275,6 +276,21 @@ class ExecToolConfig(Base):
         default=True,
         description="If true, block shell commands that reference paths outside the working directory",
     )
+    require_allowlist: bool = Field(
+        default=False,
+        description=(
+            "If true, only commands matching allow_patterns may run. "
+            "When false and allow_patterns is empty, deny_patterns alone apply."
+        ),
+    )
+    allow_patterns: list[str] = Field(
+        default_factory=list,
+        description="Optional allowlist regexes. Used when non-empty or require_allowlist=True.",
+    )
+    deny_patterns: list[str] = Field(
+        default_factory=list,
+        description="Extra deny regexes merged with built-in dangerous command patterns.",
+    )
     path_append: str = ""
     allowed_internal_ips: list[str] = Field(
         default_factory=list,
@@ -415,9 +431,19 @@ class MemoryToolsConfig(Base):
         description="Half-life for age-based importance decay; older rarely-recalled records decay faster."
     )
     consolidation_promote_access: int = Field(
-        default=5,
+        default=8,
         ge=1,
-        description="access_count above which a record is proposed for promotion to MEMORY.md."
+        description=(
+            "access_count above which a high-signal record may be proposed for "
+            "promotion to MEMORY.md. Turn transcripts are never auto-promoted."
+        ),
+    )
+    auto_summary_to_curated: bool = Field(
+        default=False,
+        description=(
+            "If true, automatic conversation summaries may write into curated "
+            "MEMORY.md. Default false: summaries go to daily logs + vector index only."
+        ),
     )
     # -- Force-search knobs (previously orphaned getattr defaults) ---------
     force_memory_search: bool = Field(
@@ -583,6 +609,52 @@ class AuxiliaryVisionConfig(Base):
     )
 
 
+class SkillsConfig(Base):
+    """Skill loading and quality gates."""
+
+    min_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum SkillImprover score for non-builtin skills to appear in the "
+            "skills index / always-active set. 0 disables the gate. Profiles may "
+            "raise this further."
+        ),
+    )
+    hide_stale: bool = Field(
+        default=True,
+        description="Hide stale/archived skills from the default skills index.",
+    )
+
+
+class ReliabilityConfig(Base):
+    """Background job reliability (cron / heartbeat)."""
+
+    cron_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Extra retries after the first failed cron job attempt",
+    )
+    cron_retry_delay_s: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=300.0,
+        description="Base delay between cron retries (linear backoff multiplier applied)",
+    )
+    dead_letter_keep: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        description="Max dead-letter failure records retained on disk",
+    )
+    notify_on_failure: bool = Field(
+        default=True,
+        description="Notify the job's channel when retries are exhausted",
+    )
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -593,6 +665,7 @@ class ToolsConfig(Base):
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
     restrict_to_workspace: bool = True  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
@@ -747,6 +820,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
 

@@ -158,7 +158,13 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     session_manager = SessionManager(config.workspace_path)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-    cron = CronService(cron_store_path)
+    reliability = getattr(config, "reliability", None)
+    cron = CronService(
+        cron_store_path,
+        max_retries=getattr(reliability, "cron_max_retries", 2),
+        retry_delay_s=getattr(reliability, "cron_retry_delay_s", 5.0),
+        dead_letter_keep=getattr(reliability, "dead_letter_keep", 50),
+    )
 
     agent = AgentLoop(
         ctx_or_bus=bus,
@@ -183,6 +189,28 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         warn_threshold_usd=config.budget.warn_threshold_usd,
         budget_config=config.budget if config.budget.enabled else None,
     )
+
+    
+    async def on_cron_failure(job: CronJob, error: str) -> None:
+        """Notify user when cron retries are exhausted."""
+        if reliability is not None and not getattr(reliability, "notify_on_failure", True):
+            return
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+        summary = (
+            f"[Cron Failure] Job '{job.name}' failed after retries.\n"
+            f"Error: {error}\n"
+            f"Instruction: {job.payload.message[:300]}"
+        )
+        try:
+            from markbot.bus.events import OutboundMessage
+            await bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=summary)
+            )
+        except Exception as exc:
+            logger.warning("Failed to publish cron failure notice: {}", exc)
+
+    cron.on_failure = on_cron_failure
 
     async def on_cron_job(job: CronJob) -> str | None:
         from markbot.schedule.evaluator import evaluate_response
@@ -214,7 +242,19 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             cron_session.retain_recent_legal_suffix(8)
             agent.sessions.save(cron_session)
 
-        response = resp.content if resp else ""
+        response = (resp.content if resp else "") or ""
+
+        # Surface hard model/runtime failures so CronService can retry and
+        # dead-letter instead of marking the job "ok" with an error string.
+        failure_markers = (
+            "All ",
+            "error calling the AI model",
+            "models in chain failed",
+            "Budget exceeded",
+        )
+        lowered = response.lower()
+        if any(m.lower() in lowered for m in failure_markers) or response.startswith("Sorry, I encountered an error"):
+            raise RuntimeError(f"cron agent failure: {response[:500]}")
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:

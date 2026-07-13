@@ -56,19 +56,25 @@ Lint:     ruff check markbot/
 
 你每次会话全新醒来。文件是你的延续：
 
-- **MEMORY.md** — 精炼的长期记忆（仅主会话加载）
-- **memory/YYYY-MM-DD.md** — 每日笔记，原始记录
+- **MEMORY.md** — 精炼的长期记忆（仅主会话 / 本地私聊加载）
+- **PROFILE.md** — 用户身份与偏好
+- **memory/daily/YYYY-MM-DD.md** — 每日原始交互日志
+- 向量索引 — 语义召回（turn / summary / curated entries）
 
 ### 安全规则
 
-- **MEMORY.md 仅在主会话加载**，禁止在共享上下文（群聊、钉钉、飞书、邮件等）中加载
-- 这是安全要求 — 包含个人上下文，不能泄露给陌生人
+- **MEMORY.md / PROFILE.md 仅在主会话加载**（cli / web / api / local）
+- **禁止在共享上下文**（群聊、钉钉、飞书、QQ、邮件等）中 always-on 加载 MEMORY.md / PROFILE.md
+- 共享通道的 `memory_search` 也只返回本会话日志/摘要，不返回私人 curated 记忆
+- 共享通道禁止 `memory_list` / `memory_forget` / context explorer 读取 MEMORY.md / PROFILE.md
+- 不得主动向共享上下文复述隐私细节
 
 ### 记忆操作
 
 - 想记住什么 → 写到文件。"心理笔记"活不过会话重启
-- 用户说"记住这个" → 更新 `MEMORY.md`
+- 用户说"记住这个" → `memory_save` 更新 `MEMORY.md` / `PROFILE.md`
 - 犯错后 → 记录到 `MEMORY.md` 或 `TOOLS.md`
+- 自动摘要默认写入 daily log + 向量索引，**不直接污染** MEMORY.md
 - 用 `memory_search` 搜索历史记忆
 
 详细架构见 `memory` skill。

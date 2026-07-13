@@ -221,6 +221,20 @@ class AgentLoop:
                 compactor.set_todo_tool(todo_tool)
         if self._memory_search_tool:
             self._memory_search_tool.set_session_context(channel, chat_id)
+        # Propagate channel privacy context to curated memory tools and
+        # context-explorer tools so shared channels cannot list/load
+        # MEMORY.md / PROFILE.md content.
+        for name in (
+            "memory_list",
+            "memory_forget",
+            "memory_save",
+            "explore_context_catalog",
+            "search_context",
+            "load_context",
+        ):
+            tool = self.tools.get(name) if self.tools else None
+            if tool is not None and hasattr(tool, "set_session_context"):
+                tool.set_session_context(channel, chat_id)
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -412,6 +426,20 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
+
+            # Permission / question replies must NOT take the per-session lock.
+            # Approval waits inside an in-flight turn that already holds the
+            # lock; if the reply also waits on that lock the turn deadlocks
+            # until the approval timeout. Resolve these short-circuit replies
+            # concurrently via the pipeline middleware only.
+            if self._is_pending_question_reply(msg):
+                task = asyncio.create_task(self._dispatch_unlocked(msg))
+                self._track_task(msg.session_key, task)
+                task.add_done_callback(
+                    lambda t, k=msg.session_key: self._untrack_task(k, t)
+                )
+                continue
+
             task = asyncio.create_task(self._dispatch(msg))
             self._track_task(msg.session_key, task)
             task.add_done_callback(
@@ -629,6 +657,49 @@ class AgentLoop:
         self._session_failure_state.pop(session_key, None)
 
         logger.info("Cleaned up state for idle session {}", session_key)
+
+    def _is_pending_question_reply(self, msg: InboundMessage) -> bool:
+        """Return True if this inbound is answering a pending ask/approval.
+
+        Used to route the reply outside the per-session lock so the waiting
+        tool turn can observe it.
+        """
+        meta = msg.metadata or {}
+        qid = meta.get("question_id")
+        if not qid:
+            content = (msg.content or "").strip()
+            if content.startswith("[Q:") and "]" in content:
+                try:
+                    qid = content.split("[Q:", 1)[1].split("]", 1)[0].strip()
+                except (IndexError, AttributeError):
+                    qid = None
+        if not qid:
+            return False
+
+        question_tool = getattr(self, "question_tool", None)
+        pending = getattr(question_tool, "_pending_questions", None) or {}
+        if qid in pending:
+            return True
+
+        approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+        if approver is not None and qid in getattr(approver, "_pending", {}):
+            return True
+        return False
+
+    async def _dispatch_unlocked(self, msg: InboundMessage) -> None:
+        """Process a message without the per-session lock (question replies)."""
+        gate = self._concurrency_gate or nullcontext()
+        async with gate:
+            try:
+                response = await self._process_message(msg)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Error processing unlocked reply for session {}", msg.session_key
+                )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""

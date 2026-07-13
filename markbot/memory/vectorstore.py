@@ -439,7 +439,14 @@ class SQLiteVectorStore(VectorStore):
         self._enforce_max_records()
 
     def _enforce_max_records(self) -> None:
-        """Evict oldest records when over capacity (LRU by created_at)."""
+        """Evict lowest-importance records when over capacity.
+
+        Importance approximation used by SQL (no python loop):
+          - low access_count first
+          - then older created_at
+        This is a practical stand-in for Consolidator.importance() and
+        keeps the working set biased toward frequently recalled facts.
+        """
         try:
             cur = self._write_conn.execute("SELECT COUNT(*) FROM records")
             total = cur.fetchone()[0]
@@ -448,21 +455,24 @@ class SQLiteVectorStore(VectorStore):
         if total <= self._max_records:
             return
         excess = total - self._max_records
-        # Delete the oldest records, but prefer low-access_count ones when
-        # created_at ties (importance-aware eviction).
         with self._write_lock:
             self._write_conn.execute(
                 """
                 DELETE FROM records WHERE id IN (
                     SELECT id FROM records
-                    ORDER BY access_count ASC, created_at ASC
+                    ORDER BY
+                        access_count ASC,
+                        created_at ASC
                     LIMIT ?
                 )
                 """,
                 (excess,),
             )
             self._write_conn.commit()
-        logger.debug("VectorStore LRU evicted {} records (was {})", excess, total)
+        logger.debug(
+            "VectorStore importance-LRU evicted {} records (was {})",
+            excess, total,
+        )
 
     def query(
         self,

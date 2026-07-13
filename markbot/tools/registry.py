@@ -32,6 +32,10 @@ class ToolRegistry:
             Callable[[BaseTool, dict, ToolContext], PermissionDecision]
         ] = []
         self._definitions_cache: list[dict[str, Any]] | None = None
+        # Optional interactive approver. When set, ``ask`` decisions wait for
+        # a real user yes/no instead of returning a text instruction to the
+        # model. Signature: async (tool_name, params, context, reason) -> bool
+        self._permission_approver: Callable | None = None
 
     def _invalidate_cache(self) -> None:
         self._definitions_cache = None
@@ -127,6 +131,15 @@ class ToolRegistry:
         """Add a permission handler."""
         self._permission_handlers.append(handler)
 
+    def set_permission_approver(self, approver: Callable | None) -> None:
+        """Set interactive permission approver for ``ask`` decisions.
+
+        The approver should be an async callable:
+        ``(tool_name: str, params: dict, context: ToolContext, reason: str) -> bool``.
+        Returning True allows the tool; False denies it.
+        """
+        self._permission_approver = approver
+
     async def check_permission(
         self,
         tool: BaseTool,
@@ -202,12 +215,34 @@ class ToolRegistry:
             return f"Error: Tool '{name}' execution denied."
 
         if decision.behavior == "ask":
-            reason = f" Reason: {decision.reason}" if decision.reason else ""
-            return (
-                f"Permission required: Tool '{name}' was not executed.{reason} "
-                "Ask the user for explicit approval, or switch to a mode/profile "
-                "that permits this tool."
-            )
+            reason = decision.reason or "This tool requires confirmation before running."
+            # Non-interactive callers (cron/autopilot/tests without approver)
+            # cannot block on a human; deny rather than silently allowing.
+            if context.is_non_interactive and self._permission_approver is None:
+                return (
+                    f"Error: Tool '{name}' requires confirmation but the session "
+                    f"is non-interactive. Reason: {reason}"
+                )
+            if self._permission_approver is None:
+                return (
+                    f"Permission required: Tool '{name}' was not executed. "
+                    f"Reason: {reason} "
+                    "No interactive approval channel is configured. "
+                    "Use /mode auto for unattended runs, or enable an approver."
+                )
+            try:
+                approved = self._permission_approver(name, params, context, reason)
+                if hasattr(approved, "__await__"):
+                    approved = await approved
+            except Exception as e:
+                logger.error("Permission approver failed for {}: {}", name, e)
+                return f"Error: Permission approval failed for '{name}': {e}"
+            if not approved:
+                return (
+                    f"Error: Tool '{name}' execution denied by user. "
+                    f"Reason: {reason}"
+                )
+            # User approved — fall through to execute.
 
         # Update params if modified by permission check
         if decision.updated_input:

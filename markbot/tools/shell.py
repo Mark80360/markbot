@@ -31,15 +31,23 @@ class ExecTool(Tool):
         working_dir: str | None = None,
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
-        restrict_to_workspace: bool = False,
+        restrict_to_workspace: bool = True,
+        require_allowlist: bool = False,
         path_append: str = "",
         allowed_internal_ips: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or DANGEROUS_COMMAND_PATTERNS
+        # Always keep built-in deny patterns; append any user extras.
+        base_deny = list(DANGEROUS_COMMAND_PATTERNS)
+        if deny_patterns:
+            for p in deny_patterns:
+                if p not in base_deny:
+                    base_deny.append(p)
+        self.deny_patterns = base_deny
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.require_allowlist = require_allowlist
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
         self._cmd_timestamps: defaultdict[str, list[float]] = defaultdict(list)
@@ -262,7 +270,20 @@ class ExecTool(Tool):
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
-        if self.allow_patterns:
+        # Shell metacharacter / interpreter chaining that commonly bypasses
+        # simple command denylists. This is still best-effort, not a sandbox.
+        if self._looks_like_shell_injection(cmd):
+            return (
+                "Error: Command blocked by safety guard "
+                "(shell chaining / interpreter injection detected)"
+            )
+
+        if self.allow_patterns or self.require_allowlist:
+            if not self.allow_patterns:
+                return (
+                    "Error: Command blocked by safety guard "
+                    "(allowlist required but empty — configure tools.exec.allow_patterns)"
+                )
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
@@ -321,7 +342,39 @@ class ExecTool(Tool):
         return None
 
     @staticmethod
+    def _looks_like_shell_injection(command: str) -> bool:
+        """Heuristic block for common shell-injection bypasses.
+
+        Not a complete sandbox. Prefer containers / OS sandbox for hard isolation.
+        """
+        lower = command.lower()
+        # Nested shells / remote code execution via interpreters
+        nested = [
+            r"\bbash\s+-c\b",
+            r"\bsh\s+-c\b",
+            r"\bzsh\s+-c\b",
+            r"\bpython(?:3)?\s+-c\b",
+            r"\bperl\s+-e\b",
+            r"\bruby\s+-e\b",
+            r"\bnode\s+-e\b",
+            r"\bpowershell\b.*-enc(?:odedcommand)?\b",
+            r"/dev/tcp/",
+            r"\bprocess\.popen\b",
+            r"\bos\.system\b",
+            r"`[^`]+`",
+            r"\$\([^)]+\)",
+        ]
+        for pat in nested:
+            if re.search(pat, lower):
+                return True
+        # Command substitution / process substitution
+        if "$(" in command or "`" in command or "<(" in command or ">(" in command:
+            return True
+        return False
+
+    @staticmethod
     def _looks_like_path(s: str) -> bool:
+
         s = s.strip()
         if not s:
             return False
