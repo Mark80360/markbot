@@ -130,6 +130,8 @@ def _get_task_id(context: ToolContext) -> str:
 class BrowserNavigateTool(Tool):
     """Navigate to a URL in the browser."""
 
+    _is_read_only = True
+
     @property
     def name(self) -> str:
         return "browser_navigate"
@@ -184,7 +186,17 @@ class BrowserNavigateTool(Tool):
                     return f"Error: redirect blocked - {err}"
             status = response.status if response else "unknown"
             title = await page.title()
-            return f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
+            # Return navigation status + compact snapshot so the model can
+            # immediately interact without a separate browser_snapshot call.
+            snapshot = await page.accessibility.snapshot()
+            snapshot_text = _format_snapshot_tree(snapshot) if snapshot else ""
+            header = f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
+            if snapshot_text:
+                max_chars = 8000
+                if len(snapshot_text) > max_chars:
+                    snapshot_text = snapshot_text[:max_chars] + f"\n... (truncated, {len(snapshot_text)} total chars)"
+                return f"{header}\n\n{snapshot_text}"
+            return header
         except Exception as e:
             return f"Navigation error: {e}"
 
@@ -223,9 +235,7 @@ class BrowserSnapshotTool(Tool):
             if not snapshot:
                 return "No accessibility tree available"
 
-            lines: list[str] = []
-            _format_snapshot(snapshot, lines, depth=0)
-            result = "\n".join(lines)
+            result = _format_snapshot_tree(snapshot)
 
             max_chars = 8000
             if len(result) > max_chars:
@@ -256,6 +266,13 @@ def _format_snapshot(node: dict, lines: list[str], depth: int) -> None:
         _format_snapshot(child, lines, depth + 1)
 
 
+def _format_snapshot_tree(snapshot: dict) -> str:
+    """Format an accessibility snapshot tree into a readable string."""
+    lines: list[str] = []
+    _format_snapshot(snapshot, lines, depth=0)
+    return "\n".join(lines)
+
+
 class BrowserClickTool(Tool):
     """Click an element on the page."""
 
@@ -268,7 +285,7 @@ class BrowserClickTool(Tool):
         return (
             "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). "
             "The ref IDs are shown in square brackets in the snapshot output. "
-            "Requires browser_navigate and browser_snapshot to be called first."
+            "Requires browser_navigate to be called first (which returns a snapshot with ref IDs)."
         )
 
     @property
@@ -342,7 +359,7 @@ class BrowserTypeTool(Tool):
         return (
             "Type text into an input field identified by its ref ID. "
             "Clears the field first, then types the new text. "
-            "Requires browser_navigate and browser_snapshot to be called first."
+            "Requires browser_navigate to be called first (which returns a snapshot with ref IDs)."
         )
 
     @property
@@ -384,6 +401,8 @@ class BrowserTypeTool(Tool):
 
 class BrowserScrollTool(Tool):
     """Scroll the page."""
+
+    _is_read_only = True
 
     @property
     def name(self) -> str:
@@ -472,6 +491,8 @@ class BrowserPressTool(Tool):
 
 class BrowserBackTool(Tool):
     """Navigate back in browser history."""
+
+    _is_read_only = True
 
     @property
     def name(self) -> str:

@@ -79,13 +79,14 @@ def normalize_timezone(tz: str | None) -> str:
     if not tz:
         return "UTC"
 
+    from loguru import logger
     from zoneinfo import ZoneInfo
 
     try:
         ZoneInfo(tz)
         return tz
     except (KeyError, Exception):
-        pass
+        logger.opt(exception=True).debug("Timezone '{}' is not a valid IANA name, trying offset map", tz)
 
     _OFFSET_MAP: dict[str, str] = {
         "UTC-12": "Etc/GMT+12", "UTC-11": "Pacific/Pago_Pago",
@@ -115,9 +116,8 @@ def normalize_timezone(tz: str | None) -> str:
             ZoneInfo(normalized)
             return normalized
         except (KeyError, Exception):
-            pass
+            logger.opt(exception=True).debug("Timezone '{}' offset-mapped name '{}' failed to validate", tz, normalized)
 
-    from loguru import logger
     logger.warning("Unrecognised timezone '{}', falling back to UTC", tz)
     return "UTC"
 
@@ -198,14 +198,23 @@ def build_assistant_message(
     Ensures ``content`` is never ``None`` — normalises to empty string.
     This prevents downstream crashes in serialisation / compaction / context-checking
     paths that assume content is always iterable or string-castable.
+
+    ``reasoning_content`` is **always** written to the message, even when the
+    model didn't return any reasoning on this turn (we substitute an empty
+    string). Thinking-mode providers such as DeepSeek V4+ and Kimi K2 reject
+    subsequent turns with HTTP 400 ``reasoning_content must be passed back``
+    when the field is missing entirely once thinking mode is on, so the
+    explicit empty string is the safest acknowledgement. See debug session
+    ``markbot-multimodal-chain-fail``.
     """
     if content is None:
         content = ""
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
-    if reasoning_content is not None:
-        msg["reasoning_content"] = reasoning_content
+    # Always emit ``reasoning_content``; substitute "" when absent so the
+    # provider sees a stable shape across turns.
+    msg["reasoning_content"] = reasoning_content if reasoning_content is not None else ""
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks
     return msg
@@ -274,7 +283,10 @@ def build_status_content(
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Recurses into subdirectories (e.g. ``agents/``), preserving structure.
+    """
     from importlib.resources import files as pkg_files
     try:
         tpl = pkg_files("markbot") / "templates"
@@ -292,9 +304,16 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
-    for item in tpl.iterdir():
-        if item.name.endswith(".md") and not item.name.startswith("."):
-            _write(item, workspace / item.name)
+    def _sync_dir(src_dir, dest_dir: Path):
+        for item in src_dir.iterdir():
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                _sync_dir(item, dest_dir / item.name)
+            elif item.is_file() and item.name.endswith(".md"):
+                _write(item, dest_dir / item.name)
+
+    _sync_dir(tpl, workspace)
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:

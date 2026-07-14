@@ -28,6 +28,7 @@ from markbot.autopilot.verification import (
     run_verification_steps,
     verification_passed,
 )
+from markbot.types.permission import PermissionMode
 
 if TYPE_CHECKING:
     from markbot.agent.loop import AgentLoop
@@ -108,23 +109,16 @@ def _render_run_report(
 class AutopilotService:
     """Orchestrate the autopilot pipeline within a MarkBot workspace."""
 
-    def __init__(self, store: AutopilotStore) -> None:
+    def __init__(self, store: AutopilotStore, agent_loop: "AgentLoop") -> None:
         self._store = store
-        self._agent_loop: AgentLoop | None = None
+        self._agent_loop = agent_loop
 
     @property
     def store(self) -> AutopilotStore:
         return self._store
 
-    def bind_agent_loop(self, agent_loop: AgentLoop) -> None:
-        self._agent_loop = agent_loop
-
-    def _ensure_agent_loop(self) -> AgentLoop:
-        if self._agent_loop is None:
-            raise RuntimeError(
-                "AutopilotService requires an AgentLoop "
-                "to be bound via bind_agent_loop()"
-            )
+    @property
+    def agent_loop(self) -> "AgentLoop":
         return self._agent_loop
 
     async def intake(
@@ -222,12 +216,13 @@ class AutopilotService:
             )
 
             try:
-                agent_loop = self._ensure_agent_loop()
+                agent_loop = self._agent_loop
                 response = await agent_loop.process_direct(
                     prompt,
                     session_key=f"autopilot:{card.id}",
                     channel="autopilot",
                     chat_id=card.id,
+                    permission_mode=PermissionMode.AUTO,
                 )
                 assistant_summary = response.content if response else ""
             except Exception as exc:

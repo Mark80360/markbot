@@ -42,6 +42,27 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    profile: Literal["coding", "assistant", "unattended"] = Field(
+        "coding",
+        description=(
+            "Runtime profile controlling default tool surface, permission mode, "
+            "and skill quality filters. coding=dev workflows; assistant=interactive "
+            "personal assistant with confirmation; unattended=cron/heartbeat/autopilot."
+        ),
+    )
+    default_permission_mode: Literal["default", "plan", "accept_edits", "auto", "bypass_permissions"] | None = Field(
+        None,
+        description=(
+            "Permission mode applied to AppStateProvider at gateway startup. "
+            "None inherits the selected profile default (coding/unattended→auto, "
+            "assistant→default). Interactive ``/mode`` still overrides at runtime. "
+            "Cron/autopilot/heartbeat force AUTO via process_direct."
+        ),
+    )
+    auxiliary_vision: "AuxiliaryVisionConfig" = Field(
+        default_factory=lambda: AuxiliaryVisionConfig(),
+        description="Auxiliary vision model for non-vision primary models",
+    )
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -65,6 +86,54 @@ class ModelConfig(Base):
     context_window: int = Field(65536, ge=1024, description="Context window size")
     temperature: float | None = Field(None, ge=0.0, le=2.0, description="Override default temperature")
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(None, description="Reasoning effort level")
+    capabilities: list[str] = Field(
+        default_factory=lambda: ["text"],
+        description=(
+            "Declared model capabilities. Drives capability-aware routing in the fallback chain "
+            "(e.g. per-model image stripping) and selection in feature-specific tool calls. "
+            "Allowed values: text, image (vision input / 识图), image_edit, image_generate, "
+            "video, audio, music, embedding, tool_use."
+        ),
+    )
+
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def _normalize_capabilities(cls, v: Any) -> list[str]:
+        """Accept a comma-separated string, single string, or list; lowercase + dedupe + validate enum.
+
+        String forms are split on commas so users can write
+        ``capabilities: "text, image"`` in YAML / ``.markbot/config.json``
+        without converting to a list first.
+        """
+        allowed = {
+            "text", "image", "image_edit", "image_generate",
+            "video", "audio", "music", "embedding", "tool_use",
+        }
+        if v is None or v == "":
+            return ["text"]
+        if isinstance(v, str):
+            items = [chunk for chunk in v.split(",") if chunk.strip()]
+        elif isinstance(v, list):
+            items = [str(x) for x in v]
+        else:
+            raise ValueError(f"capabilities must be a string or list of strings, got {type(v).__name__}")
+        out: list[str] = []
+        for raw in items:
+            tag = raw.strip().lower()
+            if not tag:
+                continue
+            if tag not in allowed:
+                raise ValueError(
+                    f"Unknown capability {raw!r}; allowed: {sorted(allowed)}"
+                )
+            if tag not in out:
+                out.append(tag)
+        return out or ["text"]
+
+    def has_capability(self, cap: str) -> bool:
+        """Return True if *cap* (case-insensitive) is declared."""
+        want = cap.strip().lower()
+        return any(c.lower() == want for c in self.capabilities)
 
 
 class ProviderConfig(Base):
@@ -175,7 +244,7 @@ class HeartbeatConfig(Base):
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
@@ -203,6 +272,25 @@ class ExecToolConfig(Base):
 
     enable: bool = True
     timeout: int = 60
+    restrict_to_workspace: bool = Field(
+        default=True,
+        description="If true, block shell commands that reference paths outside the working directory",
+    )
+    require_allowlist: bool = Field(
+        default=False,
+        description=(
+            "If true, only commands matching allow_patterns may run. "
+            "When false and allow_patterns is empty, deny_patterns alone apply."
+        ),
+    )
+    allow_patterns: list[str] = Field(
+        default_factory=list,
+        description="Optional allowlist regexes. Used when non-empty or require_allowlist=True.",
+    )
+    deny_patterns: list[str] = Field(
+        default_factory=list,
+        description="Extra deny regexes merged with built-in dangerous command patterns.",
+    )
     path_append: str = ""
     allowed_internal_ips: list[str] = Field(
         default_factory=list,
@@ -306,6 +394,11 @@ class MemoryToolsConfig(Base):
         ge=100,
         description="Hard cap on stored vectors; oldest low-importance records are evicted (LRU) past this."
     )
+    vector_max_scan_records: int = Field(
+        default=20_000,
+        ge=100,
+        description="Maximum vectors loaded into RAM for one SQLite vector query. Use Chroma for larger corpora."
+    )
     vector_min_content_chars: int = Field(
         default=12,
         description="Minimum content length (chars) to index as a vector; shorter text is skipped."
@@ -338,9 +431,19 @@ class MemoryToolsConfig(Base):
         description="Half-life for age-based importance decay; older rarely-recalled records decay faster."
     )
     consolidation_promote_access: int = Field(
-        default=5,
+        default=8,
         ge=1,
-        description="access_count above which a record is proposed for promotion to MEMORY.md."
+        description=(
+            "access_count above which a high-signal record may be proposed for "
+            "promotion to MEMORY.md. Turn transcripts are never auto-promoted."
+        ),
+    )
+    auto_summary_to_curated: bool = Field(
+        default=False,
+        description=(
+            "If true, automatic conversation summaries may write into curated "
+            "MEMORY.md. Default false: summaries go to daily logs + vector index only."
+        ),
     )
     # -- Force-search knobs (previously orphaned getattr defaults) ---------
     force_memory_search: bool = Field(
@@ -356,6 +459,11 @@ class MemoryToolsConfig(Base):
         default=0.3,
         ge=0.0,
         description="Minimum score for forced memory search injection."
+    )
+    daily_log_retention_days: int = Field(
+        default=30,
+        ge=0,
+        description="Days to retain raw memory/daily interaction logs; 0 disables pruning."
     )
     # -- Compaction ratios (previously orphaned getattr defaults) ---------
     memory_compact_ratio: float = Field(
@@ -383,6 +491,7 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    enabled: bool = True  # If False, server is skipped during connection
 
 class ComputerUseConfig(Base):
     """Computer use (desktop control) tool configuration."""
@@ -466,7 +575,17 @@ class BrowserConfig(Base):
 
 
 class AuxiliaryVisionConfig(Base):
-    """Auxiliary vision model configuration for pre-analyzing screenshots."""
+    """Auxiliary vision model configuration for pre-analyzing screenshots.
+
+    When the main model in the model chain cannot process images (e.g.
+    DeepSeek, Groq text-only models), screenshots from ``computer_use`` are
+    sent to the auxiliary vision model for description. The resulting text
+    description is fed back to the main model, preserving visual context
+    without requiring the main model to support image input.
+
+    Set ``provider`` + ``model`` to activate; leave empty to fall back to
+    the tool's text_summary downgrade (lossy).
+    """
 
     force_text_only: bool = Field(
         default=False,
@@ -474,11 +593,65 @@ class AuxiliaryVisionConfig(Base):
     )
     provider: str = Field(
         default="",
-        description="Provider for auxiliary vision model (empty = use same provider as main model)",
+        description=(
+            "Provider ID for the auxiliary vision model (e.g. 'openai', 'anthropic', "
+            "'dashscope'). Must match a configured provider in `providers`. "
+            "Empty = use text_summary fallback when main model lacks vision."
+        ),
     )
     model: str = Field(
         default="",
-        description="Model name for auxiliary vision (empty = use main model)",
+        description=(
+            "Model name for the auxiliary vision call (e.g. 'gpt-4o', 'claude-3-5-sonnet', "
+            "'qwen2.5-vl-72b-instruct'). Must be a vision-capable model. "
+            "Empty = use text_summary fallback."
+        ),
+    )
+
+
+class SkillsConfig(Base):
+    """Skill loading and quality gates."""
+
+    min_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum SkillImprover score for non-builtin skills to appear in the "
+            "skills index / always-active set. 0 disables the gate. Profiles may "
+            "raise this further."
+        ),
+    )
+    hide_stale: bool = Field(
+        default=True,
+        description="Hide stale/archived skills from the default skills index.",
+    )
+
+
+class ReliabilityConfig(Base):
+    """Background job reliability (cron / heartbeat)."""
+
+    cron_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Extra retries after the first failed cron job attempt",
+    )
+    cron_retry_delay_s: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=300.0,
+        description="Base delay between cron retries (linear backoff multiplier applied)",
+    )
+    dead_letter_keep: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        description="Max dead-letter failure records retained on disk",
+    )
+    notify_on_failure: bool = Field(
+        default=True,
+        description="Notify the job's channel when retries are exhausted",
     )
 
 
@@ -492,7 +665,8 @@ class ToolsConfig(Base):
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    restrict_to_workspace: bool = True  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
@@ -646,9 +820,9 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
-    auxiliary_vision: AuxiliaryVisionConfig = Field(default_factory=AuxiliaryVisionConfig)
 
     @property
     def workspace_path(self) -> Path:

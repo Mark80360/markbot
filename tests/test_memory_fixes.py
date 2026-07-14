@@ -248,19 +248,29 @@ class TestCJKTokenize:
 
 
 class TestSummaryMemorySplitting:
-    def test_oversized_summary_split_into_chunks(self, tmp_path: Path):
+    def test_oversized_summary_split_into_chunks_when_curated_enabled(self, tmp_path: Path):
         mgr = _make_manager(tmp_path)
-        mgr._memory_store = None
         mgr._started = True
         mgr._memory_store = _MemoryStoreSentinel(tmp_path)  # type: ignore[assignment]
+        mgr.auto_summary_to_curated = True
 
         huge = "bullet " * 1000  # ~6000 chars
         mgr._fallback_manager = _FakeFallback(reply=huge)
 
         _run(mgr.summary_memory(messages=[{"role": "user", "content": "hi"}]))
 
-        # The single LLM reply should have been split into multiple entries.
+        # Only when curated writes are explicitly enabled should the single
+        # LLM reply be split into multiple MEMORY.md entries.
         assert len(mgr._memory_store.added) >= 2
+
+    def test_summary_defaults_to_non_curated(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        mgr._started = True
+        mgr._memory_store = _MemoryStoreSentinel(tmp_path)  # type: ignore[assignment]
+        mgr.auto_summary_to_curated = False
+        mgr._fallback_manager = _FakeFallback(reply="durable fact about postgres")
+        _run(mgr.summary_memory(messages=[{"role": "user", "content": "hi"}]))
+        assert mgr._memory_store.added == []
 
 
 class _MemoryStoreSentinel:
@@ -474,3 +484,332 @@ class TestCheckContextTokens:
         # respects the configured max_input_length.
         assert isinstance(is_valid, bool)
         assert isinstance(to_compact, list)
+
+
+# ---------------------------------------------------------------------------
+# 2026-07 memory fixes
+# ---------------------------------------------------------------------------
+
+
+class TestMaxCompressedSummaryChars:
+    """Fix: MAX_COMPRESSED_SUMMARY_CHARS reduced to 20k to prevent feedback loop."""
+
+    def test_summary_cap_is_modest(self):
+        from markbot.utils.constants import MAX_COMPRESSED_SUMMARY_CHARS
+        assert MAX_COMPRESSED_SUMMARY_CHARS <= 20_000
+
+    def test_compact_memory_truncates_to_new_cap(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        long_text = "X" * 50_000
+        result = _run(mgr.compact_memory(
+            messages=[{"role": "user", "content": long_text}],
+        ))
+        assert len(result) <= 20_000 + 600  # cap + prefix overhead
+
+
+class TestDailyLogRetention:
+    """Fix: DailyLogManager prunes old daily log files."""
+
+    def test_prune_removes_old_files(self, tmp_path: Path):
+        from markbot.memory.daily_log import DailyLogManager
+        import time as _time
+
+        mgr = DailyLogManager(workspace=tmp_path, retention_days=7)
+        old_file = mgr.daily_dir / "2020-01-01.md"
+        old_file.write_text("# old\n", encoding="utf-8")
+        # Set mtime to 30 days ago
+        old_time = _time.time() - 30 * 86400
+        import os
+        os.utime(old_file, (old_time, old_time))
+
+        removed = mgr.prune_old_logs()
+        assert removed == 1
+        assert not old_file.exists()
+
+    def test_prune_keeps_recent_files(self, tmp_path: Path):
+        from markbot.memory.daily_log import DailyLogManager
+        from datetime import datetime
+
+        mgr = DailyLogManager(workspace=tmp_path, retention_days=7)
+        recent_file = mgr.daily_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+        recent_file.write_text("# recent\n", encoding="utf-8")
+        removed = mgr.prune_old_logs()
+        assert removed == 0
+        assert recent_file.exists()
+
+    def test_prune_uses_filename_date_before_mtime(self, tmp_path: Path):
+        from markbot.memory.daily_log import DailyLogManager
+
+        mgr = DailyLogManager(workspace=tmp_path, retention_days=7)
+        old_named = mgr.daily_dir / "2020-01-01.md"
+        old_named.write_text("# old but recently touched\n", encoding="utf-8")
+        removed = mgr.prune_old_logs()
+        assert removed == 1
+        assert not old_named.exists()
+
+    def test_retention_zero_disables_prune(self, tmp_path: Path):
+        from markbot.memory.daily_log import DailyLogManager
+        import time as _time, os
+
+        mgr = DailyLogManager(workspace=tmp_path, retention_days=0)
+        old_file = mgr.daily_dir / "2020-01-01.md"
+        old_file.write_text("# old\n", encoding="utf-8")
+        old_time = _time.time() - 365 * 86400
+        os.utime(old_file, (old_time, old_time))
+        assert mgr.prune_old_logs() == 0
+        assert old_file.exists()
+
+
+class TestVectorSearchCache:
+    """Fix: per-turn vector search cache eliminates redundant scans."""
+
+    def test_cache_returns_same_result_within_ttl(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        from markbot.memory.longterm import LongTermMemory
+        from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import InMemoryVectorStore
+
+        ltm = LongTermMemory(
+            tmp_path,
+            embedder=HashingEmbedder(),
+            vectorstore=InMemoryVectorStore(),
+        )
+        ltm.index("hello world from a test", "test")
+        mgr._longterm = ltm
+
+        r1 = mgr._cached_vector_search("hello", max_results=5, min_score=0.0)
+        r2 = mgr._cached_vector_search("hello", max_results=5, min_score=0.0)
+        assert r1 is r2  # same object — cached
+
+    def test_cache_cleared_on_sync_turn(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        from markbot.memory.longterm import LongTermMemory
+        from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import InMemoryVectorStore
+
+        ltm = LongTermMemory(
+            tmp_path,
+            embedder=HashingEmbedder(),
+            vectorstore=InMemoryVectorStore(),
+        )
+        ltm.index("hello world", "test")
+        mgr._longterm = ltm
+
+        mgr._cached_vector_search("hello", max_results=5, min_score=0.0)
+        assert len(mgr._vector_cache) == 1
+        mgr.sync_turn("user msg", "assistant msg", session_id="cli:test")
+        assert len(mgr._vector_cache) == 0
+
+    def test_prefetch_uses_current_query_before_queued_query(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        calls: list[str] = []
+        mgr._longterm = object()
+        mgr._prefetch_query = "old queued query"
+
+        def fake_search(query: str, **kwargs):
+            calls.append(query)
+            return []
+
+        mgr._cached_vector_search = fake_search  # type: ignore[method-assign]
+        mgr.prefetch("current user query", session_id="cli:test")
+        assert calls == ["current user query"]
+
+
+class TestArchivedTailHash:
+    """Fix: content-addressed high-water mark replaces positional count."""
+
+    def test_tail_hash_persists_and_reloads(self, tmp_path: Path):
+        mgr = _make_manager(tmp_path)
+        mgr.set_archived_tail_hash("abc123", session_key="cli_test")
+        assert mgr.get_archived_tail_hash(session_key="cli_test") == "abc123"
+
+        # New manager reloads from disk
+        mgr2 = _make_manager(tmp_path)
+        assert mgr2.get_archived_tail_hash(session_key="cli_test") == "abc123"
+
+    def test_content_hash_stable(self):
+        from markbot.agent.hooks.compaction import _message_content_hash
+        h1 = _message_content_hash({"role": "user", "content": "hello"})
+        h2 = _message_content_hash({"role": "user", "content": "hello"})
+        assert h1 == h2
+        h3 = _message_content_hash({"role": "assistant", "content": "hello"})
+        assert h1 != h3  # role matters
+
+    def test_missing_tail_hash_does_not_skip_candidates(self):
+        from markbot.agent.hooks.compaction import _skip_archived_by_tail
+        messages = [
+            {"role": "user", "content": "new user message"},
+            {"role": "assistant", "content": "new assistant message"},
+        ]
+        filtered, skipped, found = _skip_archived_by_tail(messages, "missing")
+        assert filtered == messages
+        assert skipped == 0
+        assert found is False
+
+    def test_found_tail_hash_skips_prefix(self):
+        from markbot.agent.hooks.compaction import _message_content_hash, _skip_archived_by_tail
+        messages = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "tail"},
+            {"role": "user", "content": "new"},
+        ]
+        tail = _message_content_hash(messages[1])
+        filtered, skipped, found = _skip_archived_by_tail(messages, tail)
+        assert filtered == messages[2:]
+        assert skipped == 2
+        assert found is True
+
+
+class TestAutoSummaryEviction:
+    """Fix: summary_memory evicts old auto-summary entries to make room."""
+
+    def test_evict_oldest_matching(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+        store = MemoryStore(working_dir=tmp_path)
+        store.add("memory", "manual entry — keep me")
+        store.add("memory", "auto chunk 1  [auto-summary]")
+        store.add("memory", "auto chunk 2  [auto-summary]")
+        evicted = store.evict_oldest_matching("memory", "[auto-summary]", 20)
+        assert evicted >= 1
+        entries = store.read("memory")["entries"]
+        assert any("keep me" in e for e in entries)
+        # At least one auto-summary entry was removed
+        auto_count = sum(1 for e in entries if "[auto-summary]" in e)
+        assert auto_count < 2
+
+    def test_evict_does_not_touch_manual_entries(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+        store = MemoryStore(working_dir=tmp_path)
+        store.add("memory", "manual entry one")
+        store.add("memory", "manual entry two")
+        evicted = store.evict_oldest_matching("memory", "[auto-summary]", 100)
+        assert evicted == 0
+        assert len(store.read("memory")["entries"]) == 2
+
+
+class TestConsolidatorBlockwiseDedup:
+    """Fix: consolidator dedup is blockwise, not O(n²) full matrix."""
+
+    def test_dedup_removes_near_duplicates(self, tmp_path: Path):
+        from markbot.memory.consolidation import Consolidator, ConsolidationConfig
+        from markbot.memory.vectorstore import InMemoryVectorStore
+        from markbot.memory.embedder import HashingEmbedder
+
+        store = InMemoryVectorStore()
+        emb = HashingEmbedder()
+        # Insert two near-identical records
+        store.upsert(type("R", (), {
+            "id": "a", "content": "hello world test", "vector": emb.embed_one("hello world test"),
+            "source": "test", "metadata": {}, "created_at": 1.0, "access_count": 1,
+        })())
+        store.upsert(type("R", (), {
+            "id": "b", "content": "hello world test", "vector": emb.embed_one("hello world test"),
+            "source": "test", "metadata": {}, "created_at": 2.0, "access_count": 1,
+        })())
+        config = ConsolidationConfig(dedup_threshold=0.99, min_records_for_dedup=0)
+        cons = Consolidator(store, config)
+        report = cons.run(emb)
+        assert report.deduped >= 1
+
+
+class TestSQLiteMaxScanRecords:
+    """Fix: SQLiteVectorStore.query caps loaded records."""
+
+    def test_query_with_scan_cap(self, tmp_path: Path):
+        from markbot.memory.vectorstore import SQLiteVectorStore
+        from markbot.memory.embedder import HashingEmbedder
+
+        store = SQLiteVectorStore(tmp_path / "test.db", max_records=100, max_scan_records=5)
+        emb = HashingEmbedder()
+        for i in range(10):
+            from markbot.memory.vectorstore import VectorRecord
+            store.upsert(VectorRecord(
+                id=f"rec_{i}", content=f"content {i}", vector=emb.embed_one(f"content {i}"),
+                source="test", metadata={},
+            ))
+        results = store.query(emb.embed_one("content 0"), top_k=3)
+        # With max_scan_records=5, query loads at most 5 records
+        assert len(results) <= 5
+        store.close()
+
+    def test_query_with_source_respects_scan_cap(self, tmp_path: Path):
+        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
+        from markbot.memory.embedder import HashingEmbedder
+
+        store = SQLiteVectorStore(tmp_path / "test_source.db", max_records=100, max_scan_records=5)
+        emb = HashingEmbedder()
+        for i in range(10):
+            store.upsert(VectorRecord(
+                id=f"same_source_{i}", content=f"source content {i}",
+                vector=emb.embed_one(f"source content {i}"),
+                source="same", metadata={},
+            ))
+        results = store.query(emb.embed_one("source content"), top_k=10, source="same")
+        assert len(results) <= 5
+        store.close()
+
+    def test_query_metadata_filter_applies_before_scan_cap(self, tmp_path: Path):
+        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
+        from markbot.memory.embedder import HashingEmbedder
+
+        store = SQLiteVectorStore(tmp_path / "test_meta.db", max_records=100, max_scan_records=5)
+        emb = HashingEmbedder()
+        for i in range(10):
+            store.upsert(VectorRecord(
+                id=f"global_{i}", content=f"global content {i}",
+                vector=emb.embed_one(f"global content {i}"),
+                source="test", metadata={"channel": "global"}, access_count=100,
+            ))
+        store.upsert(VectorRecord(
+            id="target", content="needle content",
+            vector=emb.embed_one("needle content"),
+            source="test", metadata={"channel": "target"}, access_count=0,
+        ))
+        results = store.query(
+            emb.embed_one("needle content"), top_k=5,
+            filter_metadata={"channel": "target"},
+        )
+        assert [r.id for r in results] == ["target"]
+        store.close()
+
+
+class TestEncoderMinConfidence:
+    """Fix: MemoryEncoder requires confidence >= 2 before writing."""
+
+    def test_confidence_1_does_not_write(self, tmp_path: Path):
+        from markbot.memory.encoder import MemoryEncoder, PatternMatch
+        enc = MemoryEncoder(workspace=tmp_path)
+        matches = [PatternMatch(
+            pattern_type="preference", content="I like tea",
+            raw_text="I like tea", confidence=1,
+        )]
+        encoded = enc.encode_preferences(matches)
+        assert encoded == 0
+        assert not (tmp_path / "PROFILE.md").exists()
+
+    def test_confidence_2_writes(self, tmp_path: Path):
+        from markbot.memory.encoder import MemoryEncoder, PatternMatch
+        enc = MemoryEncoder(workspace=tmp_path)
+        matches = [PatternMatch(
+            pattern_type="preference", content="I like tea",
+            raw_text="I like tea", confidence=2,
+        )]
+        encoded = enc.encode_preferences(matches)
+        assert encoded == 1
+        assert (tmp_path / "PROFILE.md").exists()
+
+    def test_confidence_2_promotes_inside_cooldown(self, tmp_path: Path):
+        from markbot.memory.encoder import MemoryEncoder, PatternMatch
+        enc = MemoryEncoder(workspace=tmp_path)
+        first = [PatternMatch(
+            pattern_type="preference", content="use concise answers",
+            raw_text="always use concise answers", confidence=1,
+        )]
+        assert enc.encode_preferences(first) == 0
+
+        repeated = [PatternMatch(
+            pattern_type="preference", content="use concise answers",
+            raw_text="always use concise answers", confidence=2,
+        )]
+        assert enc.encode_preferences(repeated) == 1
+        assert (tmp_path / "PROFILE.md").exists()

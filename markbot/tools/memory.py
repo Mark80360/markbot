@@ -21,6 +21,8 @@ class MemorySearchTool(Tool):
     """Search agent memory (MEMORY.md, PROFILE.md, daily logs) semantically.
 
     Use this tool before answering questions about prior work, decisions,
+
+    _is_read_only = True
     dates, people, preferences, or todos. Returns top relevant snippets.
 
     When ``force_memory_search`` is enabled on the manager, this tool also

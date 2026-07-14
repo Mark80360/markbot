@@ -23,14 +23,117 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from markbot.bus.events import make_session_key
+
 from markbot.agent.tokens import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
     from markbot.memory.base import BaseMemoryManager
 
-MEMORY_COMPACT_KEEP_RECENT = 4
-
+_MEMORY_COMPACT_KEEP_RECENT = 4
 _COMPACTED_MARKER = "_markbot_compacted"
+
+
+def _message_content_hash(m: dict) -> str:
+    """Stable short hash of a message's textual content.
+
+    Used as a content-addressed high-water mark for archived messages so
+    the skip logic is robust to insertion/deletion between turns (unlike
+    a positional count, which drifts when MultiLevelCompactor snips
+    messages or the history is reloaded with different framing).
+
+    Includes ``tool_calls`` (OpenAI-style top-level field) and
+    ``tool_use`` / ``tool_result`` content blocks so two assistant
+    messages with empty text but distinct tool calls don't collide.
+    Without this, every ``{"role":"assistant","content":"","tool_calls":[...]}``
+    would hash to ``sha256("assistant:")`` and ``_skip_archived_by_tail``
+    could match an early false positive, skipping un-archived messages
+    in the middle (data loss).
+    """
+    import hashlib
+    role = m.get("role", "")
+    content = m.get("content", "")
+
+    # Normalise content (string or list of blocks) into a single string.
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                parts.append(b.get("text", ""))
+            elif btype == "tool_use":
+                # Include id + name + arguments so two tool_use blocks
+                # with the same name but different args don't collide.
+                parts.append(
+                    "[tool_use:{id}:{name}:{args}]".format(
+                        id=b.get("id", ""),
+                        name=b.get("name", ""),
+                        args=b.get("input", b.get("arguments", "")),
+                    )
+                )
+            elif btype == "tool_result":
+                parts.append(
+                    "[tool_result:{id}]".format(id=b.get("tool_use_id", ""))
+                )
+        content_str = chr(10).join(parts)
+    elif isinstance(content, str):
+        content_str = content
+    else:
+        content_str = str(content or "")
+
+    # OpenAI-style top-level tool_calls (assistant messages). build_assistant_message
+    # emits this shape; without it, empty-content tool-call messages collide.
+    tool_calls_str = ""
+    tc = m.get("tool_calls")
+    if isinstance(tc, list):
+        tc_parts: list[str] = []
+        for call in tc:
+            if not isinstance(call, dict):
+                continue
+            cid = call.get("id", "")
+            fn = call.get("function")
+            if isinstance(fn, dict):
+                fname = fn.get("name", "")
+                fargs = fn.get("arguments", "")
+            else:
+                fname = call.get("name", "")
+                fargs = call.get("arguments", "")
+            tc_parts.append("{id}:{name}:{args}".format(id=cid, name=fname, args=fargs))
+        tool_calls_str = "|".join(tc_parts)
+
+    return hashlib.sha256(
+        f"{role}:{content_str}:{tool_calls_str}".encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _skip_archived_by_tail(
+    messages: list[dict],
+    archived_tail: str,
+) -> tuple[list[dict], int, bool]:
+    """Skip already-archived prefix if the tail hash is found.
+
+    If the tail hash cannot be found, return the original messages.  That
+    conservatively re-compacts some history, but avoids the dangerous failure
+    mode of dropping all candidates because the old tail was snipped or the
+    history was reloaded with different framing.
+    """
+    if not archived_tail:
+        return messages, 0, False
+
+    for idx, m in enumerate(messages):
+        if not isinstance(m, dict) or m.get("role") == "system":
+            continue
+        if _message_content_hash(m) == archived_tail:
+            return messages[idx + 1 :], idx + 1, True
+    return messages, 0, False
+
+# Exception types that indicate a programming bug (wrong type, missing
+# attribute, undefined name) rather than a transient operational failure.
+# These propagate to the caller so the error is visible instead of being
+# silently swallowed by the broad ``except Exception`` below.
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, ImportError)
 
 
 class MemoryCompactionHook:
@@ -113,7 +216,7 @@ class MemoryCompactionHook:
             if not getattr(self.memory_manager, "_started", False) and not getattr(self.memory_manager, "_memory_store", None):
                 return None
 
-            session_key = f"{channel}:{chat_id}" if channel and chat_id else None
+            session_key = make_session_key(channel, chat_id)
 
             str_token_count = _estimate_tokens(
                 system_prompt
@@ -175,9 +278,36 @@ class MemoryCompactionHook:
                 logger.info("All messages already compacted, skipping")
                 return None
 
+            # Skip messages that were archived in previous turns.
+            # The _markbot_compacted metadata marker does not survive
+            # session save/load (get_history strips metadata), so we use
+            # a content-addressed high-water mark: the hash of the last
+            # message archived in the previous compaction.  This is
+            # robust to message insertion/deletion between turns, unlike
+            # a positional count which drifts when messages are snipped.
+            archived_tail = self.memory_manager.get_archived_tail_hash(session_key=session_key)
+            if archived_tail:
+                filtered, skipped, found_tail = _skip_archived_by_tail(
+                    messages_to_compact, archived_tail,
+                )
+                if not found_tail:
+                    logger.info(
+                        "Archived tail {} not found; re-compacting from available history",
+                        archived_tail[:8],
+                    )
+                messages_to_compact = filtered
+                if not filtered:
+                    logger.info(
+                        "All compactable messages already archived (tail={})",
+                        archived_tail[:8],
+                    )
+                    return None
+                if skipped > 0:
+                    logger.info("Skipped {} already-archived messages (tail match={})", skipped, found_tail)
+
             if not is_valid:
                 logger.warning("Invalid messages during compaction, adjusting...")
-                keep_length = MEMORY_COMPACT_KEEP_RECENT
+                keep_length = _MEMORY_COMPACT_KEEP_RECENT
                 messages_length = len(messages)
                 while keep_length > 0 and not self._check_valid_messages(
                     messages[max(messages_length - keep_length, 0):]
@@ -197,12 +327,28 @@ class MemoryCompactionHook:
                 logger.info("All messages already compacted after adjustment, skipping")
                 return None
 
-            # Phase 1: Always trigger async summary archival for long-term memory
-            if self.memory_summary_enabled:
-                self.memory_manager.add_async_summary_task(
-                    messages=messages_to_compact,
+            # Re-apply tail-hash skip after is_valid adjustment
+            # (the adjustment may have reset messages_to_compact).
+            if archived_tail:
+                filtered, skipped, found_tail = _skip_archived_by_tail(
+                    messages_to_compact, archived_tail,
                 )
+                if not found_tail:
+                    logger.info(
+                        "Archived tail {} not found after adjustment; re-compacting from available history",
+                        archived_tail[:8],
+                    )
+                messages_to_compact = filtered
+                if not filtered:
+                    logger.info(
+                        "All compactable messages already archived after adjustment"
+                    )
+                    return None
 
+            # Phase 1: Context compaction (skip if MultiLevelCompactor
+            # already handled it).  We run this BEFORE the async summary
+            # task so the compact summary can be reused as input — this
+            # avoids a redundant LLM call with overlapping content.
             pre_compact_tokens = _estimate_tokens(
                 "".join(
                     m.get("content", "") if isinstance(m.get("content", ""), str)
@@ -220,7 +366,8 @@ class MemoryCompactionHook:
                 )
             )
 
-            # Phase 2: Context compaction (skip if MultiLevelCompactor already handled it)
+            compact_content: str | None = None
+
             if skip_context_compact:
                 logger.info(
                     "[Compaction] Skipping context compaction "
@@ -228,47 +375,71 @@ class MemoryCompactionHook:
                     "async summary archival still triggered for {} messages",
                     len(messages_to_compact),
                 )
-                return None
-
-            logger.info(
-                "[Compaction] Starting 鈥?compacting {} messages "
-                "({} tokens), total context ~{} tokens",
-                len(messages_to_compact),
-                pre_compact_tokens,
-                pre_total_tokens,
-            )
-
-            if self.context_compact_enabled:
-                compressed_summary = self.memory_manager.get_compressed_summary(session_key=session_key)
-                compact_content = await self.memory_manager.compact_memory(
-                    messages=messages_to_compact,
-                    previous_summary=compressed_summary,
-                )
-                if not compact_content:
-                    logger.warning("Context compaction failed.")
-                else:
-                    post_summary_tokens = _estimate_tokens(compact_content)
-                    saved_tokens = pre_compact_tokens - post_summary_tokens
-                    logger.info(
-                        "[Compaction] Completed 鈥?summary: {} tokens, "
-                        "saved ~{} tokens ({:.0f}% reduction)",
-                        post_summary_tokens,
-                        max(saved_tokens, 0),
-                        (saved_tokens / pre_compact_tokens * 100)
-                        if pre_compact_tokens > 0
-                        else 0,
-                    )
-                    self._mark_compacted(messages_to_compact)
-                    self.memory_manager.set_compressed_summary(
-                        compact_content, session_key=session_key,
-                    )
-                    return compact_content
             else:
-                logger.info("Context compaction skipped")
+                logger.info(
+                    "[Compaction] Starting — compacting {} messages "
+                    "({} tokens), total context ~{} tokens",
+                    len(messages_to_compact),
+                    pre_compact_tokens,
+                    pre_total_tokens,
+                )
 
-            return None
+                if self.context_compact_enabled:
+                    compressed_summary = self.memory_manager.get_compressed_summary(session_key=session_key)
+                    compact_content = await self.memory_manager.compact_memory(
+                        messages=messages_to_compact,
+                        previous_summary=compressed_summary,
+                    )
+                    if not compact_content:
+                        logger.warning("Context compaction failed.")
+                    else:
+                        post_summary_tokens = _estimate_tokens(compact_content)
+                        saved_tokens = pre_compact_tokens - post_summary_tokens
+                        logger.info(
+                            "[Compaction] Completed — summary: {} tokens, "
+                            "saved ~{} tokens ({:.0f}% reduction)",
+                            post_summary_tokens,
+                            max(saved_tokens, 0),
+                            (saved_tokens / pre_compact_tokens * 100)
+                            if pre_compact_tokens > 0
+                            else 0,
+                        )
+                        self._mark_compacted(messages_to_compact)
+                        self.memory_manager.set_compressed_summary(
+                            compact_content, session_key=session_key,
+                        )
+                        # Persist a content-addressed high-water mark so
+                        # the next turn can skip these messages by content
+                        # match rather than by fragile positional count.
+                        last_msg = messages_to_compact[-1] if messages_to_compact else None
+                        if isinstance(last_msg, dict):
+                            self.memory_manager.set_archived_tail_hash(
+                                _message_content_hash(last_msg),
+                                session_key=session_key,
+                            )
+                else:
+                    logger.info("Context compaction skipped")
 
+            # Phase 2: Trigger async summary archival for long-term memory.
+            # Pass the compact summary as input so summary_memory can reuse
+            # it instead of making a separate LLM call over raw messages.
+            if self.memory_summary_enabled:
+                self.memory_manager.add_async_summary_task(
+                    messages=messages_to_compact,
+                    compact_summary=compact_content or "",
+                )
+
+            return compact_content
+
+        except _PROGRAMMING_ERRORS:
+            # Programming bugs (TypeError, AttributeError, …) must not be
+            # swallowed — they indicate a real defect that should surface
+            # to the caller instead of degrading silently.
+            raise
         except Exception as e:
+            # Operational failures (LLM timeout, provider error, corrupt
+            # response, …) are recoverable: log and degrade gracefully so
+            # the agent can continue without compaction this turn.
             logger.exception("Failed to compact memory in pre_reasoning hook: {}", e)
             return None
 
@@ -295,4 +466,3 @@ class MemoryCompactionHook:
         return all(
             isinstance(m, dict) and "role" in m for m in messages
         )
-

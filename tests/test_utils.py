@@ -8,6 +8,7 @@ from markbot.utils.constants import (
     MAX_SEARCH_RESULTS,
 )
 from markbot.utils.helpers import (
+    build_assistant_message,
     current_time_str,
     detect_image_mime,
     ensure_dir,
@@ -201,3 +202,72 @@ class TestConstants:
 
     def test_dangerous_patterns_not_empty(self):
         assert len(DANGEROUS_COMMAND_PATTERNS) > 0
+
+
+class TestBuildAssistantMessage:
+    """Regression tests for build_assistant_message.
+
+    The contract: ``reasoning_content`` is **always** emitted on the message
+    (empty string when absent) so thinking-mode providers (DeepSeek V4+,
+    Kimi K2) can round-trip the field across turns. The previous
+    implementation gated the field on ``is not None or == ""``, which
+    evaluated False for ``None`` and produced the HTTP 400
+    ``reasoning_content must be passed back`` error.
+    """
+
+    def test_reasoning_none_serialises_to_empty_string(self):
+        # REGRESSION: was omitted entirely under the old condition.
+        msg = build_assistant_message("answer", reasoning_content=None)
+        assert msg["reasoning_content"] == ""
+
+    def test_reasoning_empty_string_preserved(self):
+        msg = build_assistant_message("answer", reasoning_content="")
+        assert msg["reasoning_content"] == ""
+
+    def test_reasoning_non_empty_preserved(self):
+        thinking = "step 1: ... step 2: ..."
+        msg = build_assistant_message("answer", reasoning_content=thinking)
+        assert msg["reasoning_content"] == thinking
+
+    def test_field_is_always_present_even_without_explicit_arg(self):
+        msg = build_assistant_message("answer")
+        assert "reasoning_content" in msg
+        assert msg["reasoning_content"] == ""
+
+    def test_content_normalised_to_empty_string_when_none(self):
+        msg = build_assistant_message(None, reasoning_content=None)
+        assert msg["content"] == ""
+        assert msg["role"] == "assistant"
+        assert msg["reasoning_content"] == ""
+
+    def test_tool_calls_attached(self):
+        tcs = [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]
+        msg = build_assistant_message("answer", tool_calls=tcs, reasoning_content="th")
+        assert msg["tool_calls"] == tcs
+        assert msg["reasoning_content"] == "th"
+
+    def test_thinking_blocks_attached(self):
+        blocks = [{"type": "thinking", "text": "..."}]
+        msg = build_assistant_message("answer", thinking_blocks=blocks, reasoning_content="th")
+        assert msg["thinking_blocks"] == blocks
+        assert msg["reasoning_content"] == "th"
+
+    def test_no_tool_calls_key_when_none(self):
+        msg = build_assistant_message("answer", reasoning_content=None)
+        assert "tool_calls" not in msg
+
+    def test_no_thinking_blocks_key_when_none(self):
+        msg = build_assistant_message("answer", reasoning_content=None)
+        assert "thinking_blocks" not in msg
+
+    def test_round_trip_through_messages_list(self):
+        # Simulate the agent loop: build, append, build again.
+        msgs = []
+        msgs.append(build_assistant_message("first", reasoning_content="thinking A"))
+        msgs.append(build_assistant_message("second", reasoning_content="thinking B"))
+        assert msgs[0]["reasoning_content"] == "thinking A"
+        assert msgs[1]["reasoning_content"] == "thinking B"
+        # Each message is independently well-formed.
+        for m in msgs:
+            assert m["role"] == "assistant"
+            assert "reasoning_content" in m

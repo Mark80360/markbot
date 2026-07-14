@@ -12,7 +12,7 @@ import httpx
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from markbot.providers.errors import classify_error
+from markbot.providers.errors import ErrorType, classify_error
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -34,9 +34,13 @@ class AzureOpenAIProvider(LLMProvider):
         api_key: str = "",
         api_base: str = "",
         default_model: str = "gpt-5.2-chat",
+        extra_headers: dict[str, str] | None = None,
+        spec: Any = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        self.extra_headers = extra_headers or {}
+        self._spec = spec
         self.api_version = "2024-10-21"
 
         # Validate required parameters
@@ -221,6 +225,7 @@ class AzureOpenAIProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error parsing Azure OpenAI response: {str(e)}",
                 finish_reason="error",
+                error_type=ErrorType.UNKNOWN,
             )
 
     async def chat_stream(
@@ -271,6 +276,7 @@ class AzureOpenAIProvider(LLMProvider):
         content_parts: list[str] = []
         tool_call_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
+        chunk: dict[str, Any] = {}
 
         async for line in response.aiter_lines():
             if not line.startswith("data: "):

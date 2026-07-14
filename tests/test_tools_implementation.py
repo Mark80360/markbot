@@ -128,11 +128,23 @@ class TestAskUserQuestionTool:
         assert tool._default_channel == "dingtalk"
         assert tool._default_chat_id == "chat123"
 
-    def test_handle_response(self, tool):
+    async def test_handle_response(self, tool):
+        # Must be async so we get a running event loop. ``asyncio.Future()``
+        # without a running loop works for ``.set_result()`` on most
+        # versions but ``.result()``/``await`` requires one, and in
+        # Python 3.12+ the deprecation path can raise RuntimeError when
+        # the test runs after another test has closed the implicit loop.
+        # pytest-asyncio is in auto mode (see pyproject.toml), so the
+        # ``async`` keyword is enough — no decorator required.
         import asyncio
-        future = asyncio.Future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
         tool._pending_questions["q1"] = future
         tool.handle_response("q1", "React")
+        # ``handle_response`` calls ``set_result`` synchronously, so the
+        # future is already done by the time we get here; ``await`` is
+        # the only safe way to read it back without ``.result()`` blocking.
+        assert future.done()
         assert future.result() == "React"
 
     def test_handle_response_unknown_id(self, tool):

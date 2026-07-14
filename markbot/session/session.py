@@ -35,6 +35,10 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
     _written_count: int = 0  # Number of messages already persisted to disk
+    # Force full write on next save (set by clear/retain to avoid stale files)
+    _dirty: bool = False
+    # Tracks last_consolidated value persisted to disk; mismatch triggers full write
+    _written_last_consolidated: int = 0
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -104,12 +108,16 @@ class Session:
         self.messages = []
         self.last_consolidated = 0
         self._written_count = 0
+        self._dirty = True
         self.updated_at = datetime.now()
 
     def retain_recent_legal_suffix(self, max_messages: int) -> None:
-        """Keep a legal recent suffix, mirroring get_history boundary rules."""
+        """Keep a legal recent suffix, mirroring get_history boundary rules.
+
+        ``max_messages <= 0`` means no limit (consistent with ``get_history``);
+        use ``clear()`` to empty the session.
+        """
         if max_messages <= 0:
-            self.clear()
             return
         if len(self.messages) <= max_messages:
             return
@@ -136,6 +144,9 @@ class Session:
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)
         self._written_count = 0
+        # Force full write: _written_count reset to 0 would otherwise append
+        # duplicates to the existing file.
+        self._dirty = True
         self.updated_at = datetime.now()
 
 
@@ -277,6 +288,7 @@ class SessionManager:
                 metadata=metadata,
                 last_consolidated=last_consolidated,
                 _written_count=len(messages),
+                _written_last_consolidated=last_consolidated,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -322,16 +334,28 @@ class SessionManager:
 
         new_messages = session.messages[session._written_count:]
         append_count = len(new_messages)
+        metadata_changed = session.last_consolidated != session._written_last_consolidated
 
-        if append_count == 0 and path.exists():
+        # Skip only when there's nothing new AND metadata is unchanged AND
+        # no structural change (clear/retain) flagged the session as dirty.
+        if append_count == 0 and not metadata_changed and not session._dirty and path.exists():
             return
 
         lock = self._get_lock(session.key)
         try:
             with lock:
-                if append_count > self._APPEND_COMPACT_THRESHOLD or not path.exists():
+                # Full write when: structural change, metadata changed, large
+                # append, or file doesn't exist. Otherwise append new messages.
+                if (
+                    session._dirty
+                    or metadata_changed
+                    or append_count > self._APPEND_COMPACT_THRESHOLD
+                    or not path.exists()
+                ):
                     self._full_write(session, path)
                     session._written_count = len(session.messages)
+                    session._written_last_consolidated = session.last_consolidated
+                    session._dirty = False
                 else:
                     self._append_write(session, path, new_messages)
                     session._written_count += append_count
@@ -366,7 +390,7 @@ class SessionManager:
                 try:
                     temp_path.unlink()
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up temp file during session write: {}", temp_path)
             raise
 
     def _append_write(self, session: Session, path: Path, new_messages: list[dict[str, Any]]) -> None:

@@ -51,6 +51,7 @@ def build_vectorstore(
     backend = str(config.get("vector_backend", "sqlite")).lower().strip()
     working_dir = Path(working_dir)
     max_records = int(config.get("vector_max_records", 50_000))
+    max_scan_records = int(config.get("vector_max_scan_records", 20_000))
 
     if backend == "chroma":
         store = _try_chroma(config, embedder, working_dir)
@@ -67,7 +68,7 @@ def build_vectorstore(
 
     # Default: SQLite.
     db_path = working_dir / "memory" / ".vectors.db"
-    return SQLiteVectorStore(db_path, max_records=max_records)
+    return SQLiteVectorStore(db_path, max_records=max_records, max_scan_records=max_scan_records)
 
 
 def _try_chroma(

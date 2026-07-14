@@ -113,6 +113,26 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
         except Exception:
             raise ValueError(f"unknown timezone '{schedule.tz}'") from None
 
+    if schedule.kind == "cron":
+        if not schedule.expr:
+            raise ValueError("cron expression is required for cron schedules")
+        try:
+            from croniter import croniter
+
+            croniter(schedule.expr, datetime.now())
+        except Exception as e:
+            raise ValueError(f"invalid cron expression '{schedule.expr}': {e}") from None
+
+    if schedule.kind == "every":
+        if not schedule.every_ms or schedule.every_ms <= 0:
+            raise ValueError("every_ms must be positive for every schedules")
+
+    if schedule.kind == "at":
+        if not schedule.at_ms:
+            raise ValueError("at_ms is required for at schedules")
+        if schedule.at_ms <= _now_ms():
+            raise ValueError("at_ms must be in the future for at schedules")
+
 
 class CronService:
     """Service for managing and executing scheduled jobs."""
@@ -123,6 +143,11 @@ class CronService:
         self,
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        *,
+        max_retries: int = 2,
+        retry_delay_s: float = 5.0,
+        dead_letter_keep: int = 50,
+        on_failure: Callable[[CronJob, str], Coroutine[Any, Any, None]] | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job
@@ -130,6 +155,10 @@ class CronService:
         self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        self.max_retries = max(0, int(max_retries))
+        self.retry_delay_s = max(0.5, float(retry_delay_s))
+        self.dead_letter_keep = max(5, int(dead_letter_keep))
+        self.on_failure = on_failure
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
@@ -264,7 +293,7 @@ class CronService:
                 try:
                     temp_path.unlink()
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up cron temp file: {}", temp_path)
             raise
 
     async def start(self) -> None:
@@ -284,13 +313,15 @@ class CronService:
             self._timer_task = None
 
     def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+        """Recompute next run times for enabled jobs with missing or past-due schedules."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
+                # Preserve future schedules; only recompute missing or past-due ones
+                if job.state.next_run_at_ms is None or job.state.next_run_at_ms <= now:
+                    job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
 
     def _get_next_wake_ms(self) -> int | None:
         """Get the earliest next run time across all jobs."""
@@ -334,30 +365,58 @@ class CronService:
         for job in due_jobs:
             await self._execute_job(job)
 
-        self._save_store()
+        if due_jobs:
+            self._save_store()
         self._arm_timer()
 
     async def _execute_job(self, job: CronJob) -> None:
-        """Execute a single job."""
+        """Execute a single job with retries and dead-letter on exhaustion."""
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
-        try:
-            if self.on_job:
-                await self.on_job(job)
+        attempts = self.max_retries + 1
+        last_error: str | None = None
+        success = False
 
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info("Cron: job '{}' completed", job.name)
-
-        except Exception as e:
-            job.state.last_status = "error"
-            job.state.last_error = str(e)
-            logger.error("Cron: job '{}' failed: {}", job.name, e)
+        for attempt in range(1, attempts + 1):
+            try:
+                if self.on_job:
+                    await self.on_job(job)
+                success = True
+                last_error = None
+                logger.info(
+                    "Cron: job '{}' completed (attempt {}/{})",
+                    job.name, attempt, attempts,
+                )
+                break
+            except Exception as e:
+                last_error = str(e)
+                logger.error(
+                    "Cron: job '{}' failed attempt {}/{}: {}",
+                    job.name, attempt, attempts, e,
+                )
+                if attempt < attempts:
+                    delay = self.retry_delay_s * attempt
+                    await asyncio.sleep(delay)
 
         end_ms = _now_ms()
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = end_ms
+        if success:
+            job.state.last_status = "ok"
+            job.state.last_error = None
+        else:
+            job.state.last_status = "error"
+            job.state.last_error = last_error
+            self._record_dead_letter(job, last_error or "unknown error")
+            if self.on_failure is not None:
+                try:
+                    await self.on_failure(job, last_error or "unknown error")
+                except Exception as notify_err:
+                    logger.warning(
+                        "Cron: failure notifier failed for '{}': {}",
+                        job.name, notify_err,
+                    )
 
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
@@ -377,6 +436,55 @@ class CronService:
         else:
             # Compute next run
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+
+    def _record_dead_letter(self, job: CronJob, error: str) -> None:
+        """Append a durable dead-letter record next to jobs.json."""
+        try:
+            path = self.store_path.parent / "dead_letter.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "job_id": job.id,
+                "job_name": job.name,
+                "error": error,
+                "failed_at_ms": _now_ms(),
+                "message": job.payload.message,
+                "channel": job.payload.channel,
+                "to": job.payload.to,
+            }
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Trim file to last N lines to avoid unbounded growth.
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > self.dead_letter_keep:
+                    path.write_text(
+                        "\n".join(lines[-self.dead_letter_keep:]) + "\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Cron: failed to write dead letter for {}: {}", job.id, exc)
+
+    def list_dead_letters(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent dead-letter records (newest last)."""
+        path = self.store_path.parent / "dead_letter.jsonl"
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            out: list[dict[str, Any]] = []
+            for line in lines[-max(1, limit):]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
 
     # ========== Public API ==========
 

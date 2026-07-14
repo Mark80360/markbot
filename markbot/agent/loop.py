@@ -19,10 +19,11 @@ from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
 from markbot.agent.stream_scrubber import ScrubberPool
-from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.bus.events import InboundMessage, OutboundMessage, make_session_key
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
+from markbot.types.permission import PermissionMode
 
 
 class AgentLoop:
@@ -139,6 +140,11 @@ class AgentLoop:
         self.mcp = ctx.mcp
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Serialises mutations to ``_active_tasks`` / ``_session_locks``.
+        # In single-threaded asyncio the individual dict ops are atomic,
+        # but multi-step sequences (track → dispatch → cleanup) benefit
+        # from an explicit guard so future refactors stay safe.
+        self._tasks_lock = asyncio.Lock()
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
@@ -167,16 +173,27 @@ class AgentLoop:
         self._scrubber_pool = ScrubberPool()
 
         # Per-session last-active timestamps for idle timeout detection.
-        # Updated on every inbound message and checked during the 1s poll
-        # gap in ``run()``. A session that has been silent longer than
-        # ``AGENT_IDLE_TIMEOUT_MINUTES`` gets a notification + cleanup.
+        # Updated on every inbound message and checked by a background
+        # ``_idle_check_loop`` task. A session that has been silent longer
+        # than ``AGENT_IDLE_TIMEOUT_MINUTES`` gets a notification + cleanup.
         self._session_last_active: dict[str, float] = {}
+        self._idle_task: asyncio.Task | None = None
+
+        # Per-session failure-loop state that survives across loop instances
+        # (compact, "继续" 等都会重建 IterationRunner → LoopState)。
+        # 关键：反思次数和失败方法黑名单必须跨 loop 边界持久化，
+        # 否则每次 compact 后 reflection_injected_count 归零，
+        # 强制停止机制在整个任务尺度上完全失效（见 logs/2026-06-27.log
+        # 中 4 次强制停止后 LLM 仍能继续撞墙的案例）。
+        # 仅在用户**新请求**（非"继续"指令）时重置，避免一次失败任务
+        # 的反思次数永远卡住后续新任务。
+        self._session_failure_state: dict[str, dict] = {}
 
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
-        if not self.mcp._mcp_servers:
+        if not self.mcp.has_servers:
             logger.debug("No MCP servers configured, skipping connection")
             return
         _t0 = time.time()
@@ -194,9 +211,30 @@ class AgentLoop:
             self.question_tool.set_context(channel, chat_id)
         if todo_tool := self.tools.get("todo"):
             if hasattr(todo_tool, "set_session"):
-                todo_tool.set_session(f"{channel}:{chat_id}")
+                todo_tool.set_session(make_session_key(channel, chat_id) or "")
+            # Wire the todo tool into the compactor so active items get
+            # re-injected as a standalone user message after auto-compaction.
+            # Done here (not at construction) because the compactor is built
+            # before the tool registry in the container.
+            compactor = getattr(self, "compactor", None)
+            if compactor is not None and hasattr(compactor, "set_todo_tool"):
+                compactor.set_todo_tool(todo_tool)
         if self._memory_search_tool:
             self._memory_search_tool.set_session_context(channel, chat_id)
+        # Propagate channel privacy context to curated memory tools and
+        # context-explorer tools so shared channels cannot list/load
+        # MEMORY.md / PROFILE.md content.
+        for name in (
+            "memory_list",
+            "memory_forget",
+            "memory_save",
+            "explore_context_catalog",
+            "search_context",
+            "load_context",
+        ):
+            tool = self.tools.get(name) if self.tools else None
+            if tool is not None and hasattr(tool, "set_session_context"):
+                tool.set_session_context(channel, chat_id)
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -221,10 +259,19 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        session=None,
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
+        permission_mode_override: PermissionMode | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
         from markbot.agent.iteration import IterationRunner
+
+        # Prefer the caller-provided session_key (which includes
+        # session_key_override, e.g. feishu thread_id) so that
+        # ToolContext.session_id matches msg.session_key — the loop's
+        # session-keyed question routing depends on this equality.
+        resolved_session_key = session_key or make_session_key(channel, chat_id) or ""
 
         runner = IterationRunner(
             loop=self,
@@ -234,9 +281,11 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
-            session_key=f"{channel}:{chat_id}",
+            session_key=resolved_session_key,
+            session=session,
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
+            permission_mode_override=permission_mode_override,
         )
         return await runner.run(initial_messages)
 
@@ -356,14 +405,14 @@ class AgentLoop:
             logger.warning("Memory manager start failed: {}", e)
         logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
+        # Background idle-session checker — runs on a 30s cadence so the
+        # main loop can block on ``consume_inbound()`` indefinitely instead
+        # of waking every second just to poll idle state.
+        self._idle_task = asyncio.create_task(self._idle_check_loop())
+
         while self._running:
-            now = time.time()
             try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                # No message in this 1s poll — check for idle sessions.
-                self._check_idle_sessions(now)
-                continue
+                msg = await self.bus.consume_inbound()
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
                 # Only ignore non-task CancelledError signals that may leak from integrations.
@@ -384,33 +433,123 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
+
+            # Permission / question replies must NOT take the per-session lock.
+            # Approval waits inside an in-flight turn that already holds the
+            # lock; if the reply also waits on that lock the turn deadlocks
+            # until the approval timeout. Resolve these short-circuit replies
+            # concurrently via the pipeline middleware only.
+            if self._is_pending_question_reply(msg):
+                task = asyncio.create_task(self._dispatch_unlocked(msg))
+                self._track_task(msg.session_key, task)
+                task.add_done_callback(
+                    lambda t, k=msg.session_key: self._untrack_task(k, t)
+                )
+                continue
+
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            self._track_task(msg.session_key, task)
+            task.add_done_callback(
+                lambda t, k=msg.session_key: self._untrack_task(k, t)
+            )
 
-            def _cleanup_task(t: asyncio.Task, k: str = msg.session_key) -> None:
-                tasks = self._active_tasks.get(k)
-                if tasks is None:
-                    self._session_locks.pop(k, None)
-                    return
-                try:
-                    tasks.remove(t)
-                except ValueError:
-                    pass
-                if not tasks:
-                    self._active_tasks.pop(k, None)
-                    self._session_locks.pop(k, None)
+    # ------------------------------------------------------------------
+    # Task tracking helpers
+    # ------------------------------------------------------------------
 
-            task.add_done_callback(_cleanup_task)
+    def _track_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Register an in-flight dispatch task under its session key."""
+        self._active_tasks.setdefault(session_key, []).append(task)
+
+    def _untrack_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Remove a completed task; clean up empty session entries."""
+        tasks = self._active_tasks.get(session_key)
+        if tasks is None:
+            self._session_locks.pop(session_key, None)
+            return
+        try:
+            tasks.remove(task)
+        except ValueError:
+            pass
+        if not tasks:
+            self._active_tasks.pop(session_key, None)
+            self._session_locks.pop(session_key, None)
+
+    def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        """Get or create the per-session serial lock."""
+        return self._session_locks.setdefault(session_key, asyncio.Lock())
+
+    # ------------------------------------------------------------------
+    # Per-session failure-loop state (survives compact / "继续" / handoff)
+    # ------------------------------------------------------------------
+
+    def get_failure_state(self, session_key: str) -> dict:
+        """Get (or create) the per-session failure-loop state.
+
+        Returns a dict with keys:
+        - ``reflection_injected_count``: int — 累计注入的反思次数，跨 loop 不归零
+        - ``failed_methods``: list[str] — 已尝试且失败的方法黑名单（去重）
+        - ``forced_stop_count``: int — 已触发强制停止的次数
+
+        这个状态在 IterationRunner.run() 启动时被读取并填入 LoopState，
+        在 _phase_check_failure_loop / _record_tool_result 中被写回。
+        仅在用户**新请求**（非"继续"指令）时由 reset_failure_state 清零。
+        """
+        return self._session_failure_state.setdefault(
+            session_key,
+            {
+                "reflection_injected_count": 0,
+                "failed_methods": [],
+                "forced_stop_count": 0,
+            },
+        )
+
+    def reset_failure_state(self, session_key: str) -> None:
+        """重置指定 session 的失败循环状态。
+
+        仅在用户输入**新请求**时调用（非"继续"/compact/handoff 续接）。
+        这样一次失败任务的反思次数不会永远卡住后续新任务。
+        """
+        self._session_failure_state[session_key] = {
+            "reflection_injected_count": 0,
+            "failed_methods": [],
+            "forced_stop_count": 0,
+        }
 
     # ------------------------------------------------------------------
     # Idle session management
     # ------------------------------------------------------------------
 
+    def has_active_conversations(self) -> bool:
+        """Return True if any session currently has an in-flight task.
+
+        Used by background services (e.g. DreamService) to avoid running
+        while a conversation is in progress.
+        """
+        for tasks in self._active_tasks.values():
+            for t in tasks:
+                if not t.done():
+                    return True
+        return False
+
+    async def _idle_check_loop(self) -> None:
+        """Background task that periodically checks for idle sessions.
+
+        Runs on a 30-second cadence so the main loop can block on
+        ``consume_inbound()`` indefinitely without waking to poll.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return
+            self._check_idle_sessions(time.time())
+
     def _check_idle_sessions(self, now: float) -> None:
         """Check and clean up sessions that have exceeded the idle timeout.
 
-        Called on each 1-second poll gap. Iterates a snapshot of the
-        session keys so we don't mutate the dict while iterating it.
+        Called by the background ``_idle_check_loop``. Iterates a snapshot
+        of the session keys so we don't mutate the dict while iterating it.
         """
         idle_seconds = AGENT_IDLE_TIMEOUT_MINUTES * 60
         if idle_seconds <= 0:
@@ -433,6 +572,11 @@ class AgentLoop:
 
         The session_key format is ``channel:chat_id``. We parse it to
         route the notification back through the correct channel.
+
+        In-flight tasks are given a grace period to complete before
+        cleanup, so we don't cancel active LLM calls or tool executions
+        mid-flight (which could leave files half-written or sessions
+        unsaved).
         """
         channel = chat_id = session_key
         if ":" in session_key:
@@ -451,21 +595,48 @@ class AgentLoop:
         # except Exception as e:
         #     logger.warning("Failed to publish idle timeout notification: {}", e)
 
+        # Gracefully wait for in-flight tasks before cleaning up.
+        # This prevents cancelling active LLM calls or tool executions
+        # that could leave state inconsistent.
+        tasks = self._active_tasks.get(session_key, [])
+        pending = [t for t in tasks if not t.done()]
+        if pending:
+            logger.info(
+                "Waiting for {} in-flight task(s) to complete for session {} "
+                "(up to 30s grace period)",
+                len(pending), session_key,
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Tasks for session {} did not complete in 30s, cancelling",
+                    session_key,
+                )
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+                # Wait briefly for cancellation to propagate.
+                await asyncio.gather(*pending, return_exceptions=True)
+
         self._cleanup_session_state(session_key)
 
     def _cleanup_session_state(self, session_key: str) -> None:
         """Release resources held by *session_key* after idle timeout.
 
-        Cancels any in-flight tasks, removes session locks, resets the
-        streaming scrubber, and cleans up steer / last-active tracking
-        so the next message from this session starts fresh.
+        Removes session locks, resets the streaming scrubber, evicts
+        memory manager session caches, and cleans up steer / last-active
+        tracking so the next message from this session starts fresh.
+
+        Note: in-flight task cancellation is handled by
+        ``_notify_idle_timeout`` before this method is called.
         """
-        # Cancel active tasks for this session.
-        tasks = self._active_tasks.pop(session_key, None)
-        if tasks:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
+        # Active tasks are already handled by _notify_idle_timeout.
+        # Just pop the list to clear the reference.
+        self._active_tasks.pop(session_key, None)
 
         # Release session-level lock.
         self._session_locks.pop(session_key, None)
@@ -473,15 +644,116 @@ class AgentLoop:
         # Reset streaming scrubber state for this session.
         self._scrubber_pool.reset(session_key)
 
+        # Evict memory manager per-session caches (summaries, archived
+        # counts).  State is persisted to disk and reloaded on next use.
+        memory_manager = getattr(self, "memory_manager", None)
+        if memory_manager and hasattr(memory_manager, "evict_session_cache"):
+            try:
+                memory_manager.evict_session_cache(session_key)
+            except Exception as e:
+                logger.debug("Failed to evict memory session cache: {}", e)
+
         # Clear steer and idle tracking.
         self._pending_steer.pop(session_key, None)
         self._session_last_active.pop(session_key, None)
 
+        # Clear per-session failure-loop state to avoid memory leak
+        # across many idle sessions. Next message from this session
+        # will be treated as a new request and reset_failure_state
+        # is called anyway, but clearing here keeps state bounded.
+        # Use getattr for robustness: AgentLoop is sometimes partially
+        # constructed in tests via __new__ which bypasses __init__.
+        failure_state = getattr(self, "_session_failure_state", None)
+        if failure_state is not None:
+            failure_state.pop(session_key, None)
+
+        # Drop any stale session-keyed question mapping so a future
+        # message in a recycled session is not misrouted to a question
+        # whose future was abandoned (e.g. task cancelled while blocked).
+        question_tool = getattr(self, "question_tool", None)
+        if question_tool is not None and hasattr(question_tool, "unregister_pending"):
+            question_tool.unregister_pending(session_key)
+
         logger.info("Cleaned up state for idle session {}", session_key)
+
+    def _is_pending_question_reply(self, msg: InboundMessage) -> bool:
+        """Return True if this inbound is answering a pending ask/approval.
+
+        Used to route the reply outside the per-session lock so the waiting
+        tool turn can observe it.
+
+        Three matching strategies, in order:
+          1. Explicit ``question_id`` in ``msg.metadata`` (channels that
+             round-trip metadata, e.g. interactive button callbacks).
+          2. ``[Q:uuid]`` prefix in the message content (CLI echo or a
+             user who literally typed the marker).
+          3. Session-keyed lookup: when a question is pending for this
+             session but the channel cannot propagate the question_id
+             (e.g. feishu plain-text replies), fall back to looking up
+             the pending question_id by session_key.  Slash commands
+             (``/stop``, ``/mode`` …) are excluded so the user can still
+             operate on a blocked session.
+        """
+        meta = msg.metadata or {}
+        qid = meta.get("question_id")
+        if not qid:
+            content = (msg.content or "").strip()
+            if content.startswith("[Q:") and "]" in content:
+                try:
+                    qid = content.split("[Q:", 1)[1].split("]", 1)[0].strip()
+                except (IndexError, AttributeError):
+                    qid = None
+
+        question_tool = getattr(self, "question_tool", None)
+
+        if qid:
+            pending = getattr(question_tool, "_pending_questions", None) or {}
+            if qid in pending:
+                return True
+            approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+            if approver is not None and qid in getattr(approver, "_pending", {}):
+                return True
+            return False
+
+        # Session-keyed fallback: the channel did not carry question_id
+        # metadata and the user did not type the ``[Q:...]`` marker, but
+        # there may still be a pending question for this session.  Route
+        # the reply to it so the waiting tool turn can resume.  Without
+        # this, platforms like feishu (plain-text replies, no button UI)
+        # deadlock: the reply is dispatched as a fresh turn, cancels the
+        # blocked approval task, and the question times out.
+        if question_tool is not None and hasattr(question_tool, "has_pending"):
+            content = (msg.content or "").strip()
+            # Never intercept slash commands — the user may need /stop,
+            # /reset, etc. to abort a blocked session.
+            if content and not content.startswith("/"):
+                if question_tool.has_pending(msg.session_key):
+                    pending_qid = question_tool.get_pending_qid(msg.session_key)
+                    if pending_qid:
+                        # Inject the qid so QuestionResponseMiddleware can
+                        # resolve the future via its existing code path.
+                        msg.metadata["question_id"] = pending_qid
+                        return True
+        return False
+
+    async def _dispatch_unlocked(self, msg: InboundMessage) -> None:
+        """Process a message without the per-session lock (question replies)."""
+        gate = self._concurrency_gate or nullcontext()
+        async with gate:
+            try:
+                response = await self._process_message(msg)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Error processing unlocked reply for session {}", msg.session_key
+                )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        lock = self._get_session_lock(msg.session_key)
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
@@ -568,6 +840,12 @@ class AgentLoop:
                         metadata=dict(msg.metadata or {}),
                     )
                 )
+            finally:
+                # The turn is ending — clear "Allow All" so the next
+                # turn in this session starts with fresh confirmations.
+                approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+                if approver is not None and hasattr(approver, "clear_allow_all"):
+                    approver.clear_allow_all(msg.session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background tasks, then close MCP connections."""
@@ -576,6 +854,8 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
         self._scrubber_pool.clear()
         try:
             self.sessions.close()
@@ -631,6 +911,7 @@ class AgentLoop:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
+        permission_mode_override: PermissionMode | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         channel = msg.channel
@@ -642,13 +923,14 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         if msg.channel == "system":
-            key = f"{channel}:{chat_id}"
+            key = make_session_key(channel, chat_id) or ""
 
         pctx = ProcessContext(
             msg=msg,
             session_key=key,
             channel=channel,
             chat_id=chat_id,
+            permission_mode_override=permission_mode_override,
         )
 
         async def _handler(ctx: ProcessContext) -> OutboundMessage | None:
@@ -707,8 +989,11 @@ class AgentLoop:
                     channel=channel,
                     chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
+                    session=session,
                     on_tool_start=on_tool_start,
                     on_tool_complete=on_tool_complete,
+                    permission_mode_override=ctx.permission_mode_override,
+                    session_key=key,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
                 self.sessions.save(session)
@@ -745,6 +1030,30 @@ class AgentLoop:
             result.metadata.setdefault("message_id", msg.metadata.get("message_id"))
             result.metadata.setdefault("reaction_id", msg.metadata.get("reaction_id"))
             return result
+
+        # 检测"继续"指令：当用户输入"继续"/"continue"等时，注入 resume 引导，
+        # 让 LLM 知道要从上次中断处续接，而不是当作全新请求处理。
+        # 配合 _finalize_loop 中写入 history 的中断原因，agent 能感知上次进度。
+        _resume_triggers = ("继续", "continue", "go on", "resume", "接着", "接着做", "继续做")
+        is_resume = raw.lower() in _resume_triggers
+        if is_resume:
+            resume_hint = (
+                "[System] 用户输入了「继续」。请检查对话历史中是否存在因"
+                "「达到工具调用迭代上限」或「预算超限」而中断的任务。"
+                "如果存在，请从上次中断处续接任务：\n"
+                "1. 先回顾历史中已完成的步骤（已创建的文件、已验证的依赖等），"
+                "不要重复这些步骤；\n"
+                "2. 识别上次中断时正在进行的子任务；\n"
+                "3. 从该子任务继续执行，直到任务完成。\n"
+                "如果历史中没有中断记录，则按正常方式处理用户请求。"
+            )
+            msg.content = resume_hint + "\n\n用户输入：" + raw
+        else:
+            # 新请求：重置该 session 的失败循环状态。
+            # 关键：失败反思次数和失败方法黑名单只在同一任务内累积；
+            # 用户开新话题时应清零，避免上次任务的反思次数卡住新任务。
+            # "继续"指令和 compact 内部触发都不重置（它们是同一任务的延续）。
+            self.reset_failure_state(key)
 
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -804,8 +1113,11 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                session=session,
                 on_tool_start=on_tool_start,
                 on_tool_complete=on_tool_complete,
+                permission_mode_override=ctx.permission_mode_override,
+                session_key=key,
             )
 
             logger.info(
@@ -859,8 +1171,15 @@ class AgentLoop:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         on_outbound_message: Callable[["OutboundMessage"], Awaitable[None]] | None = None,
+        permission_mode: PermissionMode | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload."""
+        """Process a message directly and return the outbound payload.
+
+        ``permission_mode`` lets unattended callers (cron / autopilot /
+        heartbeat) force a mode without relying on the global ``app_state``
+        being set by a prior ``/mode`` command — those paths run before any
+        interactive user can approve tool calls, so they must opt in here.
+        """
         _direct_start = time.time()
         logger.info("process_direct starting...")
         await self._connect_mcp()
@@ -876,13 +1195,23 @@ class AgentLoop:
                 logger.warning("Memory manager start failed in process_direct: {}", e)
         logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content, media=media or [])
-        return await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            on_tool_start=on_tool_start,
-            on_tool_complete=on_tool_complete,
-            on_outbound_message=on_outbound_message,
-        )
+        try:
+            return await self._process_message(
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                on_tool_start=on_tool_start,
+                on_tool_complete=on_tool_complete,
+                on_outbound_message=on_outbound_message,
+                permission_mode_override=permission_mode,
+            )
+        finally:
+            # process_direct bypasses _dispatch, so its finally block
+            # (which clears allow_all) never runs.  Clear it here to
+            # prevent the flag from leaking into the next call with
+            # the same session_key.
+            approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+            if approver is not None and hasattr(approver, "clear_allow_all"):
+                approver.clear_allow_all(session_key)

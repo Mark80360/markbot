@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from markbot.tools.base import BaseTool
+from markbot.bus.events import make_session_key
 from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
 
@@ -24,7 +25,7 @@ class SpawnTool(BaseTool):
     def set_context(self, channel: str, chat_id: str) -> None:
         self._origin_channel = channel
         self._origin_chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
+        self._session_key = make_session_key(channel, chat_id) or "cli:direct"
 
     @property
     def definition(self) -> ToolDefinition:
@@ -84,7 +85,7 @@ class SpawnTool(BaseTool):
 
         channel = context.channel or self._origin_channel
         chat_id = context.chat_id or self._origin_chat_id
-        session_key = f"{channel}:{chat_id}" if channel and chat_id else self._session_key
+        session_key = make_session_key(channel, chat_id) or self._session_key
 
         from markbot.agent.subagent.capability import CapabilityToken
 

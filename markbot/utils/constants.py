@@ -7,12 +7,36 @@ search, filesystem, explore, and other tools.
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Memory file constants (canonical definitions 鈥?import from here)
+# Memory file constants (canonical definitions — import from here)
 # ---------------------------------------------------------------------------
 MEMORY_FILENAME: str = "MEMORY.md"
 USER_FILENAME: str = "PROFILE.md"
 DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
 DEFAULT_USER_CHAR_LIMIT: int = 2000
+
+# Channels where curated MEMORY.md may be auto-loaded into the system prompt.
+# Shared / messaging channels must not receive private long-term memory.
+MAIN_MEMORY_CHANNELS: frozenset[str] = frozenset({
+    "cli",
+    "web",
+    "api",
+    "test",
+    "local",
+})
+
+# Messaging / shared channels where MEMORY.md always-on injection is forbidden.
+SHARED_MEMORY_CHANNELS: frozenset[str] = frozenset({
+    "dingtalk",
+    "feishu",
+    "qq",
+    "weixin",
+    "wechat",
+    "email",
+    "telegram",
+    "discord",
+    "slack",
+    "group",
+})
 
 # Standard directories to ignore in file operations (comprehensive list)
 IGNORE_DIRS = frozenset({
@@ -129,22 +153,35 @@ BOOTSTRAP_FILES: list[str] = [
 ]
 
 # Template files that should exist on disk (excludes conditionally-used files
-# like BOOTSTRAP.md, HEARTBEAT.md, USER.md which are intentionally not in BOOTSTRAP_FILES)
-_TEMPLATE_DIR_NAMES: frozenset[str] = frozenset({
+# like BOOTSTRAP.md, HEARTBEAT.md which are intentionally not in BOOTSTRAP_FILES)
+_TEMPLATE_ESSENTIAL: frozenset[str] = frozenset({
     "AGENTS.md", "SOUL.md", "TOOLS.md", MEMORY_FILENAME,
     USER_FILENAME, "ARCHITECTURE.md",
 })
 
+# Conditional/reference templates that exist on disk but are not loaded into
+# the system prompt automatically (loaded on-demand or per-event).
+_TEMPLATE_CONDITIONAL: frozenset[str] = frozenset({
+    "BOOTSTRAP.md",               # deleted after first-run onboarding
+    "HEARTBEAT.md",               # heartbeat task file
+    "clean-state-checklist.md",   # reference checklist
+    "evaluator-rubric.md",        # reference rubric
+    "quality-document.md",        # reference quality snapshot
+})
+
+# All known template .md files (used by check_template_sync to detect drift).
+_ALL_TEMPLATE_FILES: frozenset[str] = _TEMPLATE_ESSENTIAL | _TEMPLATE_CONDITIONAL
+
 
 def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
-    """Cross-check BOOTSTRAP_FILES constant against the templates directory.
+    """Cross-check template constants against the templates directory.
 
     Returns a list of warning messages for any discrepancies found:
-    - Template files in the directory that are not in BOOTSTRAP_FILES
-    - Entries in BOOTSTRAP_FILES that have no corresponding template file
+    - Template files on disk that are not in the known allowlist (drift)
+    - Essential template files missing from disk
 
     This function is called at startup to catch drift between the
-    hardcoded constant and the actual template files on disk.
+    hardcoded constants and the actual template files on disk.
     """
     from pathlib import Path
 
@@ -161,22 +198,21 @@ def check_template_sync(templates_dir: "Path | None" = None) -> list[str]:
         if p.is_file() and p.suffix == ".md":
             disk_files.add(p.name)
 
-    known = set(BOOTSTRAP_FILES)
-
-    missing_from_constant = disk_files - known
-    if missing_from_constant:
+    unexpected_on_disk = disk_files - _ALL_TEMPLATE_FILES
+    if unexpected_on_disk:
         warnings.append(
-            f"Template file(s) on disk but not in BOOTSTRAP_FILES: "
-            f"{sorted(missing_from_constant)}. "
-            f"Consider adding them if they should be loaded at startup."
+            f"Template file(s) on disk but not in known template sets: "
+            f"{sorted(unexpected_on_disk)}. "
+            f"Either add them to _TEMPLATE_CONDITIONAL in constants.py, "
+            f"or remove them from the templates directory."
         )
 
-    missing_from_disk = known - disk_files
-    if missing_from_disk:
+    missing_essential = _TEMPLATE_ESSENTIAL - disk_files
+    if missing_essential:
         warnings.append(
-            f"BOOTSTRAP_FILES entry(s) with no template on disk: "
-            f"{sorted(missing_from_disk)}. "
-            f"Consider removing them or creating the template files."
+            f"Essential template file(s) missing from disk: "
+            f"{sorted(missing_essential)}. "
+            f"These are required for the system to function."
         )
 
     return warnings
@@ -190,8 +226,14 @@ GUIDANCE_INJECTION_TTL: float = 3600.0
 # Maximum characters for git status in system context
 MAX_GIT_STATUS_CHARS: int = 2000
 
-# Maximum characters for compressed summary before truncation
-MAX_COMPRESSED_SUMMARY_CHARS: int = 200_000
+# Maximum characters for compressed summary before truncation.
+# Kept modest so the summary stays a *compressed* handoff, not a second
+# context window.  At ~4 chars/token this is ~5k tokens — enough for a
+# structured multi-section summary while leaving the model context window
+# for live conversation.  A larger value lets the summary grow until it
+# dominates the context budget and starves the very compaction that
+# produces it (positive feedback loop).
+MAX_COMPRESSED_SUMMARY_CHARS: int = 20_000
 
 # Maximum characters for MEMORY.md before section-based truncation
 # Should be >= DEFAULT_MEMORY_CHAR_LIMIT from memory.tool (the write limit)
@@ -208,25 +250,25 @@ DEFAULT_COMPACTION_THRESHOLD: float = 0.75
 
 # -- Memory system constants ------------------------------------------------
 
-# Default character limits for MemoryStore entries
-DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
-DEFAULT_USER_CHAR_LIMIT: int = 2000
-
 # Maximum prefetch results per turn
 MAX_PREFETCH_RESULTS: int = 3
 
 # Minimum relevance score for prefetch recall
 MIN_PREFETCH_SCORE: float = 0.15
 
-# Maximum entries in MemoryStore before cleanup hint
+# Maximum entries in MemoryStore before cleanup / rejection
 MAX_MEMORY_ENTRIES: int = 100
 MAX_USER_ENTRIES: int = 50
+
+# Access-count threshold for promoting vector hits into curated MEMORY.md.
+# Higher than historical default (5) so process noise does not leak in.
+DEFAULT_CONSOLIDATION_PROMOTE_ACCESS: int = 8
 
 # Memory security scanner cooldown (seconds) between same-pattern detections
 MEMORY_SCANNER_COOLDOWN: int = 300
 
-# Frozen snapshot refresh interval (turns)
-MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 10
+# Frozen snapshot refresh interval (successful curated writes)
+MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 1
 
 # Context fencing tags
 MEMORY_CONTEXT_TAG_OPEN: str = "<memory-context>"
@@ -241,8 +283,35 @@ DREAM_BACKUP_KEEP: int = 5
 # entire MemoryStore budget.
 SINGLE_ENTRY_SOFT_LIMIT: int = 1500
 
+# Whether automatic conversation summaries may write into curated MEMORY.md.
+# Default False: summaries go to daily logs + vector index; only explicit
+# memory_save / dream promotion / high-confidence encoder writes land in
+# MEMORY.md.
+MEMORY_AUTO_SUMMARY_TO_CURATED: bool = False
+
 # Agent idle timeout in minutes. When no inbound message is received for
 # any session within this window, a timeout notification is sent back and
 # the session's resources (active tasks, locks, scrubber state) are
 # cleaned up. Set to 0 to disable idle timeout.
 AGENT_IDLE_TIMEOUT_MINUTES: int = 30
+
+
+def is_main_memory_session(channel: str | None) -> bool:
+    """Return True when curated MEMORY.md may be always-on injected.
+
+    Main/local surfaces (cli/web/api/test/local) are trusted private sessions.
+    Explicit shared/messaging channels are rejected. Empty/None channels default
+    to main-session behaviour for local tooling compatibility. Any other
+    unrecognized channel name fails closed (no curated always-on / search).
+    """
+    if not channel:
+        return True
+    name = str(channel).strip().lower()
+    if not name:
+        return True
+    if name in SHARED_MEMORY_CHANNELS:
+        return False
+    if name in MAIN_MEMORY_CHANNELS:
+        return True
+    # Unrecognized names are treated as shared/untrusted.
+    return False

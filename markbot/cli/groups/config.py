@@ -5,7 +5,7 @@ from pathlib import Path
 
 import typer
 
-from markbot.cli.ui import console, markbot_banner
+from markbot.cli.ui import console, make_section_helpers, markbot_banner
 from markbot.config.schema import Config
 
 app = typer.Typer(
@@ -26,19 +26,44 @@ def _get_nested_value(data: dict, path: str):
     return current
 
 
-def _set_nested_value(data: dict, path: str, value) -> bool:
-    """Set a nested value in a dict using dot notation path. Returns True if successful."""
+# Sentinel used to distinguish "key missing" from "value is None".
+_MISSING = object()
+
+
+def _get_nested_value_or_missing(data: dict, path: str):
+    """Like _get_nested_value but returns _MISSING when the path is absent."""
     keys = path.split(".")
     current = data
-    for key in keys[:-1]:
+    for key in keys:
         if isinstance(current, dict) and key in current:
             current = current[key]
         else:
+            return _MISSING
+    return current
+
+
+def _set_nested_value(data: dict, path: str, value) -> bool:
+    """Set a nested value in a dict using dot notation path.
+
+    Returns True if successful. Intermediate dicts are auto-created when
+    the parent path is missing, allowing new keys to be added without
+    pre-declaring them in the schema.
+    """
+    keys = path.split(".")
+    current = data
+    for key in keys[:-1]:
+        if not isinstance(current, dict):
             return False
-    if isinstance(current, dict) and keys[-1] in current:
-        current[keys[-1]] = value
-        return True
-    return False
+        if key not in current:
+            current[key] = {}
+        elif not isinstance(current[key], dict):
+            # Don't silently overwrite a scalar with a dict.
+            return False
+        current = current[key]
+    if not isinstance(current, dict):
+        return False
+    current[keys[-1]] = value
+    return True
 
 
 def _parse_value(value_str: str):
@@ -64,18 +89,23 @@ def get(
     raw: bool = typer.Option(False, "--raw", "-r", help="Output raw value without formatting"),
 ):
     """Get a configuration value."""
-    from rich.text import Text
-
     from markbot.config.loader import load_config
 
     config = load_config()
     data = config.model_dump(by_alias=True)
-    value = _get_nested_value(data, key)
+    value = _get_nested_value_or_missing(data, key)
+
+    if value is _MISSING:
+        markbot_banner()
+        console.print()
+        console.print(f"  [yellow]○[/yellow] Key '{key}' not found")
+        console.print()
+        raise typer.Exit(1)
 
     if value is None:
         markbot_banner()
         console.print()
-        console.print(f"  [yellow]○[/yellow] Key '{key}' not found or is null")
+        console.print(f"  [yellow]○[/yellow] Key '{key}' is present but set to null")
         console.print()
         raise typer.Exit(1)
 
@@ -88,21 +118,7 @@ def get(
     else:
         markbot_banner()
 
-        W = 72  # total width
-
-        def section(title: str, color: str = "cyan") -> None:
-            title_text = f"  {title}  "
-            pad = W - len(title_text) - 2
-            line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-            console.print(line)
-
-        def kv(k: str, v: str, key_w: int = 14) -> None:
-            line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
-            console.print(line)
-
-        def divider() -> None:
-            line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-            console.print(line)
+        section, kv, divider = make_section_helpers()
 
         console.print()
 
@@ -129,8 +145,6 @@ def set_(  # noqa: A001  (shadows builtin, intentional for CLI sub-command)
     """Set a configuration value."""
     import json
 
-    from rich.text import Text
-
     from markbot.config.loader import load_config, save_config
 
     config = load_config()
@@ -138,7 +152,8 @@ def set_(  # noqa: A001  (shadows builtin, intentional for CLI sub-command)
 
     parsed_value = _parse_value(value)
 
-    if _get_nested_value(data, key) is None:
+    existing = _get_nested_value_or_missing(data, key)
+    if existing is _MISSING:
         markbot_banner()
         console.print()
         console.print(f"  [yellow]⚠[/yellow] Warning: Key '{key}' does not exist in config schema")
@@ -164,21 +179,7 @@ def set_(  # noqa: A001  (shadows builtin, intentional for CLI sub-command)
 
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(k: str, v: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -201,8 +202,6 @@ def list_(  # noqa: A001  (shadows builtin, intentional for CLI sub-command)
 ):
     """List all configuration keys and values."""
     import json
-
-    from rich.text import Text
 
     from markbot.config.loader import load_config
 
@@ -232,21 +231,7 @@ def list_(  # noqa: A001  (shadows builtin, intentional for CLI sub-command)
 
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(k: str, v: str, key_w: int = 20) -> None:
-        line = Text.from_markup(f"  [cyan]{k:<{key_w}}[/cyan] {v}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 

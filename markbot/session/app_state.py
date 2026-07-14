@@ -49,13 +49,19 @@ class AppStateProvider:
         self.store.set(updater)
 
     def update(self, **kwargs: Any) -> None:
-        """Update specific fields."""
+        """Update specific fields.
+
+        Raises ``AttributeError`` if a field doesn't exist on ``AppState``.
+        """
 
         def updater(state: AppState) -> AppState:
             new_state = state.copy()
             for key, value in kwargs.items():
-                if hasattr(new_state, key):
-                    setattr(new_state, key, value)
+                if not hasattr(new_state, key):
+                    raise AttributeError(
+                        f"AppState has no field {key!r}; cannot update"
+                    )
+                setattr(new_state, key, value)
             return new_state
 
         self.set(updater)
@@ -93,7 +99,7 @@ class AppStateProvider:
     @contextmanager
     def batch(
         self,
-    ) -> Generator[list[Callable[[AppState], AppState]], None, None]:
+    ) -> Generator[Callable[[Callable[[AppState], AppState]], None], None, None]:
         """Batch multiple updates into one notification."""
         updates: list[Callable[[AppState], AppState]] = []
 

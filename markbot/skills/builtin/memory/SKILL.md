@@ -17,21 +17,31 @@ Memory system using file-based storage for conversation compaction, async summar
 ## Architecture
 
 ### MEMORY.md — Long-Term Curated Memory
-- **Purpose**: Curated long-term facts, like a human's long-term memory
-- **Lifetime**: Permanent, updated by async summarization
-- **Storage**: `workspace/MEMORY.md`
+- **Purpose**: Curated long-term facts only (high-signal)
+- **Lifetime**: Permanent
+- **Storage**: `workspace/MEMORY.md` (flat entry list separated by `---`)
 - **Use for**: User preferences, key decisions, project context, lessons learned
-- **Auto-loaded**: Included in system prompt for main sessions
+- **Auto-loaded**: System prompt for main/private sessions only (cli/web/api/local)
+- **Not auto-loaded**: Shared messaging channels (dingtalk/feishu/qq/email/...)
+- **Shared-channel search**: `memory_search` on shared channels excludes MEMORY.md / PROFILE.md and returns only same-session logs/summaries
+- **Shared-channel list/load**: `memory_list`, `memory_forget`, and context explorer cannot read MEMORY.md / PROFILE.md on shared channels
 
 **Update MEMORY.md when:**
-- User states preferences ("I prefer dark mode", "My name is Mark")
+- User explicitly asks to remember something (`memory_save`)
+- User states durable preferences ("I prefer dark mode", "My name is Mark")
 - Project decisions are made ("API uses OAuth2", "Database is PostgreSQL")
 - Important lessons learned from mistakes
+- Dream promotion of high-access curated/summary facts
 
-### memory/YYYY-MM-DD.md — Daily Notes
-- **Purpose**: Auto-generated daily conversation summaries
-- **Lifetime**: Permanent
-- **Storage**: `workspace/memory/YYYY-MM-DD.md`
+**Do NOT put in MEMORY.md:**
+- Temporary task progress / TODO state
+- Full conversation transcripts
+- Automatic turn summaries (those go to daily logs + vector index)
+
+### memory/daily/YYYY-MM-DD.md — Daily Notes
+- **Purpose**: Raw interaction log + auto-summary notes
+- **Lifetime**: Retention-limited (default 30 days)
+- **Storage**: `workspace/memory/daily/YYYY-MM-DD.md`
 - **Use for**: Reviewing recent activity, finding past conversations
 - **Search**: Via `memory_search` tool
 
@@ -70,11 +80,12 @@ When conversation exceeds 75% of context window:
 4. Summary stored in `.compressed_summary`
 
 ### Async Summarization
-After each conversation turn:
-1. Background task summarizes via `summary_memory`
-2. Result appended to `.compressed_summary`
-3. Daily summary written to `memory/YYYY-MM-DD.md`
-4. Heartbeat summarization at scheduled times updates MEMORY.md with key facts
+On compaction / periodic auto-summary:
+1. Background task extracts durable facts via `summary_memory`
+2. Facts are indexed into vector memory (`summary/durable`)
+3. A short note is appended to `memory/daily/YYYY-MM-DD.md`
+4. Curated `MEMORY.md` is NOT modified unless `auto_summary_to_curated=true`
+5. Dream may later promote high-access curated/summary facts into MEMORY.md
 
 ## Slash Commands
 
@@ -86,6 +97,7 @@ After each conversation turn:
 
 | Component | Type | Persistence | Auto-Context |
 |-----------|------|-------------|--------------|
-| MEMORY.md | Curated facts | Permanent | ✅ Main sessions |
-| memory/*.md | Daily notes | Permanent | On demand via search |
+| MEMORY.md | Curated facts | Permanent | ✅ Main sessions only |
+| memory/daily/*.md | Daily notes | Retention-limited | On demand via search |
+| vector index | Semantic recall | Permanent (capped) | Prefetch + search |
 | .compressed_summary | Session context | Current session | Auto-injected |

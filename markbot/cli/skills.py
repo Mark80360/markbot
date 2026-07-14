@@ -146,8 +146,33 @@ def scan_script(
                 if remaining > 0:
                     console.print(f"\n[{remaining} additional findings, use --verbose to see all]")
 
+    except FileNotFoundError as e:
+        # Missing skill directory or script file — distinct from internal
+        # scanner errors so users know they typed the wrong name.
+        console.print(f"[red]✗ Not found: {e}[/red]")
+        console.print(
+            "[dim]Check the skill/script name with [cyan]markbot skills list[/cyan].[/dim]"
+        )
+        raise typer.Exit(2)
+    except KeyError:
+        # Registry raised KeyError → skill exists but script doesn't.
+        console.print(f"[red]✗ Script '{script}' not found in skill '{skill}'[/red]")
+        console.print(
+            f"[dim]Available scripts can be listed with "
+            f"[cyan]markbot skills info {skill}[/cyan].[/dim]"
+        )
+        raise typer.Exit(2)
+    except ImportError as e:
+        # Security scanner backend missing.
+        console.print(f"[yellow]⚠ Security scanner not available: {e}[/yellow]")
+        console.print(
+            "[dim]Install the optional scanner dependency, or run with --no-scan.[/dim]"
+        )
+        raise typer.Exit(3)
     except Exception as e:
-        console.print(f"[red]Error scanning script: {e}[/red]")
+        # Genuine internal error — surface the type so it's distinguishable
+        # from "wrong name" above.
+        console.print(f"[red]✗ Scanner error ({type(e).__name__}): {e}[/red]")
         raise typer.Exit(1)
     finally:
         logger.enable("markbot.core.skills.registry")

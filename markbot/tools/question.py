@@ -23,11 +23,56 @@ class AskUserQuestionTool(Tool):
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._pending_questions: dict[str, asyncio.Future] = {}
+        # Session-keyed mapping for channels (e.g. feishu) that cannot
+        # propagate question_id metadata on inbound replies.  The loop
+        # consults this to route plain-text replies to the pending future
+        # without requiring the user to type ``[Q:uuid]`` or the channel
+        # to round-trip metadata.
+        self._session_questions: dict[str, str] = {}
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
+
+    @staticmethod
+    def _session_key_for_context(context: Any) -> str:
+        """Derive the loop-level session_key from a ToolContext.
+
+        Prefers ``context.session_id`` (populated by the iteration runner
+        to match ``msg.session_key``); falls back to ``channel:chat_id``.
+        """
+        if context is None:
+            return ""
+        sid = getattr(context, "session_id", "") or ""
+        if sid:
+            return sid
+        ch = getattr(context, "channel", "") or ""
+        cid = getattr(context, "chat_id", "") or ""
+        if ch and cid:
+            return f"{ch}:{cid}"
+        return ""
+
+    def has_pending(self, session_key: str) -> bool:
+        """Return True if ``session_key`` has an unanswered question."""
+        return bool(session_key) and session_key in self._session_questions
+
+    def get_pending_qid(self, session_key: str) -> str | None:
+        """Return the pending question_id for ``session_key`` (or None)."""
+        return self._session_questions.get(session_key) if session_key else None
+
+    def register_pending(self, session_key: str, question_id: str) -> None:
+        """Register a pending question for session-keyed reply routing.
+
+        Used by callers that create their own future (e.g. the permission
+        approver fallback path) so their replies are also routed by session.
+        """
+        if session_key and question_id:
+            self._session_questions[session_key] = question_id
+
+    def unregister_pending(self, session_key: str) -> None:
+        """Drop the session-keyed mapping without resolving the future."""
+        self._session_questions.pop(session_key, None)
 
     def set_callbacks(
         self,
@@ -44,6 +89,12 @@ class AskUserQuestionTool(Tool):
             future = self._pending_questions.pop(question_id)
             if not future.done():
                 future.set_result(response)
+            # Drop the session-keyed mapping so a subsequent message in
+            # the same session starts a fresh turn instead of being
+            # routed to the now-resolved question.
+            for sk, qid in list(self._session_questions.items()):
+                if qid == question_id:
+                    del self._session_questions[sk]
 
     @property
     def name(self) -> str:
@@ -110,7 +161,9 @@ class AskUserQuestionTool(Tool):
         # Generate unique question ID
         question_id = str(uuid.uuid4())
 
-        # Format message based on channel capabilities
+        # Format message based on channel capabilities. Always embed the
+        # question id in content so replies can be correlated even when the
+        # channel cannot round-trip metadata.
         content = self._format_question(question, options)
 
         # Send question
@@ -139,20 +192,40 @@ class AskUserQuestionTool(Tool):
                 return f"Error waiting for response: {str(e)}"
         else:
             # Fallback: create future and wait
-            future: asyncio.Future[str] = asyncio.Future()
+            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
             self._pending_questions[question_id] = future
+            session_key = self._session_key_for_context(context)
+            if session_key:
+                self._session_questions[session_key] = question_id
 
             try:
                 response = await asyncio.wait_for(future, timeout=300.0)  # 5 min timeout
                 return f"User selected: {response}"
             except asyncio.TimeoutError:
                 self._pending_questions.pop(question_id, None)
+                if session_key:
+                    self._session_questions.pop(session_key, None)
                 return "Error: Question timed out (no response after 5 minutes)"
             except Exception as e:
                 self._pending_questions.pop(question_id, None)
+                if session_key:
+                    self._session_questions.pop(session_key, None)
                 return f"Error waiting for response: {str(e)}"
+            finally:
+                # handle_response() pops both maps on successful resolution
+                # and the except blocks pop on timeout/error, but a
+                # CancelledError (task aborted via /stop or session reset)
+                # bypasses every except branch.  Idempotent pops keep both
+                # maps clean regardless of the exit path.
+                self._pending_questions.pop(question_id, None)
+                if session_key:
+                    self._session_questions.pop(session_key, None)
 
-    def _format_question(self, question: str, options: list[dict[str, str]]) -> str:
+    def _format_question(
+        self,
+        question: str,
+        options: list[dict[str, str]],
+    ) -> str:
         """Format question based on channel capabilities."""
 
         # For channels with interactive capabilities (feishu, dingtalk)

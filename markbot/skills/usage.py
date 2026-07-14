@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from loguru import logger
 
@@ -50,6 +50,14 @@ class SkillUsageStore:
             self._data[skill_name] = SkillUsageEntry()
         return self._data[skill_name]
 
+    def peek(self, skill_name: str) -> Optional[SkillUsageEntry]:
+        """Return the usage entry for a skill without creating one.
+
+        Use this in read-only paths (e.g. lifecycle evaluation, listing)
+        to avoid persisting empty entries for skills that were never used.
+        """
+        return self._data.get(skill_name)
+
     def bump_view(self, skill_name: str) -> None:
         """Increment view counter and update activity timestamp."""
         entry = self.get(skill_name)
@@ -78,14 +86,15 @@ class SkillUsageStore:
         entry.state = state
         self._persist()
 
+    def remove(self, skill_name: str) -> None:
+        """Remove a skill's usage entry entirely (used when a skill is deleted)."""
+        if skill_name in self._data:
+            del self._data[skill_name]
+            self._persist()
+
     def get_all(self) -> Dict[str, SkillUsageEntry]:
         """Return all usage entries."""
         return dict(self._data)
-
-    def remove(self, skill_name: str) -> None:
-        """Remove usage data for a deleted skill."""
-        self._data.pop(skill_name, None)
-        self._persist()
 
     # -- Internal ------------------------------------------------------------
 

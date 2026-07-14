@@ -275,6 +275,7 @@ class LongTermMemory:
         channel: str | None = None,
         chat_id: str | None = None,
         source: str | None = None,
+        include_curated: bool = True,
     ) -> list[dict[str, Any]]:
         """Semantic search returning ``[{content, source, score, ...}]``.
 
@@ -307,14 +308,42 @@ class LongTermMemory:
             logger.debug("LongTermMemory.search query failed: {}", exc)
             return []
 
-        # If session-scoped filtering wiped everything but we have no
-        # explicit session request, fall back to unscoped recall so the
-        # agent still gets *some* relevant memory.
-        if not records and filter_meta is not None:
+        # Optionally merge *curated* global memories even when a session
+        # filter is active. Main/private sessions want this so preferences
+        # without channel metadata remain findable. Shared messaging
+        # channels pass include_curated=False to avoid private leakage.
+        #
+        # Privacy: never pull other sessions' raw turns into this merge, and
+        # never fall back to a fully unscoped turn history search.
+        curated_prefixes = ("memory/", "summary/", "user", "profile")
+        if filter_meta is not None and include_curated:
             try:
-                records = self._store.query(qvec, top_k=top_k, source=source)
+                global_records = self._store.query(qvec, top_k=top_k, source=source)
             except Exception:
-                pass
+                global_records = []
+            by_id = {r.id: r for r in records}
+            for rec in global_records:
+                src = (rec.source or "").lower()
+                if not any(src.startswith(p) for p in curated_prefixes):
+                    continue
+                if rec.id not in by_id or rec.score > by_id[rec.id].score:
+                    by_id[rec.id] = rec
+            records = sorted(by_id.values(), key=lambda r: r.score, reverse=True)[:top_k]
+
+            # If the session had no hits, still allow curated-only global recall
+            # (not other sessions' turn transcripts).
+            if not records:
+                curated_only = [
+                    r for r in global_records
+                    if any((r.source or "").lower().startswith(p) for p in curated_prefixes)
+                ]
+                records = sorted(curated_only, key=lambda r: r.score, reverse=True)[:top_k]
+        elif not include_curated:
+            # Strip any curated sources that slipped in via unscoped source filter.
+            records = [
+                r for r in records
+                if not any((r.source or "").lower().startswith(p) for p in curated_prefixes)
+            ]
 
         results: list[dict[str, Any]] = []
         hit_ids: list[str] = []

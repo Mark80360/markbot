@@ -1,7 +1,7 @@
 """Memory management tools for AI self-management.
 
 These tools allow the AI to autonomously manage its long-term memory:
-save, forget, list, and trigger dream optimisation.
+save, forget, and list entries.
 
 Two memory stores:
 - 'memory': agent notes — environment facts, project conventions, tool quirks
@@ -24,6 +24,12 @@ class MemorySaveTool(Tool):
     def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     @property
     def name(self) -> str:
@@ -98,6 +104,12 @@ class MemoryForgetTool(Tool):
     def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     @property
     def name(self) -> str:
@@ -143,8 +155,16 @@ class MemoryForgetTool(Tool):
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
         try:
+            from markbot.utils.constants import is_main_memory_session
+            if not is_main_memory_session(self._channel):
+                return (
+                    "Curated MEMORY.md / PROFILE.md edits are only available in "
+                    "main/private sessions (cli/web/api/local)."
+                )
             result = await self._memory_manager.delete_memory(
-                memory_id=memory_id, target=target,
+                memory_id=memory_id,
+                target=target,
+                channel=self._channel,
             )
             if not result:
                 return f"No entry containing '{memory_id[:40]}' found in {target}."
@@ -156,9 +176,17 @@ class MemoryForgetTool(Tool):
 class MemoryListTool(Tool):
     """List recent long-term memory entries."""
 
+    _is_read_only = True
+
     def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._memory_manager = memory_manager
+        self._channel: str | None = None
+        self._chat_id: str | None = None
+
+    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+        self._channel = channel
+        self._chat_id = chat_id
 
     @property
     def name(self) -> str:
@@ -201,8 +229,17 @@ class MemoryListTool(Tool):
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
         try:
+            from markbot.utils.constants import is_main_memory_session
+            if not is_main_memory_session(self._channel):
+                return (
+                    "Curated MEMORY.md / PROFILE.md listing is only available in "
+                    "main/private sessions. Use memory_search for this conversation's "
+                    "logs and summaries."
+                )
             memories = await self._memory_manager.list_memories(
-                limit=limit, target=target,
+                limit=limit,
+                target=target,
+                channel=self._channel,
             )
             if not memories:
                 return f"No {target} entries found."
@@ -219,35 +256,3 @@ class MemoryListTool(Tool):
             return f"Error listing memories: {e}"
 
 
-class DreamTool(Tool):
-    """Trigger dream-based memory optimisation."""
-
-    def __init__(self, memory_manager: BaseMemoryManager | None = None, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._memory_manager = memory_manager
-
-    @property
-    def name(self) -> str:
-        return "dream"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Trigger an AI-driven memory optimisation cycle (Dream). "
-            "This reads your memory store, summarises, merges duplicates, "
-            "and cleans outdated entries. Use when you feel your memory "
-            "is cluttered or outdated."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
-
-    async def _legacy_execute(self, **kwargs: Any) -> str:
-        if not self._memory_manager:
-            return "Error: Memory manager is not available."
-        try:
-            result = await self._memory_manager.dream()
-            return f"Dream optimisation completed: {result}" if result else "Dream optimisation completed."
-        except Exception as e:
-            return f"Error during dream optimisation: {e}"

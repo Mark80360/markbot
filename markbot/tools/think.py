@@ -15,6 +15,8 @@ from markbot.tools.base import Tool
 class ThinkTool(Tool):
     """Unified tool for structured thinking, planning, reflection, and code analysis."""
 
+
+    _is_read_only = True
     @property
     def name(self) -> str:
         return "think"

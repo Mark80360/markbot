@@ -64,7 +64,13 @@ class SkillLifecycle:
         if is_builtin:
             return SkillState.ACTIVE
 
-        entry = self._usage_store.get(skill_name)
+        # Use peek (not get) so evaluating a skill that has no usage entry
+        # doesn't persist an empty entry as a side effect.
+        entry = self._usage_store.peek(skill_name)
+        if entry is None:
+            # No usage data means the skill was just created and hasn't
+            # been tracked yet. Treat it as active (within grace period).
+            return SkillState.ACTIVE
         now = time.time()
 
         # If archived directory exists for this skill, it's archived
@@ -78,13 +84,18 @@ class SkillLifecycle:
                 return SkillState.STALE
             return SkillState.ACTIVE
 
-        # Check inactivity
-        if entry.last_activity_at is not None:
-            inactive_duration = now - entry.last_activity_at
-            if inactive_duration > ARCHIVE_THRESHOLD:
-                return SkillState.ARCHIVED
-            if inactive_duration > STALE_THRESHOLD:
-                return SkillState.STALE
+        # Check inactivity. Fall back to created_at if last_activity_at is
+        # missing (e.g. legacy data migrated before last_activity_at existed)
+        # so a skill with use_count>0 but no activity timestamp still ages
+        # out instead of being stuck in ACTIVE forever.
+        reference_ts = entry.last_activity_at
+        if reference_ts is None:
+            reference_ts = entry.created_at
+        inactive_duration = now - reference_ts
+        if inactive_duration > ARCHIVE_THRESHOLD:
+            return SkillState.ARCHIVED
+        if inactive_duration > STALE_THRESHOLD:
+            return SkillState.STALE
 
         return SkillState.ACTIVE
 
@@ -100,9 +111,9 @@ class SkillLifecycle:
         reports = []
         for skill_name, is_builtin in skills:
             current = self.evaluate(skill_name, is_builtin)
-            # Get the skill's stored state from usage store
-            entry = self._usage_store.get(skill_name)
-            stored_state = getattr(entry, 'state', SkillState.ACTIVE)
+            # Use peek to avoid creating empty entries as a side effect.
+            entry = self._usage_store.peek(skill_name)
+            stored_state = getattr(entry, 'state', SkillState.ACTIVE) if entry else SkillState.ACTIVE
 
             if current != stored_state:
                 reports.append(TransitionReport(
@@ -113,7 +124,7 @@ class SkillLifecycle:
                 ))
         return reports
 
-    def transition(self, skill_name: str, target_state: str) -> TransitionReport:
+    def transition(self, skill_name: str, target_state: str, is_builtin: bool = False) -> TransitionReport:
         """Execute a state transition for a skill.
 
         For archived state, moves the skill directory to skills/archived/.
@@ -122,10 +133,20 @@ class SkillLifecycle:
         Args:
             skill_name: Name of the skill to transition.
             target_state: Target SkillState.
+            is_builtin: If True, refuse the transition (builtins are always ACTIVE).
 
         Returns:
             TransitionReport with applied=True if successful.
         """
+        if is_builtin:
+            return TransitionReport(
+                skill_name=skill_name,
+                current_state=SkillState.ACTIVE,
+                target_state=target_state,
+                reason="Builtin skills cannot be transitioned",
+                applied=False,
+            )
+
         entry = self._usage_store.get(skill_name)
         current_state = getattr(entry, 'state', SkillState.ACTIVE)
         if current_state == target_state:

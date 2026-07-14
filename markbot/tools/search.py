@@ -97,6 +97,8 @@ def _collect_files(
 class GlobTool(Tool):
     """Enhanced tool to search for files using glob patterns."""
 
+    _is_read_only = True
+
     def __init__(
         self,
         workspace: Path | None = None,
@@ -222,6 +224,8 @@ class GlobTool(Tool):
 
 class GrepTool(Tool):
     """Enhanced tool to search file contents using regex patterns."""
+
+    _is_read_only = True
 
     def __init__(
         self,

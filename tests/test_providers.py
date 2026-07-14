@@ -39,6 +39,124 @@ class TestToolCallRequest:
         assert "arguments" in result["function"]
 
 
+# ---------------------------------------------------------------------------
+# CustomSpec thinking-type quirks (debug session markbot-multimodal-chain-fail)
+# ---------------------------------------------------------------------------
+
+
+class TestCustomSpecThinkingType:
+    def _custom(self) -> CustomSpec:
+        # Re-derive the singleton from PROVIDERS so we exercise the real spec.
+        for spec in PROVIDERS:
+            if isinstance(spec, CustomSpec):
+                return spec
+        raise AssertionError("CustomSpec missing from PROVIDERS")
+
+    def test_minimax_uses_adaptive_type(self):
+        spec = self._custom()
+        reasoning = {"enabled": True, "effort": "medium"}
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config=reasoning, model="MiniMax-M3",
+        )
+        assert eb.get("thinking") == {"type": "adaptive"}
+        # reasoning_effort still surfaced at the top level
+        assert tl.get("reasoning_effort") == "medium"
+
+    def test_minimax_disabled_still_uses_disabled_type(self):
+        spec = self._custom()
+        eb, _tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "medium"},
+            model="MiniMax-M3",
+        )
+        assert eb.get("thinking") == {"type": "disabled"}
+
+    def test_deepseek_keeps_legacy_enabled_type(self):
+        spec = self._custom()
+        # deepseek-v4 family is the "default" behavior — preserves the
+        # historical "enabled" payload that the upstream actually accepts.
+        eb, _ = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="custom/deepseek-v4-flash-free",
+        )
+        assert eb.get("thinking") == {"type": "enabled"}
+
+    def test_kimi_uses_legacy_enabled_type(self):
+        spec = self._custom()
+        eb, _ = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "low"},
+            model="kimi-k2.5",
+        )
+        assert eb.get("thinking") == {"type": "enabled"}
+
+    def test_non_thinking_model_emits_nothing(self):
+        spec = self._custom()
+        # gpt-3.5-turbo isn't in the markers — spec should not inject
+        # any thinking/reasoning config.
+        eb, tl = spec.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="gpt-3.5-turbo",
+        )
+        assert "thinking" not in eb
+        assert "reasoning_effort" not in tl
+
+
+class TestUsesAdaptiveThinking:
+    def test_minimax_m3(self):
+        assert CustomSpec._uses_adaptive_thinking("MiniMax-M3") is True
+
+    def test_minimax_m2(self):
+        assert CustomSpec._uses_adaptive_thinking("minimax-m2.5") is True
+
+    def test_deepseek(self):
+        assert CustomSpec._uses_adaptive_thinking("deepseek-v4") is False
+
+    def test_none(self):
+        assert CustomSpec._uses_adaptive_thinking(None) is False
+
+    def test_empty(self):
+        assert CustomSpec._uses_adaptive_thinking("") is False
+
+
+class TestModelConfigCapabilities:
+    """Pydantic-level checks on the new ``capabilities`` field."""
+
+    def _cfg(self, **kwargs):
+        from markbot.config.schema import ModelConfig
+        defaults = {"id": "x", "name": "x"}
+        defaults.update(kwargs)
+        return ModelConfig(**defaults)
+
+    def test_default_is_text_only(self):
+        m = self._cfg()
+        assert m.capabilities == ["text"]
+        assert m.has_capability("text") is True
+        assert m.has_capability("image") is False
+
+    def test_explicit_capabilities(self):
+        m = self._cfg(capabilities=["text", "image"])
+        assert m.has_capability("image") is True
+        assert m.has_capability("IMAGE") is True  # case-insensitive
+
+    def test_string_input_is_normalized(self):
+        # Comma-separated string is split so YAML/JSON users can write
+        # ``capabilities: "text, image, video"`` without a list.
+        m = self._cfg(capabilities="text, image, video")
+        assert m.capabilities == ["text", "image", "video"]
+
+    def test_single_string_input(self):
+        m = self._cfg(capabilities="image")
+        assert m.capabilities == ["image"]
+
+    def test_unknown_capability_rejected(self):
+        import pytest
+        with pytest.raises(ValueError):
+            self._cfg(capabilities=["text", "telepathy"])
+
+    def test_dedup(self):
+        m = self._cfg(capabilities=["text", "image", "text", "IMAGE"])
+        assert m.capabilities == ["text", "image"]
+
+
 class TestLLMResponse:
     def test_basic_response(self):
         r = LLMResponse(content="Hello!")
@@ -114,6 +232,7 @@ class TestFallbackManager:
         mgr._circuits = {}
         mgr._circuit_threshold = 3
         mgr._circuit_cooldown = 60.0
+        mgr._half_open_probes = set()
 
         assert mgr._check_circuit("test") is True
         mgr._record_failure("test")
@@ -208,17 +327,17 @@ class TestProviderSpec:
 class TestDeepSeekSpec:
     def test_thinking_model_v4(self):
         spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
-        assert spec._model_supports_thinking("deepseek-v4-pro") is True
-        assert spec._model_supports_thinking("deepseek-v4-flash") is True
+        assert spec.model_supports_thinking("deepseek-v4-pro") is True
+        assert spec.model_supports_thinking("deepseek-v4-flash") is True
 
     def test_non_thinking_model_v3(self):
         spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
-        assert spec._model_supports_thinking("deepseek-chat") is False
-        assert spec._model_supports_thinking("deepseek-v3") is False
+        assert spec.model_supports_thinking("deepseek-chat") is False
+        assert spec.model_supports_thinking("deepseek-v3") is False
 
     def test_reasoner_model(self):
         spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")
-        assert spec._model_supports_thinking("deepseek-reasoner") is True
+        assert spec.model_supports_thinking("deepseek-reasoner") is True
 
     def test_build_api_kwargs_extras_thinking_enabled(self):
         spec = DeepSeekSpec(name="deepseek", keywords=("deepseek",), env_key="DEEPSEEK_API_KEY")

@@ -38,6 +38,11 @@ class McpManager:
         """Whether MCP servers are currently connected."""
         return self._connected
 
+    @property
+    def has_servers(self) -> bool:
+        """Whether any MCP servers are configured."""
+        return bool(self._mcp_servers)
+
     async def connect(self, tool_registry: ToolRegistry) -> None:
         """Connect to configured MCP servers (one-time, lazy).
 

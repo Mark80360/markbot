@@ -77,9 +77,16 @@ class SkillImprover:
                 result.issues.append("Skill has never been used or viewed")
                 result.suggestions.append("Consider if this skill is discoverable enough")
 
-        # Check SKILL.md content
-        skill_path = self._workspace / "skills" / skill_name
-        if skill_path.exists():
+        # Check SKILL.md content. Use the skill_def's is_builtin flag to
+        # pick the right directory: workspace skills live in workspace/skills/,
+        # builtin skills live under the package's builtin_skills directory.
+        if skill_def is not None and skill_def.is_builtin:
+            from markbot.skills.core.loader import SkillLoader
+            loader = SkillLoader(self._workspace)
+            skill_path = loader.get_skill_path(skill_name)
+        else:
+            skill_path = self._workspace / "skills" / skill_name
+        if skill_path and skill_path.exists():
             md_path = skill_path / "SKILL.md"
             if md_path.exists():
                 content = md_path.read_text(encoding="utf-8")

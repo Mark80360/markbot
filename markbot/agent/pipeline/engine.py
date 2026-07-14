@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from loguru import logger
 
 from markbot.bus.events import InboundMessage, OutboundMessage
+from markbot.types.permission import PermissionMode
 
 
 @dataclass
@@ -25,6 +26,11 @@ class ProcessContext:
     channel: str = ""
     chat_id: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    # Per-turn override for the active permission mode. When set (e.g. by
+    # cron / autopilot / heartbeat callers via ``process_direct``), the
+    # iteration runner uses this instead of the global ``app_state`` mode,
+    # so unattended paths do not depend on a user having run ``/mode auto``.
+    permission_mode_override: PermissionMode | None = None
 
 
 class Middleware(Protocol):

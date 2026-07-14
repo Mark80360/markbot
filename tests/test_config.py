@@ -32,6 +32,8 @@ class TestAgentDefaults:
         assert ad.temperature == 0.1
         assert ad.max_tool_iterations == 40
         assert ad.timezone == "UTC"
+        assert ad.default_permission_mode is None  # inherit from profile
+        assert ad.profile == "coding"
 
     def test_custom_values(self):
         ad = AgentDefaults(max_tokens=4096, temperature=0.5)
@@ -41,6 +43,17 @@ class TestAgentDefaults:
     def test_timezone_normalization(self):
         ad = AgentDefaults(timezone="UTC+8")
         assert ad.timezone == "Asia/Shanghai"
+
+    def test_default_permission_mode_accepts_valid_values(self):
+        for mode in ("default", "plan", "accept_edits", "auto", "bypass_permissions"):
+            ad = AgentDefaults(default_permission_mode=mode)
+            assert ad.default_permission_mode == mode
+
+    def test_default_permission_mode_rejects_invalid_value(self):
+        import pytest
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            AgentDefaults(default_permission_mode="yolo")
 
 
 class TestModelConfig:
@@ -142,7 +155,7 @@ class TestChannelsConfig:
 class TestGatewayConfig:
     def test_defaults(self):
         gc = GatewayConfig()
-        assert gc.host == "0.0.0.0"
+        assert gc.host == "127.0.0.1"
         assert gc.port == 18790
         assert gc.heartbeat.enabled is True
         assert gc.heartbeat.interval_s == 1800
@@ -162,6 +175,10 @@ class TestExecToolConfig:
         assert etc.enable is True
         assert etc.timeout == 60
         assert etc.allowed_internal_ips == []
+        assert etc.restrict_to_workspace is True
+        assert etc.require_allowlist is False
+        assert etc.allow_patterns == []
+        assert etc.deny_patterns == []
 
 
 class TestFilesystemToolConfig:
@@ -199,7 +216,7 @@ class TestMCPServerConfig:
 class TestToolsConfig:
     def test_defaults(self):
         tc = ToolsConfig()
-        assert tc.restrict_to_workspace is False
+        assert tc.restrict_to_workspace is True
         assert tc.mcp_servers == {}
 
 
@@ -263,3 +280,103 @@ class TestProvidersConfigIsolation:
         pc1.set_provider("my_custom", custom)
         assert pc1.get_provider("my_custom") is not None
         assert pc2.get_provider("my_custom") is None
+
+
+class TestUpdateConfigValue:
+    """``update_config_value`` patches a single nested field in config.json
+    in place, preserving neighboring keys. Used by ``/mode`` to persist
+    runtime mode switches so they survive restarts.
+    """
+
+    def test_creates_intermediate_dicts_when_missing(self, tmp_path):
+        import json
+        from markbot.config.loader import update_config_value
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}", encoding="utf-8")
+        ok = update_config_value(
+            ["agents", "defaults", "defaultPermissionMode"], "auto",
+            config_path=cfg,
+        )
+        assert ok is True
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        assert data["agents"]["defaults"]["defaultPermissionMode"] == "auto"
+
+    def test_preserves_neighboring_fields(self, tmp_path):
+        import json
+        from markbot.config.loader import update_config_value
+        cfg = tmp_path / "config.json"
+        original = {
+            "agents": {"defaults": {"timezone": "Asia/Shanghai", "max_tokens": 4096}},
+            "gateway": {"port": 18790},
+        }
+        cfg.write_text(json.dumps(original, indent=2), encoding="utf-8")
+        ok = update_config_value(
+            ["agents", "defaults", "defaultPermissionMode"], "auto",
+            config_path=cfg,
+        )
+        assert ok is True
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        # New field added
+        assert data["agents"]["defaults"]["defaultPermissionMode"] == "auto"
+        # Neighbors preserved
+        assert data["agents"]["defaults"]["timezone"] == "Asia/Shanghai"
+        assert data["agents"]["defaults"]["max_tokens"] == 4096
+        assert data["gateway"]["port"] == 18790
+
+    def test_overwrites_existing_value(self, tmp_path):
+        import json
+        from markbot.config.loader import update_config_value
+        cfg = tmp_path / "config.json"
+        cfg.write_text(
+            json.dumps({"agents": {"defaults": {"defaultPermissionMode": "default"}}}),
+            encoding="utf-8",
+        )
+        ok = update_config_value(
+            ["agents", "defaults", "defaultPermissionMode"], "accept_edits",
+            config_path=cfg,
+        )
+        assert ok is True
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        assert data["agents"]["defaults"]["defaultPermissionMode"] == "accept_edits"
+
+    def test_creates_file_when_missing(self, tmp_path):
+        import json
+        from markbot.config.loader import update_config_value
+        cfg = tmp_path / "subdir" / "config.json"
+        ok = update_config_value(
+            ["agents", "defaults", "defaultPermissionMode"], "auto",
+            config_path=cfg,
+        )
+        assert ok is True
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        assert data["agents"]["defaults"]["defaultPermissionMode"] == "auto"
+
+    def test_refreshes_cached_config(self, tmp_path):
+        from markbot.config import loader as loader_mod
+        from markbot.config.loader import load_config, update_config_value
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}", encoding="utf-8")
+        # Prime the cache
+        load_config(cfg)
+        assert loader_mod._current_config.agents.defaults.default_permission_mode is None
+        update_config_value(
+            ["agents", "defaults", "defaultPermissionMode"], "auto",
+            config_path=cfg,
+        )
+        assert loader_mod._current_config.agents.defaults.default_permission_mode == "auto"
+        # Reset global cache so other tests get a fresh load
+        loader_mod._current_config = None
+        loader_mod._current_config_path = None
+
+    def test_empty_key_path_returns_false(self, tmp_path):
+        from markbot.config.loader import update_config_value
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}", encoding="utf-8")
+        ok = update_config_value([], "auto", config_path=cfg)
+        assert ok is False
+
+    def teardown_method(self):
+        # Ensure global cache doesn't leak between tests
+        from markbot.config import loader as loader_mod
+        loader_mod._current_config = None
+        loader_mod._current_config_path = None

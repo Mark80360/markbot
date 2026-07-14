@@ -40,6 +40,7 @@ class ToolBinder:
         skill_registry: "SkillRegistry | None" = None,
         timezone: str | None = None,
         publish_outbound: Any = None,
+        profile: Any = None,
     ):
         self._tools = tools
         self._workspace = workspace
@@ -57,6 +58,7 @@ class ToolBinder:
         self._skill_registry = skill_registry
         self._timezone = timezone
         self._publish_outbound = publish_outbound
+        self._profile = profile
 
         self._question_tool: Any = None
         self._memory_search_tool: Any = None
@@ -70,22 +72,31 @@ class ToolBinder:
         return self._memory_search_tool
 
     def register_all(self) -> None:
-        """Register the full default tool set."""
+        """Register the full default tool set, filtered by profile when set."""
         extra_read = [BUILTIN_SKILLS_DIR] if self._allowed_dir else None
+        profile = self._profile
 
         self._register_base_tools(extra_allowed_dirs=extra_read)
         self._register_agent_tools()
         self._register_context_tools()
-        self._register_subagent_tools()
+        if profile is None or getattr(profile, "enable_subagents", True):
+            self._register_subagent_tools()
         self._register_memory_tools()
         self._register_skill_tools()
-        self._register_autopilot_tools()
+        if profile is None or getattr(profile, "enable_autopilot", True):
+            self._register_autopilot_tools()
         self._register_desktop_tools()
 
         if self._cron_service:
             from markbot.tools.cron import CronTool
 
             self._tools.register(CronTool(self._cron_service, default_timezone=self._timezone or "UTC"))
+
+        # Soft-disable tools the profile opts out of (exact names).
+        if profile is not None:
+            for name in getattr(profile, "disabled_tools", ()) or ():
+                if self._tools.has(name):
+                    self._tools.unregister(name)
 
     def _register_base_tools(self, extra_allowed_dirs: list[Path] | None = None) -> None:
         """Register filesystem, web, shell, and search tools."""
@@ -137,11 +148,30 @@ class ToolBinder:
         )
 
         if self._exec_config and self._exec_config.enable:
+            profile = self._profile
+            restrict = getattr(self._exec_config, "restrict_to_workspace", True)
+            if profile is not None and getattr(profile, "exec_restrict_to_workspace", False):
+                restrict = True
+            require_allowlist = bool(getattr(self._exec_config, "require_allowlist", False))
+            if profile is not None and getattr(profile, "exec_require_allowlist", False):
+                require_allowlist = True
+            allow_patterns = list(getattr(self._exec_config, "allow_patterns", None) or [])
+            deny_patterns = list(getattr(self._exec_config, "deny_patterns", None) or [])
+            # Safe default allowlist for assistant/unattended when none configured.
+            if require_allowlist and not allow_patterns:
+                allow_patterns = [
+                    r"^(ls|pwd|cat|head|tail|wc|echo|date|uname|whoami|which|file|stat)\b",
+                    r"^(git|rg|grep|find|sed|awk|sort|uniq|diff|python3?|pip3?|pytest|node|npm|pnpm|yarn|make|cargo|go|rustc)\b",
+                    r"^(mkdir|touch|cp|mv|chmod|ln|tar|zip|unzip|curl|wget)\b",
+                ]
             self._tools.register(
                 ExecTool(
                     working_dir=str(self._workspace),
                     timeout=self._exec_config.timeout,
-                    restrict_to_workspace=getattr(self._exec_config, "restrict_to_workspace", False),
+                    restrict_to_workspace=restrict,
+                    require_allowlist=require_allowlist,
+                    allow_patterns=allow_patterns,
+                    deny_patterns=deny_patterns,
                     path_append=self._exec_config.path_append,
                     allowed_internal_ips=self._exec_config.allowed_internal_ips,
                 )
@@ -156,7 +186,12 @@ class ToolBinder:
         if self._code_execution_config is None or self._code_execution_config.enable:
             from markbot.tools.code import CodeExecutionTool
 
-            self._tools.register(CodeExecutionTool())
+            self._tools.register(
+                CodeExecutionTool(
+                    config=self._code_execution_config,
+                    skill_registry=self._skill_registry,
+                )
+            )
 
     def _register_agent_tools(self) -> None:
         """Register tools specific to agent operation."""
@@ -167,11 +202,14 @@ class ToolBinder:
         from markbot.tools.todo import TodoTool
 
         self._tools.register(MessageTool(send_callback=self._publish_outbound))
-        if self._subagent_manager:
+        if self._subagent_manager and (
+            self._profile is None or getattr(self._profile, "enable_subagents", True)
+        ):
             self._tools.register(SpawnTool(manager=self._subagent_manager))
         self._tools.register(ThinkTool())
         self._tools.register(TodoTool(workspace=self._workspace))
-        self._tools.register(ExploreTool(workspace=self._workspace, allowed_dir=self._allowed_dir))
+        if self._profile is None or getattr(self._profile, "enable_explore", True):
+            self._tools.register(ExploreTool(workspace=self._workspace, allowed_dir=self._allowed_dir))
 
     def _register_context_tools(self) -> None:
         """Register context explorer tools for AI-driven dynamic loading."""
@@ -203,7 +241,6 @@ class ToolBinder:
         """Register memory search and self-management tools."""
         from markbot.tools.memory import MemorySearchTool
         from markbot.tools.memory_tools import (
-            DreamTool,
             MemoryForgetTool,
             MemoryListTool,
             MemorySaveTool,
@@ -216,7 +253,6 @@ class ToolBinder:
             self._tools.register(MemorySaveTool(memory_manager=self._memory_manager))
             self._tools.register(MemoryForgetTool(memory_manager=self._memory_manager))
             self._tools.register(MemoryListTool(memory_manager=self._memory_manager))
-            self._tools.register(DreamTool(memory_manager=self._memory_manager))
 
         self._question_tool = AskUserQuestionTool(send_callback=self._publish_outbound)
         self._question_tool.set_context("", "")
@@ -231,7 +267,11 @@ class ToolBinder:
             self._tools.register(SkillViewTool(registry=self._skill_registry))
             self._tools.register(SkillsListTool(registry=self._skill_registry))
             self._skill_registry.register_script_tools()
-        self._tools.register(SkillManageTool(workspace=self._workspace))
+            self._tools.register(
+                SkillManageTool(workspace=self._workspace, skill_registry=self._skill_registry)
+            )
+        else:
+            self._tools.register(SkillManageTool(workspace=self._workspace))
 
     def _register_autopilot_tools(self) -> None:
         """Register autopilot pipeline tools."""
@@ -242,14 +282,18 @@ class ToolBinder:
 
     def _register_desktop_tools(self) -> None:
         """Register computer_use and browser automation tools."""
-        if self._computer_use_config is None or self._computer_use_config.enable:
+        profile = self._profile
+        enable_desktop = profile is None or getattr(profile, "enable_desktop", True)
+        enable_browser = profile is None or getattr(profile, "enable_browser", True)
+
+        if enable_desktop and (self._computer_use_config is None or self._computer_use_config.enable):
             from markbot.tools.computer_use.tool import ComputerUseTool
 
             tool = ComputerUseTool(config=self._computer_use_config)
             if tool.is_enabled:
                 self._tools.register(tool)
 
-        if self._browser_config is None or self._browser_config.enable:
+        if enable_browser and (self._browser_config is None or self._browser_config.enable):
             from markbot.tools.browser import BROWSER_TOOLS
 
             for browser_tool in BROWSER_TOOLS:

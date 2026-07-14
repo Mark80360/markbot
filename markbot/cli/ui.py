@@ -40,6 +40,7 @@ __all__ = [
     "response_renderable",
     "print_cli_progress_line",
     "is_exit_command",
+    "make_section_helpers",
 ]
 
 # ---------------------------------------------------------------------------
@@ -199,3 +200,38 @@ def get_prompt_session() -> PromptSession | None:
 def is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
+
+
+# ---------------------------------------------------------------------------
+# Shared section/kv/divider helpers
+# ---------------------------------------------------------------------------
+
+# Default width used by the various CLI status sub-commands. Kept here so
+# all callers render at the same width and can be tweaked in one place.
+DEFAULT_STATUS_WIDTH = 72
+
+
+def make_section_helpers(width: int = DEFAULT_STATUS_WIDTH):
+    """Return a tuple of (section, kv, divider) closures bound to ``console``.
+
+    Multiple CLI groups (channels/config/gateway/plugins/provider/status/...)
+    re-defined the same three local helpers. Centralising them here keeps the
+    rendering style consistent and lets us change the look in one place.
+    """
+    W = width
+
+    def section(title: str, color: str = "cyan") -> None:
+        title_text = f"  {title}  "
+        pad = W - len(title_text) - 2
+        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
+        console.print(line)
+
+    def kv(key: str, value: str, key_w: int = 14) -> None:
+        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
+        console.print(line)
+
+    def divider() -> None:
+        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
+        console.print(line)
+
+    return section, kv, divider

@@ -214,14 +214,14 @@ class QQChannel(BaseChannel):
             try:
                 await self._client.close()
             except Exception:
-                pass
+                logger.opt(exception=True).debug("Failed to close QQ bot client")
         self._client = None
 
         if self._http:
             try:
                 await self._http.close()
             except Exception:
-                pass
+                logger.opt(exception=True).debug("Failed to close QQ bot HTTP client")
         self._http = None
 
         logger.info("QQ bot stopped")
@@ -627,4 +627,4 @@ class QQChannel(BaseChannel):
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    logger.opt(exception=True).debug("Failed to clean up partial download file: {}", tmp_path)

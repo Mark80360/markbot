@@ -154,6 +154,7 @@ class TestMemoryEncoder:
             pattern_type="preference",
             content="use dark mode",
             raw_text="always use dark mode",
+            confidence=2,
         )]
         encoded = encoder.encode_preferences(matches)
         assert encoded == 1
@@ -163,12 +164,26 @@ class TestMemoryEncoder:
         content = profile_path.read_text(encoding="utf-8")
         assert "dark mode" in content
 
+    def test_encode_preferences_confidence_1_not_written(self, encoder, tmp_path):
+        """First sighting (confidence 1) must NOT enter the curated store."""
+        matches = [PatternMatch(
+            pattern_type="preference",
+            content="use dark mode",
+            raw_text="always use dark mode",
+            confidence=1,
+        )]
+        encoded = encoder.encode_preferences(matches)
+        assert encoded == 0
+        profile_path = tmp_path / "PROFILE.md"
+        assert not profile_path.exists()
+
     def test_encode_preferences_with_store(self, tmp_path, mock_store):
         encoder = MemoryEncoder(workspace=tmp_path, memory_store=mock_store)
         matches = [PatternMatch(
             pattern_type="preference",
             content="use dark mode",
             raw_text="always use dark mode",
+            confidence=2,
         )]
         encoded = encoder.encode_preferences(matches)
         assert encoded == 1
@@ -192,6 +207,7 @@ class TestMemoryEncoder:
             pattern_type="correction",
             content="use React not Angular",
             raw_text="no, I meant React",
+            confidence=2,
         )]
         encoded = encoder.encode_preferences(matches)
         assert encoded == 1

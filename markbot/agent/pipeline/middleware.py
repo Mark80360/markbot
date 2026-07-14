@@ -48,11 +48,21 @@ class QuestionResponseMiddleware(Middleware):
 
         if isinstance(tool, _HasHandleResponse):
             logger.debug("Handling response to question {}", question_id)
-            tool.handle_response(question_id, ctx.msg.content)
+            reply = ctx.msg.content or ""
+            # Users may echo the whole prompt including the [Q:...] marker;
+            # strip it so option matching stays clean.
+            if "[Q:" in reply:
+                reply = reply.split("[Q:", 1)[0].strip()
+            tool.handle_response(question_id, reply)
+            # Acknowledge the reply so the user sees their input was
+            # received and the blocked turn is resuming.  Without this
+            # the middleware returns an empty OutboundMessage, which some
+            # channels render as a blank bubble.
+            ack_preview = reply[:60] if reply else "received"
             return OutboundMessage(
                 channel=ctx.channel,
                 chat_id=ctx.chat_id,
-                content="",
+                content=f"✓ {ack_preview}",
                 metadata=dict(ctx.msg.metadata or {}),
             )
 
@@ -96,7 +106,33 @@ class MemoryLifecycleMiddleware(Middleware):
         self._daily_log = daily_log
         self._session_manager = session_manager
         self._auto_summary_interval = max(auto_summary_interval, 1)
+        # In-memory cache of per-session message counts. Persisted to
+        # ``session.metadata["_auto_summary_count"]`` on each turn so the
+        # count survives process restarts instead of resetting to zero.
         self._session_message_counts: dict[str, int] = {}
+
+    def _get_message_count(self, ctx: ProcessContext) -> int:
+        """Return the persisted message count for *ctx*'s session.
+
+        Reads from ``session.metadata`` (durable across restarts) and
+        caches it in ``_session_message_counts`` for the hot path.
+        """
+        session_key = ctx.session_key or "_default"
+        cached = self._session_message_counts.get(session_key)
+        if cached is not None:
+            return cached
+        persisted = 0
+        if ctx.session and isinstance(getattr(ctx.session, "metadata", None), dict):
+            persisted = int(ctx.session.metadata.get("_auto_summary_count", 0))
+        self._session_message_counts[session_key] = persisted
+        return persisted
+
+    def _set_message_count(self, ctx: ProcessContext, count: int) -> None:
+        """Update both the in-memory cache and the session metadata."""
+        session_key = ctx.session_key or "_default"
+        self._session_message_counts[session_key] = count
+        if ctx.session and isinstance(getattr(ctx.session, "metadata", None), dict):
+            ctx.session.metadata["_auto_summary_count"] = count
 
     async def before(self, ctx: ProcessContext) -> OutboundMessage | None:
         _ = ctx
@@ -110,14 +146,17 @@ class MemoryLifecycleMiddleware(Middleware):
         # Session persistence is handled by sessions.save() in
         # AgentLoop._handle_message() after save_turn().
 
-        session_key = ctx.session_key or "_default"
-        count = self._session_message_counts.get(session_key, 0) + 1
-        self._session_message_counts[session_key] = count
+        count = self._get_message_count(ctx) + 1
+        self._set_message_count(ctx, count)
         if (
             self._memory
             and count >= self._auto_summary_interval
             and count % self._auto_summary_interval == 0
         ):
+            # Honour memory_summary_enabled so operators can disable the
+            # background archival path entirely.
+            if not getattr(self._memory, "memory_summary_enabled", True):
+                return response
             try:
                 history = []
                 if ctx.session and hasattr(ctx.session, 'get_history'):
@@ -131,7 +170,7 @@ class MemoryLifecycleMiddleware(Middleware):
                         self._memory.add_async_summary_task(messages=summary_messages)
                         logger.info(
                             "Auto summary triggered (session={}, msg_count={})",
-                            session_key, count,
+                            ctx.session_key or "_default", count,
                         )
             except Exception as e:
                 logger.warning("Auto summary trigger failed: {}", e)

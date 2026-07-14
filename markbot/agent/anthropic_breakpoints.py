@@ -11,22 +11,27 @@ a cacheable span starting at the request root.
 
 ## The "system_and_3" strategy
 
-We use four breakpoints, in this order:
+Anthropic caps each request at :data:`ANTHROPIC_BREAKPOINT_LIMIT` (4)
+``cache_control`` blocks.  We distribute that budget across the three
+most valuable spans, in this order:
 
-  1. End of the **first** system block — caches the mode prompt /
-     identity / honesty / security / cache discipline.  This is the
-     single most valuable breakpoint: the system prompt is the
-     longest byte-stable prefix.
-  2. End of the **last** system block (or 1 if only one) — caches
-     the remainder of the system prompt (project context, skills,
-     reference docs).
-  3. The **last 3 tool definitions** — most LLM calls reference
-     recently-used tools, and Anthropic's per-block 4-breakpoint
-     limit means we concentrate tool breakpoints where they pay
-     off the most.
-  4. The **last user message** (or assistant message if we just
-     finished a turn) — caches the conversation tail so the next
-     turn can hit on it.
+  1. End of the **last** system block — caches the full system prompt
+     (identity, honesty, security, cache discipline, project context,
+     skills, reference docs).  The system prompt is the longest
+     byte-stable prefix, so a single breakpoint at its tail is the
+     highest-value placement.  We deliberately do **not** also mark
+     the first system block — that would consume a second breakpoint
+     without extending the cacheable span beyond what the tail marker
+     already covers.
+  2. The **last 2 tool definitions** (controlled by
+     :data:`TRAILING_TOOL_BREAKPOINTS`) — most LLM calls reference
+     recently-used tools, so we concentrate the remaining two
+     breakpoints on the trailing tools where they pay off the most.
+  3. The **last user message** — caches the conversation tail so the
+     next turn can hit on it.
+
+That totals 1 (system) + 2 (tools) + 1 (user) = 4 breakpoints,
+exactly at the Anthropic limit.
 
 ## TTL
 
@@ -66,9 +71,10 @@ ANTHROPIC_BREAKPOINT_LIMIT = 4
 
 #: How many trailing tool definitions to mark as cache breakpoints.
 #: Anthropic charges per breakpoint and limits to 4 total; with one
-#: on the system and one on the user tail, the remaining two go to
-#: the last 3 tool definitions (split into two breakpoints that
-#: anchor the 2nd- and 3rd-from-last tools).
+#: on the system tail and one on the user tail, the remaining two
+#: go to the last 2 tool definitions (one breakpoint each on the
+#: final two tools, which are the most likely to be re-used next
+#: turn).  See :func:`attach_tool_breakpoints`.
 TRAILING_TOOL_BREAKPOINTS = 2
 
 

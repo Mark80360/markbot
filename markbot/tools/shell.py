@@ -31,15 +31,23 @@ class ExecTool(Tool):
         working_dir: str | None = None,
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
-        restrict_to_workspace: bool = False,
+        restrict_to_workspace: bool = True,
+        require_allowlist: bool = False,
         path_append: str = "",
         allowed_internal_ips: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or DANGEROUS_COMMAND_PATTERNS
+        # Always keep built-in deny patterns; append any user extras.
+        base_deny = list(DANGEROUS_COMMAND_PATTERNS)
+        if deny_patterns:
+            for p in deny_patterns:
+                if p not in base_deny:
+                    base_deny.append(p)
+        self.deny_patterns = base_deny
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.require_allowlist = require_allowlist
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
         self._cmd_timestamps: defaultdict[str, list[float]] = defaultdict(list)
@@ -86,6 +94,16 @@ class ExecTool(Tool):
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
+
+        # Intercept self-restart / self-stop commands so they go through
+        # the sentinel mechanism instead of being spawned as a child of
+        # the gateway (which would die with the gateway on Windows
+        # before the "start" leg could execute).  See
+        # markbot.cli.daemon for the rationale and the watcher logic.
+        intercepted = self._maybe_intercept_self_restart(command)
+        if intercepted is not None:
+            return intercepted
+
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
@@ -165,6 +183,84 @@ class ExecTool(Tool):
                 return "Error: Command execution failed. Please check the command and try again."
             return f"Error executing command: {error_msg}"
 
+    # Patterns that identify a self-restart / self-stop invocation.
+    # We match loosely: a `markbot gateway <action>` subsequence in the
+    # tokenised command, regardless of leading env vars / wrappers.
+    _SELF_MANAGE_ACTIONS = {"restart", "stop"}
+
+    def _maybe_intercept_self_restart(self, command: str) -> str | None:
+        """Detect ``markbot gateway restart|stop`` and route via sentinel.
+
+        When the agent invokes ``markbot gateway restart`` through the
+        exec tool, the restart child becomes a descendant of the
+        gateway process.  On Windows, killing the gateway then drags
+        the restart child down with it, so the "start" phase never
+        executes — the gateway dies but nothing brings it back.
+
+        To avoid that, we intercept the command here and instead write
+        a sentinel file.  The running gateway's sentinel watcher picks
+        it up, spawns a *detached* restarter process, and exits
+        gracefully through its normal finally block.
+
+        Returns the response string if the command was intercepted,
+        or None to let the normal exec path proceed.
+        """
+        cmd = command.strip()
+        if not cmd:
+            return None
+        tokens = re.split(r"\s+", cmd)
+        # Find the first 'markbot' token; allow leading env assignments
+        # like `FOO=bar markbot gateway restart`.
+        try:
+            i = tokens.index("markbot")
+        except ValueError:
+            return None
+        if i + 2 >= len(tokens):
+            return None
+        if tokens[i + 1] != "gateway":
+            return None
+        action = tokens[i + 2]
+        if action not in self._SELF_MANAGE_ACTIONS:
+            return None
+
+        # Don't intercept ``--help`` / ``status`` / dry-run style calls —
+        # only genuine restart/stop invocations.  We treat any extra
+        # tokens after the action as flags and still intercept; that's
+        # fine because the sentinel carries no params (those come from
+        # ``gateway.params.json`` written at gateway start).
+
+        from markbot.cli.daemon import sentinel_path, write_restart_sentinel
+
+        try:
+            write_restart_sentinel(
+                reason=f"agent {action} via exec tool",
+                mode=action,
+            )
+        except Exception as e:
+            logger.error("Failed to write {} sentinel: {}", action, e)
+            return (
+                f"Error: failed to write {action} sentinel: {e}. "
+                "The command was not executed; the gateway is still running."
+            )
+
+        spath = sentinel_path()
+        if action == "restart":
+            return (
+                "Restart requested via sentinel. The gateway will shut down "
+                "gracefully after the current iteration, and a detached "
+                "restarter will bring it back up with the same parameters. "
+                "The current session's handoff will be loaded on the next "
+                "startup so the task can be resumed.\n"
+                f"Sentinel: {spath}"
+            )
+        # stop
+        return (
+            "Stop requested via sentinel. The gateway will shut down "
+            "gracefully after the current iteration. No restarter will be "
+            "spawned — the gateway stays down until manually restarted.\n"
+            f"Sentinel: {spath}"
+        )
+
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
@@ -174,7 +270,20 @@ class ExecTool(Tool):
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
-        if self.allow_patterns:
+        # Shell metacharacter / interpreter chaining that commonly bypasses
+        # simple command denylists. This is still best-effort, not a sandbox.
+        if self._looks_like_shell_injection(cmd):
+            return (
+                "Error: Command blocked by safety guard "
+                "(shell chaining / interpreter injection detected)"
+            )
+
+        if self.allow_patterns or self.require_allowlist:
+            if not self.allow_patterns:
+                return (
+                    "Error: Command blocked by safety guard "
+                    "(allowlist required but empty — configure tools.exec.allow_patterns)"
+                )
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
@@ -233,7 +342,39 @@ class ExecTool(Tool):
         return None
 
     @staticmethod
+    def _looks_like_shell_injection(command: str) -> bool:
+        """Heuristic block for common shell-injection bypasses.
+
+        Not a complete sandbox. Prefer containers / OS sandbox for hard isolation.
+        """
+        lower = command.lower()
+        # Nested shells / remote code execution via interpreters
+        nested = [
+            r"\bbash\s+-c\b",
+            r"\bsh\s+-c\b",
+            r"\bzsh\s+-c\b",
+            r"\bpython(?:3)?\s+-c\b",
+            r"\bperl\s+-e\b",
+            r"\bruby\s+-e\b",
+            r"\bnode\s+-e\b",
+            r"\bpowershell\b.*-enc(?:odedcommand)?\b",
+            r"/dev/tcp/",
+            r"\bprocess\.popen\b",
+            r"\bos\.system\b",
+            r"`[^`]+`",
+            r"\$\([^)]+\)",
+        ]
+        for pat in nested:
+            if re.search(pat, lower):
+                return True
+        # Command substitution / process substitution
+        if "$(" in command or "`" in command or "<(" in command or ">(" in command:
+            return True
+        return False
+
+    @staticmethod
     def _looks_like_path(s: str) -> bool:
+
         s = s.strip()
         if not s:
             return False

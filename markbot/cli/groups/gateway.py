@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,16 +16,26 @@ import typer
 
 from markbot import __logo__
 from markbot.cli.daemon import (
+    RESTART_MARKER_FRESH_S,
+    RESTART_POLL_INTERVAL_S,
     _gateway_paths,
+    consume_restart_marker,
+    consume_restart_sentinel,
     is_process_running,
     read_pid,
+    read_restart_sentinel,
     remove_pid,
+    sentinel_path,
+    spawn_detached_restarter,
     start_daemon,
     terminate_process,
+    write_gateway_params,
+    write_restart_marker,
 )
 from markbot.cli.runtime import make_provider
-from markbot.cli.ui import console, markbot_banner
+from markbot.cli.ui import console, make_section_helpers, markbot_banner
 from markbot.config.paths import get_cron_dir
+from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -50,6 +61,23 @@ def start(
         console.print("Use [cyan]markbot gateway stop[/cyan] to stop it first.")
         raise typer.Exit(1)
 
+    # Pre-flight: detect port conflicts before spawning the daemon so we
+    # don't leave a stale PID file behind.
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        console.print(
+            f"[red]✗ Port {port} is already in use.[/red] "
+            "Stop the other process or use [cyan]--port[/cyan] to pick a different one."
+        )
+        raise typer.Exit(1)
+    finally:
+        probe.close()
+
     if daemon:
         start_daemon(port, workspace, config, verbose)
     else:
@@ -58,6 +86,8 @@ def start(
 
 def run_gateway_foreground(port: int, workspace: str | None, config: str | None, verbose: bool) -> None:
     """Run the gateway in foreground mode."""
+    import sys
+
     from loguru import logger
 
     from markbot.agent.loop import AgentLoop
@@ -69,12 +99,56 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
 
-    setup_logging(verbose=verbose, log_file=_gateway_paths()["log_file"])
+    # Detect daemon mode: stderr has been redirected to the log file
+    # (via os.dup2 on Unix or subprocess redirection on Windows).  In
+    # this mode we use stderr as the sole loguru sink and disable Rich
+    # colour output so no raw ANSI codes leak into the log file.
+    stderr_is_log = not sys.stderr.isatty()
+    if stderr_is_log:
+        console.no_color = True
 
+    setup_logging(
+        verbose=verbose,
+        log_file=_gateway_paths()["log_file"],
+        stderr_is_log=stderr_is_log,
+    )
+
+    config_path_str = config
     config_path = Path(config) if config else None
     config = load_config(config_path)
     if workspace:
         config.agents.defaults.workspace = workspace
+
+    # Persist startup params so the detached restarter (used during
+    # agent self-restart) can relaunch the gateway with the same
+    # arguments.  See markbot.cli.daemon.spawn_detached_restarter.
+    write_gateway_params(
+        port=port,
+        workspace=workspace,
+        config=config_path_str,
+        verbose=verbose,
+    )
+
+    # If the previous gateway instance left a restart marker (i.e. it
+    # shut down via the sentinel path), record the timestamp so the
+    # bootstrap layer can inject a "you were restarted mid-task" hint
+    # into the next session's context.  We use an environment variable
+    # rather than a module-level flag so the value is visible to the
+    # ``SessionBootstrap`` instance owned by ``AgentLoop`` without
+    # introducing a new import-time dependency between those layers.
+    marker = consume_restart_marker()
+    if marker and "written_at" in marker:
+        import os as _os
+        _os.environ["MARKBOT_LAST_RESTART_AT"] = str(marker["written_at"])
+        if marker.get("reason"):
+            _os.environ["MARKBOT_LAST_RESTART_REASON"] = str(marker["reason"])
+        logger.info(
+            "Gateway restarted (marker reason={}, age={:.1f}s); "
+            "bootstrap will inject resume hint for fresh sessions within {}s",
+            marker.get("reason") or "unspecified",
+            time.time() - float(marker["written_at"]),
+            RESTART_MARKER_FRESH_S,
+        )
 
     console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
 
@@ -84,7 +158,13 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     session_manager = SessionManager(config.workspace_path)
 
     cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-    cron = CronService(cron_store_path)
+    reliability = getattr(config, "reliability", None)
+    cron = CronService(
+        cron_store_path,
+        max_retries=getattr(reliability, "cron_max_retries", 2),
+        retry_delay_s=getattr(reliability, "cron_retry_delay_s", 5.0),
+        dead_letter_keep=getattr(reliability, "dead_letter_keep", 50),
+    )
 
     agent = AgentLoop(
         ctx_or_bus=bus,
@@ -110,6 +190,28 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         budget_config=config.budget if config.budget.enabled else None,
     )
 
+    
+    async def on_cron_failure(job: CronJob, error: str) -> None:
+        """Notify user when cron retries are exhausted."""
+        if reliability is not None and not getattr(reliability, "notify_on_failure", True):
+            return
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+        summary = (
+            f"[Cron Failure] Job '{job.name}' failed after retries.\n"
+            f"Error: {error}\n"
+            f"Instruction: {job.payload.message[:300]}"
+        )
+        try:
+            from markbot.bus.events import OutboundMessage
+            await bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=summary)
+            )
+        except Exception as exc:
+            logger.warning("Failed to publish cron failure notice: {}", exc)
+
+    cron.on_failure = on_cron_failure
+
     async def on_cron_job(job: CronJob) -> str | None:
         from markbot.schedule.evaluator import evaluate_response
         from markbot.tools.cron import CronTool
@@ -131,6 +233,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                permission_mode=PermissionMode.AUTO,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -139,7 +242,19 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             cron_session.retain_recent_legal_suffix(8)
             agent.sessions.save(cron_session)
 
-        response = resp.content if resp else ""
+        response = (resp.content if resp else "") or ""
+
+        # Surface hard model/runtime failures so CronService can retry and
+        # dead-letter instead of marking the job "ok" with an error string.
+        failure_markers = (
+            "All ",
+            "error calling the AI model",
+            "models in chain failed",
+            "Budget exceeded",
+        )
+        lowered = response.lower()
+        if any(m.lower() in lowered for m in failure_markers) or response.startswith("Sorry, I encountered an error"):
+            raise RuntimeError(f"cron agent failure: {response[:500]}")
 
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -186,6 +301,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            permission_mode=PermissionMode.AUTO,
         )
 
         session = agent.sessions.get_or_create("heartbeat")
@@ -226,45 +342,115 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        # Top-level task handles; initialised to None so the finally
+        # block below can safely reference them even if setup fails
+        # before they're created.
+        sentinel_task = None
+        agent_task = None
+        channels_task = None
         try:
             await cron.start()
 
+            dream_service = None
             dream_cron = config.tools.memory.dream_cron
-            dream_task: asyncio.Task | None = None
-            if dream_cron:
-                from zoneinfo import ZoneInfo
+            if dream_cron and agent.memory_manager is not None:
+                from markbot.schedule.dream import DreamService
 
-                from croniter import croniter
-
-                async def _dream_loop():
-                    tz = ZoneInfo(config.agents.defaults.timezone)
-                    while True:
-                        try:
-                            now = datetime.now(tz=tz)
-                            cron_iter = croniter(dream_cron, now)
-                            next_ts = cron_iter.get_next(float)
-                            delay = next_ts - now.timestamp()
-                            if delay < 0:
-                                delay = 0
-                            next_dt = datetime.fromtimestamp(next_ts, tz=tz)
-                            logger.info("Next dream at {} (in {:.0f}s)", next_dt, delay)
-                            await asyncio.sleep(delay)
-                            logger.info("Triggering dream-based memory optimization")
-                            await agent.memory_manager.dream()
-                        except asyncio.CancelledError:
-                            break
-                        except Exception as e:
-                            logger.error("Dream optimization failed: {}", e)
-                            await asyncio.sleep(60)
-
-                dream_task = asyncio.create_task(_dream_loop())
+                # Dream is system-triggered only.  The is_busy_fn guard
+                # ensures it never fires while a conversation is in
+                # progress (requirement: no concurrent dream + chat).
+                dream_service = DreamService(
+                    cron_expr=dream_cron,
+                    dream_fn=agent.memory_manager.dream,
+                    state_dir=config.workspace_path,
+                    is_busy_fn=agent.has_active_conversations,
+                    timezone=config.agents.defaults.timezone,
+                )
+                await dream_service.start()
                 console.print(f"[green]✓[/green] Dream: cron={dream_cron}")
 
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+
+            # Start the skill curator for lifecycle management
+            # (auto-archive stale skills, evaluate quality).
+            curator = None
+            if agent.skill_registry is not None:
+                from markbot.skills.curator import CuratorService
+                curator = CuratorService(
+                    workspace=config.workspace_path,
+                    skill_registry=agent.skill_registry,
+                    auto_archive=True,
+                    interval_hours=6,
+                )
+                await curator.start()
+                console.print("[green]✓[/green] Skill curator: interval=6h")
+
+            # Clear any stale sentinel from a previous run before
+            # starting the watcher — otherwise a leftover sentinel
+            # would trigger an immediate self-restart loop.
+            consume_restart_sentinel()
+
+            async def _sentinel_watcher():
+                """Poll for a restart sentinel and trigger graceful shutdown."""
+                while True:
+                    await asyncio.sleep(RESTART_POLL_INTERVAL_S)
+                    payload = read_restart_sentinel()
+                    if payload is not None:
+                        return payload
+
+            sentinel_task = asyncio.create_task(_sentinel_watcher())
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+
+            # Race the main loop against the sentinel watcher.  Whoever
+            # finishes first wins; if it's the sentinel, we trigger the
+            # graceful shutdown sequence (spawn detached restarter, then
+            # let the agent finish current work before cancelling).
+            done, pending = await asyncio.wait(
+                [agent_task, channels_task, sentinel_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if sentinel_task in done and not sentinel_task.cancelled():
+                payload = sentinel_task.result()
+                if payload:
+                    mode = payload.get("mode", "restart")
+                    reason = payload.get("reason") or "unspecified"
+                    old_pid = read_pid()
+                    restarter_pid = None
+                    if mode == "restart":
+                        restarter_pid = spawn_detached_restarter(payload, old_pid)
+                        # Drop a marker so the new gateway instance
+                        # knows it followed a restart and can inject
+                        # a resume hint into the next session.
+                        try:
+                            write_restart_marker(reason=reason)
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Restart sentinel detected (reason={}); detached "
+                            "restarter spawned (pid={}), initiating graceful shutdown",
+                            reason,
+                            restarter_pid,
+                        )
+                    else:
+                        logger.info(
+                            "Stop sentinel detected (reason={}); initiating "
+                            "graceful shutdown (no restarter will be spawned)",
+                            reason,
+                        )
+                    # Signal the agent loop to stop accepting new work.
+                    # In-flight dispatches will continue to run; the
+                    # main ``while self._running`` loop will exit on its
+                    # next iteration.
+                    agent.stop()
+                    # Give the current iteration a brief window to
+                    # finish naturally so handoff/session state has a
+                    # chance to be persisted.
+                    try:
+                        await asyncio.wait_for(agent_task, timeout=10.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        pass
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:
@@ -272,8 +458,22 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            if dream_task:
-                dream_task.cancel()
+            # Cancel any still-running top-level tasks so the finally
+            # block below can drain services cleanly.
+            for t in [sentinel_task, agent_task, channels_task]:
+                if t is not None and not t.done():
+                    t.cancel()
+            for t in [sentinel_task, agent_task, channels_task]:
+                if t is None or t.done():
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if dream_service:
+                await dream_service.stop()
+            if curator:
+                await curator.stop()
             await agent.close_mcp()
             await heartbeat.stop()
             cron.stop()
@@ -288,25 +488,9 @@ def stop(
     force: bool = typer.Option(False, "--force", "-f", help="Force kill the process"),
 ):
     """Stop the MarkBot gateway service."""
-    from rich.text import Text
-
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -355,26 +539,10 @@ def restart(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     force: bool = typer.Option(False, "--force", "-f", help="Force kill before restart"),
 ):
-    """Restart the MarkBot gateway service."""
-    from rich.text import Text
-
+    """Restart the Markbot gateway service."""
     markbot_banner()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     console.print()
 
@@ -496,29 +664,16 @@ def status():
         return f"[green]✓[/green] {count} files ({size_kb:.0f} KB)"
 
     ws_raw = str(workspace)
-    if ws_raw.startswith("/home/marktang/"):
-        ws_str = "~/" + ws_raw[len("/home/marktang/"):]
+    home_str = str(Path.home())
+    if ws_raw.startswith(home_str + "/"):
+        ws_str = "~" + ws_raw[len(home_str):]
     else:
         ws_str = ws_raw
 
     # ── Render ─────────────────────────────────────────────────────────────
     console.print()
 
-    W = 72  # total width
-
-    def section(title: str, color: str = "cyan") -> None:
-        title_text = f"  {title}  "
-        pad = W - len(title_text) - 2
-        line = Text.from_markup(f"[{color}]{title_text}[/][dim]{'─' * pad}[/]")
-        console.print(line)
-
-    def kv(key: str, value: str, key_w: int = 14) -> None:
-        line = Text.from_markup(f"  [cyan]{key:<{key_w}}[/cyan] {value}")
-        console.print(line)
-
-    def divider() -> None:
-        line = Text.from_markup(f"[dim]{'─' * (W - 2)}[/]")
-        console.print(line)
+    section, kv, divider = make_section_helpers()
 
     # ─ Process ──────────────────────────────────────────────────────────────
     section("Process", "green" if running else "red")
@@ -528,10 +683,6 @@ def status():
             days, r = divmod(uptime.seconds, 3600)
             hours, minutes = divmod(r, 60)
             uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
-            mem_mb = proc.memory_info().rss / 1024 / 1024
-            cpu_pct_val = proc.cpu_percent(interval=0.1)
-            threads = proc.num_threads()
-            # line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}  |  RAM {mem_mb:.0f} MB  |  CPU {cpu_pct_val:.0f}%  |  {threads} threads[/dim]")
             line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  Uptime {uptime_str}[/dim]")
         except Exception:
             line = Text.from_markup(f"  [bold green]●  RUNNING[/bold green]   [dim]PID {pid}  |  (psutil error)[/dim]")

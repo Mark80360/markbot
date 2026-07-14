@@ -322,12 +322,19 @@ class SQLiteVectorStore(VectorStore):
         self,
         db_path: str | Path,
         max_records: int = 50_000,
+        max_scan_records: int = 20_000,
     ) -> None:
         if not _HAS_NUMPY:
             raise ImportError(
                 "SQLiteVectorStore requires numpy; install with: "
                 "pip install numpy"
             )
+        # Hard cap on how many vectors a single query() loads into RAM.
+        # Without this, a full-table scan at 50k records x 1536-dim (OpenAI
+        # embedder) allocates ~300 MB per query.  We bias the SQL sample
+        # toward recently-accessed / recently-created records so the cap
+        # preferentially keeps the most relevant working set.
+        self._max_scan_records = max(1, max_scan_records)
         self._db_path = str(db_path)
         self._max_records = max_records
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -432,7 +439,14 @@ class SQLiteVectorStore(VectorStore):
         self._enforce_max_records()
 
     def _enforce_max_records(self) -> None:
-        """Evict oldest records when over capacity (LRU by created_at)."""
+        """Evict lowest-importance records when over capacity.
+
+        Importance approximation used by SQL (no python loop):
+          - low access_count first
+          - then older created_at
+        This is a practical stand-in for Consolidator.importance() and
+        keeps the working set biased toward frequently recalled facts.
+        """
         try:
             cur = self._write_conn.execute("SELECT COUNT(*) FROM records")
             total = cur.fetchone()[0]
@@ -441,21 +455,24 @@ class SQLiteVectorStore(VectorStore):
         if total <= self._max_records:
             return
         excess = total - self._max_records
-        # Delete the oldest records, but prefer low-access_count ones when
-        # created_at ties (importance-aware eviction).
         with self._write_lock:
             self._write_conn.execute(
                 """
                 DELETE FROM records WHERE id IN (
                     SELECT id FROM records
-                    ORDER BY access_count ASC, created_at ASC
+                    ORDER BY
+                        access_count ASC,
+                        created_at ASC
                     LIMIT ?
                 )
                 """,
                 (excess,),
             )
             self._write_conn.commit()
-        logger.debug("VectorStore LRU evicted {} records (was {})", excess, total)
+        logger.debug(
+            "VectorStore importance-LRU evicted {} records (was {})",
+            excess, total,
+        )
 
     def query(
         self,
@@ -467,25 +484,49 @@ class SQLiteVectorStore(VectorStore):
     ) -> list[VectorRecord]:
         # Read via a fresh read-only connection so concurrent searches
         # don't contend with the write lock.
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            where_parts.append("source = ?")
+            params.append(source)
+        if filter_metadata:
+            for key, value in filter_metadata.items():
+                # Push metadata filters into SQLite so the scan cap is applied
+                # *after* session/source filtering.  Filtering in Python after
+                # LIMIT can miss relevant same-session rows that happen to sit
+                # just beyond the capped global working set.
+                where_parts.append("json_extract(metadata, ?) = ?")
+                params.extend((f"$.{key}", value))
+
+        where_sql = ""
+        if where_parts:
+            where_sql = " WHERE " + " AND ".join(where_parts)
+
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         try:
-            if source is not None:
-                cur = conn.execute(
-                    "SELECT id, content, vector, source, metadata, created_at, access_count "
-                    "FROM records WHERE source = ?",
-                    (source,),
-                )
-            else:
-                cur = conn.execute(
-                    "SELECT id, content, vector, source, metadata, created_at, access_count "
-                    "FROM records"
-                )
+            cur = conn.execute(
+                "SELECT id, content, vector, source, metadata, created_at, access_count "
+                f"FROM records{where_sql} "
+                "ORDER BY access_count DESC, created_at DESC LIMIT ?",
+                (*params, self._max_scan_records),
+            )
             rows = cur.fetchall()
         finally:
             conn.close()
 
         if not rows:
             return []
+
+        # Warn when the scan cap was reached — callers hitting this should
+        # either raise max_scan_records or switch to an ANN-backed store
+        # (Chroma) for better recall at scale.
+        if len(rows) >= self._max_scan_records:
+            logger.warning(
+                "SQLiteVectorStore.query scanned max_scan_records={} "
+                "(capped); {} total records in store — recall may be "
+                "incomplete, consider an ANN backend",
+                self._max_scan_records, len(rows),
+            )
 
         # Build matrices for vectorized cosine.
         ids: list[str] = []
@@ -497,8 +538,6 @@ class SQLiteVectorStore(VectorStore):
         vec_list: list[list[float]] = []
         for rid, content, vec_blob, src, meta_json, crt, acc in rows:
             meta = json.loads(meta_json) if meta_json else {}
-            if not _metadata_matches(meta, filter_metadata):
-                continue
             arr = np.frombuffer(vec_blob, dtype=np.float32)
             ids.append(rid)
             contents.append(content)
@@ -580,7 +619,8 @@ class SQLiteVectorStore(VectorStore):
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         try:
             cur = conn.execute(
-                "SELECT id, content, source, metadata, created_at, access_count FROM records"
+                "SELECT id, content, source, metadata, created_at, access_count FROM records "
+                "ORDER BY access_count DESC, created_at DESC"
             )
             rows = cur.fetchall()
         finally:

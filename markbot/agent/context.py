@@ -92,6 +92,83 @@ def unwrap_multimodal_result(result: Any) -> str | list[dict[str, Any]]:
     return result if isinstance(result, str) else str(result)
 
 
+async def unwrap_multimodal_result_async(result: Any) -> str | list[dict[str, Any]]:
+    """Async variant that uses an auxiliary vision model when available.
+
+    When the main model cannot process images but an auxiliary vision model
+    is configured (``agents.defaults.auxiliary_vision.provider`` /
+    ``.model``), the screenshot is sent to that model and replaced with its
+    text description — preserving visual information for the non-vision
+    main model.
+
+    Falls back to the synchronous :func:`unwrap_multimodal_result` behaviour
+    when no auxiliary model is configured or the auxiliary call fails.
+    """
+    if not (isinstance(result, dict) and result.get("_multimodal")):
+        return unwrap_multimodal_result(result)
+
+    from markbot.tools.computer_use.vision_routing import (
+        describe_image_via_auxiliary,
+        resolve_auxiliary_vision_model,
+        should_route_to_text_only,
+    )
+
+    # Resolve the primary model's provider/model so that per-model
+    # ``capabilities`` declarations and the built-in provider/model tables
+    # are actually consulted. Without these arguments should_route_to_text_only
+    # defaults to False (allow images) even for non-vision models.
+    primary_provider_id: str | None = None
+    primary_model_name: str | None = None
+    try:
+        from markbot.config.loader import load_config
+        config = load_config()
+        if config and config.primary_model_ref:
+            ref = config.primary_model_ref
+            # ref is "providerId/modelId" — split to get the provider id
+            # (ProviderConfig has no .id attribute, so we parse the ref).
+            if "/" in ref:
+                primary_provider_id = ref.split("/", 1)[0]
+            _, model_cfg = config.resolve_model(ref)
+            primary_model_name = model_cfg.name or model_cfg.id
+    except Exception:
+        pass
+
+    # Main model supports images — pass through unchanged.
+    if not should_route_to_text_only(
+        provider=primary_provider_id, model=primary_model_name
+    ):
+        return result.get("content") or result.get("text_summary", "")
+
+    text_summary = result.get("text_summary") or ""
+
+    # No auxiliary model configured — fall back to text_summary.
+    if resolve_auxiliary_vision_model() is None:
+        return text_summary or json.dumps(result, default=str)
+
+    # Extract the image block for the auxiliary model.
+    image_b64: str | None = None
+    mime: str = "image/png"
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "image_url":
+            url = (block.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                # data:image/png;base64,<b64>
+                header, _, data = url.partition(",")
+                if ";" in header and "base64" in header:
+                    mime = header.split(":")[1].split(";")[0]
+                image_b64 = data
+            break
+
+    if not image_b64:
+        return text_summary or json.dumps(result, default=str)
+
+    description = await describe_image_via_auxiliary(image_b64, mime, text_summary)
+    if description:
+        return f"[Vision via auxiliary model]\n{description}"
+    # Auxiliary call failed — degrade to text_summary.
+    return text_summary or json.dumps(result, default=str)
+
+
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent.
     - Separates system context and user context
@@ -205,16 +282,25 @@ You have browser tools for web page interaction. Use them when you need to inter
         for w in sync_warnings:
             logger.warning("Template sync: {}", w)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        *,
+        channel: str | None = None,
+    ) -> str:
         """Build the system prompt using priority-based sections.
 
         Tiered loading strategy:
           Priority 1 (CRITICAL): Identity, security, honesty -- never truncated.
-          Priority 2 (IMPORTANT): Essential bootstrap (AGENTS.md, PROFILE.md).
+          Priority 2 (IMPORTANT): Essential bootstrap (AGENTS.md; PROFILE.md on main sessions).
+          Priority 2 (CONDITIONAL): MEMORY.md only for main/private sessions.
           Priority 3 (STANDARD): Skills index, conditional guidance.
           Priority 4 (REFERENCE): On-demand docs (TOOLS.md, ARCHITECTURE.md).
         """
-        cache_key = f"system_prompt_{sorted(skill_names) if skill_names else ''}"
+        cache_key = (
+            f"system_prompt_{sorted(skill_names) if skill_names else ''}"
+            f"_ch_{str(channel or '').lower()}"
+        )
         cached = self._context_cache.get(cache_key)
         if cached and (time.monotonic() - cached[0]) < self._cache_ttl:
             return cached[1]
@@ -243,14 +329,15 @@ You have browser tools for web page interaction. Use them when you need to inter
             content=self._SECURITY_CORE_RULES, name="security", priority=1,
         ))
 
-        # Priority 2: Essential bootstrap (AGENTS.md, PROFILE.md)
-        essential = self._load_essential_bootstrap()
+        # Priority 2: Essential bootstrap (AGENTS.md + PROFILE.md on main sessions)
+        essential = self._load_essential_bootstrap(channel=channel)
         if essential:
             sections.append(PromptSection(
                 content=essential, name="bootstrap_essential", priority=2,
             ))
-        # Priority 2: Conditional bootstrap (MEMORY.md)
-        conditional = self._load_conditional_bootstrap()
+        # Priority 2: Conditional bootstrap (MEMORY.md) — main sessions only.
+        # Shared messaging channels must not receive private long-term memory.
+        conditional = self._load_conditional_bootstrap(channel=channel)
         if conditional:
             sections.append(PromptSection(
                 content=conditional, name="bootstrap_conditional", priority=2,
@@ -308,6 +395,26 @@ You have browser tools for web page interaction. Use them when you need to inter
                 sections.append(PromptSection(
                     content=self._BROWSER_GUIDANCE, name="browser", priority=3,
                 ))
+
+        # Priority 3: Coding context (project facts — language, package
+        # manager, verify/lint/typecheck commands). Baked into the system
+        # prompt so the model knows up-front how to verify its work in
+        # this project, instead of discovering `pytest` / `npm test` by
+        # trial and error. Byte-stable → lands in the prompt cache prefix.
+        # Mirrors agent's coding_context.detect_project_facts.
+        try:
+            from markbot.agent.coding_context import (
+                detect_project_facts,
+                render_coding_context_section,
+            )
+            coding_facts = detect_project_facts(self.workspace)
+            coding_section = render_coding_context_section(coding_facts)
+            if coding_section:
+                sections.append(PromptSection(
+                    content=coding_section, name="coding_context", priority=3,
+                ))
+        except Exception as exc:
+            logger.debug("Failed to inject coding context: {}", exc)
 
         # Priority 4: Reference docs (TOOLS.md, ARCHITECTURE.md)
         reference = self._load_reference_bootstrap()
@@ -681,13 +788,6 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
-        return """## Context Explorer
-
-Dynamically load background info when you need more context:
-1. `explore_context_catalog` → see what's available
-2. `search_context(query)` → find relevant entries
-3. `load_context(entry)` → read full content"""
-
     def _load_file_content(self, filename: str) -> str | None:
         """Load a single workspace file, returning content or None."""
         file_path = self.workspace / filename
@@ -700,29 +800,80 @@ Dynamically load background info when you need more context:
             logger.warning("Failed to load {}: {}", filename, e)
             return None
 
-    def _load_essential_bootstrap(self) -> str:
+    def _load_essential_bootstrap(self, *, channel: str | None = None) -> str:
         """Load essential bootstrap (Priority 2): AGENTS.md, PROFILE.md.
 
         SOUL.md is handled by _get_identity().
+        PROFILE.md contains personal identity/preferences and is only
+        always-on for main/private sessions (same privacy boundary as
+        MEMORY.md). Shared messaging channels skip it.
         """
-        from markbot.utils.constants import BOOTSTRAP_FILES_ESSENTIAL
+        from markbot.utils.constants import (
+            BOOTSTRAP_FILES_ESSENTIAL,
+            USER_FILENAME,
+            is_main_memory_session,
+        )
         parts = []
         for filename in BOOTSTRAP_FILES_ESSENTIAL:
             if filename == "SOUL.md":
+                continue
+            if filename == USER_FILENAME and not is_main_memory_session(channel):
                 continue
             text = self._load_file_content(filename)
             if text:
                 parts.append(f"## {filename}\n\n{text}")
         return "\n\n".join(parts) if parts else ""
 
-    def _load_conditional_bootstrap(self) -> str:
-        """Load conditional bootstrap (Priority 2): MEMORY.md."""
-        from markbot.utils.constants import BOOTSTRAP_FILES_CONDITIONAL
-        parts = []
+    def _load_conditional_bootstrap(self, *, channel: str | None = None) -> str:
+        """Load conditional bootstrap (Priority 2): curated MEMORY.md.
+
+        Only main/private sessions receive always-on MEMORY.md. Shared
+        messaging channels (dingtalk/feishu/qq/email/...) are blocked here
+        and should rely on on-demand ``memory_search`` instead.
+        """
+        from markbot.utils.constants import (
+            BOOTSTRAP_FILES_CONDITIONAL,
+            MAX_MEMORY_MD_CHARS,
+            MEMORY_FILENAME,
+            is_main_memory_session,
+        )
+        if not is_main_memory_session(channel):
+            return ""
+
+        parts: list[str] = []
         for filename in BOOTSTRAP_FILES_CONDITIONAL:
-            text = self._load_file_content(filename)
-            if text:
-                parts.append(f"## {filename}\n\n{text}")
+            file_path = self.workspace / filename
+            if not file_path.exists():
+                continue
+            try:
+                raw = file_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("Failed to load {}: {}", filename, e)
+                continue
+            if not raw.strip():
+                continue
+
+            # Prefer the MemoryStore entry parser so template/sectioned files
+            # and canonical entry-list files produce the same prompt shape.
+            if filename == MEMORY_FILENAME:
+                try:
+                    from markbot.memory.tool import MemoryStore
+                    entries = MemoryStore.parse_entries_text(raw)
+                except Exception:
+                    entries = []
+                if entries:
+                    body = "\n".join(f"- {e}" for e in entries)
+                else:
+                    body = raw.strip()
+                if len(body) > MAX_MEMORY_MD_CHARS:
+                    body = body[: max(MAX_MEMORY_MD_CHARS - 80, 0)].rstrip() + (
+                        "\n\n...[memory truncated to budget]..."
+                    )
+                parts.append(f"## {filename}\n\n{body}")
+            else:
+                text = raw.strip()
+                if text:
+                    parts.append(f"## {filename}\n\n{text}")
         return "\n\n".join(parts) if parts else ""
 
     def _load_reference_bootstrap(self) -> str:
@@ -802,7 +953,7 @@ Dynamically load background info when you need more context:
                 the leading user text byte-identical across turns so
                 the server-side prefix cache can hit on it.
         """
-        system_content = self.build_system_prompt(skill_names)
+        system_content = self.build_system_prompt(skill_names, channel=channel)
 
         if extra_system_context:
             system_content = f"{system_content}\n\n{extra_system_context}"
@@ -875,6 +1026,43 @@ Dynamically load background info when you need more context:
         is used as a text-only fallback. See ``unwrap_multimodal_result``.
         """
         content = unwrap_multimodal_result(result)
+
+        # Neutralise fence injection (4+ backtick runs) and memory-context
+        # tag spoofing before the result enters the conversation. This is
+        # the single choke point for all tool output, so every tool result
+        # is normalised exactly once regardless of producer. Multimodal
+        # content blocks (lists) are already provider-structured and pass
+        # through untouched.
+        if isinstance(content, str):
+            from markbot.agent.tool_output import sanitize_tool_output
+
+            content = sanitize_tool_output(content)
+
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content}
+        )
+        return messages
+
+    async def add_tool_result_async(
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any,
+    ) -> list[dict[str, Any]]:
+        """Async variant of :meth:`add_tool_result`.
+
+        Uses :func:`unwrap_multimodal_result_async` so that when the main
+        model cannot process images but an auxiliary vision model is
+        configured, the screenshot is described by the auxiliary model
+        instead of being discarded.
+        """
+        content = await unwrap_multimodal_result_async(result)
+
+        if isinstance(content, str):
+            from markbot.agent.tool_output import sanitize_tool_output
+
+            content = sanitize_tool_output(content)
 
         messages.append(
             {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": content}

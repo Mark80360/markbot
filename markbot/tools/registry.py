@@ -11,7 +11,7 @@ from loguru import logger
 
 from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision, PermissionMode, ToolPermissionContext
-from markbot.types.tool import ToolContext, ToolDefinition
+from markbot.types.tool import ToolContext, ToolDefinition, _sanitize_tool_name
 
 
 class ToolRegistry:
@@ -24,10 +24,18 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, BaseTool] = {}
         self._aliases: dict[str, str] = {}  # alias -> name
+        # Reverse map: sanitised wire-name -> original name. Populated on
+        # register() so that a model returning the sanitised name (the form
+        # we send on the wire) can be resolved back to the in-process tool.
+        self._sanitised: dict[str, str] = {}
         self._permission_handlers: list[
             Callable[[BaseTool, dict, ToolContext], PermissionDecision]
         ] = []
         self._definitions_cache: list[dict[str, Any]] | None = None
+        # Optional interactive approver. When set, ``ask`` decisions wait for
+        # a real user yes/no instead of returning a text instruction to the
+        # model. Signature: async (tool_name, params, context, reason) -> bool
+        self._permission_approver: Callable | None = None
 
     def _invalidate_cache(self) -> None:
         self._definitions_cache = None
@@ -40,6 +48,15 @@ class ToolRegistry:
         # Register aliases
         for alias in tool.definition.aliases:
             self._aliases[alias] = name
+
+        # Register sanitised name -> original name for round-tripping
+        # provider-returned tool_call.function.name back to our registry.
+        sanitised = _sanitize_tool_name(name)
+        if sanitised and sanitised != name:
+            # Only add the reverse mapping if the sanitised form actually
+            # differs (i.e. the original name had a non-ASCII char) so that
+            # we don't shadow unrelated tools when the name was already safe.
+            self._sanitised.setdefault(sanitised, name)
 
         self._invalidate_cache()
         logger.debug("Registered tool: {}", name)
@@ -54,6 +71,10 @@ class ToolRegistry:
             for alias in list(self._aliases.keys()):
                 if self._aliases[alias] == name:
                     del self._aliases[alias]
+            # Remove sanitised reverse mapping
+            for sanitised, original in list(self._sanitised.items()):
+                if original == name:
+                    del self._sanitised[sanitised]
 
             self._invalidate_cache()
 
@@ -68,6 +89,11 @@ class ToolRegistry:
         # Check alias
         if name in self._aliases:
             return self._tools.get(self._aliases[name])
+
+        # Check sanitised name (provider may echo the wire form)
+        resolved = self._sanitised.get(name)
+        if resolved is not None:
+            return self._tools.get(resolved)
 
         return None
 
@@ -91,12 +117,28 @@ class ToolRegistry:
         """Get all tool names."""
         return list(self._tools.keys())
 
+    def resolve_sanitised_name(self, name: str) -> str:
+        """Return the in-process name for a wire (sanitised) name.
+
+        If *name* is not a known sanitised alias, it is returned unchanged.
+        """
+        return self._sanitised.get(name, name)
+
     def add_permission_handler(
         self,
         handler: Callable[[BaseTool, dict, ToolContext], PermissionDecision],
     ) -> None:
         """Add a permission handler."""
         self._permission_handlers.append(handler)
+
+    def set_permission_approver(self, approver: Callable | None) -> None:
+        """Set interactive permission approver for ``ask`` decisions.
+
+        The approver should be an async callable:
+        ``(tool_name: str, params: dict, context: ToolContext, reason: str) -> bool``.
+        Returning True allows the tool; False denies it.
+        """
+        self._permission_approver = approver
 
     async def check_permission(
         self,
@@ -161,8 +203,8 @@ class ToolRegistry:
             context = ToolContext(
                 session_id="default",
                 workspace=".",
-                permission_mode=PermissionMode.AUTO,
-                tool_permission_context=ToolPermissionContext(mode=PermissionMode.AUTO),
+                permission_mode=PermissionMode.DEFAULT,
+                tool_permission_context=ToolPermissionContext(mode=PermissionMode.DEFAULT),
                 is_non_interactive=True,
             )
 
@@ -172,10 +214,35 @@ class ToolRegistry:
         if decision.behavior == "deny":
             return f"Error: Tool '{name}' execution denied."
 
-        if decision.behavior == "ask" and not context.is_non_interactive:
-            # In interactive mode, we would show a permission dialog
-            # For now, we'll allow it (the UI layer should handle this)
-            pass
+        if decision.behavior == "ask":
+            reason = decision.reason or "This tool requires confirmation before running."
+            # Non-interactive callers (cron/autopilot/tests without approver)
+            # cannot block on a human; deny rather than silently allowing.
+            if context.is_non_interactive and self._permission_approver is None:
+                return (
+                    f"Error: Tool '{name}' requires confirmation but the session "
+                    f"is non-interactive. Reason: {reason}"
+                )
+            if self._permission_approver is None:
+                return (
+                    f"Permission required: Tool '{name}' was not executed. "
+                    f"Reason: {reason} "
+                    "No interactive approval channel is configured. "
+                    "Use /mode auto for unattended runs, or enable an approver."
+                )
+            try:
+                approved = self._permission_approver(name, params, context, reason)
+                if hasattr(approved, "__await__"):
+                    approved = await approved
+            except Exception as e:
+                logger.error("Permission approver failed for {}: {}", name, e)
+                return f"Error: Permission approval failed for '{name}': {e}"
+            if not approved:
+                return (
+                    f"Error: Tool '{name}' execution denied by user. "
+                    f"Reason: {reason}"
+                )
+            # User approved — fall through to execute.
 
         # Update params if modified by permission check
         if decision.updated_input:

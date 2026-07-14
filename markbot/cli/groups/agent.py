@@ -133,7 +133,13 @@ def agent(
         log_file=_gateway_paths()["agent_log_file"],
     )
 
-    _cmd_start = time.time()
+    # Bridge TOOL_PROGRESS events to loguru so streamed tool output
+    # (e.g. ``pip install`` lines) is visible in the session log file.
+    # The producer in agent.iteration emits these unconditionally; without
+    # a subscriber the bus is fire-and-forget and the user sees no progress.
+    from markbot.cli.progress import register_progress_subscriber
+    register_progress_subscriber()
+
     logger.info("agent command starting...")
 
     _t0 = time.time()
@@ -157,8 +163,6 @@ def agent(
 
     _t0 = time.time()
     logger.info("Creating AgentLoop...")
-    import time as _cli_time
-    _cli_t0 = _cli_time.time()
     agent_loop = AgentLoop(
         ctx_or_bus=bus,
         fallback_manager=provider,
@@ -181,7 +185,6 @@ def agent(
         warn_threshold_usd=config.budget.warn_threshold_usd,
         budget_config=config.budget if config.budget.enabled else None,
     )
-    _cli_elapsed = _cli_time.time() - _cli_t0
     logger.info("AgentLoop created, took {:.3f}s", time.time() - _t0)
     if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
         logger.info("AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
@@ -203,20 +206,22 @@ def agent(
         # Single message mode — direct call, no bus needed
         async def run_once():
             renderer = StreamRenderer(render_markdown=markdown)
-            response = await agent_loop.process_direct(
-                message, session_id,
-                on_progress=_cli_progress,
-                on_stream=renderer.on_delta,
-                on_stream_end=renderer.on_end,
-            )
-            if not renderer.streamed:
-                await renderer.close()
-                print_agent_response(
-                    response.content if response else "",
-                    render_markdown=markdown,
-                    metadata=response.metadata if response else None,
+            try:
+                response = await agent_loop.process_direct(
+                    message, session_id,
+                    on_progress=_cli_progress,
+                    on_stream=renderer.on_delta,
+                    on_stream_end=renderer.on_end,
                 )
-            await agent_loop.close_mcp()
+                if not renderer.streamed:
+                    await renderer.close()
+                    print_agent_response(
+                        response.content if response else "",
+                        render_markdown=markdown,
+                        metadata=response.metadata if response else None,
+                    )
+            finally:
+                await agent_loop.close_mcp()
 
         asyncio.run(run_once())
     else:
@@ -238,10 +243,19 @@ def agent(
         else:
             cli_channel, cli_chat_id = "cli", session_id
 
+        # Event used to wake up the interactive loop so it can exit cleanly
+        # (instead of sys.exit which would skip finally blocks / MCP cleanup).
+        shutdown_event = asyncio.Event()
+
         def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
             restore_terminal()
-            sys.exit(0)
+            # Schedule shutdown on the running loop instead of hard-exiting.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running loop — fall back to hard exit.
+                sys.exit(0)
+            loop.call_soon_threadsafe(shutdown_event.set)
 
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
@@ -310,9 +324,28 @@ def agent(
 
             try:
                 while True:
+                    if shutdown_event.is_set():
+                        restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
                     try:
                         flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
+                        # Race prompt_async against shutdown_event so
+                        # Ctrl+C (which sets shutdown_event via the signal
+                        # handler) can interrupt a blocked prompt.
+                        prompt_task = asyncio.ensure_future(_read_interactive_input_async())
+                        shutdown_task = asyncio.ensure_future(shutdown_event.wait())
+                        done, pending = await asyncio.wait(
+                            {prompt_task, shutdown_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                        if shutdown_task in done:
+                            restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+                        user_input = prompt_task.result()
                         command = user_input.strip()
                         if not command:
                             continue
@@ -334,7 +367,14 @@ def agent(
                             metadata={"_wants_stream": True},
                         ))
 
-                        await turn_done.wait()
+                        # Bound the wait so a crashed agent loop doesn't
+                        # hang the CLI forever. The consumer task still
+                        # drains the bus, so a late response will surface.
+                        try:
+                            await asyncio.wait_for(turn_done.wait(), timeout=300.0)
+                        except asyncio.TimeoutError:
+                            console.print("[yellow]⚠ No response within 5 minutes, aborting turn.[/yellow]")
+                            turn_done.set()
 
                         if turn_response:
                             content, meta = turn_response[0]

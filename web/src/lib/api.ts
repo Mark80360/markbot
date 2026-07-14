@@ -91,13 +91,22 @@ export const api = {
   getLogFiles: () => request<{ files: string[] }>("/api/logs/files"),
 
   getSkills: () => request<{ skills: any[] }>("/api/skills"),
-  toggleSkill: (name: string, enabled: boolean) =>
-    request<{ ok: boolean }>("/api/skills/toggle", {
+  getSkillDetail: (name: string) => request<any>(`/api/skills/${encodeURIComponent(name)}`),
+  createSkill: (data: { name: string; description?: string; when_to_use?: string; content?: string }) =>
+    request<{ ok: boolean }>("/api/skills", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  deleteSkill: (name: string) =>
+    request<{ ok: boolean }>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  updateSkill: (name: string, data: { description?: string; when_to_use?: string; content?: string }) =>
+    request<{ ok: boolean }>(`/api/skills/${encodeURIComponent(name)}`, {
       method: "PUT",
-      body: JSON.stringify({ name, enabled }),
+      body: JSON.stringify(data),
     }),
 
   getCronJobs: () => request<{ jobs: any[] }>("/api/cron/jobs"),
+  getCronStatus: () => request<any>("/api/cron/status"),
   createCronJob: (data: any) =>
     request<{ ok: boolean; id: string }>("/api/cron/jobs", {
       method: "POST",
@@ -115,9 +124,16 @@ export const api = {
 
   getChannels: () => request<{ channels: any[] }>("/api/channels"),
   testChannel: (id: string) =>
-    request<{ ok: boolean }>(`/api/channels/${id}/test`, { method: "POST" }),
+    request<{ ok: boolean; message?: string; error?: string }>(`/api/channels/${id}/test`, {
+      method: "POST",
+    }),
+  toggleChannel: (id: string, enabled: boolean) =>
+    request<{ ok: boolean }>(`/api/channels/${id}/enabled?enabled=${enabled}`, {
+      method: "PUT",
+    }),
 
   getSystemStats: () => request<any>("/api/system/stats"),
+  getSystemProcess: () => request<any>("/api/system/process"),
 
   getMcpServers: () => request<{ servers: any[] }>("/api/mcp/servers"),
   addMcpServer: (data: any) =>
@@ -125,15 +141,40 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  updateMcpServer: (name: string, data: any) =>
+    request<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
   removeMcpServer: (name: string) =>
     request<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}`, { method: "DELETE" }),
   testMcpServer: (name: string) =>
-    request<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}/test`, {
-      method: "POST",
-    }),
+    request<{ ok: boolean; message?: string; error?: string; tools?: string[] }>(
+      `/api/mcp/servers/${encodeURIComponent(name)}/test`,
+      { method: "POST" },
+    ),
   toggleMcpServer: (name: string, enabled: boolean) =>
     request<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}/enabled`, {
       method: "PUT",
       body: JSON.stringify({ enabled }),
     }),
+
+  updateAgentParams: (data: any) =>
+    request<{ ok: boolean }>("/api/model/params", {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  exportEnv: () => {
+    const token = getToken();
+    return fetch("/api/env/export", {
+      headers: { "X-Markbot-Session-Token": token },
+    });
+  },
+  importEnv: (content: string) =>
+    request<{ ok: boolean; imported: number }>("/api/env/import", {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    }),
+  getEnvFile: () => request<{ path: string; content: string; exists: boolean }>("/api/env/file"),
 };

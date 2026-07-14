@@ -136,7 +136,11 @@ class TaskTracker:
             registry = self._load_registry()
             for t_dict in registry.tasks:
                 if t_dict.get("id") == task_id:
-                    return Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                    task = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
+                    # Populate cache on miss so subsequent reads avoid disk I/O
+                    if self._cache is not None:
+                        self._cache[task_id] = task
+                    return task
             return None
 
     def _save_task(self, task: Task) -> None:
@@ -167,7 +171,7 @@ class TaskTracker:
                     if tid:
                         self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
                 except Exception:
-                    pass
+                    logger.opt(exception=True).warning("Failed to hydrate task from registry entry: {}", t_dict.get("id"))
 
     def create_task(
         self,
@@ -273,7 +277,7 @@ class TaskTracker:
                 try:
                     tasks.append(Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__}))
                 except Exception:
-                    pass
+                    logger.opt(exception=True).warning("Failed to hydrate task from registry entry while listing: {}", t_dict.get("id"))
             return sorted(tasks, key=lambda t: (-t.priority, -t.updated_at))
 
     def list_active(self) -> list[Task]:
@@ -325,6 +329,6 @@ class TaskTracker:
                         if tid:
                             self._cache[tid] = Task(**{k: v for k, v in t_dict.items() if k in Task.__dataclass_fields__})
                     except Exception:
-                        pass
+                        logger.opt(exception=True).warning("Failed to hydrate task from registry entry after cleanup: {}", t_dict.get("id"))
                 logger.info("Cleaned up {} completed tasks", removed)
             return removed

@@ -86,7 +86,7 @@ class HeartbeatService:
                 if text.strip():
                     return text
             except Exception:
-                pass
+                logger.opt(exception=True).warning("Failed to read heartbeat file: {}", self.heartbeat_file)
         return None
 
     async def _decide(self, content: str) -> tuple[str, str]:
@@ -134,8 +134,10 @@ class HeartbeatService:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.opt(exception=True).warning("Heartbeat loop task raised an exception during stop")
             self._task = None
 
     async def _run_loop(self) -> None:
