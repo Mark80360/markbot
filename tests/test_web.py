@@ -99,7 +99,8 @@ class TestAuthMiddleware:
         resp = client.get("/api/status")
         assert resp.status_code == 200
         body = resp.json()
-        assert "token" in body and "version" in body
+        assert "version" in body
+        assert "token" not in body
 
 
 class TestVerifyWsToken:
@@ -345,6 +346,28 @@ class TestServerBuildApp:
         ]:
             assert path in routes
 
+    def test_workspace_override_controls_upload_dir(self, tmp_path, monkeypatch):
+        from markbot.web import auth
+        from markbot.web import server
+        from markbot.config.schema import Config
+
+        monkeypatch.setattr(auth, "_session_token", "tok")
+        monkeypatch.setattr(server, "WEB_DIST", tmp_path / "missing-dist")
+        monkeypatch.setattr("markbot.config.loader.load_config", lambda: Config())
+
+        workspace = tmp_path / "workspace"
+        app = server._build_app(workspace=workspace)
+        client = TestClient(app)
+        resp = client.post(
+            "/api/upload",
+            files={"file": ("note.txt", b"hello", "text/plain")},
+            headers={"x-markbot-session-token": "tok"},
+        )
+
+        assert resp.status_code == 200
+        upload_name = resp.json()["name"]
+        assert (workspace / ".web_uploads" / upload_name).exists()
+
 
 # ---------------------------------------------------------------------------
 # routers/status.py
@@ -352,7 +375,7 @@ class TestServerBuildApp:
 
 
 class TestStatusRouter:
-    def test_status_returns_token_and_version(self, monkeypatch):
+    def test_status_returns_version_without_token(self, monkeypatch):
         from markbot.web.routers.status import router as status_router
 
         monkeypatch.setattr(auth, "_session_token", "abc")
@@ -362,8 +385,8 @@ class TestStatusRouter:
         resp = client.get("/api/status")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["token"] == "abc"
         assert "version" in body
+        assert "token" not in body
 
 
 # ---------------------------------------------------------------------------

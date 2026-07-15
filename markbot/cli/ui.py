@@ -17,16 +17,17 @@ import os
 import select
 import sys
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
 from markbot import __logo__
 from markbot.cli.stream import ThinkingSpinner
+
+if TYPE_CHECKING:
+    from prompt_toolkit import PromptSession
 
 __all__ = [
     "markbot_banner",
@@ -58,7 +59,7 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 # prompt_toolkit session singleton, lazily initialised by
 # :func:`init_prompt_session` and read by the interactive read helper
 # in :mod:`markbot.cli.commands`.
-PROMPT_SESSION: PromptSession | None = None
+PROMPT_SESSION: "PromptSession | None" = None
 
 # Original termios settings, restored on exit. Saved by
 # :func:`init_prompt_session`.
@@ -121,6 +122,15 @@ def restore_terminal() -> None:
 def init_prompt_session() -> None:
     """Create the prompt_toolkit session with persistent file history."""
     global PROMPT_SESSION, SAVED_TERM_ATTRS
+
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import FileHistory
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Interactive agent mode requires prompt_toolkit. "
+            "Install project dependencies with `pip install -e .`."
+        ) from exc
 
     # Save terminal state so we can restore it on exit
     try:
@@ -192,7 +202,7 @@ def print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None
         console.print(f"  [dim]↳ {text}[/dim]")
 
 
-def get_prompt_session() -> PromptSession | None:
+def get_prompt_session() -> "PromptSession | None":
     """Return the current prompt_toolkit session singleton."""
     return PROMPT_SESSION
 

@@ -5,8 +5,6 @@ import logging
 from fastapi import APIRouter
 from starlette.responses import JSONResponse
 
-from markbot.web.auth import get_token
-
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -22,5 +20,4 @@ async def get_status():
         version = "unknown"
     return JSONResponse({
         "version": version,
-        "token": get_token(),
     })

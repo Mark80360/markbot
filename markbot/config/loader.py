@@ -12,6 +12,7 @@ from markbot.config.schema import Config
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
 _current_config: Config | None = None
+_workspace_override: str | None = None
 _last_validation_warnings: list[str] = []
 
 
@@ -28,6 +29,19 @@ def set_config_path(path: Path) -> None:
     global _current_config_path, _current_config
     _current_config_path = path
     _current_config = None
+
+
+def set_workspace_override(workspace: str | Path | None) -> None:
+    """Override the loaded workspace for the current process.
+
+    This is used by entry points such as ``markbot web --workspace`` where the
+    user wants a runtime override without rewriting the config file.
+    """
+    global _workspace_override, _current_config
+    _workspace_override = str(Path(workspace).expanduser()) if workspace else None
+    if _current_config is not None:
+        if _workspace_override is not None:
+            _current_config.agents.defaults.workspace = _workspace_override
 
 
 def get_config_path() -> Path:
@@ -97,6 +111,9 @@ def load_config(config_path: Path | None = None) -> Config:
                     details=errors
                 )
 
+            if _workspace_override is not None:
+                config.agents.defaults.workspace = _workspace_override
+
             _current_config = config
 
             return config
@@ -107,6 +124,8 @@ def load_config(config_path: Path | None = None) -> Config:
             raise ConfigValidationError(f"Schema validation failed: {e}")
 
     config = Config()
+    if _workspace_override is not None:
+        config.agents.defaults.workspace = _workspace_override
     _current_config = config
     return config
 

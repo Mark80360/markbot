@@ -20,13 +20,13 @@ WEB_DIST = Path(__file__).parent / "static"
 _chat_sessions: dict[str, dict[str, Any]] = {}
 
 
-def _build_app():
+def _build_app(workspace: str | Path | None = None):
     from fastapi import FastAPI
     from fastapi.responses import FileResponse, HTMLResponse, Response as FastResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.websockets import WebSocket
 
-    from markbot.web.auth import TokenAuthMiddleware, get_token, regenerate_token, verify_ws_token
+    from markbot.web.auth import TokenAuthMiddleware, get_token, verify_ws_token
     from markbot.web.store import WebSessionStore
     from markbot.web.routers.status import router as status_router
     from markbot.web.routers.config import router as config_router
@@ -39,6 +39,16 @@ def _build_app():
     from markbot.web.routers.channels import router as channels_router
     from markbot.web.routers.system import router as system_router
     from markbot.web.routers.mcp import router as mcp_router
+
+    workspace_override = Path(workspace).expanduser().resolve() if workspace else None
+
+    def _load_config():
+        from markbot.config.loader import load_config
+
+        cfg = load_config()
+        if workspace_override is not None:
+            cfg.agents.defaults.workspace = str(workspace_override)
+        return cfg
 
     app = FastAPI(title="Markbot", version="1.0")
     app.add_middleware(TokenAuthMiddleware)
@@ -65,12 +75,11 @@ def _build_app():
     async def _create_agent_loop():
         from markbot.agent.loop import AgentLoop
         from markbot.bus.queue import MessageBus
-        from markbot.config.loader import load_config
         from markbot.config.paths import get_cron_dir
         from markbot.schedule.cron import CronJob, CronService
         from markbot.session.session import SessionManager
 
-        config = load_config()
+        config = _load_config()
         bus = MessageBus()
 
         from markbot.cli.runtime import make_provider
@@ -544,8 +553,7 @@ def _build_app():
         nonlocal _upload_dir
         if _upload_dir is not None:
             return _upload_dir
-        from markbot.config.loader import load_config
-        cfg = load_config()
+        cfg = _load_config()
         d = Path(cfg.workspace_path) / ".web_uploads"
         d.mkdir(parents=True, exist_ok=True)
         _upload_dir = d
@@ -632,10 +640,11 @@ def _build_app():
     return app
 
 
-def start_server(host: str = "127.0.0.1", port: int = 9120):
+def start_server(host: str = "127.0.0.1", port: int = 9120, workspace: str | Path | None = None):
     import uvicorn
-    app = _build_app()
+    app = _build_app(workspace=workspace)
     print("\n  Markbot Web UI")
     print(f"  Listening on http://{host}:{port}")
+    print(f"  Token: {get_token()}")
     print("  Press Ctrl+C to stop\n")
     uvicorn.run(app, host=host, port=port, log_level="info")

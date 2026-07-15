@@ -31,9 +31,8 @@ def web(
         set_config_path(Path(config).expanduser().resolve())
 
     if workspace:
-        from markbot.config.loader import load_config
-        cfg = load_config()
-        cfg.agents.defaults.workspace = workspace
+        from markbot.config.loader import set_workspace_override
+        set_workspace_override(workspace)
 
     markbot_banner()
-    start_server(host=host, port=port)
+    start_server(host=host, port=port, workspace=workspace)

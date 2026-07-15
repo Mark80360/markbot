@@ -13,10 +13,6 @@ from contextlib import nullcontext
 
 import typer
 from loguru import logger
-from prompt_toolkit import print_formatted_text
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.patch_stdout import patch_stdout
 
 from markbot import __logo__, __version__
 from markbot.cli.daemon import _gateway_paths
@@ -38,6 +34,26 @@ from markbot.cli.ui import (
 from markbot.config.paths import get_cron_dir
 from markbot.utils.helpers import sync_workspace_templates
 
+try:
+    from prompt_toolkit import print_formatted_text
+    from prompt_toolkit.application import run_in_terminal
+    from prompt_toolkit.formatted_text import ANSI, HTML
+    from prompt_toolkit.patch_stdout import patch_stdout
+except ModuleNotFoundError:  # pragma: no cover - optional interactive dependency
+    print_formatted_text = None
+
+    def run_in_terminal(*args, **kwargs):  # type: ignore[override]
+        raise RuntimeError("prompt_toolkit is required for interactive agent mode")
+
+    class ANSI(str):
+        pass
+
+    class HTML(str):
+        pass
+
+    def patch_stdout():
+        return nullcontext()
+
 app = typer.Typer(
     help="Interact with the MarkBot agent.",
     invoke_without_command=True,
@@ -51,6 +67,9 @@ app = typer.Typer(
 
 async def _print_interactive_line(text: str) -> None:
     """Print async interactive updates with prompt_toolkit-safe Rich styling."""
+    if print_formatted_text is None:
+        raise RuntimeError("prompt_toolkit is required for interactive agent mode")
+
     def _write() -> None:
         ansi = render_interactive_ansi(
             lambda c: c.print(f"  [dim]↳ {text}[/dim]")
@@ -66,6 +85,9 @@ async def _print_interactive_response(
     metadata: dict | None = None,
 ) -> None:
     """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+    if print_formatted_text is None:
+        raise RuntimeError("prompt_toolkit is required for interactive agent mode")
+
     def _write() -> None:
         content = response or ""
         ansi = render_interactive_ansi(
