@@ -13,9 +13,11 @@ Examples:
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 MAX_SKILL_NAME_LENGTH = 64
 ALLOWED_RESOURCES = {"scripts", "references", "assets"}
@@ -317,7 +319,26 @@ def init_skill(skill_name, path, resources, include_examples):
     return skill_dir
 
 
-def main():
+def _resolve_args():
+    """Resolve arguments from JSON (sandbox) or argparse (CLI).
+
+    The sandbox passes parameters as a JSON string in argv[1], while
+    direct CLI invocation uses traditional argparse flags. Detect which
+    mode is in use and return a uniform namespace.
+    """
+    if len(sys.argv) >= 2 and sys.argv[1].lstrip().startswith("{"):
+        try:
+            data = json.loads(sys.argv[1])
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Invalid JSON args: {e}")
+            sys.exit(2)
+        return SimpleNamespace(
+            skill_name=data.get("skill_name", ""),
+            path=data.get("path", ""),
+            resources=data.get("resources", ""),
+            examples=bool(data.get("examples", False)),
+        )
+
     parser = argparse.ArgumentParser(
         description="Create a new skill directory with a SKILL.md template.",
     )
@@ -333,7 +354,11 @@ def main():
         action="store_true",
         help="Create example files inside the selected resource directories",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = _resolve_args()
 
     raw_skill_name = args.skill_name
     skill_name = normalize_skill_name(raw_skill_name)

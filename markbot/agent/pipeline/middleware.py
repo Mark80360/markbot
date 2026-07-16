@@ -57,7 +57,7 @@ class QuestionResponseMiddleware(Middleware):
             return OutboundMessage(
                 channel=ctx.channel,
                 chat_id=ctx.chat_id,
-                content="",
+                content=f"✓ {reply[:60]}",
                 metadata=dict(ctx.msg.metadata or {}),
             )
 

@@ -129,6 +129,11 @@ async def _retry_with_backoff(
 def _sanitize_error_message(error: Exception) -> str:
     """Remove sensitive information from error messages."""
     msg = str(error)
+    # Many network exceptions (httpx.ConnectError, timeout, etc.) have an
+    # empty str(). Fall back to the exception class name so the caller
+    # (and the LLM) gets actionable feedback instead of an empty string.
+    if not msg:
+        msg = type(error).__name__
 
     patterns_to_redact = [
         r'api[_-]?key\s*[:=]\s*["\'][^"\']+["\']',

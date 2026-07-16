@@ -254,7 +254,9 @@ class TestRegistryPermissionGate:
         reg = ToolRegistry()
         reg.register(DestructiveTool())
         result = await reg.execute("delete_file", {"path": "x"})
-        assert "Permission required" in result
+        # Default context is non-interactive (no session), so the tool
+        # is blocked with a "requires confirmation" error either way.
+        assert "requires confirmation" in result or "Permission required" in result
 
 
 class TestToolRegistry:

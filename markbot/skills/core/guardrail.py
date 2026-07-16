@@ -212,7 +212,17 @@ class SkillGuardrail:
                 violations=violations,
             )
 
-        allowed_skill_tools = {f"{self.skill.name}.{s.name}" for s in self.skill.scripts}
+        # Skill script tools are named "{skill}.{script}" (dot-separated) in
+        # the ToolDefinition, but _sanitize_tool_name (applied when sending to
+        # the LLM) replaces dots with underscores. Include both forms so the
+        # guardrail matches regardless of which name arrives in tool_name.
+        from markbot.types.tool import _sanitize_tool_name
+
+        allowed_skill_tools: set[str] = set()
+        for s in self.skill.scripts:
+            dot_name = f"{self.skill.name}.{s.name}"
+            allowed_skill_tools.add(dot_name)
+            allowed_skill_tools.add(_sanitize_tool_name(dot_name))
         all_allowed = self._allowed_tools | allowed_skill_tools
 
         if tool_name not in all_allowed:

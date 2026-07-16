@@ -219,6 +219,17 @@ if __name__ == "__main__":
         print("Usage: python quick_validate.py <skill_directory>")
         sys.exit(1)
 
-    valid, message = validate_skill(sys.argv[1])
+    arg = sys.argv[1]
+    # Sandbox passes args as JSON: {"skill_path": "..."}
+    if arg.lstrip().startswith("{"):
+        import json
+        try:
+            data = json.loads(arg)
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Invalid JSON args: {e}")
+            sys.exit(2)
+        arg = data.get("skill_path", "")
+
+    valid, message = validate_skill(arg)
     print(message)
     sys.exit(0 if valid else 1)

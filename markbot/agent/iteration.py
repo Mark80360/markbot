@@ -2703,7 +2703,7 @@ class IterationRunner:
                     )
                 else:
                     result = await self.loop.tools.execute(tc.name, tc.arguments, context=ToolContext(
-                        session_id=make_session_key(self.channel, self.chat_id) or "",
+                        session_id=self.session_key,
                         workspace=str(self.loop.workspace),
                         permission_mode=permission_mode,
                         tool_permission_context=permission_context,
@@ -2793,7 +2793,7 @@ class IterationRunner:
 
         permission_mode, permission_context = self._current_permission_context()
         _tool_ctx = ToolContext(
-            session_id=make_session_key(self.channel, self.chat_id) or "",
+            session_id=self.session_key,
             workspace=str(self.loop.workspace),
             permission_mode=permission_mode,
             tool_permission_context=permission_context,

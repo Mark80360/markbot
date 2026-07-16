@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from markbot.agent.permission_approval import PermissionApprover, _is_allow
+from markbot.agent.permission_approval import PermissionApprover, _parse_choice
 from markbot.config.profile import get_profile, list_profiles
 from markbot.config.schema import AgentDefaults, Config, ExecToolConfig, ReliabilityConfig
 from markbot.schedule.cron import CronJob, CronPayload, CronSchedule, CronService, _now_ms
@@ -71,11 +71,19 @@ class TestProfiles:
 
 class TestPermissionApproval:
     def test_is_allow_parser(self):
-        assert _is_allow("Allow")
-        assert _is_allow("User selected: Allow")
-        assert _is_allow("1")
-        assert not _is_allow("Deny")
-        assert not _is_allow("User selected: Deny")
+        assert _parse_choice("Allow") == "allow"
+        assert _parse_choice("User selected: Allow") == "allow"
+        assert _parse_choice("1") == "allow"
+        assert _parse_choice("Deny") == "deny"
+        assert _parse_choice("User selected: Deny") == "deny"
+        # Allow All
+        assert _parse_choice("2") == "allow_all"
+        assert _parse_choice("Allow All") == "allow_all"
+        assert _parse_choice("User selected: Allow All") == "allow_all"
+        assert _parse_choice("allow-all") == "allow_all"
+        # Edge: "3" or unknown → deny
+        assert _parse_choice("3") == "deny"
+        assert _parse_choice("no") == "deny"
 
     @pytest.mark.asyncio
     async def test_registry_ask_uses_approver_allow(self):

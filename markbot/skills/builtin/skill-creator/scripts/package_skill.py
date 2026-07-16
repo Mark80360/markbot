@@ -134,8 +134,19 @@ def main():
         print("  python package_skill.py skills/public/my-skill ./dist")
         sys.exit(1)
 
-    skill_path = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    # Sandbox passes args as JSON: {"skill_path": "...", "output_dir": "..."}
+    if sys.argv[1].lstrip().startswith("{"):
+        import json
+        try:
+            data = json.loads(sys.argv[1])
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Invalid JSON args: {e}")
+            sys.exit(2)
+        skill_path = data.get("skill_path", "")
+        output_dir = data.get("output_dir")
+    else:
+        skill_path = sys.argv[1]
+        output_dir = sys.argv[2] if len(sys.argv) > 2 else None
 
     print(f"Packaging skill: {skill_path}")
     if output_dir:

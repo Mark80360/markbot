@@ -263,8 +263,15 @@ class AgentLoop:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         permission_mode_override: PermissionMode | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
         from markbot.agent.iteration import IterationRunner
+
+        # Prefer the caller-provided session_key (which includes
+        # session_key_override, e.g. feishu thread_id) so that
+        # ToolContext.session_id matches msg.session_key — the loop's
+        # session-keyed question routing depends on this equality.
+        resolved_session_key = session_key or make_session_key(channel, chat_id) or ""
 
         runner = IterationRunner(
             loop=self,
@@ -274,7 +281,7 @@ class AgentLoop:
             on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
-            session_key=make_session_key(channel, chat_id) or "",
+            session_key=resolved_session_key,
             session=session,
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
@@ -654,7 +661,19 @@ class AgentLoop:
         # across many idle sessions. Next message from this session
         # will be treated as a new request and reset_failure_state
         # is called anyway, but clearing here keeps state bounded.
-        self._session_failure_state.pop(session_key, None)
+        failure_state = getattr(self, "_session_failure_state", None)
+        if failure_state is not None:
+            failure_state.pop(session_key, None)
+
+        # Clean up any lingering question-tool session mapping.
+        question_tool = getattr(self, "question_tool", None)
+        if question_tool is not None and hasattr(question_tool, "unregister_pending"):
+            question_tool.unregister_pending(session_key)
+
+        # Clear "Allow All" flag if set for this session.
+        approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+        if approver is not None and hasattr(approver, "clear_allow_all"):
+            approver.clear_allow_all(session_key)
 
         logger.info("Cleaned up state for idle session {}", session_key)
 
@@ -664,6 +683,9 @@ class AgentLoop:
         Used to route the reply outside the per-session lock so the waiting
         tool turn can observe it.
         """
+        question_tool = getattr(self, "question_tool", None)
+
+        # Strategy 1: question_id in metadata or [Q:uuid] content prefix.
         meta = msg.metadata or {}
         qid = meta.get("question_id")
         if not qid:
@@ -673,17 +695,28 @@ class AgentLoop:
                     qid = content.split("[Q:", 1)[1].split("]", 1)[0].strip()
                 except (IndexError, AttributeError):
                     qid = None
-        if not qid:
-            return False
 
-        question_tool = getattr(self, "question_tool", None)
-        pending = getattr(question_tool, "_pending_questions", None) or {}
-        if qid in pending:
-            return True
+        if qid:
+            # Check if this qid is actually pending.
+            pending = getattr(question_tool, "_pending_questions", None) or {}
+            if qid in pending:
+                return True
+            approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+            if approver is not None and qid in getattr(approver, "_pending", {}):
+                return True
 
-        approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
-        if approver is not None and qid in getattr(approver, "_pending", {}):
-            return True
+        # Strategy 2: session-keyed lookup for channels (e.g. feishu)
+        # that cannot propagate question_id metadata on inbound replies.
+        # The user's plain-text reply is matched to the pending question
+        # by session_key alone.
+        if question_tool is not None and hasattr(question_tool, "has_pending"):
+            content = (msg.content or "").strip()
+            if content and not content.startswith("/"):
+                if question_tool.has_pending(msg.session_key):
+                    pending_qid = question_tool.get_pending_qid(msg.session_key)
+                    if pending_qid:
+                        msg.metadata["question_id"] = pending_qid
+                        return True
         return False
 
     async def _dispatch_unlocked(self, msg: InboundMessage) -> None:
@@ -790,6 +823,12 @@ class AgentLoop:
                         metadata=dict(msg.metadata or {}),
                     )
                 )
+            finally:
+                # Clear "Allow All" when the turn ends so the next
+                # user request starts with fresh confirmations.
+                approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+                if approver is not None and hasattr(approver, "clear_allow_all"):
+                    approver.clear_allow_all(msg.session_key)
 
     async def close_mcp(self) -> None:
         """Drain pending background tasks, then close MCP connections."""
@@ -937,6 +976,7 @@ class AgentLoop:
                     on_tool_start=on_tool_start,
                     on_tool_complete=on_tool_complete,
                     permission_mode_override=ctx.permission_mode_override,
+                    session_key=key,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
                 self.sessions.save(session)
@@ -1060,6 +1100,7 @@ class AgentLoop:
                 on_tool_start=on_tool_start,
                 on_tool_complete=on_tool_complete,
                 permission_mode_override=ctx.permission_mode_override,
+                session_key=key,
             )
 
             logger.info(
@@ -1137,14 +1178,23 @@ class AgentLoop:
                 logger.warning("Memory manager start failed in process_direct: {}", e)
         logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content, media=media or [])
-        return await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            on_tool_start=on_tool_start,
-            on_tool_complete=on_tool_complete,
-            on_outbound_message=on_outbound_message,
-            permission_mode_override=permission_mode,
-        )
+        try:
+            return await self._process_message(
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                on_tool_start=on_tool_start,
+                on_tool_complete=on_tool_complete,
+                on_outbound_message=on_outbound_message,
+                permission_mode_override=permission_mode,
+            )
+        finally:
+            # process_direct bypasses _dispatch, so its finally block
+            # (which clears allow_all) never runs.  Clear it here to
+            # prevent the flag from leaking into the next call with
+            # the same session_key.
+            approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+            if approver is not None and hasattr(approver, "clear_allow_all"):
+                approver.clear_allow_all(session_key)
