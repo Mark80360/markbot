@@ -38,13 +38,15 @@ class MemorySaveTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Save a key piece of information to your long-term memory. "
-            "Use when you learn something important about the user, project, "
-            "or decisions that you want to recall across conversations.\n\n"
+            "Save a high-signal fact to always-on curated memory (Hermes-style). "
+            "Entries are frozen into the system prompt at session start and "
+            "persist across conversations. Keep entries short and dense.\n\n"
             "TWO TARGETS:\n"
             "- 'user': who the user is — name, role, preferences, communication style\n"
             "- 'memory': your notes — environment facts, project conventions, tool quirks\n\n"
-            "Do NOT save task progress, session outcomes, or temporary TODO state."
+            "SAVE: durable preferences, stable project decisions, lessons learned.\n"
+            "Do NOT save: task progress, temporary TODOs, secrets, one-off chatter, "
+            "or anything recoverable via memory_search / daily logs."
         )
 
     @property
@@ -87,13 +89,34 @@ class MemorySaveTool(Tool):
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
         try:
+            session_id = f"{self._channel}:{self._chat_id}" if self._channel and self._chat_id else None
+            if hasattr(self._memory_manager, "allow_curated_memory"):
+                if not self._memory_manager.allow_curated_memory(
+                    self._channel, session_id=session_id
+                ):
+                    return (
+                        "Curated MEMORY.md / PROFILE.md edits are only available in "
+                        "main/private sessions (cli/web/api/local). "
+                        "Shared channels must not write private long-term memory."
+                    )
             result = await self._memory_manager.add_memory(
-                content=content, tags=tags or [], target=target,
+                content=content,
+                tags=tags or [],
+                target=target,
+                channel=self._channel,
+                session_id=session_id,
             )
             if not result:
-                return "Error: Failed to save — character limit may have been reached."
+                return (
+                    "Error: Failed to save — character limit may have been reached. "
+                    "Remove or replace existing entries, then retry with a denser fact."
+                )
             store_label = "user profile" if target == "user" else "memory"
-            return f"Saved to {store_label}: {content[:80]}..."
+            return (
+                f"Saved to {store_label}: {content[:80]}... "
+                "(visible in system prompt from the next session; "
+                "live entries are available via memory_list now)"
+            )
         except Exception as e:
             return f"Error saving memory: {e}"
 

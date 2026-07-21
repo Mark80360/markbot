@@ -71,6 +71,17 @@ class SubagentManager:
         else:
             self.progress_manager = None
 
+    def has_running_tasks(self) -> bool:
+        """Return True if any subagent background task is still in flight.
+
+        Used by ``AgentLoop.has_active_conversations`` so Dream and other
+        background services treat subagent work as busy.
+        """
+        for task in self._running_tasks.values():
+            if not task.done():
+                return True
+        return False
+
     async def spawn(
         self,
         task: str,

@@ -138,7 +138,7 @@ class ExploreContextCatalogTool(Tool):
         has_files = False
         allow_curated = _session_allows_curated(getattr(self, '_channel', None))
         for filename in self.BOOTSTRAP_FILES:
-            if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not allow_curated:
+            if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
                 continue
             file_path = self.workspace / filename
             if file_path.exists():
@@ -444,7 +444,7 @@ class SearchContextTool(Tool):
 
         allow_curated = _session_allows_curated(getattr(self, '_channel', None))
         for filename in self.BOOTSTRAP_FILES:
-            if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not allow_curated:
+            if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
                 continue
             file_path = self.workspace / filename
             if not file_path.exists():
@@ -682,7 +682,7 @@ class LoadContextTool(Tool):
         filename_map = {
             'AGENTS_md': 'AGENTS.md',
             'SOUL_md': 'SOUL.md',
-            'USER_md': 'USER.md',
+            'USER_md': USER_FILENAME,
             'TOOLS_md': 'TOOLS.md',
             'MEMORY_md': MEMORY_FILENAME,
             'PROFILE_md': USER_FILENAME,
@@ -690,7 +690,7 @@ class LoadContextTool(Tool):
 
         filename = filename_map.get(context_id, context_id.replace('_', '.'))
 
-        if filename in (MEMORY_FILENAME, USER_FILENAME, 'USER.md') and not _session_allows_curated(
+        if filename in (MEMORY_FILENAME, USER_FILENAME) and not _session_allows_curated(
             getattr(self, '_channel', None)
         ):
             return (

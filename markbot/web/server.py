@@ -12,8 +12,6 @@ from typing import Any
 
 from starlette.routing import WebSocketRoute
 
-from markbot.types.permission import PermissionMode
-
 _log = logging.getLogger(__name__)
 
 WEB_DIST = Path(__file__).parent / "static"
@@ -73,107 +71,25 @@ def _build_app(workspace: str | Path | None = None):
             return _agent_loop
 
     async def _create_agent_loop():
-        from markbot.agent.loop import AgentLoop
-        from markbot.bus.queue import MessageBus
-        from markbot.config.paths import get_cron_dir
-        from markbot.schedule.cron import CronJob, CronService
-        from markbot.session.session import SessionManager
+        from markbot.cli.runtime import make_provider
+        from markbot.runtime import WEB_FEATURES, build_runtime
 
         config = _load_config()
-        bus = MessageBus()
-
-        from markbot.cli.runtime import make_provider
-        provider = make_provider(config)
-
-        cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-        reliability = getattr(config, "reliability", None)
-        cron = CronService(
-            cron_store_path,
-            max_retries=getattr(reliability, "cron_max_retries", 2),
-            retry_delay_s=getattr(reliability, "cron_retry_delay_s", 5.0),
-            dead_letter_keep=getattr(reliability, "dead_letter_keep", 50),
-        )
-
-        session_manager = SessionManager(config.workspace_path)
-
-        loop = AgentLoop(
-            ctx_or_bus=bus,
-            fallback_manager=provider,
-            config=config,
-            workspace=config.workspace_path,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            context_window_tokens=config.agents.defaults.context_window_tokens,
-            web_search_config=config.tools.web.search,
-            web_proxy=config.tools.web.proxy or None,
-            exec_config=config.tools.exec,
-            filesystem_config=config.tools.filesystem,
-            memory_config=config.tools.memory,
-            cron_service=cron,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            session_manager=session_manager,
-            mcp_servers=config.tools.mcp_servers,
-            channels_config=config.channels,
-            timezone=config.agents.defaults.timezone,
-            compaction_config=config.compaction,
-            max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
-            warn_threshold_usd=config.budget.warn_threshold_usd,
-            budget_config=config.budget if config.budget.enabled else None,
-        )
-
-        # Wire up cron job execution callback (mirrors gateway behavior)
-        async def _on_cron_job(job: CronJob) -> str | None:
-            from markbot.tools.cron import CronTool
-
-            reminder_note = (
-                "[Scheduled Task] Timer finished.\n\n"
-                f"Task '{job.name}' has been triggered.\n"
-                f"Scheduled instruction: {job.payload.message}"
-            )
-
-            # Prevent cron jobs from recursively scheduling new jobs
-            cron_tool = loop.tools.get("cron")
-            cron_token = None
-            if isinstance(cron_tool, CronTool):
-                cron_token = cron_tool.set_cron_context(True)
-            try:
-                resp = await loop.process_direct(
-                    reminder_note,
-                    session_key=f"cron:{job.id}",
-                    channel=job.payload.channel or "web",
-                    chat_id=job.payload.to or "direct",
-                    permission_mode=PermissionMode.AUTO,
-                )
-            finally:
-                if isinstance(cron_tool, CronTool) and cron_token is not None:
-                    cron_tool.reset_cron_context(cron_token)
-            response = (resp.content if resp else "") or ""
-            lowered = response.lower()
-            if (
-                response.startswith("Sorry, I encountered an error")
-                or "models in chain failed" in lowered
-                or "error calling the ai model" in lowered
-                or "budget exceeded" in lowered
-            ):
-                raise RuntimeError(f"cron agent failure: {response[:500]}")
-            return response
-
-        async def _on_cron_failure(job: CronJob, error: str) -> None:
-            if reliability is not None and not getattr(reliability, "notify_on_failure", True):
-                return
-            _log.warning("Cron job '{}' failed after retries: {}", job.name, error)
-
-        cron.on_job = _on_cron_job
-        cron.on_failure = _on_cron_failure
-
-        # Start the cron timer so scheduled jobs actually fire in web mode
-        await cron.start()
+        # Web profile: cron runner (log-only failures, no channel deliver),
+        # no heartbeat/dream/channels. AgentLoop params match gateway.
+        runtime = build_runtime(config, WEB_FEATURES, make_provider=make_provider)
+        await runtime.start_cron()
 
         # Share the cron service with the router so API operations use the
         # same in-memory store as the timer (avoids data races).
-        from markbot.web.routers.cron import set_cron_service
-        set_cron_service(cron)
+        if runtime.cron is not None:
+            from markbot.web.routers.cron import set_cron_service
 
-        return loop
+            set_cron_service(runtime.cron)
+
+        # Keep runtime reachable for clean shutdown if we add lifespan later.
+        app.state.agent_runtime = runtime
+        return runtime.agent
 
     # Register core routers
     app.include_router(status_router)

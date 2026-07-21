@@ -115,7 +115,7 @@ def load_config(config_path: Path | None = None) -> Config:
                 config.agents.defaults.workspace = _workspace_override
 
             _current_config = config
-
+            _apply_runtime_side_effects(config)
             return config
 
         except json.JSONDecodeError as e:
@@ -127,7 +127,25 @@ def load_config(config_path: Path | None = None) -> Config:
     if _workspace_override is not None:
         config.agents.defaults.workspace = _workspace_override
     _current_config = config
+    _apply_runtime_side_effects(config)
     return config
+
+
+def _apply_runtime_side_effects(config: Config) -> None:
+    """Apply process-global side effects that must follow every successful load.
+
+    Currently:
+    - SSRF block lists (``markbot.utils.ssrf``) — tools call
+      ``validate_url_target`` / ``contains_internal_url`` which read module
+      globals populated only via ``init_from_config``. Without this, the
+      production path would leave private-network / metadata blocks empty.
+    """
+    try:
+        from markbot.utils.ssrf import init_from_config
+
+        init_from_config(config)
+    except Exception as e:
+        logger.warning("Failed to initialise SSRF block lists from config: {}", e)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:

@@ -320,18 +320,12 @@ def _extract_decisions(messages: list[dict]) -> list[HandoffDecision]:
 def _extract_preferences_from_memory(memory_manager: Any) -> list[str]:
     prefs: list[str] = []
     try:
+        from markbot.memory.tool import MemoryStore
+
         profile_path = Path(memory_manager.working_dir) / USER_FILENAME
-        if not profile_path.exists():
-            fallback_path = Path(memory_manager.working_dir) / "USER.md"
-            if fallback_path.exists():
-                profile_path = fallback_path
         if profile_path.exists():
-            content = profile_path.read_text(encoding="utf-8").strip()
-            if content:
-                for line in content.splitlines():
-                    line = line.strip()
-                    if line.startswith("- ") or line.startswith("* "):
-                        prefs.append(line[2:].strip())
+            content = profile_path.read_text(encoding="utf-8")
+            prefs.extend(MemoryStore.parse_entries_text(content)[:10])
     except Exception:
         logger.opt(exception=True).debug("Failed to extract preferences from memory profile")
     return prefs[:10]

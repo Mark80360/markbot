@@ -139,6 +139,12 @@ class AgentLoop:
         self._running = False
         self.mcp = ctx.mcp
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
+        # Synchronous in-flight counter for paths that do not go through
+        # ``_track_task`` (notably ``process_direct`` used by cron /
+        # heartbeat / web / CLI -m). Dream and other background services
+        # consult ``has_active_conversations``; without this counter those
+        # callers would look "idle" while still mutating memory / tools.
+        self._direct_inflight: int = 0
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Serialises mutations to ``_active_tasks`` / ``_session_locks``.
         # In single-threaded asyncio the individual dict ops are atomic,
@@ -521,15 +527,26 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     def has_active_conversations(self) -> bool:
-        """Return True if any session currently has an in-flight task.
+        """Return True if any conversation or background agent work is in flight.
 
         Used by background services (e.g. DreamService) to avoid running
         while a conversation is in progress.
+
+        Covers three sources of work:
+        1. Bus-dispatched tasks tracked in ``_active_tasks`` (``run()`` path)
+        2. Synchronous ``process_direct`` calls (cron / heartbeat / web / CLI)
+        3. Subagent background tasks (spawned tools still running)
         """
+        if self._direct_inflight > 0:
+            return True
         for tasks in self._active_tasks.values():
             for t in tasks:
                 if not t.done():
                     return True
+        subagents = getattr(self, "subagents", None)
+        if subagents is not None and hasattr(subagents, "has_running_tasks"):
+            if subagents.has_running_tasks():
+                return True
         return False
 
     async def _idle_check_loop(self) -> None:
@@ -1165,36 +1182,55 @@ class AgentLoop:
         """
         _direct_start = time.time()
         logger.info("process_direct starting...")
-        await self._connect_mcp()
-        if self.memory_manager and not getattr(self.memory_manager, "_started", False):
-            try:
-                _t0 = time.time()
-                logger.info("Starting memory manager in process_direct...")
-                await self.memory_manager.start()
-                logger.info("Memory manager started in process_direct, took {:.3f}s", time.time() - _t0)
-                if self.memory_encoder and hasattr(self.memory_manager, "_memory_store") and self.memory_manager._memory_store:
-                    self.memory_encoder.set_memory_store(self.memory_manager._memory_store)
-            except Exception as e:
-                logger.warning("Memory manager start failed in process_direct: {}", e)
-        logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content, media=media or [])
+        # Mark busy before any await so Dream / other guards observe us
+        # even during MCP connect / memory start.
+        self._direct_inflight += 1
         try:
-            return await self._process_message(
-                msg,
-                session_key=session_key,
-                on_progress=on_progress,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-                on_tool_start=on_tool_start,
-                on_tool_complete=on_tool_complete,
-                on_outbound_message=on_outbound_message,
-                permission_mode_override=permission_mode,
+            await self._connect_mcp()
+            if self.memory_manager and not getattr(self.memory_manager, "_started", False):
+                try:
+                    _t0 = time.time()
+                    logger.info("Starting memory manager in process_direct...")
+                    await self.memory_manager.start()
+                    logger.info(
+                        "Memory manager started in process_direct, took {:.3f}s",
+                        time.time() - _t0,
+                    )
+                    if (
+                        self.memory_encoder
+                        and hasattr(self.memory_manager, "_memory_store")
+                        and self.memory_manager._memory_store
+                    ):
+                        self.memory_encoder.set_memory_store(self.memory_manager._memory_store)
+                except Exception as e:
+                    logger.warning("Memory manager start failed in process_direct: {}", e)
+            logger.info("process_direct startup took {:.3f}s", time.time() - _direct_start)
+            msg = InboundMessage(
+                channel=channel,
+                sender_id="user",
+                chat_id=chat_id,
+                content=content,
+                media=media or [],
             )
+            try:
+                return await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
+                    on_tool_start=on_tool_start,
+                    on_tool_complete=on_tool_complete,
+                    on_outbound_message=on_outbound_message,
+                    permission_mode_override=permission_mode,
+                )
+            finally:
+                # process_direct bypasses _dispatch, so its finally block
+                # (which clears allow_all) never runs.  Clear it here to
+                # prevent the flag from leaking into the next call with
+                # the same session_key.
+                approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
+                if approver is not None and hasattr(approver, "clear_allow_all"):
+                    approver.clear_allow_all(session_key)
         finally:
-            # process_direct bypasses _dispatch, so its finally block
-            # (which clears allow_all) never runs.  Clear it here to
-            # prevent the flag from leaking into the next call with
-            # the same session_key.
-            approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
-            if approver is not None and hasattr(approver, "clear_allow_all"):
-                approver.clear_allow_all(session_key)
+            self._direct_inflight = max(0, self._direct_inflight - 1)

@@ -4,7 +4,7 @@ Two backends:
 
 - ``sqlite`` (default): :class:`~markbot.memory.vectorstore.SQLiteVectorStore`,
   zero extra dependencies (standard library only).
-- ``chroma``: :class:`~markbot.memory.vectorstores.chroma.ChromaVectorStore`,
+- ``chroma``: :class:`~markbot.memory.vectorstores.ChromaVectorStore`,
   requires ``pip install markbot[chroma]``. Wraps ChromaDB but injects
   our :class:`~markbot.memory.embedder.Embedder` so embeddings are
   consistent and switchable (rather than Chroma's bundled default
@@ -77,8 +77,10 @@ def _try_chroma(
     working_dir: Path,
 ) -> VectorStore | None:
     """Attempt to build the Chroma backend; return None if unavailable."""
+    # Implementation lives in markbot.memory.vectorstores (package __init__),
+    # not a missing vectorstores.chroma submodule.
     try:
-        from .vectorstores.chroma import ChromaVectorStore
+        from .vectorstores import ChromaVectorStore
     except ImportError:
         logger.debug("chromadb not installed; ChromaVectorStore unavailable")
         return None

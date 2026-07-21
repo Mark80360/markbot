@@ -11,8 +11,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 MEMORY_FILENAME: str = "MEMORY.md"
 USER_FILENAME: str = "PROFILE.md"
-DEFAULT_MEMORY_CHAR_LIMIT: int = 4000
-DEFAULT_USER_CHAR_LIMIT: int = 2000
+# Hermes-aligned write budgets: keep always-on curated memory dense.
+DEFAULT_MEMORY_CHAR_LIMIT: int = 2200
+DEFAULT_USER_CHAR_LIMIT: int = 1375
 
 # Channels where curated MEMORY.md may be auto-loaded into the system prompt.
 # Shared / messaging channels must not receive private long-term memory.
@@ -235,9 +236,9 @@ MAX_GIT_STATUS_CHARS: int = 2000
 # produces it (positive feedback loop).
 MAX_COMPRESSED_SUMMARY_CHARS: int = 20_000
 
-# Maximum characters for MEMORY.md before section-based truncation
-# Should be >= DEFAULT_MEMORY_CHAR_LIMIT from memory.tool (the write limit)
-MAX_MEMORY_MD_CHARS: int = max(8_000, DEFAULT_MEMORY_CHAR_LIMIT * 2)
+# Maximum characters for MEMORY.md injection before truncation.
+# Keep close to the write budget so always-on context stays dense.
+MAX_MEMORY_MD_CHARS: int = max(DEFAULT_MEMORY_CHAR_LIMIT + DEFAULT_USER_CHAR_LIMIT + 400, 4000)
 
 # Maximum characters for daily log search results
 MAX_DAILY_LOG_RESULT_CHARS: int = 2000
@@ -256,7 +257,7 @@ MAX_PREFETCH_RESULTS: int = 3
 # Minimum relevance score for prefetch recall
 MIN_PREFETCH_SCORE: float = 0.15
 
-# Maximum entries in MemoryStore before cleanup / rejection
+# Soft entry caps (char budget is the primary limit, matching Hermes).
 MAX_MEMORY_ENTRIES: int = 100
 MAX_USER_ENTRIES: int = 50
 
@@ -267,8 +268,10 @@ DEFAULT_CONSOLIDATION_PROMOTE_ACCESS: int = 8
 # Memory security scanner cooldown (seconds) between same-pattern detections
 MEMORY_SCANNER_COOLDOWN: int = 300
 
-# Frozen snapshot refresh interval (successful curated writes)
-MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 1
+# Hermes frozen-snapshot policy: do not refresh system-prompt memory mid-session.
+# 0 = never auto-refresh after tool writes (only load/session start / explicit refresh).
+# Tool responses always reflect live entries; next session sees new snapshot.
+MEMORY_SNAPSHOT_REFRESH_INTERVAL: int = 0
 
 # Context fencing tags
 MEMORY_CONTEXT_TAG_OPEN: str = "<memory-context>"
@@ -283,10 +286,8 @@ DREAM_BACKUP_KEEP: int = 5
 # entire MemoryStore budget.
 SINGLE_ENTRY_SOFT_LIMIT: int = 1500
 
-# Whether automatic conversation summaries may write into curated MEMORY.md.
-# Default False: summaries go to daily logs + vector index; only explicit
-# memory_save / dream promotion / high-confidence encoder writes land in
-# MEMORY.md.
+# Whether auto session summaries may write into curated MEMORY.md.
+# Default False: summaries belong in daily logs / compressed handoff.
 MEMORY_AUTO_SUMMARY_TO_CURATED: bool = False
 
 # Agent idle timeout in minutes. When no inbound message is received for

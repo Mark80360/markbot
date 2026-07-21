@@ -88,13 +88,29 @@ class ChannelManager:
             logger.error("Failed to start channel {}: {}", name, e)
 
     async def start_all(self) -> None:
-        """Start all channels and the outbound dispatcher."""
-        if not self.channels:
-            logger.warning("No channels enabled")
-            return
+        """Start all channels and the outbound dispatcher.
 
-        # Start outbound dispatcher
+        The outbound dispatcher always runs, even when no inbound channels
+        are enabled. Cron / heartbeat / process_direct may still publish
+        outbound messages (e.g. failure notices); without a dispatcher those
+        messages would sit forever in the bus.
+        """
+        # Start outbound dispatcher first so deliver paths never stall
+        # solely because no channel was configured.
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
+
+        if not self.channels:
+            logger.warning(
+                "No channels enabled; outbound dispatcher is running "
+                "(messages for unknown channels will be logged and dropped)"
+            )
+            # Keep the task alive so gather-based callers still block until
+            # stop_all() cancels us, matching the multi-channel lifetime.
+            try:
+                await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+            return
 
         # Start health check loop
         self._health_check_task = asyncio.create_task(self._health_check_loop())

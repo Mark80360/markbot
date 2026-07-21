@@ -31,7 +31,6 @@ from markbot.cli.ui import (
     response_renderable,
     restore_terminal,
 )
-from markbot.config.paths import get_cron_dir
 from markbot.utils.helpers import sync_workspace_templates
 
 try:
@@ -144,10 +143,8 @@ def agent(
 
     import time
 
-    from markbot.agent.loop import AgentLoop
-    from markbot.bus.queue import MessageBus
     from markbot.log.core import setup_logging
-    from markbot.schedule.cron import CronService
+    from markbot.runtime import CLI_FEATURES, build_runtime
 
     _gateway_paths()["agent_log_dir"].mkdir(parents=True, exist_ok=True)
     setup_logging(
@@ -172,47 +169,18 @@ def agent(
     sync_workspace_templates(config.workspace_path)
     logger.debug("Workspace templates synced, took {:.3f}s", time.time() - _t0)
 
+    # CLI profile: cron store only (tools can write jobs.json); no runner /
+    # heartbeat / dream. Gateway is the full long-running runtime.
     _t0 = time.time()
-    bus = MessageBus()
-    logger.debug("MessageBus created, took {:.3f}s", time.time() - _t0)
-
-    _t0 = time.time()
-    provider = make_provider(config)
-    logger.debug("Provider created, took {:.3f}s", time.time() - _t0)
-
-    cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-    cron = CronService(cron_store_path)
-
-    _t0 = time.time()
-    logger.info("Creating AgentLoop...")
-    agent_loop = AgentLoop(
-        ctx_or_bus=bus,
-        fallback_manager=provider,
-        config=config,
-        workspace=config.workspace_path,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        filesystem_config=config.tools.filesystem,
-        memory_config=config.tools.memory,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-        compaction_config=config.compaction,
-        max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
-        warn_threshold_usd=config.budget.warn_threshold_usd,
-        budget_config=config.budget if config.budget.enabled else None,
-    )
-    logger.info("AgentLoop created, took {:.3f}s", time.time() - _t0)
-    if hasattr(agent_loop, 'ctx') and hasattr(agent_loop.ctx, 'init_summary'):
+    logger.info("Creating AgentRuntime (CLI profile)...")
+    runtime = build_runtime(config, CLI_FEATURES, make_provider=make_provider)
+    agent_loop = runtime.agent
+    bus = runtime.bus
+    logger.info("AgentRuntime created, took {:.3f}s", time.time() - _t0)
+    if hasattr(agent_loop, "ctx") and hasattr(agent_loop.ctx, "init_summary"):
         logger.info("AgentContext init breakdown:\n{}", agent_loop.ctx.init_summary)
     else:
         logger.warning("No timing data available from AgentContext")
-
     # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None
 

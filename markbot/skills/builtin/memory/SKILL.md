@@ -19,9 +19,10 @@ Memory system using file-based storage for conversation compaction, async summar
 ### MEMORY.md — Long-Term Curated Memory
 - **Purpose**: Curated long-term facts only (high-signal)
 - **Lifetime**: Permanent
-- **Storage**: `workspace/MEMORY.md` (flat entry list separated by `---`)
+- **Storage**: `workspace/MEMORY.md` (flat entry list separated by `§`, Hermes-aligned)
 - **Use for**: User preferences, key decisions, project context, lessons learned
-- **Auto-loaded**: System prompt for main/private sessions only (cli/web/api/local)
+- **Auto-loaded**: Frozen snapshot into system prompt at session start (main/private only)
+- **Mid-session writes**: Persist immediately, but system-prompt snapshot refreshes next session
 - **Not auto-loaded**: Shared messaging channels (dingtalk/feishu/qq/email/...)
 - **Shared-channel search**: `memory_search` on shared channels excludes MEMORY.md / PROFILE.md and returns only same-session logs/summaries
 - **Shared-channel list/load**: `memory_list`, `memory_forget`, and context explorer cannot read MEMORY.md / PROFILE.md on shared channels

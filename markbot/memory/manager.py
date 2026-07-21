@@ -1114,17 +1114,29 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
     # -- Extra methods for tool compatibility --------------------------------
 
-    async def add_memory(self, content: str, tags: list[str] | None = None, target: str = "memory") -> bool:
-        """Add a memory entry (for MemorySaveTool compatibility).
+    async def add_memory(
+        self,
+        content: str,
+        tags: list[str] | None = None,
+        target: str = "memory",
+        *,
+        channel: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """Add a memory entry (for MemorySaveTool).
 
         Args:
             content: The memory content to save.
-            tags: Optional categorization tags.
+            tags: Optional categorization tags (unused for curated store).
             target: 'memory' or 'user'.
+            channel: Optional channel for privacy gating.
+            session_id: Optional session key used when channel is omitted.
 
         Returns:
             True if successful.
         """
+        if not self.allow_curated_memory(channel, session_id=session_id):
+            return False
         if not self._memory_store:
             return False
         if target not in ("memory", "user"):
@@ -1257,9 +1269,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                         "content": (
                             "You are a Dream Memory Organizer. Read the memory content, "
                             "deduplicate entries, merge related items, remove outdated info, "
-                            "and reorganize into a clean markdown format. "
-                            "Output each distinct entry separated by a line containing only '---'. "
-                            "Do NOT include headers like '# Agent Memory'. "
+                            "and keep only high-signal durable facts. "
+                            "Output each distinct entry separated by a line containing only '§'. "
+                            "Do NOT include markdown headers. "
                             "Return ONLY the optimized entries."
                         ),
                     },
@@ -1271,11 +1283,18 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 self._restore_entries(old_entries, old_disk_bytes, memory_path)
                 return "Dream produced empty result; original memory preserved"
 
-            raw_entries = [
-                e.strip()
-                for e in re.split(r"\n---\n", optimized)
-                if e.strip() and not e.strip().startswith("#")
-            ]
+            from markbot.memory.tool import ENTRY_DELIMITER, MemoryStore
+            raw_entries = MemoryStore.parse_entries_text(optimized)
+            # If the model used a single-line § separator without newlines,
+            # fall back to splitting on bare § lines.
+            if len(raw_entries) <= 1 and "§" in optimized:
+                raw_entries = [
+                    e.strip()
+                    for e in re.split(r"\n?\s*§\s*\n?", optimized)
+                    if e.strip()
+                ]
+            # Drop accidental delimiter-only noise.
+            raw_entries = [e for e in raw_entries if e and e != ENTRY_DELIMITER.strip()]
 
             if not raw_entries:
                 self._restore_entries(old_entries, old_disk_bytes, memory_path)
@@ -1287,6 +1306,8 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             for raw in raw_entries:
                 candidate_entries.extend(self._split_oversized_entry(raw, self._memory_store.memory_char_limit))
 
+            from markbot.memory.tool import ENTRY_DELIMITER as _ENTRY_DELIM
+
             staged: list[str] = []
             added, skipped = 0, 0
             for entry in candidate_entries:
@@ -1294,9 +1315,16 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 if error:
                     skipped += 1
                     continue
-                sanitized = self._memory_store._scanner.sanitize(entry)
-                current_total = sum(len(e) for e in staged)
-                if current_total + len(sanitized) > self._memory_store.memory_char_limit:
+                sanitized = self._memory_store._scanner.sanitize(entry).strip()
+                if not sanitized:
+                    skipped += 1
+                    continue
+                # Hermes-style total: sum(entries) + (N-1)*delimiter after append.
+                proposed_n = len(staged) + 1
+                proposed = sum(len(e) for e in staged) + len(sanitized)
+                if proposed_n > 1:
+                    proposed += len(_ENTRY_DELIM) * (proposed_n - 1)
+                if proposed > self._memory_store.memory_char_limit:
                     skipped += 1
                     continue
                 staged.append(sanitized)

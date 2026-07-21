@@ -35,7 +35,6 @@ from markbot.cli.daemon import (
 from markbot.cli.runtime import make_provider
 from markbot.cli.ui import console, make_section_helpers, markbot_banner
 from markbot.config.paths import get_cron_dir
-from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -90,14 +89,9 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
 
     from loguru import logger
 
-    from markbot.agent.loop import AgentLoop
-    from markbot.bus.queue import MessageBus
-    from markbot.channels.manager import ChannelManager
     from markbot.config.loader import load_config
     from markbot.log.core import setup_logging
-    from markbot.schedule.cron import CronJob, CronService
-    from markbot.schedule.heartbeat import HeartbeatService
-    from markbot.session.session import SessionManager
+    from markbot.runtime import GATEWAY_FEATURES, build_runtime
 
     # Detect daemon mode: stderr has been redirected to the log file
     # (via os.dup2 on Unix or subprocess redirection on Windows).  In
@@ -153,193 +147,31 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
     console.print(f"{__logo__} Starting MarkBot gateway on port {port}...")
 
     sync_workspace_templates(config.workspace_path)
-    bus = MessageBus()
-    provider = make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
 
-    cron_store_path = get_cron_dir(config.workspace_path) / "jobs.json"
-    reliability = getattr(config, "reliability", None)
-    cron = CronService(
-        cron_store_path,
-        max_retries=getattr(reliability, "cron_max_retries", 2),
-        retry_delay_s=getattr(reliability, "cron_retry_delay_s", 5.0),
-        dead_letter_keep=getattr(reliability, "dead_letter_keep", 50),
-    )
-
-    agent = AgentLoop(
-        ctx_or_bus=bus,
-        fallback_manager=provider,
-        config=config,
-        workspace=config.workspace_path,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        filesystem_config=config.tools.filesystem,
-        memory_config=config.tools.memory,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-        compaction_config=config.compaction,
-        max_budget_usd=config.budget.max_budget_usd if config.budget.enabled else None,
-        warn_threshold_usd=config.budget.warn_threshold_usd,
-        budget_config=config.budget if config.budget.enabled else None,
-    )
-
-    
-    async def on_cron_failure(job: CronJob, error: str) -> None:
-        """Notify user when cron retries are exhausted."""
-        if reliability is not None and not getattr(reliability, "notify_on_failure", True):
-            return
-        channel = job.payload.channel or "cli"
-        chat_id = job.payload.to or "direct"
-        summary = (
-            f"[Cron Failure] Job '{job.name}' failed after retries.\n"
-            f"Error: {error}\n"
-            f"Instruction: {job.payload.message[:300]}"
-        )
-        try:
-            from markbot.bus.events import OutboundMessage
-            await bus.publish_outbound(
-                OutboundMessage(channel=channel, chat_id=chat_id, content=summary)
-            )
-        except Exception as exc:
-            logger.warning("Failed to publish cron failure notice: {}", exc)
-
-    cron.on_failure = on_cron_failure
-
-    async def on_cron_job(job: CronJob) -> str | None:
-        from markbot.schedule.evaluator import evaluate_response
-        from markbot.tools.cron import CronTool
-        from markbot.tools.message import MessageTool
-
-        reminder_note = (
-            "[Scheduled Task] Timer finished.\n\n"
-            f"Task '{job.name}' has been triggered.\n"
-            f"Scheduled instruction: {job.payload.message}"
-        )
-
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-        try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-                permission_mode=PermissionMode.AUTO,
-            )
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-            cron_session = agent.sessions.get_or_create(f"cron:{job.id}")
-            cron_session.retain_recent_legal_suffix(8)
-            agent.sessions.save(cron_session)
-
-        response = (resp.content if resp else "") or ""
-
-        # Surface hard model/runtime failures so CronService can retry and
-        # dead-letter instead of marking the job "ok" with an error string.
-        failure_markers = (
-            "All ",
-            "error calling the AI model",
-            "models in chain failed",
-            "Budget exceeded",
-        )
-        lowered = response.lower()
-        if any(m.lower() in lowered for m in failure_markers) or response.startswith("Sorry, I encountered an error"):
-            raise RuntimeError(f"cron agent failure: {response[:500]}")
-
-        message_tool = agent.tools.get("message")
-        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            return response
-
-        if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
-            )
-            if should_notify:
-                from markbot.bus.events import OutboundMessage
-                await bus.publish_outbound(OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
-                    content=response,
-                ))
-        return response
-    cron.on_job = on_cron_job
-
-    channels = ChannelManager(config, bus)
-
-    def _pick_heartbeat_target() -> tuple[str, str]:
-        enabled = set(channels.enabled_channels)
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        return "cli", "direct"
-
-    async def on_heartbeat_execute(tasks: str) -> str:
-        channel, chat_id = _pick_heartbeat_target()
-
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        resp = await agent.process_direct(
-            tasks,
-            session_key="heartbeat",
-            channel=channel,
-            chat_id=chat_id,
-            on_progress=_silent,
-            permission_mode=PermissionMode.AUTO,
-        )
-
-        session = agent.sessions.get_or_create("heartbeat")
-        session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
-        agent.sessions.save(session)
-
-        return resp.content if resp else ""
-
-    async def on_heartbeat_notify(response: str) -> None:
-        from markbot.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
-            return
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
-
+    # Full gateway profile: channels + cron runner + heartbeat + dream + curator.
+    # Process lifecycle (daemon, sentinel, asyncio race) stays here.
+    runtime = build_runtime(config, GATEWAY_FEATURES, make_provider=make_provider)
+    agent = runtime.agent
+    channels = runtime.channels
+    cron = runtime.cron
+    heartbeat = runtime.heartbeat
     hb_cfg = config.gateway.heartbeat
 
-    heartbeat = HeartbeatService(
-        workspace=config.workspace_path,
-        fallback_manager=provider,
-        model=agent.model,
-        on_execute=on_heartbeat_execute,
-        on_notify=on_heartbeat_notify,
-        interval_s=hb_cfg.interval_s,
-        enabled=hb_cfg.enabled,
-        timezone=config.agents.defaults.timezone,
-    )
+    if channels is None:
+        raise RuntimeError("GATEWAY_FEATURES requires ChannelManager")
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
 
-    cron_status = cron.status()
-    if cron_status["jobs"] > 0:
-        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+    if cron is not None:
+        cron_status = cron.status()
+        if cron_status["jobs"] > 0:
+            console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
-    console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    if heartbeat is not None:
+        console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
         # Top-level task handles; initialised to None so the finally
@@ -349,40 +181,21 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
         agent_task = None
         channels_task = None
         try:
-            await cron.start()
+            await runtime.start_cron()
 
-            dream_service = None
-            dream_cron = config.tools.memory.dream_cron
-            if dream_cron and agent.memory_manager is not None:
-                from markbot.schedule.dream import DreamService
-
-                # Dream is system-triggered only.  The is_busy_fn guard
-                # ensures it never fires while a conversation is in
-                # progress (requirement: no concurrent dream + chat).
-                dream_service = DreamService(
-                    cron_expr=dream_cron,
-                    dream_fn=agent.memory_manager.dream,
-                    state_dir=config.workspace_path,
-                    is_busy_fn=agent.has_active_conversations,
-                    timezone=config.agents.defaults.timezone,
+            # Dream is system-triggered only.  The is_busy_fn guard
+            # ensures it never fires while a conversation is in
+            # progress (requirement: no concurrent dream + chat).
+            dream_service = await runtime.start_dream()
+            if dream_service is not None:
+                console.print(
+                    f"[green]✓[/green] Dream: cron={config.tools.memory.dream_cron}"
                 )
-                await dream_service.start()
-                console.print(f"[green]✓[/green] Dream: cron={dream_cron}")
 
-            await heartbeat.start()
+            await runtime.start_heartbeat()
 
-            # Start the skill curator for lifecycle management
-            # (auto-archive stale skills, evaluate quality).
-            curator = None
-            if agent.skill_registry is not None:
-                from markbot.skills.curator import CuratorService
-                curator = CuratorService(
-                    workspace=config.workspace_path,
-                    skill_registry=agent.skill_registry,
-                    auto_archive=True,
-                    interval_hours=6,
-                )
-                await curator.start()
+            curator = await runtime.start_curator(interval_hours=6)
+            if curator is not None:
                 console.print("[green]✓[/green] Skill curator: interval=6h")
 
             # Clear any stale sentinel from a previous run before
@@ -470,15 +283,7 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
-            if dream_service:
-                await dream_service.stop()
-            if curator:
-                await curator.stop()
-            await agent.close_mcp()
-            await heartbeat.stop()
-            cron.stop()
-            agent.stop()
-            await channels.stop_all()
+            await runtime.stop()
 
     asyncio.run(run())
 

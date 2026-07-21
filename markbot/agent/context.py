@@ -800,16 +800,44 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             logger.warning("Failed to load {}: {}", filename, e)
             return None
 
+    def _format_curated_entries(
+        self,
+        raw: str,
+        *,
+        title: str,
+        char_limit: int,
+        max_chars: int,
+    ) -> str | None:
+        """Format Hermes § entries for bootstrap injection."""
+        from markbot.memory.tool import ENTRY_DELIMITER, MemoryStore
+
+        entries = MemoryStore.parse_entries_text(raw)
+        if not entries:
+            return None
+        used = sum(len(e) for e in entries) + len(ENTRY_DELIMITER) * max(len(entries) - 1, 0)
+        pct = min(100, int(used * 100 / char_limit)) if char_limit else 0
+        body = ENTRY_DELIMITER.join(entries)
+        if len(body) > max_chars:
+            body = body[: max(max_chars - 80, 0)].rstrip() + (
+                "\n\n...[memory truncated to budget]..."
+            )
+        return (
+            "══════════════════════════════════════════════\n"
+            f"{title} [~{pct}% — {used}/{char_limit} chars]\n"
+            "══════════════════════════════════════════════\n"
+            f"{body}"
+        )
+
     def _load_essential_bootstrap(self, *, channel: str | None = None) -> str:
         """Load essential bootstrap (Priority 2): AGENTS.md, PROFILE.md.
 
         SOUL.md is handled by _get_identity().
-        PROFILE.md contains personal identity/preferences and is only
-        always-on for main/private sessions (same privacy boundary as
-        MEMORY.md). Shared messaging channels skip it.
+        PROFILE.md is always-on only for main/private sessions.
         """
         from markbot.utils.constants import (
             BOOTSTRAP_FILES_ESSENTIAL,
+            DEFAULT_USER_CHAR_LIMIT,
+            MAX_MEMORY_MD_CHARS,
             USER_FILENAME,
             is_main_memory_session,
         )
@@ -817,22 +845,35 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
         for filename in BOOTSTRAP_FILES_ESSENTIAL:
             if filename == "SOUL.md":
                 continue
-            if filename == USER_FILENAME and not is_main_memory_session(channel):
-                continue
-            text = self._load_file_content(filename)
+            if filename == USER_FILENAME:
+                if not is_main_memory_session(channel):
+                    continue
+                raw = self._load_file_content(filename)
+                if not raw:
+                    continue
+                text = self._format_curated_entries(
+                    raw,
+                    title="USER PROFILE",
+                    char_limit=DEFAULT_USER_CHAR_LIMIT,
+                    max_chars=MAX_MEMORY_MD_CHARS,
+                )
+            else:
+                text = self._load_file_content(filename)
+                if text:
+                    text = f"## {filename}\n\n{text}"
             if text:
-                parts.append(f"## {filename}\n\n{text}")
+                parts.append(text)
         return "\n\n".join(parts) if parts else ""
 
     def _load_conditional_bootstrap(self, *, channel: str | None = None) -> str:
         """Load conditional bootstrap (Priority 2): curated MEMORY.md.
 
-        Only main/private sessions receive always-on MEMORY.md. Shared
-        messaging channels (dingtalk/feishu/qq/email/...) are blocked here
-        and should rely on on-demand ``memory_search`` instead.
+        Only main/private sessions receive always-on MEMORY.md.
+        Format: Hermes dense § entry list with usage meter.
         """
         from markbot.utils.constants import (
             BOOTSTRAP_FILES_CONDITIONAL,
+            DEFAULT_MEMORY_CHAR_LIMIT,
             MAX_MEMORY_MD_CHARS,
             MEMORY_FILENAME,
             is_main_memory_session,
@@ -842,38 +883,19 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
 
         parts: list[str] = []
         for filename in BOOTSTRAP_FILES_CONDITIONAL:
-            file_path = self.workspace / filename
-            if not file_path.exists():
+            if filename != MEMORY_FILENAME:
                 continue
-            try:
-                raw = file_path.read_text(encoding="utf-8", errors="replace")
-            except Exception as e:
-                logger.warning("Failed to load {}: {}", filename, e)
+            raw = self._load_file_content(filename)
+            if not raw:
                 continue
-            if not raw.strip():
-                continue
-
-            # Prefer the MemoryStore entry parser so template/sectioned files
-            # and canonical entry-list files produce the same prompt shape.
-            if filename == MEMORY_FILENAME:
-                try:
-                    from markbot.memory.tool import MemoryStore
-                    entries = MemoryStore.parse_entries_text(raw)
-                except Exception:
-                    entries = []
-                if entries:
-                    body = "\n".join(f"- {e}" for e in entries)
-                else:
-                    body = raw.strip()
-                if len(body) > MAX_MEMORY_MD_CHARS:
-                    body = body[: max(MAX_MEMORY_MD_CHARS - 80, 0)].rstrip() + (
-                        "\n\n...[memory truncated to budget]..."
-                    )
-                parts.append(f"## {filename}\n\n{body}")
-            else:
-                text = raw.strip()
-                if text:
-                    parts.append(f"## {filename}\n\n{text}")
+            text = self._format_curated_entries(
+                raw,
+                title="MEMORY (your personal notes)",
+                char_limit=DEFAULT_MEMORY_CHAR_LIMIT,
+                max_chars=MAX_MEMORY_MD_CHARS,
+            )
+            if text:
+                parts.append(text)
         return "\n\n".join(parts) if parts else ""
 
     def _load_reference_bootstrap(self) -> str:

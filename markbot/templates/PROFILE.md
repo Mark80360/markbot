@@ -1,40 +1,5 @@
----
-summary: "Agent 身份与用户资料"
-read_when:
-  - 手动引导工作区
----
-
-## Agent 身份
-
-- **名字：**
-  *（挑个你喜欢的）*
-- **定位：**
-  *（AI？机器人？使魔？机器里的幽灵？还是更怪的？）*
-- **风格：**
-  *（你给人什么感觉？犀利？温暖？混乱？冷静？）*
-- **其他**
-  *（用户设置的其他内容）*
-
-## 用户资料
-
-*了解你在帮的人。边走边更新。*
-
-- **名字：**
-- **怎么叫他们：**
-- **时区：** *（如 Asia/Shanghai 或 UTC+8）*
-- **语言偏好：**
-- **沟通风格：** 随意 / 正式 / 技术
-- **技术级别：** 初学 / 中等 / 专家
-- **代词：** *（可选）*
-
-### 工作上下文
-
-- **角色：** *（如开发者、研究者）*
-- **主要项目：**
-- **常用工具：** *（IDE、语言、框架）*
-
-### 兴趣与笔记
-
-*（他们在意什么？什么让他们烦？什么逗他们笑？边走边积累。）*
-
--
+User name and preferred address are unknown — fill via memory_save(target=user)
+§
+Timezone / language / communication style — record durable preferences only
+§
+Role, main projects, and tools — keep short high-signal facts

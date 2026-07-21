@@ -18,6 +18,7 @@ from markbot.config.schema import Config
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset()
 _ALWAYS_BLOCKED_IPS: tuple[ipaddress._BaseAddress, ...] = ()
 _PRIVATE_NETWORKS: tuple[ipaddress._BaseNetwork, ...] = ()
+_INITIALIZED: bool = False
 
 
 def _parse_ips(ip_strings: list[str]) -> tuple[ipaddress._BaseAddress, ...]:
@@ -44,11 +45,25 @@ def _parse_networks(net_strings: list[str]) -> tuple[ipaddress._BaseNetwork, ...
 
 def init_from_config(config: Config) -> None:
     """Populate SSRF block lists from Config.ssrf section."""
-    global _BLOCKED_HOSTNAMES, _ALWAYS_BLOCKED_IPS, _PRIVATE_NETWORKS
+    global _BLOCKED_HOSTNAMES, _ALWAYS_BLOCKED_IPS, _PRIVATE_NETWORKS, _INITIALIZED
     ssrf_cfg = config.ssrf
     _BLOCKED_HOSTNAMES = frozenset(s.lower() for s in ssrf_cfg.blocked_hostnames)
     _ALWAYS_BLOCKED_IPS = _parse_ips(ssrf_cfg.always_blocked_ips)
     _PRIVATE_NETWORKS = _parse_networks(ssrf_cfg.blocked_networks)
+    _INITIALIZED = True
+
+
+def _ensure_initialized() -> None:
+    """Lazily apply default Config.ssrf if nobody called init_from_config yet.
+
+    Production paths call :func:`init_from_config` from ``load_config``.
+    This guard covers direct tool use / tests that never load config, so
+    private-network and metadata blocks are never accidentally empty.
+    """
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
+    init_from_config(Config())
 
 
 def _resolve_hostname(hostname: str) -> list[ipaddress._BaseAddress]:
@@ -72,6 +87,7 @@ def validate_url_target(url: str, allow_private: bool = False) -> tuple[bool, st
     Checks scheme, hostname, blocked hostnames, always-blocked IPs, and
     private network IPs (unless ``allow_private=True``).
     """
+    _ensure_initialized()
     try:
         parsed = urlparse(url)
     except Exception as e:
@@ -115,6 +131,7 @@ def validate_resolved_url(url: str, allow_private: bool = False) -> tuple[bool, 
     resolves and checks. Used for post-redirect SSRF protection in
     browser.py.
     """
+    _ensure_initialized()
     try:
         parsed = urlparse(url)
     except Exception:
@@ -164,6 +181,7 @@ def contains_internal_url(
         allowed_ips: Optional whitelist of IPs/CIDRs that bypass blocking.
         allow_private: If True, private network URLs are not flagged.
     """
+    _ensure_initialized()
     allowed_networks: list[ipaddress._BaseNetwork] = []
     if allowed_ips:
         for s in allowed_ips:
