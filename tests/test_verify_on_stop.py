@@ -27,11 +27,15 @@ from markbot.agent.iteration import IterationRunner
 
 def _make_runner(channel: str = "cli") -> IterationRunner:
     """Build an IterationRunner bypassing __init__ for unit tests."""
+    from markbot.agent.outcome import OutcomeGate, OutcomeGateConfig
+
     runner = IterationRunner.__new__(IterationRunner)
     runner.channel = channel
     runner.loop = MagicMock()
     # resolve_sanitised_name returns the input by default.
     runner.loop.tools.resolve_sanitised_name = lambda name: name
+    # OutcomeGate is normally built in __init__; unit tests bypass that path.
+    runner._outcome_gate = OutcomeGate(OutcomeGateConfig())
     return runner
 
 

@@ -46,25 +46,49 @@ class SpawnTool(BaseTool):
                 ToolParameter(
                     name="task",
                     type="string",
-                    description="The task for the subagent to complete",
-                    required=True,
+                    description=(
+                        "Single-task mode: the task for the subagent to complete. "
+                        "Provide either `task` or `tasks` (not both)."
+                    ),
+                    required=False,
                 ),
                 ToolParameter(
                     name="label",
                     type="string",
-                    description="Optional short label for the task (for display)",
+                    description="Optional short label for the single task (for display)",
                     required=False,
                 ),
                 ToolParameter(
                     name="capability",
                     type="object",
                     description=(
-                        "Optional capability object declaring what the subagent "
-                        "may do. Keys (snake_case or camelCase): "
-                        "allowed_tools (list[str]), forbidden_tools (list[str]), "
-                        "max_iterations (int, default 15), max_budget_usd "
-                        "(number), timeout_seconds (number), description (str). "
-                        "Omit or pass null to use the default read-only profile."
+                        "Optional capability object for single-task mode. Keys "
+                        "(snake_case or camelCase): allowed_tools (list[str]), "
+                        "forbidden_tools (list[str]), max_iterations (int, default 15), "
+                        "max_budget_usd (number), timeout_seconds (number), "
+                        "description (str), template (str). Omit for the default "
+                        "read-only profile."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="template",
+                    type="string",
+                    description=(
+                        "Capability template name for single-task mode: "
+                        "research | code_edit | verify | browse | read_only. "
+                        "Ignored when an explicit capability.allowed_tools is provided."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="tasks",
+                    type="array",
+                    description=(
+                        "Batch mode: array of task objects. Each item: "
+                        "{task: string (required), label?: string, "
+                        "template?: string, capability?: object}. "
+                        "Use instead of single `task` when spawning multiple leaf agents."
                     ),
                     required=False,
                 ),
@@ -79,20 +103,46 @@ class SpawnTool(BaseTool):
         return PermissionDecision(behavior="ask")
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> str:
-        task = params["task"]
-        label = params.get("label")
-        capability_param = params.get("capability")
-
         channel = context.channel or self._origin_channel
         chat_id = context.chat_id or self._origin_chat_id
         session_key = make_session_key(channel, chat_id) or self._session_key
 
-        from markbot.agent.subagent.capability import CapabilityToken
+        batch = params.get("tasks")
+        task = params.get("task")
+        if batch is not None and task:
+            return (
+                "Error: provide either `task` (single) or `tasks` (batch), not both."
+            )
+        if batch is not None:
+            if not isinstance(batch, list):
+                return "Error: `tasks` must be an array of task objects."
+            if not batch:
+                return "Error: `tasks` list is empty."
+            return await self._manager.spawn_batch(
+                tasks=batch,
+                origin_channel=channel,
+                origin_chat_id=chat_id,
+                session_key=session_key,
+            )
+
+        if not task:
+            return "Error: either `task` or `tasks` is required."
+        label = params.get("label")
+        capability_param = params.get("capability")
+        template = params.get("template")
+
+        from markbot.agent.subagent.templates import resolve_capability
 
         try:
-            capability = CapabilityToken.from_dict(capability_param)
+            capability = resolve_capability(
+                capability_param, template=template
+            )
         except (TypeError, ValueError) as e:
-            logger.warning("SpawnTool: invalid capability payload, falling back to read-only: {}", e)
+            logger.warning(
+                "SpawnTool: invalid capability payload, falling back to read-only: {}", e
+            )
+            from markbot.agent.subagent.capability import CapabilityToken
+
             capability = CapabilityToken.read_only(
                 description="Invalid capability payload — read-only fallback"
             )

@@ -132,6 +132,25 @@ class AgentLoop:
         self.prefix_stability = ctx.prefix_stability
         self.llm_response_cache = ctx.llm_response_cache
         self.token_estimate_cache = ctx.token_estimate_cache
+        # Per-loop deferred mutation policy (config-driven). Keep the active
+        # turn's prefix cache byte-stable when defer_mutations=True.
+        from markbot.agent.cache_policy import CacheMutationPolicy
+
+        cache_cfg = getattr(getattr(self.config, "tools", None), "cache_policy", None)
+        self.cache_mutation_policy = CacheMutationPolicy.from_settings(cache_cfg)
+        # Context compression narrow waist (defaults to MultiLevelCompactor).
+        from markbot.agent.context_engine import CompactorContextEngine
+
+        self.context_engine = CompactorContextEngine(self.compactor)
+        # Tool-surface footprint (soft-disable ladder).
+        from markbot.agent.footprint import ToolFootprint
+
+        self.tool_footprint = ToolFootprint()
+        if getattr(ctx, "profile", None) is not None:
+            self.tool_footprint.apply_profile(ctx.profile)
+            from markbot.agent.footprint import apply_footprint_to_registry
+
+            apply_footprint_to_registry(self.tools, self.tool_footprint)
         # Increment on every add/remove/clear of the message list so
         # the token-estimate cache invalidates correctly.
         self._messages_revision: int = 0
@@ -195,17 +214,122 @@ class AgentLoop:
         # 的反思次数永远卡住后续新任务。
         self._session_failure_state: dict[str, dict] = {}
 
+        # Let skill hot-load/unload defer tool-surface mutations via this loop.
+        if self.skill_registry is not None and hasattr(
+            self.skill_registry, "bind_cache_policy"
+        ):
+            try:
+                self.skill_registry.bind_cache_policy(self.cache_mutation_policy)
+            except Exception as e:
+                logger.debug("bind_cache_policy failed: {}", e)
+
         logger.info("Initialization complete, total took {:.3f}s", time.time() - _init_start)
 
+    def request_cache_mutation(
+        self,
+        kind,
+        description: str,
+        apply,
+        *,
+        now: bool = False,
+    ) -> str:
+        """Public facade for deferred tool/system/skill mutations."""
+        return self.cache_mutation_policy.request(
+            kind, description, apply, now=now
+        )
+
+    def footprint_status_lines(self) -> list[str]:
+        """Human-readable control-plane surface for /status."""
+        pending = []
+        try:
+            pending = list(self.cache_mutation_policy.peek_pending() or [])
+        except Exception:
+            pending = []
+        snap = self.tool_footprint.snapshot(
+            self.tools, pending_mutations=pending
+        )
+        lines = snap.as_lines()
+        lines.append(f"context_engine={getattr(self.context_engine, 'name', '?')}")
+        return lines
+
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Connect to configured MCP servers (one-time, lazy).
+
+        Network connect may run anytime; tool-schema registration is deferred
+        through :meth:`request_cache_mutation` when a turn is active so the
+        active prefix cache stays byte-stable.
+        """
         if not self.mcp.has_servers:
             logger.debug("No MCP servers configured, skipping connection")
             return
+        if getattr(self.mcp, "is_connected", False):
+            return
         _t0 = time.time()
         logger.info("Connecting to MCP servers...")
-        await self.mcp.connect(self.tools)
+        # Stage tools without registering — registration is cache-sensitive.
+        staged = await self.mcp.connect(self.tools, register_tools=False)
+        if staged:
+            from markbot.agent.cache_policy import MutationKind
+
+            tools = list(staged)
+
+            def _register() -> None:
+                for tool in tools:
+                    self.tools.register(tool)
+                if hasattr(self.tools, "invalidate_definitions_cache"):
+                    self.tools.invalidate_definitions_cache()
+
+            status = self.request_cache_mutation(
+                MutationKind.TOOLS,
+                f"register {len(tools)} MCP tool(s)",
+                _register,
+            )
+            logger.info("MCP tool surface mutation: {}", status)
         logger.info("MCP connection took {:.3f}s", time.time() - _t0)
+
+    def set_profile(self, profile: Any, *, now: bool = False) -> str:
+        """Hot-switch runtime profile tool surface (soft-disable ladder).
+
+        Permission mode is updated immediately when app_state is available.
+        Tool-schema soft-disable is deferred unless *now* or no active turn.
+        """
+        from markbot.agent.cache_policy import MutationKind
+        from markbot.agent.footprint import apply_footprint_to_registry
+        from markbot.config.profile import get_profile
+
+        if isinstance(profile, str):
+            profile = get_profile(profile)
+        if profile is None:
+            return "No profile provided"
+
+        # Keep ctx/profile reference current for status + future binds.
+        if getattr(self, "ctx", None) is not None:
+            try:
+                self.ctx.profile = profile
+            except Exception:
+                pass
+
+        # Permission mode is not a schema/prefix mutation — apply immediately.
+        app_state = getattr(getattr(self, "ctx", None), "app_state", None)
+        if app_state is not None:
+            try:
+                mode = PermissionMode(getattr(profile, "permission_mode", "default"))
+                app_state.set_permission_mode(mode)
+            except Exception as e:
+                logger.debug("set_profile permission switch failed: {}", e)
+
+        name = str(getattr(profile, "name", "") or "?")
+
+        def _apply() -> None:
+            self.tool_footprint.apply_profile(profile)
+            apply_footprint_to_registry(self.tools, self.tool_footprint)
+
+        return self.request_cache_mutation(
+            MutationKind.PROFILE,
+            f"switch profile to {name}",
+            _apply,
+            now=now,
+        )
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""

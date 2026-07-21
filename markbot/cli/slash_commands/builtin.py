@@ -57,24 +57,34 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     cumulative = token_summary["total"]
     last = loop._last_usage
 
+    base = build_status_content(
+        version=__version__, model=loop.model,
+        start_time=loop._start_time,
+        context_window_tokens=loop.context_window_tokens,
+        context_tokens=last.get("prompt_tokens", 0),
+        session_msg_count=len(session.messages),
+        session_history_count=len(session.get_history(max_messages=0)),
+        tool_count=len(loop.tools.get_definitions()),
+        last_usage=last,
+        cumulative_input=cumulative["input_tokens"],
+        cumulative_output=cumulative["output_tokens"],
+        cumulative_cache_creation=cumulative["cache_creation_input_tokens"],
+        cumulative_cache_read=cumulative["cache_read_input_tokens"],
+        api_calls=token_summary["api_calls"],
+    )
+    # Control-plane surface: footprint ladder + deferred mutations + engine.
+    if hasattr(loop, "footprint_status_lines"):
+        try:
+            cp_lines = loop.footprint_status_lines()
+            if cp_lines:
+                base = base.rstrip() + "\n\n[Control Plane]\n" + "\n".join(cp_lines)
+        except Exception:
+            pass
+
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=build_status_content(
-            version=__version__, model=loop.model,
-            start_time=loop._start_time,
-            context_window_tokens=loop.context_window_tokens,
-            context_tokens=last.get("prompt_tokens", 0),
-            session_msg_count=len(session.messages),
-            session_history_count=len(session.get_history(max_messages=0)),
-            tool_count=len(loop.tools.get_definitions()),
-            last_usage=last,
-            cumulative_input=cumulative["input_tokens"],
-            cumulative_output=cumulative["output_tokens"],
-            cumulative_cache_creation=cumulative["cache_creation_input_tokens"],
-            cumulative_cache_read=cumulative["cache_read_input_tokens"],
-            api_calls=token_summary["api_calls"],
-        ),
+        content=base,
         metadata={"render_as": "text"},
     )
 
@@ -229,24 +239,24 @@ async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
-    """Return available slash commands."""
-    lines = [
-        "🦞 MarkBot commands:",
-        "/new — Start fresh session with memory summary",
-        "/compact — Force manual context compaction",
-        "/compact_str — View current compressed summary",
-        "/clear — Clear history and compressed summary",
-        "/stop — Cancel all active tasks and subagents",
-        "/steer <text> — Inject mid-task instruction into running agent",
-        "/status — Show session status, token usage, and statistics",
-        "/mode [mode] — Show or set permission mode (default/plan/auto/bypass)\n/profile [name] — Show or set runtime profile (coding/assistant/unattended)",
-        "/restart — Restart the agent process",
-        "/help — Show available slash commands",
-    ]
+    """Return available slash commands from the CommandDef catalog."""
+    from markbot.cli.slash_commands.command_def import CommandCatalog
+
+    catalog = None
+    if ctx.loop is not None:
+        commands = getattr(ctx.loop, "commands", None)
+        catalog = getattr(commands, "catalog", None) if commands is not None else None
+        if catalog is None:
+            catalog = getattr(ctx.loop, "_command_catalog", None)
+    if isinstance(catalog, CommandCatalog):
+        content = catalog.help_text()
+    else:
+        # Fallback when catalog not attached (tests / minimal loops).
+        content = build_builtin_catalog().help_text()
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content="\n".join(lines),
+        content=content,
         metadata={"render_as": "text"},
     )
 
@@ -360,7 +370,19 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
                 f"autopilot={p.enable_autopilot}, min_skill_score={p.min_skill_score}"
             )
         lines.append("")
-        lines.append("Use: /profile <name> to persist (takes effect on next restart).")
+        lines.append(
+            "Use: /profile <name> to switch now "
+            "(tool surface is deferred mid-turn for cache safety; "
+            "permission mode applies immediately)."
+        )
+        # Show live footprint profile when available.
+        live = None
+        try:
+            live = getattr(getattr(loop, "tool_footprint", None), "profile_name", None)
+        except Exception:
+            live = None
+        if live and live != current:
+            lines.append(f"Live process profile: {live}")
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="\n".join(lines),
@@ -394,16 +416,100 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def build_builtin_catalog() -> "CommandCatalog":
+    """Single-source CommandDef catalog for built-in slash commands."""
+    from markbot.cli.slash_commands.command_def import (
+        CommandCatalog,
+        CommandDef,
+        CommandTier,
+    )
+
+    catalog = CommandCatalog()
+    catalog.register(
+        CommandDef(
+            name="/stop",
+            handler=cmd_stop,
+            description="Cancel all active tasks and subagents",
+            tier=CommandTier.PRIORITY,
+            category="control",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/steer",
+            handler=cmd_steer,
+            description="Inject mid-task instruction into running agent",
+            tier=CommandTier.PRIORITY,
+            args_hint="<text>",
+            category="control",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/restart",
+            handler=cmd_restart,
+            description="Restart the agent process",
+            tier=CommandTier.PRIORITY,
+            category="control",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/status",
+            handler=cmd_status,
+            description="Show session status, token usage, and statistics",
+            tier=CommandTier.PRIORITY,
+            category="session",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/new",
+            handler=cmd_new,
+            description="Start fresh session with memory summary",
+            category="session",
+        ),
+        CommandDef(
+            name="/compact",
+            handler=cmd_compact,
+            description="Force manual context compaction",
+            category="session",
+        ),
+        CommandDef(
+            name="/compact_str",
+            handler=cmd_compact_str,
+            description="View current compressed summary",
+            category="session",
+        ),
+        CommandDef(
+            name="/mode",
+            handler=cmd_mode,
+            description="Show or set permission mode (default/plan/auto/bypass)",
+            args_hint="[mode]",
+            category="runtime",
+        ),
+        CommandDef(
+            name="/profile",
+            handler=cmd_profile,
+            description="Show or set runtime profile (coding/assistant/unattended)",
+            args_hint="[name]",
+            category="runtime",
+        ),
+        CommandDef(
+            name="/clear",
+            handler=cmd_clear,
+            description="Clear history and compressed summary",
+            category="session",
+        ),
+        CommandDef(
+            name="/help",
+            handler=cmd_help,
+            description="Show available slash commands",
+            category="general",
+        ),
+    )
+    return catalog
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
-    """Register the default set of slash commands."""
-    router.priority("/stop", cmd_stop)
-    router.priority("/steer", cmd_steer)
-    router.priority("/restart", cmd_restart)
-    router.priority("/status", cmd_status)
-    router.exact("/new", cmd_new)
-    router.exact("/compact", cmd_compact)
-    router.exact("/compact_str", cmd_compact_str)
-    router.exact("/mode", cmd_mode)
-    router.exact("/profile", cmd_profile)
-    router.exact("/clear", cmd_clear)
-    router.exact("/help", cmd_help)
+    """Register the default set of slash commands via CommandDef catalog."""
+    catalog = build_builtin_catalog()
+    catalog.apply_to_router(router)
+    # Stash on router for help / autocomplete consumers.
+    setattr(router, "catalog", catalog)

@@ -5,7 +5,7 @@ Refactored to use new core types inspired by MarkBot.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from markbot.types.permission import PermissionDecision, PermissionMode
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
@@ -66,6 +66,24 @@ class BaseTool(ABC):
     def is_enabled(self) -> bool:
         """Check if tool is enabled. Defaults to True."""
         return True
+
+    def available_when(self) -> bool:
+        """Service-gate: return False to hide the tool from model schema.
+
+        Use this for tools that need external credentials / binaries.
+        When False, the tool is not exposed via ``ToolRegistry.definitions``
+        so it does not inflate every API call's tool footprint.
+        Defaults to True. Prefer overriding this over permanently registering
+        unavailable tools.
+        """
+        return True
+
+    def is_available(self) -> bool:
+        """Combined enable + service gate check."""
+        try:
+            return bool(self.is_enabled) and bool(self.available_when())
+        except Exception:
+            return False
 
     def is_read_only(self, params: dict[str, Any]) -> bool:
         """Check if tool operation is read-only. Defaults to False."""

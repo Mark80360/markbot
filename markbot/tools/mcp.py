@@ -136,13 +136,24 @@ class MCPToolWrapper(Tool):
 
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
-) -> None:
-    """Connect to configured MCP servers and register their tools."""
+    mcp_servers: dict,
+    registry: ToolRegistry,
+    stack: AsyncExitStack,
+    *,
+    register_tools: bool = True,
+) -> list[Any]:
+    """Connect to configured MCP servers and optionally register their tools.
+
+    When *register_tools* is False, wrappers are returned without touching
+    *registry* so the caller can defer schema-visible registration through
+    :class:`~markbot.agent.cache_policy.CacheMutationPolicy`.
+    """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
+
+    pending_tools: list[Any] = []
 
     for name, cfg in mcp_servers.items():
         try:
@@ -226,8 +237,20 @@ async def connect_mcp_servers(
                     )
                     continue
                 wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
-                registry.register(wrapper)
-                logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
+                pending_tools.append(wrapper)
+                if register_tools:
+                    registry.register(wrapper)
+                    logger.debug(
+                        "MCP: registered tool '{}' from server '{}'",
+                        wrapper.name,
+                        name,
+                    )
+                else:
+                    logger.debug(
+                        "MCP: staged tool '{}' from server '{}' (deferred register)",
+                        wrapper.name,
+                        name,
+                    )
                 registered_count += 1
                 if enabled_tools:
                     if tool_def.name in enabled_tools:
@@ -247,6 +270,14 @@ async def connect_mcp_servers(
                         ", ".join(available_wrapped_names) or "(none)",
                     )
 
-            logger.info("MCP server '{}': connected, {} tools registered", name, registered_count)
+            action = "registered" if register_tools else "staged"
+            logger.info(
+                "MCP server '{}': connected, {} tools {}",
+                name,
+                registered_count,
+                action,
+            )
         except Exception as e:
             logger.error("MCP server '{}': failed to connect: {}", name, e)
+
+    return pending_tools

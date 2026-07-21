@@ -50,6 +50,54 @@ class SkillRegistry:
         self._min_score = float(min_score or 0.0)
         self._hide_stale = bool(hide_stale)
         self._quality_scores: dict[str, float] = {}
+        # Optional CacheMutationPolicy — when bound, tool-surface changes
+        # from skill hot-load/unload are deferred until turn end.
+        self._cache_policy: Any | None = None
+
+    def bind_cache_policy(self, policy: Any | None) -> None:
+        """Bind a CacheMutationPolicy for deferred skill tool-surface changes."""
+        self._cache_policy = policy
+
+    def _schedule_script_tools_reload(self, skill: SkillDefinition) -> None:
+        """Register/unregister this skill's script tools, deferred when possible."""
+        if self.tool_registry is None:
+            return
+
+        def _apply() -> None:
+            if self.tool_registry is None:
+                return
+            prefix = f"{skill.name}."
+            for existing_name in list(self.tool_registry.tool_names):
+                if existing_name.startswith(prefix):
+                    remainder = existing_name[len(prefix):]
+                    if "." not in remainder:
+                        self.tool_registry.unregister(existing_name)
+            for script in skill.scripts:
+                tool = SkillTool(
+                    skill.name,
+                    script,
+                    self.workspace,
+                    self._usage_store,
+                    loader=self._loader,
+                    skill_registry=self,
+                )
+                self.tool_registry.register(tool)
+                logger.info("Hot-loaded skill tool: {}", tool.definition.name)
+            if hasattr(self.tool_registry, "invalidate_definitions_cache"):
+                self.tool_registry.invalidate_definitions_cache()
+
+        policy = self._cache_policy
+        if policy is not None and hasattr(policy, "request"):
+            from markbot.agent.cache_policy import MutationKind
+
+            status = policy.request(
+                MutationKind.SKILLS,
+                f"reload skill scripts: {skill.name}",
+                _apply,
+            )
+            logger.info("Skill tool surface mutation: {}", status)
+        else:
+            _apply()
 
     def load_all(self) -> None:
         """Load all skills from workspace and builtin."""
@@ -121,26 +169,10 @@ class SkillRegistry:
             if config:
                 self._config_cache[skill.name] = config
 
-        if register_scripts and self.tool_registry:
-            # Unregister old script tools for this skill first, in case an
-            # edit changed the script set. SkillTool names are
-            # ``{skill_name}.{script_name}``.  Only match tools whose
-            # remainder after the skill prefix contains no dot, so that
-            # reloading skill "foo" doesn't accidentally unregister tools
-            # belonging to a skill named "foo.bar".
-            prefix = f"{skill.name}."
-            for existing_name in list(self.tool_registry.tool_names):
-                if existing_name.startswith(prefix):
-                    remainder = existing_name[len(prefix):]
-                    if "." not in remainder:
-                        self.tool_registry.unregister(existing_name)
-            for script in skill.scripts:
-                tool = SkillTool(
-                    skill.name, script, self.workspace, self._usage_store,
-                    loader=self._loader, skill_registry=self,
-                )
-                self.tool_registry.register(tool)
-                logger.info("Hot-loaded skill tool: {}", tool.definition.name)
+        if register_scripts and self.tool_registry is not None:
+            # Defer when CacheMutationPolicy is bound so mid-turn skill
+            # edits do not bust the active prefix-cache tool schema.
+            self._schedule_script_tools_reload(skill)
 
         return True
 
@@ -181,14 +213,30 @@ class SkillRegistry:
         """
         removed = self._skills.pop(name, None) is not None
         self._config_cache.pop(name, None)
-        if self.tool_registry:
-            # Skill tools are named ``{skill_name}.{script_name}``, so only
-            # match the prefix. An exact-name match would risk unregistering
-            # an unrelated built-in tool that happens to share the name.
-            prefix = f"{name}."
-            for existing_name in list(self.tool_registry.tool_names):
-                if existing_name.startswith(prefix):
-                    self.tool_registry.unregister(existing_name)
+        if self.tool_registry is not None:
+            def _apply_unload() -> None:
+                if self.tool_registry is None:
+                    return
+                # Skill tools are named ``{skill_name}.{script_name}``.
+                prefix = f"{name}."
+                for existing_name in list(self.tool_registry.tool_names):
+                    if existing_name.startswith(prefix):
+                        self.tool_registry.unregister(existing_name)
+                if hasattr(self.tool_registry, "invalidate_definitions_cache"):
+                    self.tool_registry.invalidate_definitions_cache()
+
+            policy = self._cache_policy
+            if policy is not None and hasattr(policy, "request"):
+                from markbot.agent.cache_policy import MutationKind
+
+                status = policy.request(
+                    MutationKind.SKILLS,
+                    f"unload skill scripts: {name}",
+                    _apply_unload,
+                )
+                logger.info("Skill tool surface mutation: {}", status)
+            else:
+                _apply_unload()
         if removed:
             logger.info("Skill '{}' unloaded", name)
         return removed
@@ -200,7 +248,7 @@ class SkillRegistry:
         the shared ToolRegistry.  This centralises skill-tool registration
         in one place rather than splitting it between here and ToolBinder.
         """
-        if not self.tool_registry:
+        if self.tool_registry is None:
             return
         for skill in self._skills.values():
             for script in skill.scripts:

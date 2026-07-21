@@ -11,6 +11,7 @@ from loguru import logger
 
 from markbot.agent.cost import BudgetExceededError, CostTracker
 from markbot.agent.subagent.capability import CapabilityToken
+from markbot.agent.subagent.policy import DelegationPolicy, DelegationTracker
 from markbot.agent.subagent.progress import NullProgressTracker, SubagentProgressManager
 from markbot.bus.events import InboundMessage
 from markbot.bus.queue import MessageBus
@@ -41,6 +42,7 @@ class SubagentManager:
         cost_tracker=None,
         skill_registry=None,
         memory_manager=None,
+        delegation_policy: DelegationPolicy | None = None,
     ):
         self.fallback_manager = fallback_manager
         self.config = config
@@ -65,6 +67,20 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
+        # Delegation control plane (depth / concurrency / blocked tools).
+        if delegation_policy is None and config is not None:
+            try:
+                dcfg = getattr(getattr(config, "tools", None), "delegation", None)
+                if dcfg is not None:
+                    delegation_policy = DelegationPolicy.from_mapping(
+                        dcfg.model_dump() if hasattr(dcfg, "model_dump") else dict(dcfg)
+                    )
+            except Exception as e:
+                logger.debug("Failed to load delegation policy from config: {}", e)
+        self.delegation = DelegationTracker(
+            policy=delegation_policy or DelegationPolicy()
+        )
+
         # Initialize progress manager
         if workspace:
             self.progress_manager = SubagentProgressManager(workspace)
@@ -82,6 +98,9 @@ class SubagentManager:
                 return True
         return False
 
+    def _running_count(self) -> int:
+        return sum(1 for t in self._running_tasks.values() if not t.done())
+
     async def spawn(
         self,
         task: str,
@@ -90,14 +109,27 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         capability: CapabilityToken | None = None,
+        parent_task_id: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        ok, reason = self.delegation.policy.check_can_spawn(
+            current_depth=self.delegation.depth_of(parent_task_id),
+            running_children=self._running_count(),
+            session_child_count=self.delegation.session_count(session_key),
+        )
+        if not ok:
+            logger.warning("Spawn denied by DelegationPolicy: {}", reason)
+            return f"Error: {reason}"
+
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         if capability is None:
-            capability = CapabilityToken.read_only()
+            capability = self.delegation.policy.default_capability()
+        capability = self.delegation.policy.harden_capability(capability)
+
+        self.delegation.register_child(task_id, parent_task_id, session_key)
 
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin, capability)
@@ -108,6 +140,7 @@ class SubagentManager:
 
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
+            self.delegation.unregister(task_id)
             if session_key and (ids := self._session_tasks.get(session_key)):
                 ids.discard(task_id)
                 if not ids:
@@ -117,6 +150,50 @@ class SubagentManager:
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+
+    async def spawn_batch(
+        self,
+        tasks: list[dict[str, Any]],
+        origin_channel: str = "cli",
+        origin_chat_id: str = "direct",
+        session_key: str | None = None,
+        parent_task_id: str | None = None,
+    ) -> str:
+        """Spawn multiple leaf subagents in parallel (batch parallel tasks).
+
+        Each item is a dict with keys: task (required), label, capability.
+        """
+        if not tasks:
+            return "Error: tasks list is empty."
+        results: list[str] = []
+        for item in tasks:
+            if not isinstance(item, dict):
+                results.append("Error: each task must be an object with a 'task' field.")
+                continue
+            task_text = item.get("task") or ""
+            if not task_text:
+                results.append("Error: task text is required.")
+                continue
+            from markbot.agent.subagent.templates import resolve_capability
+
+            try:
+                cap = resolve_capability(
+                    item.get("capability"),
+                    template=item.get("template"),
+                )
+            except (TypeError, ValueError):
+                cap = None
+            msg = await self.spawn(
+                task=task_text,
+                label=item.get("label"),
+                origin_channel=origin_channel,
+                origin_chat_id=origin_chat_id,
+                session_key=session_key,
+                capability=cap,
+                parent_task_id=parent_task_id,
+            )
+            results.append(msg)
+        return "\n".join(results)
 
     async def _run_subagent(
         self,
@@ -214,9 +291,33 @@ class SubagentManager:
             {"role": "user", "content": task},
         ]
 
+        # Child guardrail: stricter failure-window for leaf agents.
+        from markbot.agent.tool_guardrails import (
+            GuardrailAction,
+            GuardrailConfig,
+            ToolCallGuardrail,
+            is_failure_result,
+        )
+
+        child_guardrail = ToolCallGuardrail(
+            GuardrailConfig(
+                exact_failure_warn=1,
+                exact_failure_block=3,
+                tool_streak_warn=2,
+                tool_streak_block=4,
+                window_size=5,
+                window_failure_threshold=4,
+                max_reflections=1,
+            )
+        )
+
         max_iterations = capability.max_iterations
         iteration = 0
         final_result: str | None = None
+        residual_risk = ""
+        child_halted = False
+        artifacts: list[str] = []
+        evidence: list[str] = []
 
         while iteration < max_iterations:
             iteration += 1
@@ -274,11 +375,18 @@ class SubagentManager:
                 from markbot.types.permission import PermissionMode as _PM
                 from markbot.types.permission import ToolPermissionContext as _TPC
                 from markbot.types.tool import ToolContext as _TC
+                # force_auto_permission avoids interactive ask deadlock in
+                # headless children; when False, still non-interactive DEFAULT.
+                _perm = (
+                    _PM.AUTO
+                    if self.delegation.policy.force_auto_permission
+                    else _PM.DEFAULT
+                )
                 _sub_tool_ctx = _TC(
                     session_id=f"subagent:{task_id}",
                     workspace=str(self.workspace),
-                    permission_mode=_PM.AUTO,
-                    tool_permission_context=_TPC(mode=_PM.AUTO),
+                    permission_mode=_perm,
+                    tool_permission_context=_TPC(mode=_perm),
                     is_non_interactive=True,
                 )
 
@@ -302,6 +410,8 @@ class SubagentManager:
                             "subagent's capability token. Pick a tool from the "
                             "available set and try again."
                         )
+                    if child_guardrail.is_call_blocked(tc.name, tc.arguments):
+                        return child_guardrail.block_message(tc.name, tc.arguments)
                     return await tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx)
 
                 results = await asyncio.gather(
@@ -309,6 +419,7 @@ class SubagentManager:
                     return_exceptions=True,
                 )
 
+                halt_child = False
                 for tool_call, result in zip(response.tool_calls, results):
                     if isinstance(result, BaseException):
                         logger.error(
@@ -316,17 +427,52 @@ class SubagentManager:
                         )
                         result = f"Error: {type(result).__name__}: {result}"
                     else:
-                        # Unwrap _multimodal tool results (e.g. computer_use
-                        # screenshots) so the provider receives a proper content
-                        # array / text fallback instead of a raw dict.
                         from markbot.agent.context import unwrap_multimodal_result_async
                         result = await unwrap_multimodal_result_async(result)
+                    # Child guardrail observe (skip capability denials already blocked).
+                    try:
+                        if capability.allows(tool_call.name):
+                            child_guardrail.observe(
+                                tool_call.name,
+                                tool_call.arguments,
+                                result,
+                                is_failure=is_failure_result(result),
+                            )
+                    except Exception:
+                        pass
+                    # Collect light artifacts / evidence for structured return.
+                    if tool_call.name in ("write_file", "edit_file") and isinstance(result, str):
+                        if not str(result).lower().startswith("error"):
+                            path = ""
+                            if isinstance(tool_call.arguments, dict):
+                                path = str(tool_call.arguments.get("path") or "")
+                            if path:
+                                artifacts.append(path)
+                    if tool_call.name in ("exec", "grep", "web_search") and isinstance(result, str):
+                        snippet = str(result).strip().replace("\n", " ")[:160]
+                        if snippet:
+                            evidence.append(f"{tool_call.name}: {snippet}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.name,
                         "content": result,
                     })
+
+                window = child_guardrail.evaluate_failure_window()
+                if window.action is GuardrailAction.HALT:
+                    residual_risk = window.message or "child guardrail halt"
+                    final_result = (
+                        f"Subagent halted by guardrail: {residual_risk}"
+                    )
+                    halt_child = True
+                elif window.action is GuardrailAction.WARN and window.message:
+                    messages.append({
+                        "role": "user",
+                        "content": f"[System Warning — child guardrail]\n{window.message}",
+                    })
+                if halt_child:
+                    break
             else:
                 final_result = response.content
                 break
@@ -336,17 +482,27 @@ class SubagentManager:
                 f"Subagent reached max_iterations ({max_iterations}) without "
                 "producing a final response."
             )
+            residual_risk = residual_risk or "max_iterations exhausted"
             logger.warning("Subagent [{}] exhausted iterations", task_id)
             await tracker.fail(final_result)
             progress = tracker.get_progress()
-            await self._announce_result(task_id, label, task, final_result, origin, "error", progress)
+            await self._announce_result(
+                task_id, label, task, final_result, origin, "error", progress,
+                artifacts=artifacts, evidence=evidence, residual_risk=residual_risk,
+            )
             return
 
-        await tracker.complete(final_result)
-        logger.info("Subagent [{}] completed successfully", task_id)
-
+        status = "error" if residual_risk and "halt" in residual_risk.lower() else "ok"
+        if status == "ok":
+            await tracker.complete(final_result)
+            logger.info("Subagent [{}] completed successfully", task_id)
+        else:
+            await tracker.fail(final_result)
         progress = tracker.get_progress()
-        await self._announce_result(task_id, label, task, final_result, origin, "ok", progress)
+        await self._announce_result(
+            task_id, label, task, final_result, origin, status, progress,
+            artifacts=artifacts, evidence=evidence, residual_risk=residual_risk,
+        )
 
     def _register_subagent_tools(self, tools: ToolRegistry, capability: CapabilityToken) -> None:
         """Register tools for subagent based on capability token.
@@ -458,36 +614,25 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
         progress: Any = None,
+        *,
+        artifacts: list[str] | None = None,
+        evidence: list[str] | None = None,
+        residual_risk: str = "",
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        from markbot.agent.subagent.progress import SubagentProgress
+        from markbot.agent.subagent.templates import format_result_payload
 
-        status_text = {
-            "ok": "completed successfully",
-            "cancelled": "was cancelled",
-            "error": "failed",
-        }.get(status, "failed")
-
-        # Build progress summary
-        progress_info = ""
-        if isinstance(progress, SubagentProgress):
-            progress_info = f"""
-<task_info>
-<task_id>{task_id}</task_id>
-<duration_seconds>{progress.duration_seconds:.1f}</duration_seconds>
-<total_tokens>{progress.total_tokens}</total_tokens>
-<tool_uses>{progress.tool_use_count}</tool_uses>
-<output_file>{self.progress_manager.get_output_file(task_id) if self.progress_manager else 'N/A'}</output_file>
-</task_info>"""
-
-        announce_content = f"""[Subagent '{label}' {status_text}]
-
-Task: {task}{progress_info}
-
-Result:
-{result}
-
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+        announce_content = format_result_payload(
+            status=status,
+            task_id=task_id,
+            label=label,
+            task=task,
+            result=result,
+            artifacts=artifacts,
+            evidence=evidence,
+            residual_risk=residual_risk,
+            progress=progress,
+        )
 
         # Publish result as a system message so AgentLoop._handle_message()
         # rewrites channel="system" → origin_channel via the explicit

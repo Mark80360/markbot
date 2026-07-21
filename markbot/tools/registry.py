@@ -5,7 +5,8 @@ Refactored to use new core types inspired by MarkBot.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -32,13 +33,51 @@ class ToolRegistry:
             Callable[[BaseTool, dict, ToolContext], PermissionDecision]
         ] = []
         self._definitions_cache: list[dict[str, Any]] | None = None
+        # Fingerprint of available tool names so service-gates re-evaluate
+        # without forcing a full schema rebuild on every call.
+        self._definitions_cache_key: tuple[str, ...] | None = None
         # Optional interactive approver. When set, ``ask`` decisions wait for
         # a real user yes/no instead of returning a text instruction to the
         # model. Signature: async (tool_name, params, context, reason) -> bool
         self._permission_approver: Callable | None = None
+        # Soft-disabled names stay registered but are hidden from model schema.
+        self._soft_disabled: set[str] = set()
 
     def _invalidate_cache(self) -> None:
         self._definitions_cache = None
+        self._definitions_cache_key = None
+
+    def invalidate_definitions_cache(self) -> None:
+        """Public cache bust — e.g. after deferred tool-surface mutations."""
+        self._invalidate_cache()
+
+    def set_soft_disabled(self, names: set[str] | frozenset[str] | list[str]) -> None:
+        """Hide *names* from model-facing schema without unregistering."""
+        new = {str(n) for n in names}
+        if new != self._soft_disabled:
+            self._soft_disabled = new
+            self._invalidate_cache()
+
+    def get_soft_disabled(self) -> set[str]:
+        return set(self._soft_disabled)
+
+    def _is_tool_available(self, tool: BaseTool) -> bool:
+        """True when the tool should appear in model-facing schema."""
+        name = getattr(getattr(tool, "definition", None), "name", None) or ""
+        if name and name in self._soft_disabled:
+            return False
+        try:
+            if hasattr(tool, "is_available"):
+                return bool(tool.is_available())
+            return bool(getattr(tool, "is_enabled", True))
+        except Exception:
+            return False
+
+    def _available_tools(self) -> list[BaseTool]:
+        return [t for t in self._tools.values() if self._is_tool_available(t)]
+
+    def _available_names_key(self) -> tuple[str, ...]:
+        return tuple(sorted(t.definition.name for t in self._available_tools()))
 
     def register(self, tool: BaseTool) -> None:
         """Register a tool."""
@@ -103,13 +142,24 @@ class ToolRegistry:
 
     @property
     def definitions(self) -> list[ToolDefinition]:
-        """Get all tool definitions."""
-        return [t.definition for t in self._tools.values() if t.is_enabled]
+        """Get definitions for tools currently available to the model.
+
+        Unavailable (service-gated / disabled) tools are omitted so they do
+        not inflate every API call's tool schema footprint.
+        """
+        return [t.definition for t in self._available_tools()]
 
     def get_definitions(self) -> list[dict[str, Any]]:
-        """Get tool definitions in OpenAI format (cached)."""
-        if self._definitions_cache is None:
+        """Get tool definitions in OpenAI format (cached by available-name set).
+
+        Cache key is the sorted tuple of available tool names. When a gate
+        flips mid-session, the next call rebuilds schema without requiring an
+        explicit invalidate.
+        """
+        key = self._available_names_key()
+        if self._definitions_cache is None or self._definitions_cache_key != key:
             self._definitions_cache = [d.to_openai_schema() for d in self.definitions]
+            self._definitions_cache_key = key
         return self._definitions_cache
 
     @property
@@ -198,6 +248,17 @@ class ToolRegistry:
                 f"Use only the tools listed above."
             )
 
+        # Soft-disabled tools stay registered for hot re-enable, but must not
+        # execute — defence-in-depth when the model hallucinates a hidden name.
+        tool_name = getattr(getattr(tool, "definition", None), "name", name) or name
+        if tool_name in self._soft_disabled:
+            available = ", ".join(sorted(t.definition.name for t in self._available_tools()))
+            return (
+                f"Error: Tool '{tool_name}' is soft-disabled by the current "
+                f"tool footprint / profile and cannot be executed. "
+                f"Available tools: {available or '(none)'}."
+            )
+
         # Create default context if not provided
         if context is None:
             context = ToolContext(
@@ -259,12 +320,44 @@ class ToolRegistry:
 
     def get_definitions_for_provider(self, provider: str = "openai") -> list[dict[str, Any]]:
         """Get tool definitions for specific provider format."""
-        tools = [t for t in self._tools.values() if t.is_enabled]
+        tools = [t for t in self._tools.values() if self._is_tool_available(t)]
 
         if provider == "anthropic":
             return [t.definition.to_anthropic_schema() for t in tools]
         else:
             return [t.definition.to_openai_schema() for t in tools]
+
+    def register_gated(
+        self,
+        tool: BaseTool,
+        *,
+        available_when: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Register *tool* only when the optional gate returns True.
+
+        Returns whether the tool was registered. Prefer this over registering
+        unavailable tools and relying on soft-disable later — gated tools never
+        enter the schema and never inflate API cost.
+        """
+        if available_when is not None:
+            try:
+                if not available_when():
+                    logger.debug(
+                        "Skipped gated tool {} (available_when=False)",
+                        getattr(getattr(tool, "definition", None), "name", tool),
+                    )
+                    return False
+            except Exception as e:
+                logger.debug("Gate check failed, skipping tool: {}", e)
+                return False
+        elif not self._is_tool_available(tool):
+            logger.debug(
+                "Skipped gated tool {} (is_available=False)",
+                getattr(getattr(tool, "definition", None), "name", tool),
+            )
+            return False
+        self.register(tool)
+        return True
 
     def __len__(self) -> int:
         return len(self._tools)

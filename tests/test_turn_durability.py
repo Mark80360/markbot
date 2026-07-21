@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from markbot.agent.cache_policy import CacheMutationPolicy
 from markbot.agent.iteration import (
     IterationRunner,
     LoopState,
@@ -59,6 +60,8 @@ class _Loop:
         self.tool_executor = ToolExecutor(tools)
         self.sessions = MagicMock()
         self._messages_revision = 0
+        self.config = None
+        self.cache_mutation_policy = CacheMutationPolicy()
 
 
 @pytest.fixture

@@ -49,6 +49,9 @@ class ToolDefinition:
     aliases: list[str] = field(default_factory=list)
     is_read_only: bool = False
     is_destructive: bool = False
+    # Optional service-gate label for docs / tooling (e.g. "requires BRAVE_API_KEY").
+    # Actual availability is enforced by BaseTool.available_when / is_available().
+    availability_hint: str = ""
 
     def to_openai_schema(self) -> dict[str, Any]:
         properties = {}

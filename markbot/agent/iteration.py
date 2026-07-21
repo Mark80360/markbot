@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from markbot.agent.cache_policy import CacheMutationPolicy
 from markbot.agent.compact import CompactAction, is_prompt_too_long_error, offload_tool_output
 from markbot.agent.cost import BudgetExceededError
 from markbot.agent.cache_protocol import (
@@ -32,6 +33,14 @@ from markbot.agent.prefix_cache import (
 )
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
+from markbot.agent.tool_guardrails import (
+    GuardrailAction,
+    GuardrailConfig,
+    PreblockedResult,
+    ToolCallGuardrail,
+    is_failure_result,
+    is_preblocked_result,
+)
 from markbot.bus.events import EventType, make_session_key
 from markbot.session.handoff import build_handoff_from_session
 from markbot.types.permission import PermissionMode, ToolPermissionContext
@@ -79,8 +88,8 @@ class TurnExitReason(str, Enum):
     PTL_RECOVERY_FAILED = "ptl_recovery_failed"
     """Prompt-too-long error and reactive compaction could not fix it."""
 
-    FAILURE_LOOP_FORCED_STOP = "failure_loop_forced_stop"
-    """Consecutive tool failures triggered forced stop (reflections exhausted)."""
+    GUARDRAIL_HALT = "guardrail_halt"
+    """Tool-loop guardrail forced stop (failure window / reflections exhausted)."""
 
     INVALID_TOOL_MAX_RETRIES = "invalid_tool_max_retries"
     """LLM kept calling non-existent tools after 3 self-correction retries."""
@@ -319,68 +328,9 @@ def _classify_shell_command(command: str) -> str:
     return "neutral"
 
 
-# 连续失败检测配置
-# 观察窗口：只看最近 N 次 tool call 结果
-_FAILURE_WINDOW = 6
-# 触发阈值：窗口内失败次数 >= 此值时注入反思提示
-_FAILURE_THRESHOLD = 4
-# 反思提示最大注入次数：超过后强制停止，避免无限循环
-_MAX_REFLECTIONS = 2
-# 单工具连续失败阈值：达到此值时注入禁用提示，逼 LLM 换工具类别
-_TOOL_FAILURE_STREAK_THRESHOLD = 3
-# Exact-failure 阈值：同一工具 + 相同参数签名连续失败 N 次时，注入
-# "换个方法"提示。比 _TOOL_FAILURE_STREAK_THRESHOLD 更早触发（2 次），
-# 因为相同参数重复失败几乎一定是死路。Mirrors agent's
-# exact_failure_warn_after=2.
-_EXACT_FAILURE_WARN_THRESHOLD = 2
-# No-progress 阈值：幂等工具返回完全相同结果 N 次时，注入"无进展"提示。
-# 适用于 read_file / search_files / glob 等只读工具——返回相同内容说明
-# LLM 在原地踏步。Mirrors agent's no_progress_warn_after=2.
-_NO_PROGRESS_WARN_THRESHOLD = 2
-# 幂等/只读工具集合——对这些工具做 no-progress 检测。
-# 写工具（write_file/edit_file）即使参数相同也可能合法重试（修复后重写），
-# 所以不纳入 no-progress 检测。
-_IDEMPOTENT_TOOL_NAMES: frozenset[str] = frozenset({
-    "read_file", "list_directory", "glob", "grep", "search_files",
-    "search_codebase", "find", "list", "todo",
-})
 # Todo 主动 reinjection 间隔（iteration 数）。
-# markbot 只在 compact 后 reinject todo（见 compact.py:_apply_auto_compaction），
-# 长任务若不 compact，todo 长期不在上下文里，模型可能忘记 plan 或重复
-# 已完成步骤。每 N 轮主动注入一次活跃 todo 快照作为 system message，
-# 让模型始终能看到剩余任务。compact 触发时同步更新计数避免重复注入。
+# 长任务若不 compact，todo 长期不在上下文里；每 N 轮主动注入一次活跃 todo。
 _TODO_REINJECT_INTERVAL = 8
-
-# 失败标志关键词（小写匹配）
-# 注意：关键词要足够具体，避免误判正常输出。
-# - 不用 "404"（可能出现在文件大小、行号等正常文本中）
-# - 不用 "not found"（过于宽泛，改用更具体的 "command not found" 等）
-# - 不用 "timeout"（可能出现在 "no timeout" 等正常文本中，改用 "connection timed out"）
-# - 不用裸 "forbidden"（可能出现在正常抓取页面内容中），用 "forbidden origin" 等更具体形式
-# - 不用 "http status 4"/"status code: 4" 等文本前缀：web_fetch 成功抓取的页面
-#   如果讲 HTTP 状态码就会误判。HTTP 失败靠 JSON 结构化检测（"status_code": 4xx）覆盖。
-# - 不用 "connection reset"/"http error" 等宽泛词：网络教程页面会包含这些词。
-#   只保留足够具体的短语（"fetch failed"、"readability failed" 等）。
-_FAILURE_KEYWORDS = (
-    # 通用错误（既有，exec 类失败信号）
-    "error:", "traceback", "no module named", "modulenotfounderror",
-    "filenotfounderror", "command not found", "no such file or directory",
-    "connection refused", "connection timed out", "timed out",
-    "permission denied", "access denied", "exit code: 1",
-    "exit code: 2", "exit code: 127", "failed to",
-    "unable to", "cannot ", "can't ", "is not installed",
-    "is not available", "500 internal server error",
-    # web_fetch / HTTP 类失败（仅保留足够具体的短语，避免误判正常页面内容）
-    "fetch failed",
-    "readability extraction failed", "readability failed",
-    "jina reader", "forbidden origin",
-    # JSON 格式的错误字段（web_fetch 失败常返回 {"error": "..."}）
-    # 这些是结构化的，不会出现在正常页面正文里，安全。
-    '"error":', '"errors":', '"error_code":', '"errcode":',
-    # JSON 格式的 HTTP 状态码失败（4xx/5xx），结构化安全
-    '"status_code": 4', '"status_code": 5',
-    '"status": 4', '"status": 5',
-)
 
 
 # ---------------------------------------------------------------------------
@@ -453,37 +403,6 @@ class LoopState:
     steer_continues: int = 0
     # Cache telemetry (populated by _phase_call_llm).
     last_cache_event: CacheEvent | None = None
-    # 连续失败检测：记录最近 tool call 的成功/失败，用于识别"死胡同"循环。
-    # True=成功，False=失败。只保留最近 _FAILURE_WINDOW 条。
-    recent_tool_results: list = field(default_factory=list)
-    # 反思提示已注入次数：避免无限注入反思，超过阈值后强制停止。
-    # 注意：此值从 self.loop.get_failure_state(session_key) 加载，跨 loop
-    # （compact / "继续" / handoff）持久化，仅在用户新请求时重置。
-    reflection_injected_count: int = 0
-    # 已尝试且失败的方法黑名单（跨 loop 持久化）。
-    # 每次工具失败时追加 "tool_name: 失败摘要"，去重。
-    # 用于：1) compact summary 注入；2) 反思提示中提醒 LLM 不要重试。
-    failed_methods: list = field(default_factory=list)
-    # 强制停止已触发次数（跨 loop 持久化）。
-    # 当 forced_stop_count > 0 且再次触发失败循环时，直接强制停止，不再给反思机会。
-    forced_stop_count: int = 0
-    # 单工具连续失败计数（per-loop，不持久化）。
-    # key=tool_name, value=连续失败次数。成功则归零。
-    # 当某工具连续失败 >= _TOOL_FAILURE_STREAK_THRESHOLD 次时，
-    # 注入禁用提示，逼 LLM 换工具类别（见 logs/2026-06-27.log 中
-    # web_fetch 连续 3 次 Jina Reader 失败后仍继续 web_fetch 的案例）。
-    tool_consecutive_failures: dict = field(default_factory=dict)
-    # 已注入禁用提示的工具集合，避免反复注入。
-    tools_disabled_warned: set = field(default_factory=set)
-    # Exact-failure 追踪：key = "tool_name:args_signature"，value = 连续失败次数。
-    # 当同一工具+相同参数连续失败 >= _EXACT_FAILURE_WARN_THRESHOLD 时注入提示。
-    # 成功调用（任意参数）会清除该工具的所有 exact-failure 计数。
-    exact_failure_counts: dict = field(default_factory=dict)
-    # No-progress 追踪：key = "tool_name:args_signature"，value = (结果哈希, 连续次数)。
-    # 当幂等工具用相同参数返回相同结果 >= _NO_PROGRESS_WARN_THRESHOLD 时注入提示。
-    no_progress_counts: dict = field(default_factory=dict)
-    # 已注入 exact-failure / no-progress 提示的签名集合，避免反复注入。
-    guardrail_signatures_warned: set = field(default_factory=set)
     # 结构化退出原因：在每个 return IterationResult 处赋值，由 _finalize_loop
     # 写入日志和 handoff。None 表示尚未到退出点（仍在迭代中）。
     exit_reason: TurnExitReason | None = None
@@ -560,6 +479,33 @@ class IterationRunner:
         self._stream_filter = StreamFilter(on_stream)
         self._bootstrap_report: Any | None = None
         self.permission_mode_override = permission_mode_override
+        # Single control-plane decision engine (config-driven).
+        self._tool_guardrail = self._build_tool_guardrail()
+        policy = getattr(loop, "cache_mutation_policy", None)
+        if policy is None:
+            raise RuntimeError("AgentLoop.cache_mutation_policy is required")
+        self._cache_policy: CacheMutationPolicy = policy
+        # Outcome gate + multi-axis runtime budget (config-driven).
+        from markbot.agent.budget_axes import RuntimeBudget, RuntimeBudgetConfig
+        from markbot.agent.outcome import OutcomeGate, OutcomeGateConfig
+
+        tools_cfg = getattr(getattr(loop, "config", None), "tools", None)
+        self._outcome_gate = OutcomeGate(
+            OutcomeGateConfig.from_settings(
+                getattr(tools_cfg, "outcome_gate", None) if tools_cfg else None
+            )
+        )
+        self._runtime_budget = RuntimeBudget(
+            RuntimeBudgetConfig.from_settings(
+                getattr(tools_cfg, "runtime_budget", None) if tools_cfg else None
+            )
+        )
+
+    def _build_tool_guardrail(self) -> ToolCallGuardrail:
+        """Build ToolCallGuardrail from ToolsConfig.guardrails."""
+        tools_cfg = getattr(getattr(self.loop, "config", None), "tools", None)
+        g = getattr(tools_cfg, "guardrails", None) if tools_cfg is not None else None
+        return ToolCallGuardrail(config=GuardrailConfig.from_settings(g))
 
     def _durable_turn_enabled(self) -> bool:
         return self.session is not None
@@ -669,24 +615,38 @@ class IterationRunner:
             batches.append([i])
         return batches
 
+    async def _execute_one_tool_call(self, tc: Any, ctx: ToolContext) -> Any:
+        """Execute a single tool call, or return a pre-block denial without running it.
+
+        Pre-block is the single enforcement point for
+        ``ToolCallGuardrail.blocked_tools`` / ``blocked_signatures``.
+        """
+        if self._tool_guardrail.is_call_blocked(tc.name, tc.arguments):
+            msg = self._tool_guardrail.block_message(tc.name, tc.arguments)
+            logger.warning(
+                "Guardrail pre-blocked tool={} args={}",
+                tc.name,
+                str(getattr(tc, "arguments", ""))[:120],
+            )
+            return PreblockedResult(msg)
+        return await self.loop.tools.execute(tc.name, tc.arguments, context=ctx)
+
     async def _execute_tool_calls_safely(
         self, tool_calls: list[Any], ctx: ToolContext
     ) -> list[Any]:
-        """Execute tool calls in safe batches, preserving call order."""
+        """Execute tool calls in safe batches, preserving call order.
+
+        Each call is pre-checked against the guardrail block list so
+        blocked tools/signatures never hit the real executor.
+        """
         out: list[Any] = [None] * len(tool_calls)
         for batch in self._plan_tool_batches(tool_calls):
             if len(batch) == 1:
                 idx = batch[0]
-                tc = tool_calls[idx]
-                out[idx] = await self.loop.tools.execute(
-                    tc.name, tc.arguments, context=ctx
-                )
+                out[idx] = await self._execute_one_tool_call(tool_calls[idx], ctx)
             else:
                 gathered = await asyncio.gather(
-                    *(
-                        self.loop.tools.execute(tool_calls[i].name, tool_calls[i].arguments, context=ctx)
-                        for i in batch
-                    ),
+                    *(self._execute_one_tool_call(tool_calls[i], ctx) for i in batch),
                     return_exceptions=True,
                 )
                 for i, res in zip(batch, gathered):
@@ -706,32 +666,38 @@ class IterationRunner:
 
         self._flush_current_inbound(state)
 
-        # 从 AgentLoop 加载跨 loop 持久化的失败循环状态。
-        # 关键：reflection_injected_count / failed_methods / forced_stop_count
-        # 必须跨 compact / "继续" / handoff 边界保留，否则强制停止机制
-        # 在整个任务尺度上失效（每次新 loop 都从 0 开始，永远凑不够阈值）。
-        # 仅在用户输入新请求时由 loop.reset_failure_state() 清零。
+        # Load cross-loop guardrail state (reflection / forced-stop / blacklist).
+        # Reset only on a brand-new user request via loop.reset_failure_state().
         if self.session_key:
             try:
                 persisted = self.loop.get_failure_state(self.session_key)
-                state.reflection_injected_count = persisted.get(
-                    "reflection_injected_count", 0
-                )
-                state.failed_methods = list(persisted.get("failed_methods", []))
-                state.forced_stop_count = persisted.get("forced_stop_count", 0)
-                if state.reflection_injected_count or state.failed_methods or state.forced_stop_count:
+                self._tool_guardrail.load_persisted(persisted)
+                gs = self._tool_guardrail.state
+                if gs.reflection_count or gs.failed_methods or gs.forced_stop_count:
                     logger.info(
-                        "Resumed failure-loop state for session={}: "
+                        "Resumed guardrail state for session={}: "
                         "reflections={}, failed_methods={}, forced_stops={}",
                         self.session_key,
-                        state.reflection_injected_count,
-                        len(state.failed_methods),
-                        state.forced_stop_count,
+                        gs.reflection_count,
+                        len(gs.failed_methods),
+                        gs.forced_stop_count,
                     )
             except Exception as e:
-                logger.warning(
-                    "Failed to load persisted failure-loop state: {}", e
-                )
+                logger.warning("Failed to load persisted guardrail state: {}", e)
+
+        # Turn-local counters (blocked tools/signatures, streaks) always start
+        # clean for this IterationRunner; only cross-loop fields persist.
+        self._tool_guardrail.reset_turn_local()
+        self._runtime_budget.reset()
+
+        # Cache-safe turn boundary: apply any deferred mutations, then lock.
+        try:
+            applied = self._cache_policy.apply_pending()
+            if applied:
+                logger.info("Applied deferred cache mutations: {}", applied)
+            self._cache_policy.begin_turn()
+        except Exception as e:
+            logger.debug("cache_policy begin_turn failed: {}", e)
 
         logger.info(
             "Starting agent loop with {} initial messages",
@@ -748,6 +714,20 @@ class IterationRunner:
                 self.chat_id,
             )
             logger.info("Current message count: {}", len(state.messages))
+
+            # Wall-time axis must be checked before another LLM call so a
+            # long-running turn can halt cleanly without waiting for usage.
+            axis_hit = self._runtime_budget.evaluate()
+            if axis_hit.hit:
+                logger.error("Runtime budget axis hit: {}", axis_hit.message)
+                state.budget_exceeded = True
+                state.exit_reason = TurnExitReason.BUDGET_EXCEEDED
+                if state.final_content is None:
+                    state.final_content = (
+                        f"[Runtime Budget] {axis_hit.message}. "
+                        "Stopping turn with residual work open."
+                    )
+                break
 
             result = await self._run_one_iteration(state)
             # Propagate exit reason from the iteration result to loop state.
@@ -815,39 +795,72 @@ class IterationRunner:
 
     async def _phase_compact(self, state: LoopState) -> None:
         task_context = self.loop._gather_task_context()
+        engine = getattr(self.loop, "context_engine", None)
 
-        state.messages, compact_result = await self.loop.compactor.maybe_compact(
-            state.messages, state.current_tokens, self.loop.context_window_tokens,
-            task_context=task_context,
-        )
-        state.last_compact_action = compact_result.action
-        if compact_result.action != CompactAction.NONE:
+        if engine is not None and hasattr(engine, "should_compress"):
+            # Narrow waist: all compression goes through ContextEngine.
+            if not engine.should_compress(
+                state.messages,
+                state.current_tokens,
+                self.loop.context_window_tokens,
+            ):
+                return
+            engine_result = await engine.compress(
+                state.messages,
+                state.current_tokens,
+                self.loop.context_window_tokens,
+                task_context=task_context,
+            )
+            state.messages = engine_result.messages
+            action_name = engine_result.action or "none"
+            try:
+                state.last_compact_action = CompactAction(action_name)
+            except Exception:
+                state.last_compact_action = (
+                    CompactAction.NONE
+                    if action_name in ("", "none", None)
+                    else CompactAction.AUTO_COMPACT
+                )
+            tokens_before = engine_result.tokens_before
+            tokens_after = engine_result.tokens_after
+            messages_before = 0  # engine may not report
+            messages_after = len(state.messages)
+            summary = engine_result.summary or ""
+            compact_changed = engine_result.changed
+        else:
+            state.messages, compact_result = await self.loop.compactor.maybe_compact(
+                state.messages, state.current_tokens, self.loop.context_window_tokens,
+                task_context=task_context,
+            )
+            state.last_compact_action = compact_result.action
+            tokens_before = compact_result.tokens_before
+            tokens_after = compact_result.tokens_after
+            messages_before = compact_result.messages_before
+            messages_after = compact_result.messages_after
+            summary = compact_result.summary or ""
+            compact_changed = compact_result.action != CompactAction.NONE
+
+        if compact_changed:
+            action_val = getattr(state.last_compact_action, "value", state.last_compact_action)
             logger.info(
                 "Compaction applied: action={}, "
                 "messages: {} -> {}, tokens: {} -> {}{}",
-                compact_result.action.value,
-                compact_result.messages_before,
-                compact_result.messages_after,
-                compact_result.tokens_before,
-                compact_result.tokens_after,
-                f", summary={compact_result.summary[:100]}..."
-                if compact_result.summary
-                else "",
+                action_val,
+                messages_before or "?",
+                messages_after,
+                tokens_before,
+                tokens_after,
+                f", summary={summary[:100]}..." if summary else "",
             )
-            state.current_tokens = compact_result.tokens_after
+            state.current_tokens = tokens_after
             if len(state.messages) < state.new_msg_start:
                 state.new_msg_start = self.loop._recalc_new_msg_start_after_compact(
                     state.messages, state.initial_count, state.new_msg_start,
                 )
             # 关键修复：compact 后显式注入「已尝试且失败的方法」黑名单。
-            # compact summary 的 LLM 生成时只会保留任务目标和工具名，
-            # 细节丢失，导致 LLM compact 后立刻又去 web_fetch GitHub、
-            # 又去 strings 二进制——和前一轮一模一样的失败路径（见
-            # logs/2026-06-27.log Interaction #44 后的重复撞墙）。
-            # 把跨 loop 持久化的 failed_methods 作为独立 system message
-            # 注入到 compact summary 之后，确保 LLM 能看到并避开。
-            if state.failed_methods:
-                recent = state.failed_methods[-15:]
+            failed_methods = self._tool_guardrail.state.failed_methods
+            if failed_methods:
+                recent = failed_methods[-15:]
                 blacklist_msg = {
                     "role": "system",
                     "content": (
@@ -858,8 +871,6 @@ class IterationRunner:
                         + "\n".join(f"- {m}" for m in recent)
                     ),
                 }
-                # 插到所有开头 system 消息之后（system prompt / compact_msg 之后），
-                # 保证 LLM 优先看到且不破坏 system prompt 的首位。
                 insert_idx = 0
                 for i, m in enumerate(state.messages):
                     if m.get("role") == "system":
@@ -870,14 +881,8 @@ class IterationRunner:
                 self._account_insert(state, insert_idx)
                 logger.info(
                     "Injected failure blacklist ({} entries) after compact ({}) at idx {}",
-                    len(recent), compact_result.action.value, insert_idx,
+                    len(recent), action_val, insert_idx,
                 )
-            # compact 内部已 reinject todo（见 compact.py:_apply_auto_compaction
-            # 末尾的 todo_tool.format_for_injection 调用），同步更新计数避免
-            # 本轮 _phase_maybe_reinject_todo 重复注入。其他 tier（COLLAPSE /
-            # MICRO_COMPACT / HISTORY_SNIP）虽然没在 compactor 内部 reinject
-            # todo，但既然发生了 compact 说明上下文已被重写，下一轮主动 reinject
-            # 时机由 _TODO_REINJECT_INTERVAL 自然延后即可，不会漏。
             state.last_todo_reinject_iter = state.iteration
 
     async def _phase_maybe_reinject_todo(self, state: LoopState) -> None:
@@ -1258,313 +1263,43 @@ class IterationRunner:
             )
 
     def _is_tool_result_failure(self, result: Any) -> bool:
-        """判断 tool 执行结果是否为失败。
-
-        判断依据（按优先级）：
-        1. BaseException → 失败（_phase_execute_tools 通常已转为 "Error: ..." 字符串）
-        2. dict 结果含非空 error/errors 字段、HTTP status >= 400、ok/success=False → 失败
-        3. 字符串以 "Error:" 开头 → 失败
-        4. 字符串可解析为 JSON 且解析后 dict 满足上述失败条件 → 失败
-        5. 字符串包含失败关键词（exit code 非零、fetch failed 等）→ 失败
-
-        注意：web_fetch / HTTP 类工具失败常返回 ``{"error": "Fetch failed (...)"}``
-        这种 JSON 字符串，必须显式解析才能识别，纯关键词匹配会漏检。
-        """
-        if isinstance(result, BaseException):
-            return True
-
-        # dict 结构化结果（部分工具直接返回 dict）
-        if isinstance(result, dict):
-            return self._dict_has_error(result)
-
-        if not isinstance(result, str):
-            # list / int / multimodal 等视为成功
-            return False
-
-        if result.startswith("Error:"):
-            return True
-
-        # 尝试解析 JSON 字符串（web_fetch 失败常以 JSON 形式返回）
-        stripped = result.lstrip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                parsed = json.loads(stripped)
-            except (json.JSONDecodeError, ValueError):
-                parsed = None
-            if isinstance(parsed, dict) and self._dict_has_error(parsed):
-                return True
-
-        lower = result.lower()
-        return any(kw in lower for kw in _FAILURE_KEYWORDS)
-
-    @staticmethod
-    def _dict_has_error(obj: dict) -> bool:
-        """检查 dict 形式的 tool 结果是否表示失败。
-
-        覆盖三种常见失败信号：
-        - 非空 error / errors / error_code / errcode 字段
-        - HTTP 状态码 >= 400（status / status_code / http_status）
-        - 显式 ok=False / success=False
-        """
-        # 非空错误字段
-        for k in ("error", "errors", "error_code", "errcode"):
-            v = obj.get(k)
-            if v:  # 非空字符串、非零、非空列表都算
-                return True
-        # HTTP 状态码失败
-        for k in ("status", "status_code", "http_status", "code"):
-            v = obj.get(k)
-            if isinstance(v, int) and v >= 400:
-                return True
-        # 显式失败标记
-        if obj.get("ok") is False or obj.get("success") is False:
-            return True
-        return False
+        """Delegate to the single failure classifier in tool_guardrails."""
+        return is_failure_result(result)
 
     def _record_tool_result(
         self, state: LoopState, result: Any, tool_name: str = "",
         tool_call: Any = None,
     ) -> None:
-        """记录 tool 结果到滑动窗口，用于连续失败检测。
+        """Feed one tool observation into ToolCallGuardrail and apply hints.
 
-        失败时同时把 "tool_name: 简短摘要" 追加到 ``state.failed_methods``
-        黑名单（去重），并同步回 AgentLoop 的持久化状态，供 compact summary
-        和反思提示引用，避免 LLM compact 后失忆式重复撞墙。
+        All counters / blocks / blacklists live on ``self._tool_guardrail``.
 
-        同时执行三层 guardrail 检测（mirrors agent's tool_guardrails）:
-        1. 单工具连续失败（_TOOL_FAILURE_STREAK_THRESHOLD）→ 禁用提示
-        2. Exact-failure：同一工具+相同参数签名连续失败 → "换方法"提示
-        3. No-progress：幂等工具相同参数返回相同结果 → "无进展"提示
+        Pre-blocked denials are not re-observed — they would otherwise
+        inflate the failure window without new information.
         """
-        is_failure = self._is_tool_result_failure(result)
-        state.recent_tool_results.append(is_failure)
-        # 只保留最近 _FAILURE_WINDOW 条
-        if len(state.recent_tool_results) > _FAILURE_WINDOW:
-            state.recent_tool_results = state.recent_tool_results[-_FAILURE_WINDOW:]
-
-        # 失败时记录方法黑名单（跨 loop 持久化）
-        if is_failure and tool_name:
-            entry = self._summarize_failed_method(tool_name, result)
-            if entry and entry not in state.failed_methods:
-                # 上限保护：最多保留 30 条，避免无限增长
-                if len(state.failed_methods) >= 30:
-                    state.failed_methods = state.failed_methods[-29:]
-                state.failed_methods.append(entry)
-                self._persist_failure_state(state)
-
-        # 单工具连续失败检测：达到阈值时注入禁用提示，逼 LLM 换工具类别。
-        # 仅在本次 loop 内计数（不跨 loop 持久化，因为 compact 后上下文已变）。
-        if tool_name:
-            if is_failure:
-                state.tool_consecutive_failures[tool_name] = (
-                    state.tool_consecutive_failures.get(tool_name, 0) + 1
-                )
-            else:
-                # 成功则归零
-                state.tool_consecutive_failures.pop(tool_name, None)
-
-            streak = state.tool_consecutive_failures.get(tool_name, 0)
-            if (
-                streak >= _TOOL_FAILURE_STREAK_THRESHOLD
-                and tool_name not in state.tools_disabled_warned
-            ):
-                state.tools_disabled_warned.add(tool_name)
-                logger.warning(
-                    "Tool '{}' failed {} times in a row — injecting disable hint",
-                    tool_name, streak,
-                )
-                self._inject_tool_disable_hint(state, tool_name, streak)
-
-        # Exact-failure 和 no-progress 检测需要 tool_call 来提取参数签名。
-        # 当 tool_call 不可用（旧调用路径）时跳过——这两层是新增的精细检测，
-        # 不影响既有的连续失败检测。
-        if tool_call is not None and tool_name:
-            self._check_exact_failure(state, tool_name, tool_call, result, is_failure)
-            self._check_no_progress(state, tool_name, tool_call, result)
-
-    @staticmethod
-    def _args_signature(tool_call: Any) -> str:
-        """Build a stable signature for a tool call's arguments.
-
-        Used as the key for exact-failure and no-progress tracking. We sort
-        dict keys so {"a": 1, "b": 2} and {"b": 2, "a": 1} produce the same
-        signature. Long values are truncated to keep the signature compact.
-        """
-        args = getattr(tool_call, "arguments", None)
-        if args is None:
-            return ""
-        if isinstance(args, dict):
-            parts = []
-            for k in sorted(args.keys()):
-                v = str(args[k])
-                if len(v) > 60:
-                    v = v[:57] + "..."
-                parts.append(f"{k}={v}")
-            return ",".join(parts)
-        if isinstance(args, list):
-            return str(args)[:200]
-        return str(args)[:200]
-
-    @staticmethod
-    def _result_signature(result: Any) -> str:
-        """Build a compact hashable signature of a tool result.
-
-        Used for no-progress detection on idempotent tools — two calls with
-        the same args returning the same signature indicate the model is
-        re-reading the same unchanged content. We truncate to keep memory
-        bounded; we only care about *equality*, not full content.
-        """
-        if isinstance(result, BaseException):
-            return f"exc:{type(result).__name__}"
-        text = result if isinstance(result, str) else str(result)
-        # 256 chars is enough to distinguish "same content" from "different
-        # content" for read-only tools — we are not doing real diffing.
-        return text[:256]
-
-    def _check_exact_failure(
-        self, state: LoopState, tool_name: str,
-        tool_call: Any, result: Any, is_failure: bool,
-    ) -> None:
-        """Exact-failure guardrail: same tool + same args failing repeatedly.
-
-        When the same call signature fails _EXACT_FAILURE_WARN_THRESHOLD
-        times in a row, inject a hint telling the model to change approach.
-        Any successful call with the same tool (any args) resets all
-        exact-failure counters for that tool — the model found a working
-        invocation.
-        """
-        sig = self._args_signature(tool_call)
-        if not sig:
+        if not tool_name:
             return
-        key = f"{tool_name}:{sig}"
-        if is_failure:
-            state.exact_failure_counts[key] = (
-                state.exact_failure_counts.get(key, 0) + 1
+        if is_preblocked_result(result):
+            return
+        args = getattr(tool_call, "arguments", None) if tool_call is not None else None
+        decision = self._tool_guardrail.observe(tool_name, args, result)
+        self._persist_failure_state()
+        if decision.action is GuardrailAction.WARN and decision.message:
+            self._append_hint_to_last_tool_result(
+                state, f"\n\n[System Warning — guardrail]\n{decision.message}"
             )
-        else:
-            # Success: clear all exact-failure entries for this tool —
-            # the model found a working approach, do not nag it.
-            to_clear = [k for k in state.exact_failure_counts if k.startswith(f"{tool_name}:")]
-            for k in to_clear:
-                del state.exact_failure_counts[k]
-            return
-
-        count = state.exact_failure_counts[key]
-        if (
-            count >= _EXACT_FAILURE_WARN_THRESHOLD
-            and key not in state.guardrail_signatures_warned
-        ):
-            state.guardrail_signatures_warned.add(key)
+        elif decision.action is GuardrailAction.BLOCK and decision.message:
+            self._append_hint_to_last_tool_result(
+                state, f"\n\n[System Warning — guardrail BLOCK]\n{decision.message}"
+            )
             logger.warning(
-                "Exact-failure guardrail: tool '{}' with args [{}] failed "
-                "{} times — injecting change-approach hint",
-                tool_name, sig, count,
+                "Guardrail BLOCK tool={} reason={} count={}",
+                tool_name, decision.reason, decision.count,
             )
-            self._inject_exact_failure_hint(state, tool_name, sig, count)
-
-    def _check_no_progress(
-        self, state: LoopState, tool_name: str,
-        tool_call: Any, result: Any,
-    ) -> None:
-        """No-progress guardrail: idempotent tool returning identical output.
-
-        Only applies to read-only tools (read_file / glob / grep / etc.) —
-        write tools legitimately produce similar confirmations. When the
-        same call signature returns the same result signature
-        _NO_PROGRESS_WARN_THRESHOLD times, inject a hint telling the model
-        it is re-reading unchanged content and should act instead.
-        """
-        lookup_name = self.loop.tools.resolve_sanitised_name(tool_name) \
-            if hasattr(self.loop, "tools") else tool_name
-        if lookup_name not in _IDEMPOTENT_TOOL_NAMES:
-            return
-        # Skip failures — those are handled by exact-failure / streak detection.
-        if self._is_tool_result_failure(result):
-            return
-        sig = self._args_signature(tool_call)
-        if not sig:
-            return
-        key = f"{tool_name}:{sig}"
-        result_sig = self._result_signature(result)
-        prev = state.no_progress_counts.get(key)
-        if prev is None or prev[0] != result_sig:
-            state.no_progress_counts[key] = (result_sig, 1)
-            return
-        new_count = prev[1] + 1
-        state.no_progress_counts[key] = (result_sig, new_count)
-        if (
-            new_count >= _NO_PROGRESS_WARN_THRESHOLD
-            and key not in state.guardrail_signatures_warned
-        ):
-            state.guardrail_signatures_warned.add(key)
-            logger.warning(
-                "No-progress guardrail: idempotent tool '{}' with args [{}] "
-                "returned identical result {} times — injecting hint",
-                tool_name, sig, new_count,
-            )
-            self._inject_no_progress_hint(state, tool_name, sig, new_count)
-
-    def _inject_tool_disable_hint(
-        self, state: LoopState, tool_name: str, streak: int
-    ) -> None:
-        """注入"该工具已连续失败 N 次，不要再用"的提示到最近一条 tool result。
-
-        这是对 _phase_check_failure_loop 的补充：失败循环检测看的是整体
-        失败率，而单工具连续失败检测看的是某个具体工具是否在反复撞墙。
-        后者更早触发（3 次 vs 4/6 次），且针对性强——直接告诉 LLM 换工具。
-        """
-        hint = (
-            f"\n\n[System Warning — 工具连续失败]\n"
-            f"工具 `{tool_name}` 已连续失败 {streak} 次。这强烈表明该工具"
-            "在当前任务/环境下不可用或方法不对。**请立即停止使用此工具**，"
-            "改用完全不同的工具或方法。如果没有任何替代方案，请直接告知用户"
-            "当前环境无法完成此任务，并说明缺失的条件。"
-        )
-        self._append_hint_to_last_tool_result(state, hint)
-
-    def _inject_exact_failure_hint(
-        self, state: LoopState, tool_name: str, args_sig: str, count: int
-    ) -> None:
-        """注入"相同参数已失败 N 次，换方法"提示。
-
-        比 _inject_tool_disable_hint 更精细：不是禁用整个工具，而是指出
-        *特定参数组合*行不通，引导 LLM 调整参数或换工具。例如 read_file
-        用同一个不存在路径失败 2 次，提示 LLM 先 list_directory 确认路径。
-        """
-        hint = (
-            f"\n\n[System Warning — 相同调用重复失败]\n"
-            f"工具 `{tool_name}` 用参数 [{args_sig}] 已连续失败 {count} 次。"
-            "**完全相同的调用注定会再次失败**——不要用同样的参数重试。"
-            "请：1) 检查参数是否有拼写/路径错误；2) 用只读工具（如 "
-            "list_directory / glob）确认目标；3) 或换一个完全不同的方法。"
-        )
-        self._append_hint_to_last_tool_result(state, hint)
-
-    def _inject_no_progress_hint(
-        self, state: LoopState, tool_name: str, args_sig: str, count: int
-    ) -> None:
-        """注入"无进展"提示：幂等工具返回相同结果，说明在原地踏步。
-
-        常见场景：LLM 反复 read_file 同一文件想"重新确认内容"，但文件
-        没变，结果当然一样。提示 LLM 基于已知内容采取行动，而不是重复读取。
-        """
-        hint = (
-            f"\n\n[System Warning — 无进展检测]\n"
-            f"只读工具 `{tool_name}` 用参数 [{args_sig}] 已返回**完全相同**"
-            f"的结果 {count} 次。重复读取未变化的内容不会带来新信息。"
-            "**停止重复调用**，基于已有信息采取行动：执行修改、换一个工具、"
-            "或向用户报告当前状态。"
-        )
-        self._append_hint_to_last_tool_result(state, hint)
 
     @staticmethod
     def _append_hint_to_last_tool_result(state: LoopState, hint: str) -> None:
-        """把 hint 文本追加到最近一条 tool result 消息（或作为 user 消息）。
-
-        追加到 tool result 而非新建 user 消息，是因为这样 LLM 在下一轮
-        看到的是"工具返回值末尾的指导"，语义上更连贯，也不会打断
-        tool/assistant 的消息配对结构。
-        """
+        """Append hint text to the latest tool result (or as a user message)."""
         last_tool_idx = None
         for i in range(len(state.messages) - 1, -1, -1):
             if state.messages[i].get("role") == "tool":
@@ -1580,44 +1315,6 @@ class IterationRunner:
                 )
         else:
             state.messages.append({"role": "user", "content": hint})
-
-    @staticmethod
-    def _summarize_failed_method(tool_name: str, result: Any) -> str:
-        """生成 "tool_name: 失败摘要" 用于黑名单。
-
-        摘要要短（≤80 字符），让 LLM 在 compact summary / 反思提示中
-        能快速识别"这个方法已经试过且失败了"。
-        """
-        if isinstance(result, BaseException):
-            detail = f"{type(result).__name__}: {result}"
-        elif isinstance(result, dict):
-            # 取 error 字段或整体 str
-            err = result.get("error") or result.get("errors") or result.get("error_code")
-            detail = str(err) if err else str(result)
-        elif isinstance(result, str):
-            # 尝试解析 JSON
-            stripped = result.lstrip()
-            if stripped.startswith("{"):
-                try:
-                    obj = json.loads(stripped)
-                    if isinstance(obj, dict):
-                        err = obj.get("error") or obj.get("errors") or obj.get("error_code")
-                        if err:
-                            detail = str(err)
-                        else:
-                            detail = result
-                    else:
-                        detail = result
-                except (json.JSONDecodeError, ValueError):
-                    detail = result
-            else:
-                detail = result
-        else:
-            detail = str(result)
-        # 截断到 80 字符
-        if len(detail) > 80:
-            detail = detail[:77] + "..."
-        return f"{tool_name}: {detail}"
 
     def _record_file_mutation(
         self, state: LoopState, tool_call: Any, result: Any
@@ -1709,53 +1406,49 @@ class IterationRunner:
             # gate.
             state.verification_done = True
 
-    def _should_inject_verify_nudge(self, state: LoopState) -> bool:
-        """Decide whether to inject a verify-on-stop nudge.
-
-        Conditions (all must hold):
-        0. The current channel is a local/programming surface (cli/web).
-           Messaging channels (feishu/qq/weixin/...) are skipped — the
-           verify nudge is noise there.
-        1. We have not already injected ``_MAX_VERIFY_NUDGES`` nudges.
-        2. EITHER:
-           a. The model ran a side-effect action command (restart/install/
-              pull/kill) without a follow-up verify (``side_effect_pending``
-              is True) — checked BEFORE the ``verification_done`` short-
-              circuit so that a neutral command (echo/python/node/...) run
-              after the action doesn't accidentally satisfy the gate. Only
-              a true verify command (status/is-active/ps/logs) clears
-              ``side_effect_pending`` via ``_record_verification_call``.
-           b. The model edited at least one non-doc file this turn
-              (``file_mutations`` has non-doc entries) AND has NOT called
-              any verification tool this turn (``verification_done`` is
-              False). The ``verification_done`` short-circuit applies to
-              the file-edit path only — a pytest run after edits clears
-              the nudge as expected.
-
-        Returns ``True`` when a nudge should be injected.
-        """
-        if self.channel not in _VERIFY_ON_STOP_SURFACES:
-            return False
-        if state.verify_nudges >= _MAX_VERIFY_NUDGES:
-            return False
-        # Condition 2a: pending side-effect action awaiting verification.
-        # Checked BEFORE the verification_done short-circuit so neutral
-        # commands (echo/python/node/...) don't accidentally clear the gate —
-        # only a true verify command clears side_effect_pending.
-        if state.side_effect_pending:
-            return True
-        # Condition 2b: file-edit path. The verification_done short-circuit
-        # applies here: a pytest/eslint run after edits clears the nudge.
-        if state.verification_done:
-            return False
+    def _non_doc_mutations(self, state: LoopState) -> list[dict]:
+        """File mutations that require verification (exclude docs)."""
+        out: list[dict] = []
         for mut in state.file_mutations:
             path = mut.get("path", "")
             ext = ""
             if "." in path:
                 ext = "." + path.rsplit(".", 1)[-1].lower()
             if ext not in _NO_VERIFY_EXTENSIONS:
-                return True
-        return False
+                out.append(mut)
+        return out
+
+    def _outcome_decision(self, state: LoopState):
+        """Evaluate OutcomeGate for the current turn surface / mutations."""
+        non_doc = self._non_doc_mutations(state)
+        return self._outcome_gate.evaluate(
+            surface=self.channel,
+            file_mutations=non_doc,
+            verification_done=state.verification_done,
+            side_effect_pending=state.side_effect_pending,
+            nudge_count=state.verify_nudges,
+            claims_completion=True,
+        )
+
+    def _should_inject_verify_nudge(self, state: LoopState) -> bool:
+        """Decide whether to inject a verify-on-stop nudge.
+
+        Delegates the final decision to :class:`OutcomeGate` (config-driven
+        surfaces / max_nudges / verification requirements) while preserving
+        the non-doc file filter and side-effect-pending semantics.
+        """
+        from markbot.agent.outcome import OutcomeAction
+
+        return self._outcome_decision(state).action is OutcomeAction.NUDGE
+
+    def _outcome_footer_message(self, state: LoopState) -> str:
+        """Return OutcomeGate footer text when verification is still missing."""
+        from markbot.agent.outcome import OutcomeAction
+
+        decision = self._outcome_decision(state)
+        if decision.action is OutcomeAction.FOOTER and decision.message:
+            return decision.message.strip()
+        return ""
 
     def _build_verify_nudge(self, state: LoopState) -> str:
         """Build the verify-on-stop nudge text.
@@ -1894,56 +1587,39 @@ class IterationRunner:
 
         return None
 
-    def _persist_failure_state(self, state: LoopState) -> None:
-        """把当前的失败循环状态同步回 AgentLoop 的 per-session 持久化存储。"""
+    def _persist_failure_state(self) -> None:
+        """Write guardrail cross-loop fields back to AgentLoop session store."""
         if not self.session_key:
             return
         try:
             persisted = self.loop.get_failure_state(self.session_key)
-            persisted["reflection_injected_count"] = state.reflection_injected_count
-            persisted["failed_methods"] = list(state.failed_methods)
-            persisted["forced_stop_count"] = state.forced_stop_count
+            persisted.update(self._tool_guardrail.to_persisted())
         except Exception as e:
-            logger.warning("Failed to persist failure-loop state: {}", e)
+            logger.warning("Failed to persist guardrail state: {}", e)
 
     def _phase_check_failure_loop(self, state: LoopState) -> IterationResult | None:
-        """检测连续失败循环，注入反思提示或强制停止。
+        """Apply failure-window policy after a tool batch.
 
-        当最近 _FAILURE_WINDOW 次 tool call 中有 >= _FAILURE_THRESHOLD 次失败时：
-        - 若该 session 之前已强制停止过（forced_stop_count > 0）：直接再次强制停止，
-          不再给反思机会。这是关键修复——避免 compact/"继续" 后 reflection_injected_count
-          被重置导致 LLM 又能继续撞墙。
-        - 若反思次数 < _MAX_REFLECTIONS：注入反思提示（含失败方法黑名单），让 LLM 重新评估
-        - 若反思次数 >= _MAX_REFLECTIONS：强制停止，避免无限消耗 token
+        WARN → inject reflection (count toward max_reflections).
+        HALT → force-stop the turn with a structured final message.
         """
-        if len(state.recent_tool_results) < _FAILURE_THRESHOLD:
+        decision = self._tool_guardrail.evaluate_failure_window()
+        if decision.action is GuardrailAction.ALLOW:
             return None
 
-        failure_count = sum(1 for f in state.recent_tool_results if f)
-        if failure_count < _FAILURE_THRESHOLD:
-            return None
+        gs = self._tool_guardrail.state
+        cfg = self._tool_guardrail.config
+        failure_count = decision.count
+        window_len = len(gs.recent_failures)
+        failed_methods = list(gs.failed_methods)
 
-        # 已达最大反思次数，或之前已强制停止过 → 直接强制停止
-        # （跨 loop 持久化：forced_stop_count > 0 意味着这个任务已经在更早的
-        # loop 里被强制停止过，现在 compact/"继续" 又触发了失败循环，
-        # 不应再给反思机会，直接停止并汇报。）
-        should_force_stop = (
-            state.reflection_injected_count >= _MAX_REFLECTIONS
-            or state.forced_stop_count > 0
-        )
-        if should_force_stop:
-            reason = (
-                f"max reflections ({_MAX_REFLECTIONS}) exceeded"
-                if state.reflection_injected_count >= _MAX_REFLECTIONS
-                else f"prior forced stop (count={state.forced_stop_count})"
-            )
+        if decision.action is GuardrailAction.HALT:
+            forced = self._tool_guardrail.note_forced_stop()
+            self._persist_failure_state()
             logger.warning(
-                "Failure loop detected ({} failures in last {} calls), {} — forcing stop",
-                failure_count, len(state.recent_tool_results), reason,
+                "Guardrail HALT ({} failures in last {} calls): {}",
+                failure_count, window_len, decision.message,
             )
-            state.forced_stop_count += 1
-            self._persist_failure_state(state)
-            # 清理 guardrail，与 _phase_final_response 行为一致
             if self.loop.guardrail_manager:
                 for skill_name in list(self.loop.guardrail_manager.active_skills):
                     result = self.loop.guardrail_manager.stop_guarding(skill_name)
@@ -1952,16 +1628,14 @@ class IterationRunner:
                             "Guardrail stopped for '{}': {} violation(s)",
                             skill_name, len(result.violations),
                         )
-            # 构造包含失败方法黑名单的最终汇报，让用户能看到真实阻塞点
             blacklist_text = ""
-            if state.failed_methods:
-                # 取最近 10 条，避免过长
-                recent = state.failed_methods[-10:]
+            if failed_methods:
+                recent = failed_methods[-10:]
                 blacklist_text = "\n\n**已尝试但失败的方法（不要重复）：**\n"
                 blacklist_text += "\n".join(f"- {m}" for m in recent)
             state.final_content = (
                 "我检测到任务陷入连续失败循环（最近多次 tool 调用均失败），"
-                f"已第 {state.forced_stop_count} 次强制停止以避免无谓的 token 消耗。"
+                f"已第 {forced} 次强制停止以避免无谓的 token 消耗。"
                 + blacklist_text
                 + "\n\n**可能的原因：**\n"
                 "- 当前环境缺少完成任务所需的依赖（如 ffmpeg、特定 Python 包等）\n"
@@ -1978,32 +1652,28 @@ class IterationRunner:
                 state.final_content,
             )
             return IterationResult(
-                should_break=True, exit_reason=TurnExitReason.FAILURE_LOOP_FORCED_STOP
+                should_break=True, exit_reason=TurnExitReason.GUARDRAIL_HALT
             )
 
-        # 注入反思提示
-        state.reflection_injected_count += 1
-        self._persist_failure_state(state)
+        # WARN → reflection
+        reflection_n = self._tool_guardrail.note_reflection()
+        self._persist_failure_state()
         logger.warning(
-            "Failure loop detected ({} failures in last {} calls), "
-            "injecting reflection #{} (persisted total)",
-            failure_count, len(state.recent_tool_results),
-            state.reflection_injected_count,
+            "Guardrail failure-window WARN ({} failures in last {} calls), "
+            "injecting reflection #{}",
+            failure_count, window_len, reflection_n,
         )
-
-        # 构造失败方法黑名单片段，提醒 LLM 不要重试这些方法
         blacklist_section = ""
-        if state.failed_methods:
-            recent = state.failed_methods[-8:]
+        if failed_methods:
+            recent = failed_methods[-8:]
             blacklist_section = (
                 "\n\n**已尝试且失败的方法（绝对不要重复这些）：**\n"
                 + "\n".join(f"- {m}" for m in recent)
                 + "\n\n如果你接下来要用的方法和上面任意一条相似，请立刻停止并告知用户。"
             )
-
         reflection_text = (
             "[System Warning — 连续失败检测]\n"
-            f"系统检测到你在最近 {len(state.recent_tool_results)} 次 tool 调用中"
+            f"系统检测到你在最近 {window_len} 次 tool 调用中"
             f"有 {failure_count} 次失败。这通常意味着当前策略遇到了"
             "环境或依赖层面的硬性限制，继续用类似方式尝试只会浪费资源。"
             + blacklist_section
@@ -2015,45 +1685,11 @@ class IterationRunner:
             "3. **策略调整**：如果可行，换一种**完全不同**的方法；"
             "如果不可行，明确告知用户并停止。\n\n"
             "重要：这是第 "
-            f"{state.reflection_injected_count}/{_MAX_REFLECTIONS} 次反思，"
+            f"{reflection_n}/{cfg.max_reflections} 次反思，"
             "达到上限后将强制停止。不要再用相同或类似的方式重试。"
             "如果任务在当前环境不可行，直接回复用户说明原因。"
         )
-
-        # 注入到最后一条 tool result 之后（作为 user 消息追加，
-        # 这样 LLM 能在下一轮看到反思提示）
-        last_tool_idx = None
-        for i in range(len(state.messages) - 1, -1, -1):
-            if state.messages[i].get("role") == "tool":
-                last_tool_idx = i
-                break
-
-        if last_tool_idx is not None:
-            existing = state.messages[last_tool_idx].get("content", "")
-            if isinstance(existing, str):
-                state.messages[last_tool_idx]["content"] = (
-                    existing + "\n\n" + reflection_text
-                )
-            elif isinstance(existing, list):
-                state.messages[last_tool_idx]["content"].append(
-                    {"type": "text", "text": reflection_text}
-                )
-        else:
-            # 没有 tool result 时，作为 user 消息追加
-            state.messages.append({
-                "role": "user",
-                "content": reflection_text,
-            })
-
-        # 反思后只保留窗口的一半（而非完全清空）。
-        # 完全清空会让 LLM 又得凑够 _FAILURE_THRESHOLD 次失败才再触发检测，
-        # 等于给"不换方法继续撞墙"的 LLM 续命，浪费 token（见
-        # logs/2026-06-27.log 中反思后立刻又重复 web_fetch 失败的案例）。
-        # 保留一半意味着：反思后若继续失败，只需再积累少量失败就能再次触发，
-        # 逼 LLM 要么真换方法（成功会稀释窗口），要么快速走到强制停止。
-        if state.recent_tool_results:
-            keep = max(1, _FAILURE_WINDOW // 2)
-            state.recent_tool_results = state.recent_tool_results[-keep:]
+        self._append_hint_to_last_tool_result(state, "\n\n" + reflection_text)
         return None
 
     def _phase_memory_sync(self, state: LoopState) -> None:
@@ -2597,6 +2233,34 @@ class IterationRunner:
                 _actual_model = _a.model.name
                 break
 
+        # Token axis (in addition to CostTracker USD).
+        usage = getattr(response, "usage", None) or {}
+        total = int(
+            usage.get("total_tokens", 0)
+            or (
+                int(usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0)
+                + int(
+                    usage.get("completion_tokens", 0)
+                    or usage.get("output_tokens", 0)
+                    or 0
+                )
+            )
+            or 0
+        )
+        if total:
+            self._runtime_budget.add_tokens(total)
+        axis_hit = self._runtime_budget.evaluate()
+        if axis_hit.hit:
+            logger.error("Runtime budget axis hit: {}", axis_hit.message)
+            state.budget_exceeded = True
+            state.final_content = (
+                f"[Runtime Budget] {axis_hit.message}. "
+                "Stopping turn with residual work open."
+            )
+            return IterationResult(
+                should_break=True, exit_reason=TurnExitReason.BUDGET_EXCEEDED
+            )
+
         try:
             call_cost = self.loop.cost_tracker.update_from_response(
                 response, model=_actual_model
@@ -2696,22 +2360,24 @@ class IterationRunner:
                 f"Please use only the tools listed above."
             )
             permission_mode, permission_context = self._current_permission_context()
+            recovery_ctx = ToolContext(
+                session_id=self.session_key,
+                workspace=str(self.loop.workspace),
+                permission_mode=permission_mode,
+                tool_permission_context=permission_context,
+                is_non_interactive=self._is_non_interactive(),
+                channel=self.channel,
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+            )
             for tc in response.tool_calls:
                 if not self.loop.tools.has(tc.name):
                     state.messages = await self.loop.context.add_tool_result_async(
                         state.messages, tc.id, tc.name, error_msg
                     )
                 else:
-                    result = await self.loop.tools.execute(tc.name, tc.arguments, context=ToolContext(
-                        session_id=self.session_key,
-                        workspace=str(self.loop.workspace),
-                        permission_mode=permission_mode,
-                        tool_permission_context=permission_context,
-                        is_non_interactive=self._is_non_interactive(),
-                        channel=self.channel,
-                        chat_id=self.chat_id,
-                        message_id=self.message_id,
-                    ))
+                    # Same pre-block path as the normal tool phase.
+                    result = await self._execute_one_tool_call(tc, recovery_ctx)
                     state.messages = await self.loop.context.add_tool_result_async(
                         state.messages, tc.id, tc.name, result
                     )
@@ -2721,13 +2387,13 @@ class IterationRunner:
                     # doesn't false-positive on the final response.
                     self._record_file_mutation(state, tc, result)
                     self._record_verification_call(state, tc, result)
-                    # Also feed the result into failure detection and
-                    # guardrails, so a valid tool failing in this recovery
-                    # path is still tracked (exact-failure / no-progress /
-                    # recent_tool_results). Without this, the recovery path
-                    # would be a blind spot for failure-loop detection.
+                    # Feed recovery-path results into the guardrail engine.
                     self._record_tool_result(state, result, tc.name, tc)
             self._flush_messages(state)
+            # Batch-end failure-window check (same as normal tool phase).
+            failure_result = self._phase_check_failure_loop(state)
+            if failure_result is not None:
+                return failure_result
             return IterationResult(
                 should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
             )
@@ -3049,12 +2715,10 @@ class IterationRunner:
             })
             state.new_msg_start += 2
             self._flush_messages(state)
-            # Wipe file_mutations so the file-edit nudge does not re-fire
-            # immediately without new edits. NOTE: side_effect_pending is
-            # intentionally NOT cleared — the model must run a verify command
-            # (status/is-active/ps) to clear it, not just attempt completion
-            # again. This forces a real post-condition check after actions.
-            state.file_mutations = []
+            # Keep file_mutations so OutcomeGate can still see residual
+            # unverified work and escalate NUDGE → FOOTER via nudge_count.
+            # side_effect_pending is likewise not cleared — only a real
+            # verification tool (status/tests/ps) clears it.
             return IterationResult(
                 should_continue=True,
                 exit_reason=TurnExitReason.TOOL_CONTINUE,
@@ -3063,8 +2727,10 @@ class IterationRunner:
         verifier_footer = self._maybe_inject_mutation_verifier_footer(
             state, clean or ""
         )
-        if verifier_footer:
-            saved_content = (clean or "") + "\n\n---\n" + verifier_footer
+        outcome_footer = self._outcome_footer_message(state)
+        footers = [f for f in (verifier_footer, outcome_footer) if f]
+        if footers:
+            saved_content = (clean or "") + "\n\n---\n" + "\n".join(footers)
         else:
             saved_content = clean
 
@@ -3203,8 +2869,9 @@ class IterationRunner:
             # 而不是泛泛的英文模板。同时保留失败方法清单，让"继续"时
             # LLM 能从 history 看到已尝试的方法。
             blacklist_text = ""
-            if state.failed_methods:
-                recent = state.failed_methods[-10:]
+            failed_methods = self._tool_guardrail.state.failed_methods
+            if failed_methods:
+                recent = failed_methods[-10:]
                 blacklist_text = "\n\n**已尝试但失败的方法（继续时不要重复）：**\n"
                 blacklist_text += "\n".join(f"- {m}" for m in recent)
             state.final_content = (
@@ -3300,6 +2967,17 @@ class IterationRunner:
         self._phase_active_memory_encoding(state)
 
         self._phase_memory_sync(state)
+
+        # End of turn: unlock prefix-cache mutation queue and apply deferred
+        # tool/skill/prompt surface changes for the *next* turn only.
+        try:
+            applied = self._cache_policy.end_turn()
+            if applied:
+                logger.info(
+                    "Applied deferred cache mutations after turn: {}", applied
+                )
+        except Exception as e:
+            logger.debug("cache_policy end_turn failed: {}", e)
 
         await self._phase_generate_handoff(state, cost_summary)
 

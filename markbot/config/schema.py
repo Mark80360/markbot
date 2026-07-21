@@ -655,6 +655,114 @@ class ReliabilityConfig(Base):
     )
 
 
+class GuardrailsConfig(Base):
+    """Tool-loop guardrail thresholds (pure decision engine)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable tool-loop guardrails (exact-failure / no-progress / window halt)",
+    )
+    exact_failure_warn: int = Field(default=2, ge=1, le=20)
+    exact_failure_block: int = Field(default=4, ge=1, le=50)
+    tool_streak_warn: int = Field(default=3, ge=1, le=20)
+    tool_streak_block: int = Field(default=5, ge=1, le=50)
+    no_progress_warn: int = Field(default=2, ge=1, le=20)
+    no_progress_block: int = Field(default=4, ge=1, le=50)
+    window_size: int = Field(default=6, ge=2, le=40)
+    window_failure_threshold: int = Field(default=4, ge=2, le=40)
+    max_reflections: int = Field(default=2, ge=0, le=10)
+    failed_methods_cap: int = Field(
+        default=30,
+        ge=1,
+        le=200,
+        description="Max entries retained in the cross-loop failed-methods blacklist",
+    )
+    idempotent_tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tools treated as idempotent for no-progress detection. "
+            "Empty list uses the engine built-in default set."
+        ),
+    )
+
+
+class DelegationConfig(Base):
+    """Subagent spawn control plane (depth / concurrency / blocked tools)."""
+
+    max_spawn_depth: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description="Max parent→child spawn depth. 1 = children cannot spawn.",
+    )
+    max_concurrent_children: int = Field(
+        default=3,
+        ge=1,
+        le=32,
+        description="Max concurrently running subagents per process",
+    )
+    max_children_per_session: int = Field(
+        default=8,
+        ge=1,
+        le=100,
+        description="Max subagents a single session may spawn",
+    )
+    blocked_tools: list[str] = Field(
+        default_factory=lambda: [
+            "spawn",
+            "message",
+            "cron",
+            "ask_user_question",
+            "skill_manage",
+            "computer_use",
+        ],
+        description="Tools always forbidden for subagents (merged into CapabilityToken)",
+    )
+    force_auto_permission: bool = Field(
+        default=True,
+        description="Force AUTO permission mode inside subagents (avoid interactive deadlock)",
+    )
+    allow_nested_spawn: bool = Field(
+        default=False,
+        description="Allow children to call spawn (orchestrator role)",
+    )
+
+
+class CachePolicyConfig(Base):
+    """Prefix-cache mutation policy."""
+
+    defer_mutations: bool = Field(
+        default=True,
+        description=(
+            "Defer tool-surface / system-prompt mutations until the next turn "
+            "so the active conversation keeps a byte-stable prefix cache."
+        ),
+    )
+
+
+class OutcomeGateConfigSchema(Base):
+    """Verify-before-finish outcome gate."""
+
+    enabled: bool = Field(default=True)
+    max_nudges: int = Field(default=2, ge=0, le=10)
+    surfaces: list[str] = Field(default_factory=lambda: ["cli", "web"])
+    require_verification_for_mutations: bool = Field(default=True)
+    require_verification_for_side_effects: bool = Field(default=True)
+
+
+class RuntimeBudgetAxesConfig(Base):
+    """Optional hard ceilings beyond CostTracker USD budget."""
+
+    max_wall_seconds: float | None = Field(
+        default=None,
+        description="Hard wall-clock limit for a single turn (seconds)",
+    )
+    max_total_tokens: int | None = Field(
+        default=None,
+        description="Hard total-token limit for a single turn",
+    )
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -668,6 +776,11 @@ class ToolsConfig(Base):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     restrict_to_workspace: bool = True  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    delegation: DelegationConfig = Field(default_factory=DelegationConfig)
+    cache_policy: CachePolicyConfig = Field(default_factory=CachePolicyConfig)
+    outcome_gate: OutcomeGateConfigSchema = Field(default_factory=OutcomeGateConfigSchema)
+    runtime_budget: RuntimeBudgetAxesConfig = Field(default_factory=RuntimeBudgetAxesConfig)
 
 
 class CompactionConfig(Base):

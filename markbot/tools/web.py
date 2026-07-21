@@ -185,6 +185,15 @@ class WebSearchTool(Tool):
         self.config = config if config is not None else WebSearchConfig()
         self.proxy = proxy
 
+    def available_when(self) -> bool:
+        """Always available: DuckDuckGo is the zero-config fallback provider.
+
+        Paid providers (Brave/Tavily/Jina) still require keys at call time and
+        fall back to DuckDuckGo when missing — so the tool stays in the schema
+        without inflating cost only when truly unusable.
+        """
+        return True
+
     async def _legacy_execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         provider = self.config.provider.strip().lower() or "brave"
         n = min(max(count or self.config.max_results, 1), 10)

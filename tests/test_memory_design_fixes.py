@@ -1,12 +1,12 @@
-"""Regression tests for MEMORY.md design fixes (2026-07).
+"""Regression tests for MEMORY.md design (Hermes-aligned, no legacy formats).
 
 Covers:
-- MemoryStore entry parser accepts template / sectioned / entry-list formats
+- MemoryStore entry parser accepts Hermes § format only
 - Main-session gate for always-on MEMORY.md injection
 - No dual injection of curated MEMORY via get_memory_context
 - Auto-summary does not pollute curated MEMORY.md by default
 - Session-scoped vector search still recalls global curated memories
-- Snapshot refreshes after memory_save
+- Frozen snapshot does not auto-refresh after memory_save
 """
 
 from __future__ import annotations
@@ -37,7 +37,21 @@ def _make_manager(tmp_path: Path, *, long_term_enabled: bool = False):
 
 
 class TestMemoryStoreParser:
-    def test_parses_entry_list_format(self, tmp_path: Path):
+    def test_parses_hermes_entry_list_format(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+
+        p = tmp_path / "MEMORY.md"
+        p.write_text(
+            "prefer dark mode\n§\nuse postgres\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(working_dir=tmp_path)
+        entries = store.read("memory")["entries"]
+        assert any("dark mode" in e for e in entries)
+        assert any("postgres" in e for e in entries)
+
+    def test_rejects_legacy_dash_format_as_single_blob(self, tmp_path: Path):
+        """No --- / bullet compatibility: old markdown is not split into entries."""
         from markbot.memory.tool import MemoryStore
 
         p = tmp_path / "MEMORY.md"
@@ -47,10 +61,12 @@ class TestMemoryStoreParser:
         )
         store = MemoryStore(working_dir=tmp_path)
         entries = store.read("memory")["entries"]
-        assert any("dark mode" in e for e in entries)
-        assert any("postgres" in e for e in entries)
+        # Without §, the whole file is one entry (or empty if only whitespace).
+        assert len(entries) == 1
+        assert "prefer dark mode" in entries[0]
+        assert "use postgres" in entries[0]
 
-    def test_parses_template_sectioned_markdown(self):
+    def test_parses_template_hermes_markdown(self):
         from markbot.memory.tool import MemoryStore
 
         text = Path("markbot/templates/MEMORY.md").read_text(encoding="utf-8")
@@ -70,6 +86,26 @@ class TestMemoryStoreParser:
         assert blocked["success"] is False
         assert "Entry count limit" in blocked["message"]
 
+    def test_duplicate_add_is_noop(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+
+        store = MemoryStore(working_dir=tmp_path)
+        assert store.add("memory", "same fact")["success"]
+        r = store.add("memory", "same fact")
+        assert r["success"] is True
+        assert "already exists" in r["message"]
+        assert store.memory_entries.count("same fact") == 1
+
+    def test_ambiguous_remove_rejected(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+
+        store = MemoryStore(working_dir=tmp_path)
+        store.add("memory", "prefers postgres for analytics")
+        store.add("memory", "prefers redis for cache")
+        r = store.remove("memory", "prefers")
+        assert r["success"] is False
+        assert "Ambiguous" in r["message"]
+
 
 class TestMainSessionGate:
     def test_helper_classifies_channels(self):
@@ -87,12 +123,12 @@ class TestMainSessionGate:
         from markbot.agent.context import ContextBuilder
 
         (tmp_path / "MEMORY.md").write_text(
-            "# Agent Memory\n\nsecret preference: favorite color is blue\n",
+            "secret preference: favorite color is blue\n",
             encoding="utf-8",
         )
         (tmp_path / "AGENTS.md").write_text("# agents\n", encoding="utf-8")
         (tmp_path / "PROFILE.md").write_text(
-            "# profile\n\nuser real name is Alice Secret\n",
+            "user real name is Alice Secret\n",
             encoding="utf-8",
         )
         (tmp_path / "SOUL.md").write_text("# soul\n", encoding="utf-8")
@@ -160,13 +196,34 @@ class TestAutoSummaryPolicy:
 
 
 class TestSnapshotRefresh:
-    def test_add_refreshes_snapshot(self, tmp_path: Path):
+    def test_add_does_not_auto_refresh_snapshot(self, tmp_path: Path):
+        """Hermes frozen-snapshot policy: mid-session writes stay off prompt."""
         from markbot.memory.tool import MemoryStore
 
         store = MemoryStore(working_dir=tmp_path)
         assert "fresh fact" not in store.system_prompt_snapshot
         store.add("memory", "fresh fact about deployment host")
+        assert "fresh fact about deployment host" not in store.system_prompt_snapshot
+        assert "fresh fact about deployment host" in store.memory_entries
+        store.refresh_snapshot()
         assert "fresh fact about deployment host" in store.system_prompt_snapshot
+
+    def test_profile_reads_hermes_entries_only(self, tmp_path: Path):
+        from markbot.memory.tool import MemoryStore
+
+        (tmp_path / "PROFILE.md").write_text(
+            "User's name is 马克\n§\nLives in Shanghai\n",
+            encoding="utf-8",
+        )
+        # USER.md is ignored (no legacy fallback).
+        (tmp_path / "USER.md").write_text(
+            "This should not be loaded\n",
+            encoding="utf-8",
+        )
+        store = MemoryStore(working_dir=tmp_path)
+        assert any("马克" in e for e in store.user_entries)
+        assert any("Shanghai" in e for e in store.user_entries)
+        assert not any("should not be loaded" in e for e in store.user_entries)
 
 
 class TestGlobalCuratedRecall:
@@ -317,11 +374,11 @@ class TestSharedListAndExplorerPrivacy:
         )
 
         (tmp_path / "MEMORY.md").write_text(
-            "# Agent Memory\n\nsecret preference: favorite color is blue\n",
+            "secret preference: favorite color is blue\n",
             encoding="utf-8",
         )
         (tmp_path / "PROFILE.md").write_text(
-            "# profile\n\nuser real name is Alice Secret\n",
+            "user real name is Alice Secret\n",
             encoding="utf-8",
         )
         (tmp_path / "AGENTS.md").write_text("# agents\n", encoding="utf-8")

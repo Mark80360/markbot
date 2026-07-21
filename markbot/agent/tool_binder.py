@@ -92,11 +92,15 @@ class ToolBinder:
 
             self._tools.register(CronTool(self._cron_service, default_timezone=self._timezone or "UTC"))
 
-        # Soft-disable tools the profile opts out of (exact names).
-        if profile is not None:
-            for name in getattr(profile, "disabled_tools", ()) or ():
-                if self._tools.has(name):
-                    self._tools.unregister(name)
+        # Soft-disable tools the profile opts out of (exact names + group flags).
+        # Prefer soft-disable over unregister so mid-session rebind / deferred
+        # mutations can re-enable without re-importing tool classes.
+        from markbot.agent.footprint import ToolFootprint, apply_footprint_to_registry
+
+        footprint = ToolFootprint()
+        footprint.apply_profile(profile)
+        apply_footprint_to_registry(self._tools, footprint)
+        self._footprint = footprint
 
     def _register_base_tools(self, extra_allowed_dirs: list[Path] | None = None) -> None:
         """Register filesystem, web, shell, and search tools."""
@@ -290,12 +294,18 @@ class ToolBinder:
             from markbot.tools.computer_use.tool import ComputerUseTool
 
             tool = ComputerUseTool(config=self._computer_use_config)
-            if tool.is_enabled:
-                self._tools.register(tool)
+            # Service-gated: only enter the registry (and thus the model
+            # schema / API tool footprint) when a backend is actually usable.
+            self._tools.register_gated(tool)
 
         if enable_browser and (self._browser_config is None or self._browser_config.enable):
             from markbot.tools.browser import BROWSER_TOOLS
 
             for browser_tool in BROWSER_TOOLS:
-                self._tools.register(browser_tool)
+                # Prefer register_gated so unavailable browser backends do not
+                # inflate every API call's tool list.
+                if hasattr(browser_tool, "is_available") or hasattr(browser_tool, "is_enabled"):
+                    self._tools.register_gated(browser_tool)
+                else:
+                    self._tools.register(browser_tool)
 

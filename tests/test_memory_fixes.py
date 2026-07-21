@@ -151,30 +151,32 @@ class TestMemoryStoreCharLimit:
         store = MemoryStore(working_dir=str(tmp_path), memory_char_limit=2000)
         for i in range(5):
             r = store.add("memory", f"entry {i} " + "x" * 100)
-            assert r["success"] is True
+            assert r["success"] is True, r
         assert len(store.memory_entries) == 5
 
     def test_total_just_under_limit_accepted(self, tmp_path: Path):
         from markbot.memory.tool import MemoryStore
 
-        # 3 entries of 100 chars + 2 delimiters of 7 chars each = 314 used,
-        # so adding a 4th of 100 should still fit (414 < 1000).
+        # Unique entries (exact duplicates are no-ops).
+        # 3 entries of 100 chars + delimiters should still fit under 1000.
         store = MemoryStore(working_dir=str(tmp_path), memory_char_limit=1000)
         for i in range(3):
-            assert store.add("memory", "x" * 100)["success"]
-        assert store.add("memory", "x" * 100)["success"]
+            assert store.add("memory", f"e{i}-" + "x" * 96)["success"]
+        assert store.add("memory", "e3-" + "x" * 96)["success"]
 
     def test_total_over_limit_rejected(self, tmp_path: Path):
-        from markbot.memory.tool import MemoryStore
+        from markbot.memory.tool import ENTRY_DELIMITER, MemoryStore
 
         store = MemoryStore(working_dir=str(tmp_path), memory_char_limit=500)
-        store.add("memory", "x" * 200)
-        store.add("memory", "x" * 200)
-        # After two entries, used = 400 chars + 1 delimiter (7) = 407.
-        # A 3rd 200-char entry would push to 407 + 7 + 200 = 614 > 500.
-        r = store.add("memory", "x" * 200)
+        assert store.add("memory", "a" * 200)["success"]
+        assert store.add("memory", "b" * 200)["success"]
+        # After two unique entries, used ≈ 400 + delimiter.
+        # A 3rd 200-char entry would push over 500.
+        r = store.add("memory", "c" * 200)
         assert r["success"] is False
         assert "limit" in r["message"].lower()
+        # Sanity: delimiter is Hermes § form.
+        assert ENTRY_DELIMITER == "\n§\n"
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +406,7 @@ class TestDreamBackupPruning:
         mgr._memory_store._persist("memory")
 
         mgr._fallback_manager = _FakeFallback(
-            reply="new entry\n---\nanother new entry",
+            reply="new entry\n§\nanother new entry",
         )
 
         # Run dream() 7 times to create 7 backup files.
