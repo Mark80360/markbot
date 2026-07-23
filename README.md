@@ -53,7 +53,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 
 ### Developer Experience
 
-- **Slash Commands**: Built-in commands like `/new`, `/compact`, `/compact_str`, `/clear`, `/stop`, `/status`, `/restart`, `/help`
+- **Slash Commands**: Built-in commands like `/new`, `/compact`, `/compact_str`, `/clear`, `/stop`, `/steer`, `/status`, `/mode`, `/profile`, `/restart`, `/help`
 - **Event Bus**: Event-driven architecture for message passing and component communication
 - **Context Explorer**: Explore project context with semantic search and catalog (explore_context_catalog, search_context, load_context)
 - **Todo Management**: Built-in persistent todo tracking tool for task management
@@ -223,11 +223,14 @@ markbot onboard --guided
 # Non-interactive defaults (for scripts/Docker)
 markbot onboard --defaults
 
-# Start interactive mode
-markbot
+# Start interactive mode (REPL)
+markbot agent
 
 # Start with specific workspace
-markbot --workspace /path/to/workspace
+markbot agent --workspace /path/to/workspace
+
+# Single-shot message (non-interactive)
+markbot agent -m "Hello!"
 
 # Run as gateway server
 markbot gateway start
@@ -242,25 +245,48 @@ markbot onboard --wizard         # Interactive menu-driven wizard
 markbot onboard --guided         # Linear step-by-step guided setup
 markbot onboard --defaults       # Non-interactive defaults
 
+# Agent (interactive REPL or single-shot)
+markbot agent                    # Start interactive chat (requires a TTY)
+markbot agent -m "Hello!"        # Single-shot message (non-interactive)
+markbot agent --workspace /path  # Use a specific workspace
+markbot agent --config file.json # Use a specific config file
+
 # Gateway management
-markbot gateway start            # Start gateway server
-markbot gateway stop             # Stop gateway server
+markbot gateway start            # Start gateway server (daemonized by default)
+markbot gateway start --foreground  # Run in the foreground
+markbot gateway stop             # Stop gateway server (--force to hard-kill)
 markbot gateway restart          # Restart gateway server
 markbot gateway status           # Check gateway status
 
+# Web UI server
+markbot web                      # Start web UI (default http://127.0.0.1:9120)
+markbot web --host 0.0.0.0 --port 8080
+
 # Skill management
-markbot skills list
-markbot skills install <skill-name>
-markbot skills info <skill-name>
+markbot skills list              # List all available skills
+markbot skills info <skill-name> # Show detailed skill information
+markbot skills scan <skill> <script>  # Scan a script for security issues
 
 # Autopilot tasks
-markbot autopilot list
-markbot autopilot add
-markbot autopilot run <task-id>
+markbot autopilot list           # List all autopilot tasks
+markbot autopilot add "Title"    # Add a new task (--body, --source, --labels)
+markbot autopilot show <task-id> # Show detailed task info
+markbot autopilot tick           # Run the next queued task
+markbot autopilot reject <id>    # Reject a task (--reason)
+markbot autopilot requeue <id>   # Requeue a failed/rejected task
+markbot autopilot stats          # Show autopilot statistics
+markbot autopilot journal        # Show the autopilot journal
+
+# Other command groups
+markbot status                   # Show process / workspace / runtime status
+markbot config get|set|list|show # Inspect and edit config values
+markbot channels status|login    # Channel health and OAuth login
+markbot provider login           # Provider OAuth login (e.g. Codex, Copilot)
+markbot plugins list             # List discovered skill plugins
 
 # Doctor diagnostics
-markbot doctor
-markbot doctor fix
+markbot doctor                   # Check environment and configuration
+markbot doctor fix               # Auto-fix common issues
 ```
 
 ### Slash Commands (in chat)
@@ -275,6 +301,7 @@ markbot doctor fix
 | `/steer` | Inject mid-task instruction into running agent |
 | `/status` | Show session status, token usage, and statistics |
 | `/mode [mode]` | Show or set permission mode (default/plan/accept_edits/auto/bypass) |
+| `/profile [name]` | Show or set runtime profile (coding/assistant/unattended) |
 | `/restart` | Restart the agent process |
 | `/help` | Show available slash commands |
 
@@ -384,7 +411,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
   },
   "providers": {
     "anthropic": {
-      "apiKey": "${ANTHROPIC_apiKey}",
+      "apiKey": "YOUR_ANTHROPIC_API_KEY",
       "models": [
         {
           "id": "claude-sonnet-4-20250514",
@@ -396,7 +423,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
       ]
     },
     "deepseek": {
-      "apiKey": "${DEEPSEEK_apiKey}",
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
       "models": [
         {
           "id": "deepseek-chat",
@@ -415,7 +442,7 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
     "web": {
       "search": {
         "provider": "brave",
-        "apiKey": "${BRAVE_apiKey}"
+        "apiKey": "YOUR_BRAVE_API_KEY"
       }
     },
     "exec": {
@@ -452,9 +479,21 @@ MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by de
 }
 ```
 
-### Environment Variables
+### API Keys & Secrets
 
-Most sensitive configuration values can be provided via environment variables using `${VAR_NAME}` syntax in the config file.
+API keys are entered directly in `config.json` under
+`providers.<name>.apiKey` (and `tools.web.search.apiKey` for web search).
+MarkBot does **not** interpolate `${VAR_NAME}` placeholders — paste the
+literal key value. To avoid committing secrets, keep `config.json` outside
+version control, or point MarkBot at a separate file with `--config`.
+
+Config-file path and workspace are overridden via CLI flags, not env vars:
+
+```bash
+markbot agent --config /etc/markbot/config.json --workspace /var/lib/markbot
+markbot gateway start --config /etc/markbot/config.json
+markbot web --config /etc/markbot/config.json
+```
 
 ## Built-in Tools
 
@@ -767,9 +806,10 @@ Advanced built-in memory management:
 - **CompactAttachment**: Preserves key context across compaction rounds
 - **Tool Output Offloading**: Oversized tool results offloaded to files with inline previews
 - **PTL Retry**: Prompt-Too-Long retry with head truncation
-- **Summarization**: Extract key information from interactions into MEMORY.md
+- **Summarization**: Extract durable facts into daily logs + vector index (curated MEMORY.md only on explicit save / dream promotion)
 - **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule (includes vector consolidation)
 - **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
+- **Main-session MEMORY gate**: Always-on MEMORY.md injection is limited to private surfaces (cli/web/api/local); shared messaging channels use on-demand search only
 - **Security Scanner**: Injection and exfiltration detection for memory content
 - **Sensitive Data Redaction**: Automatic scrubbing of API keys, tokens, passwords, JWTs, and connection strings before LLM summarization
 - **Context Fencing**: `<memory-context>` tags with streaming scrubber
@@ -1025,7 +1065,7 @@ model can ingest images directly:
 {
   "providers": {
     "deepseek": {
-      "apiKey": "${DEEPSEEK_apiKey}",
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
       "models": [
         {
           "id": "deepseek-chat",
@@ -1146,8 +1186,9 @@ touching your model/key configuration.
 Best for local development and one-off sessions.
 
 ```bash
-markbot                       # default workspace (~/.markbot/workspace)
-markbot --workspace /path/to/ws
+markbot agent                       # default workspace (~/.markbot/workspace)
+markbot agent --workspace /path/to/ws
+markbot agent -m "Hello!"           # single-shot (non-interactive, no TTY needed)
 ```
 
 The CLI loads the agent loop, reads the model chain from
@@ -1221,11 +1262,10 @@ out of the box, but the daemon maps cleanly onto either:
 ```bash
 # systemd unit (drop into /etc/systemd/system/markbot.service)
 [Service]
-ExecStart=/usr/local/bin/markbot gateway start --foreground
+ExecStart=/usr/local/bin/markbot gateway start --foreground --config /etc/markbot/config.json --workspace /var/lib/markbot
 Restart=on-failure
 User=markbot
 WorkingDirectory=/var/lib/markbot
-Environment=MARKBOT_CONFIG=/etc/markbot/config.json
 ```
 
 ```dockerfile
@@ -1233,21 +1273,26 @@ Environment=MARKBOT_CONFIG=/etc/markbot/config.json
 FROM python:3.12-slim
 RUN pip install markbot[web,desktop-linux,chroma]
 COPY config.json /etc/markbot/config.json
-ENV MARKBOT_CONFIG=/etc/markbot/config.json
 EXPOSE 9120
-CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120"]
+CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/markbot/config.json"]
 ```
 
 ### Environment variables
 
+These tune runtime behavior; they are **not** used for config-file or API-key
+substitution (use the `--config` / `--workspace` flags and the `apiKey` fields
+in `config.json` for those).
+
 | Variable | Effect |
 |----------|--------|
-| `MARKBOT_CONFIG` | Override the config file path (default `~/.markbot/config.json`) |
-| `MARKBOT_WORKSPACE` | Override the workspace directory |
 | `MARKBOT_COMPUTER_USE_BACKEND` | Force `cua` / `atspi` / `pyautogui` / `noop` |
 | `MARKBOT_CUA_DRIVER_CMD` | Path to a pre-installed `cua-driver` binary |
+| `MARKBOT_CUA_DRIVER_VERSION` | Pin the `cua-driver` version (default `0.5.0`) |
 | `MARKBOT_VISION_FORCE_TEXT_ONLY` | `1`/`true` = force all multimodal tool results to text-only (skip images); `0`/`false` = allow images. Overrides `agents.defaults.auxiliaryVision.forceTextOnly` |
-| `ANTHROPIC_apiKey` / `OPENAI_apiKey` / … | Provider keys (used as fallbacks for `${...}` substitutions in `config.json`) |
+| `MARKBOT_MAX_CONCURRENT_REQUESTS` | Max concurrent in-flight LLM requests per loop (default `3`) |
+| `MARKBOT_PRODUCTION` | `1`/`true` tightens shell-tool safety restrictions |
+| `MARKBOT_ARTIFACT_DIR` | Override the directory used for offloaded tool-output artifacts |
+| `MARKBOT_IMAGE_TOKEN_ESTIMATE` | Override the per-image token cost estimate used for budgeting |
 
 ## Development
 
@@ -1258,11 +1303,18 @@ markbot/
 ├── agent/              # Core agent loop and processing
 │   ├── loop.py             # Main agent processing engine
 │   ├── iteration.py        # Iteration runner for agent loop
+│   ├── outcome.py          # Iteration outcome / result types
 │   ├── tool_binder.py      # Tool registration and binding
+│   ├── tool_guardrails.py  # Tool failure-loop detection & guardrails
+│   ├── permission_approval.py # Permission approval / ask handling
 │   ├── compact.py          # 4-tier progressive compaction
 │   ├── context.py          # Context builder for agent prompts
+│   ├── context_engine.py   # Context engine (assembly orchestration)
+│   ├── coding_context.py   # Coding context (project facts / manifests)
 │   ├── container.py        # Agent context container
 │   ├── cost.py             # Token & cost tracking with budget control
+│   ├── budget_axes.py      # Budget axes (token/cost/turn limits)
+│   ├── footprint.py        # Tool footprint profile / status ladder
 │   ├── tokens.py           # Token estimation
 │   ├── tool_output.py      # Tool output offloading + head+tail collapse
 │   ├── stream.py           # Stream filtering (think-tag removal)
@@ -1270,6 +1322,7 @@ markbot/
 │   ├── anthropic_breakpoints.py # Anthropic cache_control breakpoint strategy
 │   ├── cache_chip.py       # Per-block cache chip / prefix-cache bookkeeping
 │   ├── cache_discipline.py # Cache discipline / TTL policy
+│   ├── cache_policy.py     # Cache policy resolution
 │   ├── cache_protocol.py   # Provider-agnostic cache protocol types
 │   ├── prefix_cache.py     # Cross-provider prefix-cache helpers
 │   ├── llm_response_cache.py # LLM response cache
@@ -1282,8 +1335,10 @@ markbot/
 │   ├── subagent/           # Background task delegation
 │   │   ├── capability.py   # CapabilityToken for delegation
 │   │   ├── manager.py      # Subagent manager
+│   │   ├── policy.py       # Subagent policy (budget/timeout/caps)
 │   │   ├── progress.py     # Progress tracking
 │   │   ├── spawn.py        # Spawn tool
+│   │   ├── templates.py    # Subagent prompt templates
 │   │   └── tools.py        # Check/List subagent tools
 │   ├── mcp/                # MCP protocol support
 │   │   └── manager.py      # MCP connection manager
@@ -1370,7 +1425,10 @@ markbot/
 │   ├── schema.py       # Pydantic config schema
 │   ├── loader.py       # Config loading/saving
 │   ├── paths.py        # Path resolution
+│   ├── profile.py      # Runtime profiles (coding/assistant/unattended)
 │   └── validator.py    # Config validation
+├── runtime/            # Declarative loop & side-service assembly
+│   └── factory.py      # Builds AgentLoop + Cron/Channels/Heartbeat from config
 ├── memory/             # Memory system
 │   ├── base.py         # BaseMemoryManager ABC
 │   ├── manager.py      # Main MemoryManager (file-backed + vector index)
@@ -1428,6 +1486,7 @@ markbot/
 │   ├── models.py       # Model suggestions
 │   ├── slash_commands/ # Slash command routing
 │   │   ├── router.py   # CommandRouter
+│   │   ├── command_def.py # CommandDef / CommandCatalog
 │   │   └── builtin.py  # Built-in commands
 │   └── groups/         # Top-level command groups
 │       ├── agent.py        # `markbot agent` subcommands
@@ -1456,6 +1515,7 @@ markbot/
 │   ├── helpers.py      # Helper functions
 │   ├── tokens.py       # Token utilities
 │   ├── atomic.py       # Atomic file write helpers
+│   ├── network.py      # Network helpers (proxy / connectivity)
 │   ├── ssrf.py         # SSRF guard for outbound HTTP
 │   └── website_policy.py # Per-domain website policy (allow/deny/proxy)
 ├── log/                # Logging
@@ -1470,6 +1530,14 @@ markbot/
     ├── ARCHITECTURE.md # Architecture context
     └── agents/         # Agent-specific templates
 ```
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ### Code Quality
 

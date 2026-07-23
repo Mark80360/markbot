@@ -481,6 +481,10 @@ class IterationRunner:
         self.permission_mode_override = permission_mode_override
         # Single control-plane decision engine (config-driven).
         self._tool_guardrail = self._build_tool_guardrail()
+        # Skill-guardrail hard-constraint block map: tc.id -> violation message.
+        # Populated during the pre-execution check_all pass, enforced in
+        # ``_execute_one_tool_call`` so error/critical violations never run.
+        self._guardrail_blocked: dict[str, str] = {}
         policy = getattr(loop, "cache_mutation_policy", None)
         if policy is None:
             raise RuntimeError("AgentLoop.cache_mutation_policy is required")
@@ -615,11 +619,53 @@ class IterationRunner:
             batches.append([i])
         return batches
 
+    def _check_skill_guardrail(self, tc: Any) -> None:
+        """Run skill-guardrail checks for *tc* and populate the block map.
+
+        Activates guarding if *tc* targets a skill tool, then runs
+        ``check_all`` and records error/critical violations in
+        ``self._guardrail_blocked`` so ``_execute_one_tool_call`` can
+        short-circuit the call with a ``PreblockedResult``.
+
+        Called from both the normal tool phase and the invalid-tool
+        recovery path so guardrail coverage is identical in both.
+        """
+        # Resolve provider-echoed (sanitised) name back to in-process name
+        # so downstream detection (skill guardrail, etc.) still works.
+        lookup_name = self.loop.tools.resolve_sanitised_name(tc.name)
+        if "." in lookup_name:
+            skill_name = lookup_name.split(".", 1)[0]
+            skill_def = self.loop.skill_registry.get(skill_name)
+            if skill_def and skill_name not in self.loop.guardrail_manager.active_skills:
+                self.loop.guardrail_manager.start_guarding(skill_def)
+                logger.info("Guardrail activated for skill: {}", skill_name)
+
+        guardrail_results = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
+        for gr in guardrail_results:
+            for v in gr.violations:
+                logger.warning(
+                    "Guardrail violation [{}] {} (tool: {}, skill: {})",
+                    v.severity.upper(),
+                    v.message,
+                    tc.name,
+                    getattr(v, 'tool_name', 'unknown'),
+                )
+                # Enforce hard constraint: error/critical violations block
+                # the tool call before execution. The PreblockedResult
+                # returned by _execute_one_tool_call flows through the
+                # existing observe() skip path (is_preblocked_result) so
+                # the failure window is not inflated by re-observation.
+                if v.severity in ("error", "critical") and tc.id not in self._guardrail_blocked:
+                    self._guardrail_blocked[tc.id] = v.message
+
     async def _execute_one_tool_call(self, tc: Any, ctx: ToolContext) -> Any:
         """Execute a single tool call, or return a pre-block denial without running it.
 
-        Pre-block is the single enforcement point for
-        ``ToolCallGuardrail.blocked_tools`` / ``blocked_signatures``.
+        Pre-block is the single enforcement point for two layers:
+          * ``ToolCallGuardrail.blocked_tools`` / ``blocked_signatures``
+            (loop-level failure-streak / no-progress defense)
+          * ``SkillGuardrail`` error/critical violations (skill hard
+            constraints such as "do not modify SOUL.md during a skill")
         """
         if self._tool_guardrail.is_call_blocked(tc.name, tc.arguments):
             msg = self._tool_guardrail.block_message(tc.name, tc.arguments)
@@ -629,6 +675,16 @@ class IterationRunner:
                 str(getattr(tc, "arguments", ""))[:120],
             )
             return PreblockedResult(msg)
+        skill_block_msg = self._guardrail_blocked.get(tc.id)
+        if skill_block_msg is not None:
+            logger.warning(
+                "Skill guardrail blocked tool={} (violation: {})",
+                tc.name,
+                skill_block_msg[:120],
+            )
+            return PreblockedResult(
+                f"Blocked by skill guardrail: {skill_block_msg}"
+            )
         return await self.loop.tools.execute(tc.name, tc.arguments, context=ctx)
 
     async def _execute_tool_calls_safely(
@@ -688,6 +744,7 @@ class IterationRunner:
         # Turn-local counters (blocked tools/signatures, streaks) always start
         # clean for this IterationRunner; only cross-loop fields persist.
         self._tool_guardrail.reset_turn_local()
+        self._guardrail_blocked.clear()
         self._runtime_budget.reset()
 
         # Cache-safe turn boundary: apply any deferred mutations, then lock.
@@ -2376,6 +2433,9 @@ class IterationRunner:
                         state.messages, tc.id, tc.name, error_msg
                     )
                 else:
+                    # Run skill guardrail checks (same as normal tool phase)
+                    # so error/critical violations block execution here too.
+                    self._check_skill_guardrail(tc)
                     # Same pre-block path as the normal tool phase.
                     result = await self._execute_one_tool_call(tc, recovery_ctx)
                     state.messages = await self.loop.context.add_tool_result_async(
@@ -2401,26 +2461,7 @@ class IterationRunner:
             self._invalid_tool_retries = 0
 
         for tc in response.tool_calls:
-            # Resolve provider-echoed (sanitised) name back to in-process name
-            # so downstream detection (skill guardrail, etc.) still works.
-            lookup_name = self.loop.tools.resolve_sanitised_name(tc.name)
-            if "." in lookup_name:
-                skill_name = lookup_name.split(".", 1)[0]
-                skill_def = self.loop.skill_registry.get(skill_name)
-                if skill_def and skill_name not in self.loop.guardrail_manager.active_skills:
-                    self.loop.guardrail_manager.start_guarding(skill_def)
-                    logger.info("Guardrail activated for skill: {}", skill_name)
-
-            guardrail_results = self.loop.guardrail_manager.check_all(tc.name, tc.arguments)
-            for gr in guardrail_results:
-                for v in gr.violations:
-                    logger.warning(
-                        "Guardrail violation [{}] {} (tool: {}, skill: {})",
-                        v.severity.upper(),
-                        v.message,
-                        tc.name,
-                        getattr(v, 'tool_name', 'unknown'),
-                    )
+            self._check_skill_guardrail(tc)
 
         logger.info("Executing {} tool calls...", len(response.tool_calls))
 
@@ -2471,6 +2512,8 @@ class IterationRunner:
         )
 
         for tc in response.tool_calls:
+            if tc.id in self._guardrail_blocked:
+                continue
             if self.on_tool_start:
                 context_str = None
                 if isinstance(tc.arguments, dict):
@@ -2482,7 +2525,10 @@ class IterationRunner:
                     logger.debug("on_tool_start callback failed: {}", e)
 
         # Emit TOOL_CALLED for each tool so monitors can track usage.
+        # Skip guardrail-blocked calls — they never actually executed.
         for tc in response.tool_calls:
+            if tc.id in self._guardrail_blocked:
+                continue
             self._emit(
                 EventType.TOOL_CALLED,
                 {"tool": tc.name, "call_id": tc.id},

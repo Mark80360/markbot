@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, Union
 
+from loguru import logger
+
 # Resource module is Unix-only
 try:
     import resource
@@ -20,6 +22,24 @@ except ImportError:
 # Windows: flag to suppress the console window that subprocess.Popen would
 # otherwise pop up for every child process. 0x08000000 == CREATE_NO_WINDOW.
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Environment variables considered safe to inherit into sandboxed children.
+# Secrets (API keys, tokens, passwords) are intentionally excluded — skills
+# must declare any needed env via SandboxConfig.environment.
+_SAFE_INHERITED_ENV_KEYS: frozenset[str] = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+    "LC_MESSAGES", "TMPDIR", "TEMP", "TMP", "SHELL", "TZ", "PWD",
+    "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",  # macOS dyld
+    "LD_LIBRARY_PATH",  # Linux ld.so
+})
+
+# Substrings that mark an env var as sensitive — never inherited even if it
+# appears in the safe set (belt-and-suspenders with the allowlist above).
+_SENSITIVE_ENV_SUBSTRINGS: tuple[str, ...] = (
+    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+    "CREDENTIAL", "API_KEY", "ACCESS_KEY",
+    "PRIVATE_KEY", "BEARER",
+)
 
 
 def _decode_output(data: bytes | None) -> str:
@@ -70,6 +90,14 @@ class SandboxConfig:
     # line; the previous hard-coded 5s killed the process too eagerly on
     # slow networks. Exposed here so operators can tune it per workload.
     stderr_drain_timeout_s: float = 15.0
+    # When True (default), attempt OS-level isolation before running the
+    # child: macOS ``sandbox-exec`` denies network and restricts file
+    # writes; Linux ``bwrap`` unshares the network namespace and bind-mounts
+    # the filesystem read-only except for cwd/tmp. If the platform tool is
+    # unavailable, the run degrades to PATH restriction (the legacy
+    # ``network`` flag) and ``ExecutionResult.isolation_level`` reflects
+    # ``"degraded"`` so callers know true isolation was not applied.
+    isolate: bool = True
 
     def resolve_workspace_path(self, workspace: Path) -> None:
         """Resolve {workspace} placeholder in allowed_paths."""
@@ -87,6 +115,10 @@ class ExecutionResult:
     stderr: str
     exit_code: Optional[int]
     execution_time_ms: float
+    # "os" = OS-level isolation (sandbox-exec / bwrap) was applied.
+    # "degraded" = OS tool unavailable; fell back to PATH restriction only.
+    # "none" = isolation disabled (isolate=False).
+    isolation_level: str = "none"
 
 
 class Sandbox:
@@ -122,6 +154,10 @@ class Sandbox:
         "nodejs": "node",
         "js": "node",
     }
+
+    # Cache for OS isolation tool availability: tool_name -> resolved path
+    # or "" (checked and unavailable). Absent key means unchecked.
+    _isolation_tool_cache: dict[str, str] = {}
 
     def __init__(self, config: Optional[Union[SandboxConfig, dict]] = None):
         """Initialize sandbox with configuration."""
@@ -260,15 +296,37 @@ class Sandbox:
         cmd, env = self._build_command(effective_script, language, args)
         cwd = cwd or script.parent
 
-        # Prepare environment
-        process_env = os.environ.copy()
+        # Prepare environment — inherit only safe, non-sensitive variables.
+        # Secrets (API keys, tokens) are NOT forwarded so a compromised skill
+        # script cannot exfiltrate them via os.environ. Skills that need a
+        # specific env var must declare it via SandboxConfig.environment.
+        process_env = {
+            k: v for k, v in os.environ.items()
+            if k in _SAFE_INHERITED_ENV_KEYS
+            and not any(s in k.upper() for s in _SENSITIVE_ENV_SUBSTRINGS)
+        }
         process_env.update(env)
         process_env["SANDBOX_MODE"] = "1"
 
-        # Apply PATH restrictions if no network
-        if not self.config.network:
-            # Keep only essential paths plus the interpreter's directory
-            import shutil
+        # Attempt OS-level isolation (macOS sandbox-exec / Linux bwrap).
+        # When applied, this denies network access and restricts file
+        # writes at the kernel level — far stronger than PATH restriction.
+        cmd, isolation_level = self._build_isolated_command(
+            cmd, cwd, effective_script
+        )
+        if isolation_level == "degraded":
+            logger.warning(
+                "OS isolation requested but tool unavailable; "
+                "falling back to PATH restriction only. "
+                "Install sandbox-exec (macOS, built-in) or bwrap (Linux) "
+                "for true network/filesystem isolation."
+            )
+
+        # Apply PATH restrictions only when OS isolation was NOT applied.
+        # OS isolation already denies network at the kernel level, so PATH
+        # clamping is redundant there and can break interpreter resolution
+        # inside the sandbox namespace.
+        if isolation_level != "os" and not self.config.network:
             interpreter_dir = str(Path(cmd[0]).parent.resolve()) if os.path.isfile(cmd[0]) else ""
 
             if os.name == "nt":
@@ -287,12 +345,30 @@ class Sandbox:
                 if os.name == "nt" or resource is None or not hasattr(resource, "setrlimit"):
                     return
                 try:
+                    # CPU time (soft, hard) — hard is soft+5s grace for SIGXCPU.
                     resource.setrlimit(
                         resource.RLIMIT_CPU,
                         (self.config.max_cpu_time, self.config.max_cpu_time + 5),
                     )
+                    # Memory. RLIMIT_AS on macOS is unreliable (breaks dyld
+                    # and malloc), so use RLIMIT_RSS (advisory) there; Linux
+                    # keeps the hard virtual-address cap via RLIMIT_AS.
                     max_memory = self.config.max_memory_mb * 1024 * 1024
-                    resource.setrlimit(resource.RLIMIT_AS, (max_memory, max_memory))
+                    if sys.platform == "darwin":
+                        rlimit_mem = getattr(resource, "RLIMIT_RSS", None)
+                        if rlimit_mem is not None:
+                            resource.setrlimit(rlimit_mem, (max_memory, max_memory))
+                    else:
+                        resource.setrlimit(resource.RLIMIT_AS, (max_memory, max_memory))
+                    # Open file descriptors — previously a dead config field.
+                    rlimit_nofile = getattr(resource, "RLIMIT_NOFILE", None)
+                    if rlimit_nofile is not None and self.config.max_files > 0:
+                        try:
+                            _, cur_hard = resource.getrlimit(rlimit_nofile)
+                        except (ValueError, OSError):
+                            cur_hard = self.config.max_files
+                        target = min(self.config.max_files, cur_hard)
+                        resource.setrlimit(rlimit_nofile, (target, cur_hard))
                 except (ValueError, OSError):
                     pass
 
@@ -326,6 +402,7 @@ class Sandbox:
                     stderr=_decode_output(stderr_data),
                     exit_code=process.returncode,
                     execution_time_ms=execution_time,
+                    isolation_level=isolation_level,
                 )
 
             except asyncio.TimeoutError:
@@ -344,6 +421,7 @@ class Sandbox:
                     stderr=f"Script execution timed out after {self.config.timeout}s",
                     exit_code=-1,
                     execution_time_ms=execution_time,
+                    isolation_level=isolation_level,
                 )
 
         except Exception as e:
@@ -355,6 +433,7 @@ class Sandbox:
                 stderr=f"Failed to execute script: {e}",
                 exit_code=-1,
                 execution_time_ms=execution_time,
+                isolation_level=isolation_level,
             )
         finally:
             # Clean up the preamble temp file if we created one.
@@ -444,3 +523,179 @@ class Sandbox:
                 continue
 
         return False, f"Script {script} is outside allowed paths: {self.config.allowed_paths}"
+
+    # ------------------------------------------------------------------
+    # OS-level isolation (macOS sandbox-exec / Linux bwrap)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_isolation_tool(cls, tool: str) -> str | None:
+        """Resolve *tool* to its path, with a one-time dry-run check.
+
+        Returns the executable path if the tool is available and functional,
+        otherwise ``None``. The result is cached per-tool for the process
+        lifetime so the dry-run cost is paid only once.
+
+        ``sandbox-exec`` on macOS may exist but fail at ``sandbox_apply``
+        due to SIP or missing entitlements; ``bwrap`` on Linux may fail if
+        unprivileged user namespaces are disabled. A no-op invocation
+        catches both cases so we degrade gracefully instead of crashing.
+        """
+        cached = cls._isolation_tool_cache.get(tool)
+        if cached:
+            return cached
+        if cached == "":
+            return None
+
+        import shutil
+        import subprocess
+
+        path = shutil.which(tool)
+        available = False
+        if path is not None:
+            try:
+                if tool == "sandbox-exec":
+                    result = subprocess.run(
+                        [path, "-p", "(version 1)\n(allow default)"],
+                        capture_output=True, timeout=3,
+                    )
+                    available = result.returncode == 0
+                elif tool == "bwrap":
+                    result = subprocess.run(
+                        [path, "--unshare-net", "--ro-bind", "/", "/", "true"],
+                        capture_output=True, timeout=3,
+                    )
+                    available = result.returncode == 0
+            except Exception:
+                available = False
+
+        if available and path:
+            cls._isolation_tool_cache[tool] = path
+            return path
+
+        cls._isolation_tool_cache[tool] = ""
+        if path is not None:
+            logger.warning(
+                "{} found at {} but failed dry-run availability check; "
+                "OS isolation disabled for this process. "
+                "Falling back to PATH restriction.",
+                tool, path,
+            )
+        else:
+            logger.info(
+                "{} not installed; OS isolation unavailable. "
+                "Install {} for true network/filesystem isolation.",
+                tool,
+                "bubblewrap (apt install bubblewrap)" if tool == "bwrap"
+                else "sandbox-exec (macOS built-in)",
+            )
+        return None
+
+    def _build_isolated_command(
+        self, cmd: list[str], cwd: Path, script_path: Path
+    ) -> tuple[list[str], str]:
+        """Wrap *cmd* with OS-level isolation if configured and available.
+
+        Returns ``(wrapped_cmd, isolation_level)`` where *isolation_level*
+        is:
+
+        * ``"os"`` — isolation applied (sandbox-exec or bwrap available).
+        * ``"degraded"`` — tool unavailable; caller should fall back to
+          PATH restriction via the legacy ``network`` flag.
+        * ``"none"`` — ``isolate=False`` or Windows (no isolation attempted).
+        """
+        if not self.config.isolate or os.name == "nt":
+            return cmd, "none"
+
+        writable = self._writable_paths_for(cwd, script_path)
+
+        if sys.platform == "darwin":
+            sandbox_exec = self._resolve_isolation_tool("sandbox-exec")
+            if sandbox_exec is None:
+                return cmd, "degraded"
+            profile = self._build_sandbox_exec_profile(writable)
+            return [sandbox_exec, "-p", profile] + cmd, "os"
+
+        if sys.platform.startswith("linux"):
+            bwrap = self._resolve_isolation_tool("bwrap")
+            if bwrap is None:
+                return cmd, "degraded"
+            args = self._build_bwrap_args(writable)
+            return [bwrap] + args + cmd, "os"
+
+        return cmd, "degraded"
+
+    @staticmethod
+    def _writable_paths_for(cwd: Path, script_path: Path) -> list[str]:
+        """Collect paths the child must be able to write to.
+
+        Includes the working directory, the script's parent (for preamble
+        temp files), and system temp directories (python ``tempfile``,
+        pip cache, etc.).
+        """
+        import tempfile
+
+        paths: set[str] = set()
+        try:
+            paths.add(str(cwd.resolve()))
+        except (OSError, RuntimeError):
+            paths.add(str(cwd))
+        try:
+            script_parent = script_path.parent.resolve()
+            paths.add(str(script_parent))
+        except (OSError, RuntimeError):
+            pass
+        try:
+            paths.add(tempfile.gettempdir())
+        except Exception:
+            pass
+        for t in ("/tmp", "/private/tmp", "/var/tmp"):
+            if Path(t).exists():
+                paths.add(t)
+        return sorted(paths)
+
+    @staticmethod
+    def _build_sandbox_exec_profile(writable_paths: list[str]) -> str:
+        """Build a macOS ``sandbox-exec`` profile.
+
+        * Denies **all** network access.
+        * Allows file reads everywhere (interpreter deps, stdlib, etc.).
+        * Denies file writes by default, then re-allows only the working
+          directory, script directory, and system temp dirs.
+        """
+        lines = [
+            "(version 1)",
+            "(deny network*)",
+            "(allow file-read*)",
+            "(deny file-write*)",
+            "(allow process*)",
+            "(allow sysctl*)",
+            "(allow signal)",
+            "(allow ipc-posix*)",
+        ]
+        for p in writable_paths:
+            # Escape backslashes and double quotes for the profile string.
+            safe = p.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'(allow file-write* (subpath "{safe}"))')
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_bwrap_args(writable_paths: list[str]) -> list[str]:
+        """Build ``bubblewrap`` args for Linux.
+
+        * ``--unshare-net`` — isolated network namespace (no network).
+        * ``--ro-bind / /`` — root filesystem read-only.
+        * ``--bind <p> <p>`` — specific writable bind-mounts (cwd, tmp).
+        * ``--dev`` / ``--proc`` / ``--tmpfs /run`` — standard mounts.
+        """
+        args = [
+            "--unshare-net",
+            "--ro-bind", "/", "/",
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", "/run",
+        ]
+        for p in writable_paths:
+            if Path(p).exists():
+                args.extend(["--bind", p, p])
+        return args
