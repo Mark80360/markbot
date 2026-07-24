@@ -45,6 +45,7 @@ dependencies = [
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",
     "portalocker>=2.5.0,<4.0.0",
+    "filelock>=3.13.0,<4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -118,10 +119,10 @@ allow-direct-references = true
 [tool.hatch.build]
 include = [
     "markbot/**/*.py",
+    "markbot/locales/*.json",
     "markbot/templates/**/*.md",
     "markbot/skills/**/*.md",
     "markbot/skills/**/*.sh",
-    "markbot/web/static/**/*",
 ]
 
 [tool.hatch.build.targets.wheel]

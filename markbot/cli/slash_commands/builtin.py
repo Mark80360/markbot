@@ -11,6 +11,7 @@ from loguru import logger
 from markbot import __version__
 from markbot.bus.events import OutboundMessage, make_session_key
 from markbot.cli.slash_commands.router import CommandContext, CommandRouter
+from markbot.locales import t
 from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import build_status_content
 
@@ -33,7 +34,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     total = cancelled + sub_cancelled
     session = loop.sessions.get_or_create(msg.session_key)
     loop.sessions.save(session)
-    content = f"Stopped {total} task(s)." if total else "No active task to stop."
+    content = t("cmd.stop.stopped", count=total) if total else t("cmd.stop.none")
     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
 
@@ -46,7 +47,7 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
         os.execv(sys.executable, [sys.executable, "-m", "markbot"] + sys.argv[1:])
 
     asyncio.create_task(_do_restart())
-    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="Restarting...")
+    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=t("cmd.restart.restarting"))
 
 
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:
@@ -107,7 +108,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.invalidate(session.key)
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="New session started. Summary task dispatched in background.",
+        content=t("cmd.new.started"),
     )
 
 
@@ -118,14 +119,14 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
     if not mm:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="Memory manager is not available.",
+            content=t("cmd.compact.no_manager"),
         )
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     history = session.get_history(max_messages=0)
     if not history:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="No messages to compact.",
+            content=t("cmd.compact.no_messages"),
         )
     session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
     # Run the synchronous compaction first, then reuse its output as
@@ -152,11 +153,11 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
         loop.sessions.save(session)
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=f"Compact complete!\n\n**Compressed Summary:**\n{summary}",
+            content=t("cmd.compact.complete", summary=summary),
         )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="Compact failed. Check logs for details.",
+        content=t("cmd.compact.failed"),
     )
 
 
@@ -167,18 +168,18 @@ async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
     if not mm:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="Memory manager is not available.",
+            content=t("cmd.compact_str.no_manager"),
         )
     session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
     summary = mm.get_compressed_summary(session_key=session_key)
     if not summary:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="No compressed summary yet. Use /compact or wait for auto-compaction.",
+            content=t("cmd.compact_str.none"),
         )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content=f"**Compressed Summary:**\n\n{summary}",
+        content=t("cmd.compact_str.show", summary=summary),
     )
 
 
@@ -199,7 +200,7 @@ async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.save(session)
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="History cleared. Compressed summary reset.",
+        content=t("cmd.clear.done"),
     )
 
 
@@ -211,7 +212,7 @@ async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
     if not steer_text:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content="Usage: /steer <instruction>\nExample: /steer focus on error handling",
+            content=t("cmd.steer.usage"),
         )
     session_key = msg.session_key
     # Steer is only consumed by ``_inject_pending_steer`` inside an active
@@ -223,18 +224,18 @@ async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
     if not has_running:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content="No agent loop is currently running for this session.",
+            content=t("cmd.steer.no_running"),
         )
     accepted = loop.steer(session_key, steer_text)
     if accepted:
         preview = steer_text[:80] + "..." if len(steer_text) > 80 else steer_text
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content=f"Steer queued: {preview}",
+            content=t("cmd.steer.queued", preview=preview),
         )
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
-        content="Steer rejected (empty instruction).",
+        content=t("cmd.steer.rejected"),
     )
 
 
@@ -287,22 +288,22 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
     if app_state is None:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="App state provider is not available.",
+            content=t("cmd.mode.no_app_state"),
         )
 
     arg = (ctx.args or "").strip().lower()
     if not arg:
         current = app_state.get_permission_mode()
         lines = [
-            "Permission modes:",
-            "  default    — confirm before destructive tools (interactive approval)",
-            "  plan       — read-only only, blocks all mutations",
-            "  accept_edits — allow file edits, still confirm destructive ops",
-            "  auto       — allow all tools without confirmation",
-            "  bypass     — bypass all permission checks (dangerous)",
+            t("cmd.mode.modes_header"),
+            t("cmd.mode.mode_default"),
+            t("cmd.mode.mode_plan"),
+            t("cmd.mode.mode_accept_edits"),
+            t("cmd.mode.mode_auto"),
+            t("cmd.mode.mode_bypass"),
             "",
-            f"Current mode: {current.value}",
-            "Use: /mode <mode> to switch.",
+            t("cmd.mode.current", mode=current.value),
+            t("cmd.mode.usage_hint"),
         ]
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
@@ -314,7 +315,7 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
     if mode is None:
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=f"Unknown mode '{arg}'. Valid: {', '.join(sorted(_MODE_ALIASES))}.",
+            content=t("cmd.mode.unknown", arg=arg, valid=", ".join(sorted(_MODE_ALIASES))),
         )
 
     app_state.set_permission_mode(mode)
@@ -327,9 +328,9 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
     persisted = update_config_value(
         ["agents", "defaults", "defaultPermissionMode"], mode.value,
     )
-    content = f"Permission mode set to: {mode.value}"
+    content = t("cmd.mode.set_to", mode=mode.value)
     if not persisted:
-        content += " (warning: failed to persist to config.json — mode will reset on restart)"
+        content += t("cmd.mode.persist_failed")
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=content,
@@ -359,22 +360,19 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
 
     arg = (ctx.args or "").strip().lower()
     if not arg:
-        lines = ["Runtime profiles:"]
+        lines = [t("cmd.profile.header")]
         for name in list_profiles():
             p = get_profile(name)
-            mark = " (current)" if name == current else ""
-            lines.append(f"  {name}{mark} — {p.description}")
+            mark = t("cmd.profile.current_mark") if name == current else ""
+            lines.append(t("cmd.profile.profile_line", name=name, mark=mark, desc=p.description))
             lines.append(
-                f"    permission={p.permission_mode}, "
-                f"desktop={p.enable_desktop}, browser={p.enable_browser}, "
-                f"autopilot={p.enable_autopilot}, min_skill_score={p.min_skill_score}"
+                t("cmd.profile.profile_detail",
+                  permission=p.permission_mode, desktop=p.enable_desktop,
+                  browser=p.enable_browser, autopilot=p.enable_autopilot,
+                  min_skill_score=p.min_skill_score)
             )
         lines.append("")
-        lines.append(
-            "Use: /profile <name> to switch now "
-            "(tool surface is deferred mid-turn for cache safety; "
-            "permission mode applies immediately)."
-        )
+        lines.append(t("cmd.profile.usage_hint"))
         # Show live footprint profile when available.
         live = None
         try:
@@ -382,7 +380,7 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
         except Exception:
             live = None
         if live and live != current:
-            lines.append(f"Live process profile: {live}")
+            lines.append(t("cmd.profile.live_profile", name=live))
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
             content="\n".join(lines),
@@ -392,7 +390,7 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
     if arg not in list_profiles():
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=f"Unknown profile '{arg}'. Valid: {', '.join(list_profiles())}.",
+            content=t("cmd.profile.unknown", arg=arg, valid=", ".join(list_profiles())),
         )
 
     from markbot.config.loader import update_config_value
@@ -405,12 +403,9 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
             app_state.set_permission_mode(PermissionMode(profile.permission_mode))
         except Exception:
             pass
-    content = (
-        f"Profile set to: {arg} (permission default: {profile.permission_mode}). "
-        "Tool surface changes apply on next gateway restart."
-    )
+    content = t("cmd.profile.set_to", name=arg, permission=profile.permission_mode)
     if not persisted:
-        content += " (warning: failed to persist to config.json)"
+        content += t("cmd.profile.persist_failed")
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
     )

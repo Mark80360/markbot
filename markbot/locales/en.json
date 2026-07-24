@@ -1,0 +1,80 @@
+{
+  "_comment": "MarkBot static-message catalog -- English (baseline / source of truth). Only user-facing static messages from permission approval prompts and slash-command replies live here. Agent-generated output, log lines, error tracebacks, tool outputs, and slash-command descriptions stay in English and are NOT translated. Keys are dotted paths; nesting below is purely for readability. Values may contain {placeholder} tokens for str.format substitution. When adding a new key, add it to EVERY locale file in the same commit -- tests/test_i18n.py asserts catalog parity.",
+
+  "permission": {
+    "confirmation_header": "🔐 Permission Confirmation",
+    "tool_label": "Tool: {tool_name}",
+    "reason_label": "Reason: {reason}",
+    "arguments_label": "Arguments:",
+    "args_none": "  (none)",
+    "choose_option": "Choose an option:",
+    "option_allow": "  1. Allow — run {tool_name} once",
+    "option_allow_all": "  2. Allow All — auto-approve remaining tools in this task",
+    "option_deny": "  3. Deny — do not run",
+    "reply_hint": "Reply with the number or label.",
+    "opt_allow_label": "Allow",
+    "opt_allow_desc": "Run {tool_name} once",
+    "opt_allow_all_label": "Allow All",
+    "opt_allow_all_desc": "Auto-approve remaining tools in this task",
+    "opt_deny_label": "Deny",
+    "opt_deny_desc": "Do not run this tool"
+  },
+
+  "cmd": {
+    "stop": {
+      "stopped": "Stopped {count} task(s).",
+      "none": "No active task to stop."
+    },
+    "restart": {
+      "restarting": "Restarting..."
+    },
+    "new": {
+      "started": "New session started. Summary task dispatched in background."
+    },
+    "compact": {
+      "no_manager": "Memory manager is not available.",
+      "no_messages": "No messages to compact.",
+      "complete": "Compact complete!\n\n**Compressed Summary:**\n{summary}",
+      "failed": "Compact failed. Check logs for details."
+    },
+    "compact_str": {
+      "no_manager": "Memory manager is not available.",
+      "none": "No compressed summary yet. Use /compact or wait for auto-compaction.",
+      "show": "**Compressed Summary:**\n\n{summary}"
+    },
+    "clear": {
+      "done": "History cleared. Compressed summary reset."
+    },
+    "steer": {
+      "usage": "Usage: /steer <instruction>\nExample: /steer focus on error handling",
+      "no_running": "No agent loop is currently running for this session.",
+      "queued": "Steer queued: {preview}",
+      "rejected": "Steer rejected (empty instruction)."
+    },
+    "mode": {
+      "no_app_state": "App state provider is not available.",
+      "modes_header": "Permission modes:",
+      "mode_default": "  default    — confirm before destructive tools (interactive approval)",
+      "mode_plan": "  plan       — read-only only, blocks all mutations",
+      "mode_accept_edits": "  accept_edits — allow file edits, still confirm destructive ops",
+      "mode_auto": "  auto       — allow all tools without confirmation",
+      "mode_bypass": "  bypass     — bypass all permission checks (dangerous)",
+      "current": "Current mode: {mode}",
+      "usage_hint": "Use: /mode <mode> to switch.",
+      "unknown": "Unknown mode '{arg}'. Valid: {valid}.",
+      "set_to": "Permission mode set to: {mode}",
+      "persist_failed": " (warning: failed to persist to config.json — mode will reset on restart)"
+    },
+    "profile": {
+      "header": "Runtime profiles:",
+      "current_mark": " (current)",
+      "profile_line": "  {name}{mark} — {desc}",
+      "profile_detail": "    permission={permission}, desktop={desktop}, browser={browser}, autopilot={autopilot}, min_skill_score={min_skill_score}",
+      "usage_hint": "Use: /profile <name> to switch now (tool surface is deferred mid-turn for cache safety; permission mode applies immediately).",
+      "live_profile": "Live process profile: {name}",
+      "unknown": "Unknown profile '{arg}'. Valid: {valid}.",
+      "set_to": "Profile set to: {name} (permission default: {permission}). Tool surface changes apply on next gateway restart.",
+      "persist_failed": " (warning: failed to persist to config.json)"
+    }
+  }
+}

@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.bus.events import OutboundMessage
+from markbot.locales import t
 from markbot.types.tool import ToolContext
 
 
@@ -94,9 +95,9 @@ class PermissionApprover:
 
         prompt = _build_prompt(tool_name, params, reason)
         options = [
-            {"label": "Allow", "description": f"Run {tool_name} once"},
-            {"label": "Allow All", "description": "Auto-approve remaining tools in this task"},
-            {"label": "Deny", "description": "Do not run this tool"},
+            {"label": t("permission.opt_allow_label"), "description": t("permission.opt_allow_desc", tool_name=tool_name)},
+            {"label": t("permission.opt_allow_all_label"), "description": t("permission.opt_allow_all_desc")},
+            {"label": t("permission.opt_deny_label"), "description": t("permission.opt_deny_desc")},
         ]
 
         # CLI can approve via stdin without a concurrent inbound bus consumer
@@ -190,12 +191,12 @@ def _build_prompt(tool_name: str, params: dict[str, Any], reason: str) -> str:
     """
     args_text = _format_args(params)
     lines = [
-        "🔐 Permission Confirmation",
+        t("permission.confirmation_header"),
         "",
-        f"Tool: {tool_name}",
-        f"Reason: {reason}",
+        t("permission.tool_label", tool_name=tool_name),
+        t("permission.reason_label", reason=reason),
         "",
-        "Arguments:",
+        t("permission.arguments_label"),
         args_text,
     ]
     return "\n".join(lines)
@@ -206,12 +207,12 @@ def _format_full_prompt(header: str, tool_name: str) -> str:
     return "\n".join([
         header,
         "",
-        "Choose an option:",
-        f"  1. Allow — run {tool_name} once",
-        "  2. Allow All — auto-approve remaining tools in this task",
-        "  3. Deny — do not run",
+        t("permission.choose_option"),
+        t("permission.option_allow", tool_name=tool_name),
+        t("permission.option_allow_all"),
+        t("permission.option_deny"),
         "",
-        "Reply with the number or label.",
+        t("permission.reply_hint"),
     ])
 
 
@@ -223,7 +224,7 @@ def _format_args(params: dict[str, Any], max_value_len: int = 80) -> str:
     decide allow/deny, not the full file contents.
     """
     if not params:
-        return "  (none)"
+        return t("permission.args_none")
     lines: list[str] = []
     for key, value in params.items():
         if isinstance(value, (dict, list)):
@@ -261,6 +262,12 @@ def _parse_choice(response: str) -> str:
     """Parse an approval response.
 
     Returns ``"allow"``, ``"allow_all"``, or ``"deny"``.
+
+    Recognizes the localized option labels (e.g. ``"允许"`` / ``"全部允许"``
+    / ``"拒绝"`` when display language is Chinese) so a non-English UI
+    still routes correctly.  English keywords (``allow`` / ``deny`` /
+    ``allow all``) and bare numbers (1/2/3) are always accepted as a
+    fallback, regardless of the active language.
     """
     text = (response or "").strip().lower()
     # Strip "User selected:" prefix from AskUserQuestionTool.
@@ -269,7 +276,22 @@ def _parse_choice(response: str) -> str:
     # Strip [Q:uuid] suffix if present.
     if "[q:" in text:
         text = text.split("[q:", 1)[0].strip()
-    # Check bare numbers / keywords first (before label stripping).
+
+    # Localized label matching — check the current language's option labels
+    # first so a user who clicks "允许" (zh) is correctly routed to "allow".
+    # Order matters: check "allow_all" before "allow" because the
+    # allow-all label may contain the allow label as a substring.
+    allow_all_label = t("permission.opt_allow_all_label").lower()
+    deny_label = t("permission.opt_deny_label").lower()
+    allow_label = t("permission.opt_allow_label").lower()
+    if allow_all_label and allow_all_label in text:
+        return "allow_all"
+    if deny_label and deny_label in text:
+        return "deny"
+    if allow_label and allow_label in text:
+        return "allow"
+
+    # English keyword fallback (always accepted regardless of UI language).
     if "allow all" in text or "allow-all" in text or text.strip() in {"2", "all"}:
         return "allow_all"
     if "deny" in text or text.startswith("no") or text.startswith("cancel"):

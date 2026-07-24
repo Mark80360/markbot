@@ -866,6 +866,27 @@ class CompactionConfig(Base):
     )
 
 
+class DisplayConfig(Base):
+    """Display / UI preferences.
+
+    Currently only holds the UI language for static user-facing messages
+    (permission approval prompts, slash-command replies).  Does NOT affect
+    agent responses, log lines, tool outputs, or slash-command descriptions
+    -- those follow the user's input language naturally.  Supported: en, zh.
+    Unknown values fall back to en.
+    """
+
+    language: str = Field(
+        default="en",
+        description=(
+            "UI language for static user-facing messages (approval prompts, "
+            "slash-command replies). Does NOT affect agent responses, log "
+            "lines, tool outputs, or slash-command descriptions. "
+            "Supported: en, zh. Unknown values fall back to en."
+        ),
+    )
+
+
 class BudgetConfig(Base):
     """Cost tracking and budget control configuration."""
 
@@ -936,6 +957,7 @@ class Config(BaseSettings):
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    display: DisplayConfig = Field(default_factory=DisplayConfig)
 
     @property
     def workspace_path(self) -> Path:

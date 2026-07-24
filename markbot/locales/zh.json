@@ -1,0 +1,80 @@
+{
+  "_comment": "MarkBot 静态消息目录 -- 中文（简体）。See locales/en.json for the source of truth; keep keys in sync.",
+
+  "permission": {
+    "confirmation_header": "🔐 权限确认",
+    "tool_label": "工具：{tool_name}",
+    "reason_label": "原因：{reason}",
+    "arguments_label": "参数：",
+    "args_none": "  （无）",
+    "choose_option": "请选择一个选项：",
+    "option_allow": "  1. 允许 — 执行 {tool_name} 一次",
+    "option_allow_all": "  2. 全部允许 — 自动批准本次任务中剩余的工具",
+    "option_deny": "  3. 拒绝 — 不执行",
+    "reply_hint": "回复编号或名称。",
+    "opt_allow_label": "允许",
+    "opt_allow_desc": "执行 {tool_name} 一次",
+    "opt_allow_all_label": "全部允许",
+    "opt_allow_all_desc": "自动批准本次任务中剩余的工具",
+    "opt_deny_label": "拒绝",
+    "opt_deny_desc": "不执行此工具"
+  },
+
+  "cmd": {
+    "stop": {
+      "stopped": "已停止 {count} 个任务。",
+      "none": "没有活跃的任务可停止。"
+    },
+    "restart": {
+      "restarting": "正在重启..."
+    },
+    "new": {
+      "started": "已开始新会话。摘要任务已在后台调度。"
+    },
+    "compact": {
+      "no_manager": "内存管理器不可用。",
+      "no_messages": "没有可压缩的消息。",
+      "complete": "压缩完成！\n\n**压缩摘要：**\n{summary}",
+      "failed": "压缩失败。请查看日志了解详情。"
+    },
+    "compact_str": {
+      "no_manager": "内存管理器不可用。",
+      "none": "暂无压缩摘要。使用 /compact 或等待自动压缩。",
+      "show": "**压缩摘要：**\n\n{summary}"
+    },
+    "clear": {
+      "done": "历史已清除。压缩摘要已重置。"
+    },
+    "steer": {
+      "usage": "用法：/steer <指令>\n示例：/steer 专注于错误处理",
+      "no_running": "当前会话没有正在运行的代理循环。",
+      "queued": "已排队指令：{preview}",
+      "rejected": "指令已拒绝（空指令）。"
+    },
+    "mode": {
+      "no_app_state": "应用状态提供器不可用。",
+      "modes_header": "权限模式：",
+      "mode_default": "  default    — 破坏性工具前确认（交互式审批）",
+      "mode_plan": "  plan       — 仅只读，阻止所有修改",
+      "mode_accept_edits": "  accept_edits — 允许文件编辑，仍确认破坏性操作",
+      "mode_auto": "  auto       — 允许所有工具，无需确认",
+      "mode_bypass": "  bypass     — 绕过所有权限检查（危险）",
+      "current": "当前模式：{mode}",
+      "usage_hint": "使用：/mode <模式> 来切换。",
+      "unknown": "未知模式 '{arg}'。有效值：{valid}。",
+      "set_to": "权限模式已设置为：{mode}",
+      "persist_failed": "（警告：未能持久化到 config.json — 模式将在重启后重置）"
+    },
+    "profile": {
+      "header": "运行时配置：",
+      "current_mark": "（当前）",
+      "profile_line": "  {name}{mark} — {desc}",
+      "profile_detail": "    permission={permission}, desktop={desktop}, browser={browser}, autopilot={autopilot}, min_skill_score={min_skill_score}",
+      "usage_hint": "使用：/profile <名称> 立即切换（工具表面为缓存安全在当前回合延迟生效；权限模式立即应用）。",
+      "live_profile": "实时进程配置：{name}",
+      "unknown": "未知配置 '{arg}'。有效值：{valid}。",
+      "set_to": "配置已设置为：{name}（权限默认：{permission}）。工具表面更改将在下次网关重启时生效。",
+      "persist_failed": "（警告：未能持久化到 config.json）"
+    }
+  }
+}
