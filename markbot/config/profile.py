@@ -19,7 +19,7 @@ TOOL_GROUPS: dict[str, frozenset[str]] = {
         "glob", "grep",
     }),
     "core_web": frozenset({"web_search", "web_fetch", "web_extract"}),
-    "core_shell": frozenset({"exec", "run_code", "code_execution"}),
+    "core_shell": frozenset({"exec", "run_code"}),
     "agent_ops": frozenset({
         "message", "think", "todo", "ask_user_question",
         "spawn", "check_subagent", "list_subagents",

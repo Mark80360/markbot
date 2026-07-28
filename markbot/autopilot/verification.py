@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import shlex
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +79,7 @@ def build_verification_commands(
     return selected
 
 
-def run_verification_steps(
+async def run_verification_steps(
     policy: VerificationPolicy,
     *,
     cwd: Path,
@@ -100,45 +100,9 @@ def run_verification_steps(
             )
             continue
 
-        target: str | list[str] = cmd.raw if cmd.shell else list(cmd.argv)
         try:
-            completed = subprocess.run(
-                target,
-                cwd=cwd,
-                shell=cmd.shell,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
-            steps.append(
-                VerificationStep(
-                    command=cmd.raw,
-                    returncode=completed.returncode,
-                    status="success" if completed.returncode == 0 else "failed",
-                    stdout=(completed.stdout or "")[-4000:],
-                    stderr=(completed.stderr or "")[-4000:],
-                )
-            )
-        except FileNotFoundError as exc:
-            steps.append(
-                VerificationStep(
-                    command=cmd.raw,
-                    returncode=-1,
-                    status="error",
-                    stderr=f"executable not found: {exc}",
-                )
-            )
-        except subprocess.TimeoutExpired as exc:
-            steps.append(
-                VerificationStep(
-                    command=cmd.raw,
-                    returncode=-1,
-                    status="error",
-                    stdout=str(getattr(exc, "stdout", ""))[-4000:],
-                    stderr=f"Timed out after {exc.timeout}s",
-                )
-            )
+            step = await _run_single_command(cmd, cwd=cwd, timeout=timeout)
+            steps.append(step)
         except Exception as exc:
             steps.append(
                 VerificationStep(
@@ -150,6 +114,65 @@ def run_verification_steps(
             )
 
     return steps
+
+
+async def _run_single_command(
+    cmd: VerificationCommand,
+    *,
+    cwd: Path,
+    timeout: int,
+) -> VerificationStep:
+    """Execute a single verification command asynchronously."""
+    if cmd.shell:
+        process = await asyncio.create_subprocess_shell(
+            cmd.raw,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        process = await asyncio.create_subprocess_exec(
+            *cmd.argv,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        return VerificationStep(
+            command=cmd.raw,
+            returncode=-1,
+            status="error",
+            stderr=f"Timed out after {timeout}s",
+        )
+    except asyncio.CancelledError:
+        # Prevent zombie subprocess when parent task is cancelled
+        # (autopilot shutdown, /stop, etc.)
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        raise
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+    stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+
+    return VerificationStep(
+        command=cmd.raw,
+        returncode=process.returncode or 0,
+        status="success" if process.returncode == 0 else "failed",
+        stdout=stdout[-4000:],
+        stderr=stderr[-4000:],
+    )
 
 
 def render_verification_report(
@@ -184,7 +207,10 @@ def render_verification_report(
 
 def verification_passed(steps: list[VerificationStep]) -> bool:
     if not steps:
-        return True
+        # No verification commands were applicable — nothing was verified.
+        # This is NOT a pass; treat it as a failure to prevent "false completion"
+        # in unattended autopilot runs.
+        return False
     return all(
         step.status in ("success", "skipped")
         for step in steps

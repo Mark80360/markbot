@@ -306,7 +306,7 @@ class AutopilotVerifyTool(BaseTool):
         config = store.load_config()
         store.update_status(task_id, status="verifying", note="running verification")
 
-        steps = run_verification_steps(
+        steps = await run_verification_steps(
             config.verification_policy,
             cwd=workspace,
         )

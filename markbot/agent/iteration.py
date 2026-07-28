@@ -124,7 +124,7 @@ VERIFICATION_TOOL_NAMES: frozenset[str] = frozenset({
     "exec",          # shell — runs pytest, npm test, make, etc.
     "shell",
     "run_command",
-    "code_execution",  # in-process Python (sandboxed)
+    "run_code",      # in-process Python (sandboxed) — CodeExecutionTool.name
 })
 
 # File extensions that are pure documentation — editing them does not
@@ -416,7 +416,7 @@ class LoopState:
     # 让 LLM 先跑测试/lint/type-check。超过 _MAX_VERIFY_NUDGES 后放行，
     # 避免无限验证循环。
     verify_nudges: int = 0
-    # 本轮是否已调用过验证类工具（exec/shell/code_execution）。
+    # 本轮是否已调用过验证类工具（exec/shell/run_code）。
     # 用于 verify-on-stop 判定：如果已验证过，则不再注入 nudge。
     verification_done: bool = False
     # 本轮是否执行了副作用动作命令（restart/install/pull/kill 等）
@@ -1433,9 +1433,9 @@ class IterationRunner:
         lookup_name = self.loop.tools.resolve_sanitised_name(tool_call.name)
         if lookup_name not in VERIFICATION_TOOL_NAMES:
             return
-        # code_execution is in-process Python (ad-hoc checks, not ops
+        # run_code is in-process Python (ad-hoc checks, not ops
         # actions) — always counts as verification.
-        if lookup_name == "code_execution":
+        if lookup_name == "run_code":
             state.verification_done = True
             state.side_effect_pending = False
             return
@@ -2613,7 +2613,7 @@ class IterationRunner:
             # excluded because their file effects are not deterministically
             # parseable from arguments.
             self._record_file_mutation(state, tool_call, result)
-            # Track verification tool calls (exec/shell/code_execution) for
+            # Track verification tool calls (exec/shell/run_code) for
             # the verify-on-stop nudge — see _should_inject_verify_nudge.
             self._record_verification_call(state, tool_call, result)
 
@@ -2733,7 +2733,7 @@ class IterationRunner:
 
         # Verify-on-stop nudge: if the model edited files this turn but
         # tries to end without calling any verification tool (exec/shell/
-        # code_execution), inject a nudge and continue the loop instead of
+        # run_code), inject a nudge and continue the loop instead of
         # accepting the final response. Mirrors agent's verify-on-stop:
         # "completion requires both done AND verified". Capped at
         # _MAX_VERIFY_NUDGES per turn to avoid infinite loops. Skipped for

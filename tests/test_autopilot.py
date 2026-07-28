@@ -525,45 +525,51 @@ class TestBuildVerificationCommands:
 
 
 class TestRunVerificationSteps:
-    def test_empty_policy_no_steps(self, tmp_path: Path):
-        steps = run_verification_steps(VerificationPolicy(), cwd=tmp_path)
+    @pytest.mark.asyncio
+    async def test_empty_policy_no_steps(self, tmp_path: Path):
+        steps = await run_verification_steps(VerificationPolicy(), cwd=tmp_path)
         assert steps == []
 
-    def test_runs_real_command(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        import subprocess as sp
-        from types import SimpleNamespace
+    @pytest.mark.asyncio
+    async def test_runs_real_command(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # Mock _run_single_command instead of subprocess.run since
+        # run_verification_steps is now async.
+        from markbot.autopilot import verification as vmod
 
-        def fake_run(target, *, cwd, shell, text, capture_output, check, timeout):
-            assert shell is False
-            assert cwd == tmp_path
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        async def fake_run_single(cmd, *, cwd, timeout):
+            return VerificationStep(
+                command=cmd.raw, returncode=0, status="success", stdout="ok\n",
+            )
 
-        monkeypatch.setattr(sp, "run", fake_run)
+        monkeypatch.setattr(vmod, "_run_single_command", fake_run_single)
         (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
         policy = VerificationPolicy(commands=["pytest -q"])
-        steps = run_verification_steps(policy, cwd=tmp_path)
+        steps = await run_verification_steps(policy, cwd=tmp_path)
         assert len(steps) == 1
         assert steps[0].status == "success"
         assert steps[0].returncode == 0
         assert steps[0].stdout == "ok\n"
 
-    def test_error_command_produces_error_step(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_error_command_produces_error_step(self, tmp_path: Path):
         policy = VerificationPolicy(commands=["bad && cmd"])
-        steps = run_verification_steps(policy, cwd=tmp_path)
+        steps = await run_verification_steps(policy, cwd=tmp_path)
         assert len(steps) == 1
         assert steps[0].status == "error"
         assert steps[0].returncode == -1
 
-    def test_missing_executable(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_missing_executable(self, tmp_path: Path):
         policy = VerificationPolicy(commands=["this-binary-does-not-exist-xyz"])
-        steps = run_verification_steps(policy, cwd=tmp_path)
+        steps = await run_verification_steps(policy, cwd=tmp_path)
         assert steps[0].status == "error"
-        assert "not found" in steps[0].stderr.lower()
+        assert steps[0].returncode == -1
 
 
 class TestVerificationPassed:
-    def test_empty_passes(self):
-        assert verification_passed([]) is True
+    def test_empty_fails(self):
+        # Empty steps = nothing was verified, must not claim success
+        assert verification_passed([]) is False
 
     def test_all_success(self):
         steps = [
@@ -851,10 +857,11 @@ class TestVerifyTool:
         _clear_store_cache()
         ctx = _build_context(temp_workspace)
         tool = AutopilotVerifyTool()
+        # Empty verification no longer passes — the card stays "repairing"
         result = await tool.execute({"task_id": c.id, "summary": "done"}, ctx)
-        assert "PASSED" in result
+        assert "FAILED" in result
         card = store.get_card(c.id)
-        assert card.status == "completed"
+        assert card.status == "repairing"
         _invalidate_store(temp_workspace)
 
     async def test_fails_when_verification_fails(
@@ -868,7 +875,7 @@ class TestVerifyTool:
         c, _ = store.enqueue_card(source_kind="manual_idea", title="t", body="b")
         _clear_store_cache()
 
-        def fake_run(policy, *, cwd, timeout=1800):
+        async def fake_run(policy, *, cwd, timeout=1800):
             return [VerificationStep(command="false", returncode=1, status="failed")]
 
         monkeypatch.setattr(
@@ -968,11 +975,14 @@ class TestAutopilotService:
         svc = service_mod.AutopilotService(store, agent)
         # disable human gate so config is plain
         store._file_config = None
-        # ensure no verification commands → passes
+        # ensure no verification commands → provide a passing step
+        async def fake_verify(policy, *, cwd):
+            return [VerificationStep(command="echo ok", returncode=0, status="success")]
+
         monkeypatch.setattr(
             service_mod,
             "run_verification_steps",
-            lambda policy, *, cwd: [],
+            fake_verify,
             raising=True,
         )
         await svc.intake(source_kind="manual_idea", title="T", body="b")
@@ -1001,7 +1011,7 @@ class TestAutopilotService:
         agent = FakeAgentLoop(content="tried")
         svc = service_mod.AutopilotService(store, agent)
 
-        def fake_run(policy, *, cwd):
+        async def fake_run(policy, *, cwd):
             return [VerificationStep(command="false", returncode=1, status="failed")]
 
         monkeypatch.setattr(service_mod, "run_verification_steps", fake_run, raising=True)
@@ -1057,8 +1067,11 @@ class TestAutopilotService:
     ):
         agent = FakeAgentLoop(content="ok")
         svc = service_mod.AutopilotService(store, agent)
+        async def fake_verify(policy, *, cwd):
+            return [VerificationStep(command="echo ok", returncode=0, status="success")]
+
         monkeypatch.setattr(
-            service_mod, "run_verification_steps", lambda policy, *, cwd: [], raising=True,
+            service_mod, "run_verification_steps", fake_verify, raising=True,
         )
         await svc.intake(source_kind="manual_idea", title="T", body="b")
         result = await svc.tick()

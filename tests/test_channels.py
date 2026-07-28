@@ -389,12 +389,22 @@ class TestChannelManager:
         assert set(mgr.enabled_channels) >= {"dingtalk", "email"}
 
     @pytest.mark.asyncio
-    async def test_start_all_with_no_channels_returns_early(self):
+    async def test_start_all_with_no_channels_creates_dispatcher(self):
         cfg = self._make_config({})
         mgr = ChannelManager(cfg, _make_bus())
-        # Should not raise; should not create dispatch tasks.
-        await mgr.start_all()
-        assert mgr._dispatch_task is None
+        # Outbound dispatcher always runs, even without inbound channels.
+        # start_all() now blocks on the dispatch task (non-cancelling return)
+        # so we wrap it with a short timeout to avoid hanging the test suite.
+        try:
+            await asyncio.wait_for(mgr.start_all(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        assert mgr._dispatch_task is not None
+        mgr._dispatch_task.cancel()
+        try:
+            await mgr._dispatch_task
+        except asyncio.CancelledError:
+            pass
 
     @pytest.mark.asyncio
     async def test_stop_all_with_no_channels(self):

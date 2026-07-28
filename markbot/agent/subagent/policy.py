@@ -81,7 +81,13 @@ class DelegationPolicy:
         return CapabilityToken.read_only()
 
     def harden_capability(self, capability: CapabilityToken | None) -> CapabilityToken:
-        """Merge policy blocked tools into a capability token."""
+        """Merge policy blocked tools into a capability token.
+        
+        Note: allow_nested_spawn / max_spawn_depth are intentionally not
+        enforced here because the subagent tool registry (manager.py) does
+        not include the spawn tool — subagents cannot recursively spawn,
+        making the depth and nesting controls unreachable.
+        """
         if capability is None:
             capability = self.default_capability()
         merged_forbidden = tuple(
@@ -139,6 +145,8 @@ class DelegationTracker:
     # parent_task_id -> depth (root parent uses depth 0)
     depths: dict[str, int] = field(default_factory=dict)
     session_spawn_counts: dict[str, int] = field(default_factory=dict)
+    # task_id -> session_key for proper quota release on unregister
+    _task_sessions: dict[str, str] = field(default_factory=dict)
 
     def depth_of(self, parent_id: str | None) -> int:
         if not parent_id:
@@ -153,10 +161,18 @@ class DelegationTracker:
             self.session_spawn_counts[session_key] = (
                 self.session_spawn_counts.get(session_key, 0) + 1
             )
+            self._task_sessions[task_id] = session_key
         return child_depth
 
     def unregister(self, task_id: str) -> None:
         self.depths.pop(task_id, None)
+        session_key = self._task_sessions.pop(task_id, None)
+        if session_key and session_key in self.session_spawn_counts:
+            count = self.session_spawn_counts[session_key] - 1
+            if count <= 0:
+                del self.session_spawn_counts[session_key]
+            else:
+                self.session_spawn_counts[session_key] = count
 
     def session_count(self, session_key: str | None) -> int:
         if not session_key:

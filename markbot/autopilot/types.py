@@ -104,6 +104,9 @@ class AutopilotPolicy:
     repair_stop_on: list[str] = field(
         default_factory=lambda: ["agent_runtime_error", "permission_error"],
     )
+    # Safety cap for unattended runs — prevents runaway cost in
+    # autopilot mode. Set to 0 to disable.
+    max_budget_usd: float = 5.0
 
 
 @dataclass

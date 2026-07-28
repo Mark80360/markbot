@@ -330,7 +330,8 @@ class TestIdleTimeout:
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._session_last_active = {"ses:1": 0}
-        loop._active_tasks = {"ses:1": [asyncio.Future()]}
+        _fut_loop = asyncio.new_event_loop()
+        loop._active_tasks = {"ses:1": [_fut_loop.create_future()]}
         loop._session_locks = {"ses:1": asyncio.Lock()}
         loop._pending_steer = {"ses:1": "pending"}
         loop._scrubber_pool = type("Fake", (), {

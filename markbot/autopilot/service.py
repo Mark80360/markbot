@@ -228,26 +228,43 @@ class AutopilotService:
             except Exception as exc:
                 logger.error("Autopilot agent execution failed: {}", exc)
                 assistant_summary = ""
-                self._store.update_status(
-                    card.id,
-                    status="failed",
-                    note=f"agent runtime error: {exc}",
-                    metadata_updates={
-                        "last_failure_stage": "agent_runtime_error",
-                        "last_failure_summary": str(exc),
-                    },
+                prior_failure_stage = "agent_runtime_error"
+                prior_failure_summary = str(exc)
+                self._store.append_journal(
+                    kind="run_error",
+                    summary=f"{card.title}: agent runtime error on attempt {attempt_count}",
+                    task_id=card.id,
+                    metadata={"attempt": attempt_count, "error": str(exc)},
                 )
-                return TaskRunResult(
-                    card_id=card.id,
-                    status="failed",
-                    assistant_summary=str(exc),
-                    attempt_count=attempt_count,
-                    worktree_path=str(working_cwd),
-                )
+                # Check policy: should we repair or stop?
+                repair_stop_on = config.autopilot_policy.repair_stop_on
+                repair_retry_on = config.autopilot_policy.repair_retry_on
+                should_stop = prior_failure_stage in repair_stop_on
+                should_retry = prior_failure_stage in repair_retry_on or not repair_retry_on
+                if should_stop or not should_retry or attempt_count >= max_attempts:
+                    self._store.update_status(
+                        card.id,
+                        status="failed",
+                        note=f"agent runtime error: {exc}",
+                        metadata_updates={
+                            "last_failure_stage": prior_failure_stage,
+                            "last_failure_summary": prior_failure_summary,
+                        },
+                    )
+                    return TaskRunResult(
+                        card_id=card.id,
+                        status="failed",
+                        assistant_summary=str(exc),
+                        attempt_count=attempt_count,
+                        worktree_path=str(working_cwd),
+                    )
+                # Continue loop for repair attempt
+                self._store.update_status(card.id, status="repairing", note=f"retrying after agent error (attempt {attempt_count}/{max_attempts})")
+                continue
 
             self._store.update_status(card.id, status="verifying")
 
-            verification_steps = run_verification_steps(
+            verification_steps = await run_verification_steps(
                 config.verification_policy,
                 cwd=working_cwd,
             )

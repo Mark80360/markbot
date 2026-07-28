@@ -723,7 +723,10 @@ class AgentLoop:
         if ":" in session_key:
             channel, chat_id = session_key.split(":", 1)
 
-        # 暂时取消，不要删除
+        # Idle timeout notification is intentionally disabled:
+        # notifying a user whose session was already idle for 30+ minutes
+        # is unlikely to be useful and may be confusing. The session
+        # cleanup still runs (in-flight task drain + state removal).
         # try:
         #     await self.bus.publish_outbound(
         #         OutboundMessage(

@@ -62,8 +62,14 @@ class AnthropicProvider(LLMProvider):
     def _convert_messages(
         self, messages: list[dict[str, Any]],
     ) -> tuple[str | list[dict[str, Any]], list[dict[str, Any]]]:
-        """Return ``(system, anthropic_messages)``."""
-        system: str | list[dict[str, Any]] = ""
+        """Return ``(system, anthropic_messages)``.
+
+        Multiple system messages are accumulated into a list so that
+        harness-injected mid-conversation system messages (e.g. failure
+        blocklisting, todo re-injection, compact summaries, snip notices)
+        are not silently overwritten.
+        """
+        system_blocks: list[dict[str, Any]] = []
         raw: list[dict[str, Any]] = []
 
         for msg in messages:
@@ -71,7 +77,9 @@ class AnthropicProvider(LLMProvider):
             content = msg.get("content")
 
             if role == "system":
-                system = content if isinstance(content, (str, list)) else str(content or "")
+                text = content if isinstance(content, str) else str(content or "")
+                if text:
+                    system_blocks.append({"type": "text", "text": text})
                 continue
 
             if role == "tool":
@@ -98,6 +106,16 @@ class AnthropicProvider(LLMProvider):
                     "content": self._convert_user_content(content),
                 })
                 continue
+
+        # Post-loop: convert accumulated system blocks into the format
+        # expected by the Anthropic Messages API (str or list of text blocks).
+        system: str | list[dict[str, Any]]
+        if not system_blocks:
+            system = ""
+        elif len(system_blocks) == 1:
+            system = system_blocks[0]["text"]
+        else:
+            system = system_blocks
 
         return system, self._merge_consecutive(raw)
 
