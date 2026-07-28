@@ -193,14 +193,24 @@ class TestRecordVerificationCall:
         # the file-edit verify path (most exec calls ARE verification).
         assert state.verification_done is True
 
-    def test_code_execution_always_counts_as_verification(self):
+    def test_run_code_always_counts_as_verification(self):
         runner = _make_runner()
         state = _make_state(side_effect_pending=True)
         runner._record_verification_call(
-            state, _tool_call("code_execution", ""), "result"
+            state, _tool_call("run_code", ""), "result"
         )
         assert state.verification_done is True
         assert state.side_effect_pending is False
+
+    def test_registered_run_code_tool_name_is_tracked(self):
+        """Regression guard: the code-execution tool registers as ``run_code``
+        (see CodeExecutionTool.name). VERIFICATION_TOOL_NAMES must contain
+        that exact name, otherwise real run_code calls never count as
+        verification and verify-on-stop nudges fire spuriously."""
+        from markbot.agent.iteration import VERIFICATION_TOOL_NAMES
+        from markbot.tools.code import CodeExecutionTool
+
+        assert CodeExecutionTool().name in VERIFICATION_TOOL_NAMES
 
     def test_non_verification_tool_ignored(self):
         runner = _make_runner()

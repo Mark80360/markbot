@@ -140,39 +140,27 @@ async def update_cron_job(job_id: str, data: CronUpdate):
 
         # Toggle enabled state via the dedicated method
         if data.enabled is not None and data.enabled != job.enabled:
-            cron.enable_job(job_id, data.enabled)
-            # Re-fetch the updated job
-            job = cron.get_job(job_id)
-            if job is None:
+            toggled = cron.enable_job(job_id, data.enabled)
+            if toggled is None:
                 return JSONResponse({"error": "Job disappeared after toggle"}, status_code=500)
 
-        # Update fields in place to preserve the job ID
-        changed = False
-        if data.name is not None and data.name != job.name:
-            job.name = data.name
-            changed = True
-        if data.command is not None and data.command != job.payload.message:
-            job.payload.message = data.command
-            changed = True
+        # Build a new schedule if the cron expr or tz changed
+        new_schedule = None
         if data.schedule is not None or data.tz is not None:
-            from markbot.schedule.cron import CronSchedule, _compute_next_run, _now_ms, _validate_schedule_for_add
+            from markbot.schedule.cron import CronSchedule
             new_expr = data.schedule if data.schedule is not None else (job.schedule.expr or "")
             new_tz = data.tz if data.tz is not None else job.schedule.tz
             new_schedule = CronSchedule(kind="cron", expr=new_expr, tz=new_tz)
-            # Validate cron expression and timezone before applying
-            _validate_schedule_for_add(new_schedule)
-            job.schedule = new_schedule
-            # Recompute next run for the new schedule
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms()) if job.enabled else None
-            changed = True
 
-        if changed:
-            job.updated_at_ms = int(__import__("time").time() * 1000)
-            # Persist changes by saving the store
-            cron._save_store()
-            cron._arm_timer()
-
-        return JSONResponse({"ok": True, "job": _job_to_dict(job)})
+        updated = cron.update_job(
+            job_id,
+            name=data.name,
+            message=data.command,
+            schedule=new_schedule,
+        )
+        if updated is None:
+            return JSONResponse({"error": "Job not found"}, status_code=404)
+        return JSONResponse({"ok": True, "job": _job_to_dict(updated)})
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:

@@ -89,8 +89,14 @@ def _get_cpu_info() -> dict:
 @router.get("/api/system/stats")
 async def system_stats():
     from markbot import __version__
-    import psutil
     import asyncio
+    try:
+        import psutil
+    except ImportError:
+        return JSONResponse(
+            {"error": "psutil not installed", "version": __version__},
+            status_code=503,
+        )
 
     # Run blocking psutil calls in a thread to avoid blocking the event loop
     def _gather():

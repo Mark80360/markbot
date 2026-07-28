@@ -25,7 +25,6 @@ def regenerate_token() -> str:
     return _session_token
 
 
-EXEMPT_PREFIXES = {"/api/status"}
 EXEMPT_PATHS = {"/api/status"}
 
 
@@ -34,12 +33,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         # 非 API 路径（SPA 路由、静态资源）免认证
         if not path.startswith("/api/"):
             return True
-        if path in EXEMPT_PATHS:
-            return True
-        for prefix in EXEMPT_PREFIXES:
-            if path.startswith(prefix):
-                return True
-        return False
+        return path in EXEMPT_PATHS
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -47,6 +41,11 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         if self._is_exempt(request.url.path):
             return await call_next(request)
         token = request.headers.get("x-markbot-session-token", "")
+        # Fallback to ?token= for browser-native resource loads (img/audio/
+        # video tags, opened download links) which cannot attach custom
+        # headers. Uses the same session token via secrets.compare_digest.
+        if not token:
+            token = request.query_params.get("token", "")
         if not secrets.compare_digest(token, _session_token):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)

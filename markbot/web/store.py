@@ -167,19 +167,24 @@ class WebSessionStore:
     def bulk_delete_sessions(self, ids: list[str]) -> int:
         if not ids:
             return 0
-        placeholders = ",".join("?" * len(ids))
-        cur = self._conn.execute(
-            f"DELETE FROM web_sessions WHERE id IN ({placeholders})", ids,
-        )
-        self._conn.commit()
-        return cur.rowcount
+        # SQLite 默认参数上限 999；分批避免超限。
+        BATCH = 900
+        deleted = 0
+        for i in range(0, len(ids), BATCH):
+            batch = ids[i:i + BATCH]
+            placeholders = ",".join("?" * len(batch))
+            cur = self._conn.execute(
+                f"DELETE FROM web_sessions WHERE id IN ({placeholders})", batch,
+            )
+            self._conn.commit()
+            deleted += cur.rowcount
+        return deleted
 
     def delete_messages_from(self, session_id: str, timestamp: float) -> int:
         cur = self._conn.execute(
             "DELETE FROM web_messages WHERE session_id = ? AND timestamp >= ?",
             (session_id, timestamp),
         )
-        self._conn.commit()
         self._conn.execute(
             "UPDATE web_sessions SET message_count = (SELECT COUNT(*) FROM web_messages WHERE session_id = ?) WHERE id = ?",
             (session_id, session_id),
@@ -200,7 +205,13 @@ class WebSessionStore:
         )
         self._conn.commit()
 
-    def export_session_markdown(self, session_id: str) -> str | None:
+    def export_session_markdown(self, session_id: str) -> tuple[str, str] | None:
+        """Export a session as markdown.
+
+        Returns ``(markdown, title)`` so callers don't need a second
+        ``get_session`` lookup just to obtain the title. Returns None if
+        the session does not exist.
+        """
         row = self._conn.execute(
             "SELECT title FROM web_sessions WHERE id = ?", (session_id,),
         ).fetchone()
@@ -218,4 +229,17 @@ class WebSessionStore:
             lines.append("")
             lines.append(m["content"])
             lines.append("")
-        return "\n".join(lines)
+        return "\n".join(lines), title
+
+
+# Module-level singleton accessor. Prefer get_store() over constructing
+# WebSessionStore() directly so all callers (server + sessions router)
+# share one connection pool and operate on the same in-memory state.
+_instance: "WebSessionStore | None" = None
+
+
+def get_store() -> "WebSessionStore":
+    global _instance
+    if _instance is None:
+        _instance = WebSessionStore()
+    return _instance

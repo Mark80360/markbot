@@ -117,6 +117,20 @@ def _write_env_file(path: Path, env_dict: dict[str, str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _invalidate_agent_safe() -> None:
+    """Invalidate the cached web agent loop so it rebuilds with new env vars.
+
+    Imported lazily to avoid a circular import with markbot.web.server.
+    Failures are swallowed because env persistence already succeeded.
+    """
+    try:
+        from markbot.web.server import invalidate_agent
+
+        invalidate_agent()
+    except Exception:
+        pass
+
+
 class EnvSet(BaseModel):
     key: str
     value: str
@@ -149,6 +163,10 @@ async def set_env(data: EnvSet):
     except Exception:
         pass  # Still return ok since we set it in the process env
 
+    # Env changes (e.g. API keys) may be cached by the running agent loop;
+    # invalidate so it rebuilds on the next request.
+    _invalidate_agent_safe()
+
     return JSONResponse({"ok": True})
 
 
@@ -165,6 +183,8 @@ async def delete_env(key: str):
             _write_env_file(env_path, env_dict)
     except Exception:
         pass
+
+    _invalidate_agent_safe()
 
     return JSONResponse({"ok": True})
 
@@ -223,6 +243,8 @@ async def import_env(data: EnvImport):
             os.environ[k] = v
             existing[k] = v
         _write_env_file(env_path, existing)
+
+        _invalidate_agent_safe()
 
         return JSONResponse({"ok": True, "imported": len(env_dict)})
     except Exception as e:

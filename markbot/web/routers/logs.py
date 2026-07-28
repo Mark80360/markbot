@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -50,7 +51,8 @@ async def get_logs(file: str = "markbot.log", lines: int = 200, level: str = "",
         text = log_file.read_text(encoding="utf-8", errors="replace")
         entries = text.strip().split("\n")[-lines:]
         if level:
-            entries = [e for e in entries if level.upper() in e]
+            pat = re.compile(rf"\b{re.escape(level.upper())}\b")
+            entries = [e for e in entries if pat.search(e)]
         if component:
             entries = [e for e in entries if component.lower() in e.lower()]
         return JSONResponse({"logs": entries, "file": file, "path": str(log_file)})

@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Save, Code, FormInput, Search, X, RotateCcw,
   Settings, Bot, Brain, Shield, Globe, Wrench,
+  ChevronRight, ChevronDown,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Loading } from "@/components/Loading";
@@ -13,10 +14,13 @@ import { cn } from "@/lib/utils";
 const CATEGORY_ICONS: Record<string, typeof Settings> = {
   general: Settings,
   agent: Bot,
+  agents: Bot,
   memory: Brain,
   security: Shield,
   tools: Wrench,
   web: Globe,
+  channels: Globe,
+  providers: Brain,
 };
 
 function getNestedValue(obj: any, path: string): any {
@@ -35,8 +39,14 @@ function setNestedValue(obj: any, path: string, value: any): any {
   return result;
 }
 
-function flattenConfig(obj: any, prefix = ""): { key: string; value: any; type: string }[] {
-  const result: { key: string; value: any; type: string }[] = [];
+interface FlatField {
+  key: string;
+  value: any;
+  type: string;
+}
+
+function flattenConfig(obj: any, prefix = ""): FlatField[] {
+  const result: FlatField[] = [];
   if (obj === null || obj === undefined) return result;
   if (typeof obj !== "object" || Array.isArray(obj)) {
     const type = Array.isArray(obj) ? "array" : typeof obj;
@@ -55,8 +65,24 @@ function flattenConfig(obj: any, prefix = ""): { key: string; value: any; type: 
 }
 
 function getCategory(key: string): string {
-  const first = key.split(".")[0];
-  return first || "general";
+  return key.split(".")[0] || "general";
+}
+
+/** Get the sub-group key within a category (2nd segment of the path). */
+function getSubGroup(key: string): string {
+  const parts = key.split(".");
+  return parts.length > 1 ? parts[1] : "_root";
+}
+
+/** Group fields by sub-group within a category. */
+function groupBySubGroup(fields: FlatField[]): Map<string, FlatField[]> {
+  const map = new Map<string, FlatField[]>();
+  for (const f of fields) {
+    const sg = getSubGroup(f.key);
+    if (!map.has(sg)) map.set(sg, []);
+    map.get(sg)!.push(f);
+  }
+  return map;
 }
 
 function ConfigField({
@@ -102,7 +128,7 @@ function ConfigField({
           type="number"
           value={value ?? ""}
           onChange={(e) => onChange(fieldKey, e.target.value === "" ? null : Number(e.target.value))}
-          className="w-24 px-2 py-1 text-sm text-right rounded border border-border bg-background-secondary text-text-primary outline-none focus:border-accent-teal"
+          className="w-28 px-2 py-1 text-sm text-right rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
         />
       </div>
     );
@@ -117,7 +143,7 @@ function ConfigField({
           type="text"
           value={strValue}
           onChange={(e) => onChange(fieldKey, e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
-          className="w-48 px-2 py-1 text-sm rounded border border-border bg-background-secondary text-text-primary outline-none focus:border-accent-teal"
+          className="w-48 px-2 py-1 text-sm rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
           placeholder="逗号分隔"
         />
       </div>
@@ -131,8 +157,54 @@ function ConfigField({
         type="text"
         value={value ?? ""}
         onChange={(e) => onChange(fieldKey, e.target.value)}
-        className="w-48 px-2 py-1 text-sm rounded border border-border bg-background-secondary text-text-primary outline-none focus:border-accent-teal"
+        className="w-48 px-2 py-1 text-sm rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
       />
+    </div>
+  );
+}
+
+/** A sub-group section within a category. */
+function SubGroupSection({
+  name,
+  fields,
+  onChange,
+  defaultOpen = true,
+}: {
+  name: string;
+  fields: FlatField[];
+  onChange: (key: string, value: any) => void;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const displayName = name === "_root" ? "基本" : name.replace(/_/g, " ");
+
+  return (
+    <div className="border-b border-border last:border-b-0">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center gap-2 px-4 py-2.5 hover:bg-background-hover/50 transition-colors"
+      >
+        {open ? <ChevronDown size={12} className="text-text-muted" /> : <ChevronRight size={12} className="text-text-muted" />}
+        <span className="text-xs font-medium text-accent-teal uppercase tracking-wider">{displayName}</span>
+        <span className="text-[10px] text-text-muted ml-auto">{fields.length} 项</span>
+      </button>
+      {open && (
+        <div className="px-4 pb-3">
+          {fields.map((field) => (
+            <div key={field.key}>
+              <div className="flex items-center gap-1 py-0.5">
+                <span className="text-[10px] text-text-muted font-mono truncate">{field.key}</span>
+              </div>
+              <ConfigField
+                fieldKey={field.key}
+                value={field.value}
+                type={field.type}
+                onChange={onChange}
+              />
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -189,6 +261,12 @@ export default function ConfigPage() {
     [flatFields, activeCategory],
   );
 
+  /** Sub-groups within the active category. */
+  const categorySubGroups = useMemo(() => groupBySubGroup(categoryFields), [categoryFields]);
+
+  /** Search results grouped by sub-group. */
+  const searchSubGroups = useMemo(() => groupBySubGroup(searchResults), [searchResults]);
+
   const handleFieldChange = (key: string, value: any) => {
     setConfig((prev: any) => setNestedValue(prev, key, value));
   };
@@ -242,6 +320,9 @@ export default function ConfigPage() {
 
   if (loading) return <main className="flex-1 p-6"><Loading /></main>;
 
+  const activeSubGroups = isSearching ? searchSubGroups : categorySubGroups;
+  const totalFields = isSearching ? searchResults.length : categoryFields.length;
+
   return (
     <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
       <PageHeader
@@ -285,7 +366,7 @@ export default function ConfigPage() {
         <div className="rounded-lg border border-border bg-background-secondary overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-2 border-b border-border">
             <Code size={14} className="text-text-muted" />
-            <span className="text-xs text-text-secondary">config.yaml</span>
+            <span className="text-xs text-text-secondary">config.json</span>
           </div>
           <textarea
             value={raw}
@@ -342,30 +423,26 @@ export default function ConfigPage() {
           </aside>
 
           <div className="flex-1 min-w-0">
-            <div className="rounded-lg border border-border bg-background-secondary">
+            <div className="rounded-lg border border-border bg-background-secondary overflow-hidden">
               <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
                 <span className="text-sm font-medium text-text-primary capitalize">
                   {isSearching ? `搜索: ${searchQuery}` : activeCategory}
                 </span>
                 <span className="text-xs text-text-muted">
-                  {(isSearching ? searchResults : categoryFields).length} 项
+                  {totalFields} 项 · {activeSubGroups.size} 组
                 </span>
               </div>
-              <div className="divide-y divide-border">
-                {(isSearching ? searchResults : categoryFields).map((field) => (
-                  <div key={field.key} className="px-4">
-                    <div className="flex items-center gap-2 py-0.5">
-                      <span className="text-xs text-text-muted font-mono">{field.key}</span>
-                    </div>
-                    <ConfigField
-                      fieldKey={field.key}
-                      value={field.value}
-                      type={field.type}
-                      onChange={handleFieldChange}
-                    />
-                  </div>
+              <div>
+                {Array.from(activeSubGroups.entries()).map(([groupName, fields]) => (
+                  <SubGroupSection
+                    key={groupName}
+                    name={groupName}
+                    fields={fields}
+                    onChange={handleFieldChange}
+                    defaultOpen={activeSubGroups.size <= 5}
+                  />
                 ))}
-                {(isSearching ? searchResults : categoryFields).length === 0 && (
+                {totalFields === 0 && (
                   <p className="text-sm text-text-muted text-center py-8">
                     {isSearching ? "没有匹配的配置项" : "该分类下没有配置项"}
                   </p>

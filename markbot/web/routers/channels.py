@@ -140,7 +140,7 @@ async def test_channel(channel_id: str):
         # Attempt TCP connection with timeout
         try:
             _, _ = await asyncio.wait_for(
-                asyncio.get_event_loop().getaddrinfo(host, port),
+                asyncio.get_running_loop().getaddrinfo(host, port),
                 timeout=5.0,
             )
             future = asyncio.open_connection(host, port)

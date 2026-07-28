@@ -2,7 +2,7 @@ import { Check, Copy, FileText, Pencil, RotateCcw, User, X, Check as CheckIcon }
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { cn } from "@/lib/utils";
+import { authUrl, cn } from "@/lib/utils";
 import { ToolCall } from "@/components/ToolCall";
 import type { Message } from "@/types/chat";
 
@@ -76,9 +76,9 @@ export function ChatMessage({ message, isStreaming, onEdit, onRegenerate }: Chat
                     const isImage = /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(url);
                     if (isImage) {
                       return (
-                        <a key={i} href={url} target="_blank" rel="noopener noreferrer">
+                        <a key={i} href={authUrl(url)} target="_blank" rel="noopener noreferrer">
                           <img
-                            src={url}
+                            src={authUrl(url)}
                             alt={`attachment ${i + 1}`}
                             className="max-w-[200px] max-h-[200px] rounded-lg border border-user-bubble-border object-cover"
                           />
@@ -86,7 +86,7 @@ export function ChatMessage({ message, isStreaming, onEdit, onRegenerate }: Chat
                       );
                     }
                     return (
-                      <a key={i} href={url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-accent-teal underline">
+                      <a key={i} href={authUrl(url)} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-accent-teal underline">
                         <FileText size={12} />
                         {url.split("/").pop()}
                       </a>
@@ -155,9 +155,9 @@ export function ChatMessage({ message, isStreaming, onEdit, onRegenerate }: Chat
                     const isImage = /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(url);
                     if (isImage) {
                       return (
-                        <a key={i} href={url} target="_blank" rel="noopener noreferrer">
+                        <a key={i} href={authUrl(url)} target="_blank" rel="noopener noreferrer">
                           <img
-                            src={url}
+                            src={authUrl(url)}
                             alt={`attachment ${i + 1}`}
                             className="max-w-[300px] max-h-[300px] rounded-lg border border-border object-cover hover:opacity-90 transition-opacity"
                           />
@@ -167,7 +167,7 @@ export function ChatMessage({ message, isStreaming, onEdit, onRegenerate }: Chat
                     return (
                       <a
                         key={i}
-                        href={url}
+                        href={authUrl(url)}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="flex items-center gap-1.5 text-xs bg-background-secondary border border-border rounded-lg px-3 py-2 hover:bg-background-tertiary transition-colors"

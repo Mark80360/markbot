@@ -61,6 +61,11 @@ export function useChat() {
 
     ws.onopen = () => {
       reconnectAttemptsRef.current = 0;
+      // 重连后恢复当前 session，否则后端会新建 session 导致上下文断裂
+      const sid = currentSessionIdRef.current;
+      if (sid && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "resume_session", session_id: sid }));
+      }
     };
 
     ws.onmessage = (event) => {
@@ -70,6 +75,22 @@ export function useChat() {
         switch (data.type) {
           case "session": {
             setCurrentSessionIdWithRef(data.session_id);
+            // 后端在 user 消息入库后会回传 user_ts；给最后一条尚无
+            // serverTimestamp 的 user 消息补上，否则 edit 按钮不会显示。
+            if (data.user_ts) {
+              setMessages((prev) => {
+                let updated = false;
+                const next = [...prev];
+                for (let i = next.length - 1; i >= 0; i--) {
+                  if (next[i].role === "user" && next[i].serverTimestamp == null) {
+                    next[i] = { ...next[i], serverTimestamp: data.user_ts };
+                    updated = true;
+                    break;
+                  }
+                }
+                return updated ? next : prev;
+              });
+            }
             fetchSessions();
             break;
           }
@@ -118,6 +139,7 @@ export function useChat() {
                         streaming: false,
                         toolCalls: Array.from(activeToolCallsRef.current.values()),
                         media: data.media,
+                        serverTimestamp: data.timestamp,
                       }
                     : m
                 )
@@ -141,6 +163,7 @@ export function useChat() {
                 role: "assistant",
                 content: data.content,
                 timestamp: Date.now(),
+                serverTimestamp: data.timestamp,
                 toolCalls: Array.from(activeToolCallsRef.current.values()),
                 media: data.media,
               },
@@ -271,8 +294,13 @@ export function useChat() {
           if (res.ok) {
             const data = await res.json();
             mediaUrls.push(data.url);
+          } else {
+            const err = await res.json().catch(() => ({ error: res.statusText }));
+            console.warn(`[markbot] upload failed for ${file.name}:`, err.error || res.status);
           }
-        } catch { /* ignore single file failure */ }
+        } catch (e) {
+          console.warn(`[markbot] upload error for ${file.name}:`, e);
+        }
       }
     }
 
@@ -342,8 +370,13 @@ export function useChat() {
           if (res.ok) {
             const data = await res.json();
             mediaUrls.push(data.url);
+          } else {
+            const err = await res.json().catch(() => ({ error: res.statusText }));
+            console.warn(`[markbot] upload failed for ${file.name}:`, err.error || res.status);
           }
-        } catch { /* ignore */ }
+        } catch (e) {
+          console.warn(`[markbot] upload error for ${file.name}:`, e);
+        }
       }
     }
 

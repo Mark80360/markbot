@@ -564,6 +564,46 @@ class CronService:
                 return job
         return None
 
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        name: str | None = None,
+        message: str | None = None,
+        schedule: CronSchedule | None = None,
+    ) -> CronJob | None:
+        """Update mutable fields of an existing job.
+
+        Only fields supplied (non-None) are changed; the schedule is
+        validated and next_run_at_ms is recomputed on schedule change.
+        Toggling ``enabled`` remains the responsibility of ``enable_job``.
+        Returns the updated job, or None if ``job_id`` was not found.
+        """
+        store = self._load_store()
+        for job in store.jobs:
+            if job.id != job_id:
+                continue
+            changed = False
+            if name is not None and name != job.name:
+                job.name = name
+                changed = True
+            if message is not None and message != job.payload.message:
+                job.payload.message = message
+                changed = True
+            if schedule is not None:
+                _validate_schedule_for_add(schedule)
+                job.schedule = schedule
+                job.state.next_run_at_ms = (
+                    _compute_next_run(job.schedule, _now_ms()) if job.enabled else None
+                )
+                changed = True
+            if changed:
+                job.updated_at_ms = _now_ms()
+                self._save_store()
+                self._arm_timer()
+            return job
+        return None
+
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job."""
         store = self._load_store()

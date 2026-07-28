@@ -6,7 +6,6 @@ import { ToastProvider } from "@/components/Toast";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "@/components/Sidebar";
 import ChatPage from "@/pages/ChatPage";
-import SessionsPage from "@/pages/SessionsPage";
 import ConfigPage from "@/pages/ConfigPage";
 import EnvPage from "@/pages/EnvPage";
 import ModelsPage from "@/pages/ModelsPage";
@@ -24,7 +23,6 @@ function AppLayout() {
       <Routes>
         <Route path="/" element={<Navigate to="/chat" replace />} />
         <Route path="/chat" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
-        <Route path="/sessions" element={<ErrorBoundary><SessionsPage /></ErrorBoundary>} />
         <Route path="/config" element={<ErrorBoundary><ConfigPage /></ErrorBoundary>} />
         <Route path="/env" element={<ErrorBoundary><EnvPage /></ErrorBoundary>} />
         <Route path="/models" element={<ErrorBoundary><ModelsPage /></ErrorBoundary>} />

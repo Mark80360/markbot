@@ -2,24 +2,26 @@ import {
   Bot, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen,
   Plus, Sun, Trash2, Sparkles, Settings, Key, Brain,
   FileText, Package, Clock, Radio, Cable, Monitor,
+  ChevronDown, ChevronRight,
 } from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/contexts/ThemeContext";
 import { useSidebar } from "@/contexts/SidebarContext";
 import { useChatContext } from "@/contexts/ChatContext";
+import { useState } from "react";
 
-const NAV_ITEMS = [
-  { path: "/chat", label: "Chat", icon: Sparkles },
-  { path: "/sessions", label: "Sessions", icon: MessageSquare },
+const MAIN_NAV = { path: "/chat", label: "Chat", icon: Sparkles };
+
+const SETTINGS_NAV = [
   { path: "/config", label: "Config", icon: Settings },
   { path: "/env", label: "Keys", icon: Key },
   { path: "/models", label: "Models", icon: Brain },
-  { path: "/logs", label: "Logs", icon: FileText },
-  { path: "/skills", label: "Skills", icon: Package },
-  { path: "/cron", label: "Cron", icon: Clock },
   { path: "/channels", label: "Channels", icon: Radio },
   { path: "/mcp", label: "MCP", icon: Cable },
+  { path: "/skills", label: "Skills", icon: Package },
+  { path: "/cron", label: "Cron", icon: Clock },
+  { path: "/logs", label: "Logs", icon: FileText },
   { path: "/system", label: "System", icon: Monitor },
 ];
 
@@ -43,7 +45,12 @@ export function Sidebar() {
   const { collapsed, toggle } = useSidebar();
   const navigate = useNavigate();
   const { clearMessages, sessions, currentSessionId, switchSession, deleteSession } = useChatContext();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const open = !collapsed;
+
+  // Check if any settings nav is active
+  const location = window.location.pathname;
+  const isSettingsActive = SETTINGS_NAV.some((item) => location === item.path || location.startsWith(item.path + "/"));
 
   return (
     <>
@@ -92,29 +99,27 @@ export function Sidebar() {
           </button>
         </div>
 
+        {/* Chat nav */}
         <div className="px-3 py-1">
-          <div className="text-xs text-display text-text-tertiary mb-2 px-2">导航</div>
           <nav className="space-y-0.5">
-            {NAV_ITEMS.map((item) => (
-              <NavLink
-                key={item.path}
-                to={item.path}
-                className={({ isActive }) =>
-                  cn(
-                    "flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-all",
-                    isActive
-                      ? "bg-accent-teal-dim text-text-primary"
-                      : "text-text-secondary hover:bg-background-hover hover:text-text-primary",
-                  )
-                }
-              >
-                <item.icon size={14} className="flex-shrink-0" />
-                <span>{item.label}</span>
-              </NavLink>
-            ))}
+            <NavLink
+              to={MAIN_NAV.path}
+              className={({ isActive }) =>
+                cn(
+                  "flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-all",
+                  isActive
+                    ? "bg-accent-teal-dim text-text-primary"
+                    : "text-text-secondary hover:bg-background-hover hover:text-text-primary",
+                )
+              }
+            >
+              <MAIN_NAV.icon size={14} className="flex-shrink-0" />
+              <span>{MAIN_NAV.label}</span>
+            </NavLink>
           </nav>
         </div>
 
+        {/* Session history */}
         <div className="flex-1 overflow-y-auto scrollbar-none px-3 py-2">
           <div className="text-xs text-display text-text-tertiary mb-2 px-2">
             对话历史
@@ -168,6 +173,42 @@ export function Sidebar() {
                 </div>
               ))}
             </div>
+          )}
+        </div>
+
+        {/* Settings section at bottom */}
+        <div className="border-t border-border">
+          <button
+            onClick={() => setSettingsOpen(!settingsOpen)}
+            className={cn(
+              "w-full flex items-center gap-2 px-4 py-2.5 text-sm transition-colors",
+              isSettingsActive ? "text-accent-teal" : "text-text-secondary hover:text-text-primary",
+            )}
+          >
+            <Settings size={14} className="flex-shrink-0" />
+            <span className="flex-1 text-left">设置</span>
+            {settingsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </button>
+          {settingsOpen && (
+            <nav className="space-y-0.5 px-2 pb-2">
+              {SETTINGS_NAV.map((item) => (
+                <NavLink
+                  key={item.path}
+                  to={item.path}
+                  className={({ isActive }) =>
+                    cn(
+                      "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs transition-all",
+                      isActive
+                        ? "bg-accent-teal-dim text-text-primary"
+                        : "text-text-tertiary hover:bg-background-hover hover:text-text-primary",
+                    )
+                  }
+                >
+                  <item.icon size={12} className="flex-shrink-0" />
+                  <span>{item.label}</span>
+                </NavLink>
+              ))}
+            </nav>
           )}
         </div>
 

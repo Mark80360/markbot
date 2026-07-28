@@ -3,11 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
-from markbot.web.store import WebSessionStore
+from markbot.web.store import get_store
 
 router = APIRouter()
 
-store = WebSessionStore()
+store = get_store()
 
 
 class SessionRename(BaseModel):
@@ -70,14 +70,16 @@ async def patch_session(session_id: str, data: SessionRename):
 
 @router.get("/api/sessions/{session_id}/export")
 async def export_session(session_id: str, format: str = "markdown"):
-    md = store.export_session_markdown(session_id)
-    if md is None:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
     if format == "json":
         data = store.get_session(session_id)
+        if not data:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
         return JSONResponse(data)
+    result = store.export_session_markdown(session_id)
+    if result is None:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    md, title = result
     from starlette.responses import Response
-    title = (store.get_session(session_id) or {}).get("title", "session")
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "session"
     return Response(
         content=md,
