@@ -156,6 +156,14 @@ class ExecTool(Tool):
                 except ProcessLookupError:
                     pass
                 raise
+            except Exception:
+                # Kill on any other unexpected exception from communicate()
+                # to prevent zombie processes — same rationale as above.
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                raise
 
             output_parts = []
 

@@ -162,14 +162,23 @@ async def _run_single_command(
         except ProcessLookupError:
             pass
         raise
+    except Exception:
+        # Kill on any other unexpected exception (OSError, etc.) to
+        # prevent zombie processes — same rationale as CancelledError.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        raise
 
     stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
     stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
 
+    rc = process.returncode if process.returncode is not None else -1
     return VerificationStep(
         command=cmd.raw,
-        returncode=process.returncode or 0,
-        status="success" if process.returncode == 0 else "failed",
+        returncode=rc,
+        status="success" if rc == 0 else "failed",
         stdout=stdout[-4000:],
         stderr=stderr[-4000:],
     )
