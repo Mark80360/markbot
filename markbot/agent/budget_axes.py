@@ -11,6 +11,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
+# Default per-turn ceilings. These are ON by default so a runaway loop
+# cannot burn unbounded time/tokens before the iteration cap fires —
+# previously both axes defaulted to None (disabled), leaving
+# ``max_iterations`` as the only backstop. Set the config value to 0
+# (or a negative number) to disable an axis explicitly.
+#
+# Tuning notes (post-audit): the token axis counts the FULL prompt of
+# every LLM call (cache hits included), so 1M was reachable after ~20
+# iterations on a 50k context — too aggressive for legitimate heavy
+# turns; 3M gives runaway loops a hard stop while leaving normal work
+# headroom. 600s wall was within reach of a single slow build/test run;
+# 900s covers that while still bounding true runaways.
+DEFAULT_MAX_WALL_SECONDS = 900.0
+DEFAULT_MAX_TOTAL_TOKENS = 3_000_000
+
 
 class BudgetAxis(str, Enum):
     NONE = "none"
@@ -36,8 +51,8 @@ class BudgetAxisHit:
 class RuntimeBudgetConfig:
     """Hard limits evaluated each iteration (in addition to CostTracker)."""
 
-    max_wall_seconds: float | None = None
-    max_total_tokens: int | None = None
+    max_wall_seconds: float | None = DEFAULT_MAX_WALL_SECONDS
+    max_total_tokens: int | None = DEFAULT_MAX_TOTAL_TOKENS
 
     @classmethod
     def from_settings(cls, settings: Any | None = None) -> "RuntimeBudgetConfig":
@@ -52,9 +67,27 @@ class RuntimeBudgetConfig:
         wall = get("max_wall_seconds", get("maxWallSeconds", None))
         tokens = get("max_total_tokens", get("maxTotalTokens", None))
         return cls(
-            max_wall_seconds=float(wall) if wall not in (None, "") else None,
-            max_total_tokens=int(tokens) if tokens not in (None, "") else None,
+            max_wall_seconds=_ceiling_or_disabled(wall, DEFAULT_MAX_WALL_SECONDS),
+            max_total_tokens=_ceiling_or_disabled(tokens, DEFAULT_MAX_TOTAL_TOKENS),
         )
+
+
+def _ceiling_or_disabled(value: Any, default: float) -> Any:
+    """Normalise a configured ceiling.
+
+    - ``None`` / ``""`` (unset) → the built-in default (axis stays ON).
+    - ``0`` or negative → ``None`` (axis explicitly disabled).
+    - anything else → the numeric value.
+    """
+    if value in (None, ""):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if num <= 0:
+        return None
+    return int(num) if isinstance(default, int) else num
 
 
 @dataclass

@@ -14,6 +14,7 @@ Decision lattice (strictest wins when multiple fire):
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -33,6 +34,32 @@ DEFAULT_WINDOW_SIZE = 6
 DEFAULT_WINDOW_FAILURE_THRESHOLD = 4
 DEFAULT_MAX_REFLECTIONS = 2
 DEFAULT_FAILED_METHODS_CAP = 30
+
+# Cumulative failure-rate defense (plugs the "stable 3/6 failures forever"
+# hole in the rolling window): once at least this many calls were observed
+# in a turn and the cumulative failure ratio is at or above the configured
+# ratio, the same warn→reflect→halt policy applies. Counters reset after
+# each reflection so a recovered turn is not poisoned by its rough start.
+DEFAULT_CUMULATIVE_MIN_CALLS = 8
+DEFAULT_CUMULATIVE_FAILURE_RATIO = 0.5
+
+# Stagnation defense: iterations that produce no new information (every
+# tool call repeats a previously-seen tool+args signature, no file
+# mutation, and the assistant text is a parrot of the previous iteration)
+# are counted even when all calls SUCCEED. This is the primary defense
+# against "productive-looking" runaway loops that the failure-driven
+# detectors cannot see.
+DEFAULT_STAGNATION_WARN = 6
+DEFAULT_STAGNATION_BLOCK = 10
+
+# Tools whose purpose is polling/waiting on external async state. An
+# iteration consisting solely of these is progress-neutral: it neither
+# resets nor advances the stagnation counter, so an agent legitimately
+# waiting on a subagent is never flagged as stuck.
+_WAIT_NEUTRAL_TOOLS: frozenset[str] = frozenset({
+    "check_subagent",
+    "list_subagents",
+})
 
 # Per-turn hard caps on runaway-prone tools. These are HARD ceilings that
 # fire regardless of failure detection — even if all calls succeed, hitting
@@ -150,6 +177,12 @@ class GuardrailConfig:
     max_reflections: int = DEFAULT_MAX_REFLECTIONS
     idempotent_tools: frozenset[str] = DEFAULT_IDEMPOTENT_TOOLS
     failed_methods_cap: int = DEFAULT_FAILED_METHODS_CAP
+    # Cumulative failure-rate defense
+    cumulative_min_calls: int = DEFAULT_CUMULATIVE_MIN_CALLS
+    cumulative_failure_ratio: float = DEFAULT_CUMULATIVE_FAILURE_RATIO
+    # Stagnation defense (success-loop detector)
+    stagnation_warn: int = DEFAULT_STAGNATION_WARN
+    stagnation_block: int = DEFAULT_STAGNATION_BLOCK
     # Per-turn loop caps (0 = unlimited)
     max_web_searches_per_turn: int = DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_web_fetches_per_turn: int = DEFAULT_MAX_WEB_FETCHES_PER_TURN
@@ -190,6 +223,14 @@ class GuardrailConfig:
             max_reflections=int(get("max_reflections", DEFAULT_MAX_REFLECTIONS)),
             idempotent_tools=tools,
             failed_methods_cap=int(get("failed_methods_cap", DEFAULT_FAILED_METHODS_CAP)),
+            cumulative_min_calls=int(
+                get("cumulative_min_calls", DEFAULT_CUMULATIVE_MIN_CALLS)
+            ),
+            cumulative_failure_ratio=float(
+                get("cumulative_failure_ratio", DEFAULT_CUMULATIVE_FAILURE_RATIO)
+            ),
+            stagnation_warn=int(get("stagnation_warn", DEFAULT_STAGNATION_WARN)),
+            stagnation_block=int(get("stagnation_block", DEFAULT_STAGNATION_BLOCK)),
             max_web_searches_per_turn=int(
                 get("max_web_searches_per_turn", DEFAULT_MAX_WEB_SEARCHES_PER_TURN)
             ),
@@ -247,6 +288,17 @@ class GuardrailState:
     forced_stop_count: int = 0
     # Per-turn loop cap counters: tool_name → call count this turn
     turn_call_counts: dict[str, int] = field(default_factory=dict)
+    # Cumulative failure-rate counters (per-turn; reset after reflection)
+    total_calls: int = 0
+    total_failures: int = 0
+    # Stagnation detection state (per-turn)
+    seen_signatures: set[str] = field(default_factory=set)
+    stagnant_iterations: int = 0
+    last_assistant_hash: str = ""
+    # Stagnation reflections are budgeted independently from failure
+    # reflections so a turn that burned its failure-reflection budget
+    # still gets one stagnation-specific warning before HALT.
+    stagnation_reflections: int = 0
 
 
 def args_signature(arguments: Any, max_len: int = 200) -> str:
@@ -279,6 +331,47 @@ def result_signature(result: Any, max_len: int = 256) -> str:
         return f"exc:{type(result).__name__}"
     text = result if isinstance(result, str) else str(result)
     return text[:max_len]
+
+
+# Pagination / positional parameters where digit variation is the classic
+# loop-evasion pattern (re-reading the same resource at offset=100, 200,
+# 300...). Only digits under THESE keys are collapsed by
+# normalized_args_signature — collapsing digits everywhere would merge
+# legitimately distinct calls (ports, version numbers, grep patterns like
+# "error1" vs "error2") into one bucket and false-trigger no-progress.
+_NUMERIC_PARAM_KEYS: frozenset[str] = frozenset({
+    "offset", "limit", "page", "page_size", "pagesize", "line",
+    "line_number", "lineno", "index", "idx", "skip", "cursor",
+    "position", "pos",
+})
+
+
+def normalized_args_signature(arguments: Any, max_len: int = 160) -> str:
+    """Looser args signature for no-progress detection.
+
+    Replaces values of pagination/positional keys (see
+    ``_NUMERIC_PARAM_KEYS``) with a ``#`` placeholder so near-identical
+    retries like ``read_file(path, offset=100)`` →
+    ``read_file(path, offset=200)`` cluster into the same bucket instead
+    of evading the counter forever. All other digits (ports, versions,
+    search patterns) are preserved. Exact-failure tracking keeps using
+    the strict :func:`args_signature` because there identical means
+    byte-identical.
+    """
+    def _norm(value: Any, key: str | None = None) -> Any:
+        if key is not None and key.lower() in _NUMERIC_PARAM_KEYS:
+            return "#"
+        if isinstance(value, Mapping):
+            return {k: _norm(v, k) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_norm(v) for v in value]
+        return value
+
+    try:
+        normalized = _norm(arguments)
+    except Exception:
+        normalized = arguments
+    return args_signature(normalized, max_len=max_len)
 
 
 def _dict_has_error(obj: Mapping[str, Any]) -> bool:
@@ -452,6 +545,12 @@ class ToolCallGuardrail:
         self.state.blocked_tools.clear()
         self.state.tools_warned.clear()
         self.state.turn_call_counts.clear()
+        self.state.total_calls = 0
+        self.state.total_failures = 0
+        self.state.seen_signatures.clear()
+        self.state.stagnant_iterations = 0
+        self.state.last_assistant_hash = ""
+        self.state.stagnation_reflections = 0
 
     def reset_for_turn(self) -> None:
         """Full reset for a new user turn — clears ALL state including
@@ -491,6 +590,9 @@ class ToolCallGuardrail:
             if is_failure is None
             else bool(is_failure)
         )
+        self.state.total_calls += 1
+        if failed:
+            self.state.total_failures += 1
         self.state.recent_failures.append(failed)
         if len(self.state.recent_failures) > self.config.window_size:
             self.state.recent_failures = self.state.recent_failures[-self.config.window_size :]
@@ -507,38 +609,72 @@ class ToolCallGuardrail:
         return _strictest(*decisions)
 
     def evaluate_failure_window(self) -> GuardrailDecision:
-        """Check rolling failure rate for reflection warn / forced halt."""
+        """Check rolling failure rate for reflection warn / forced halt.
+
+        Two detectors, strictest wins:
+        1. Rolling window — ≥ threshold failures in the last N calls.
+        2. Cumulative rate — after ``cumulative_min_calls`` observations,
+           a turn whose lifetime failure ratio stays at or above
+           ``cumulative_failure_ratio`` is intervened even if the rolling
+           window never fills (the "stable 3/6 failures forever" hole).
+        """
         if not self.config.enabled:
             return GuardrailDecision(action=GuardrailAction.ALLOW)
 
         cfg = self.config
         st = self.state
-        if len(st.recent_failures) < cfg.window_failure_threshold:
-            return GuardrailDecision(action=GuardrailAction.ALLOW)
 
-        failures = sum(1 for f in st.recent_failures if f)
-        if failures < cfg.window_failure_threshold:
-            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        window_decision = GuardrailDecision(action=GuardrailAction.ALLOW)
+        if len(st.recent_failures) >= cfg.window_failure_threshold:
+            failures = sum(1 for f in st.recent_failures if f)
+            if failures >= cfg.window_failure_threshold:
+                window_decision = self._failure_intervention(
+                    reason="failure_window",
+                    count=failures,
+                    detail=(
+                        f"{failures}/{len(st.recent_failures)} failures "
+                        "in the recent window"
+                    ),
+                )
 
-        if st.forced_stop_count > 0 or st.reflection_count >= cfg.max_reflections:
-            return GuardrailDecision(
-                action=GuardrailAction.HALT,
-                reason="failure_window_exhausted",
-                count=failures,
-                message=(
-                    f"Consecutive tool failures ({failures}/{len(st.recent_failures)}) "
-                    f"exceeded reflection budget "
-                    f"({st.reflection_count}/{cfg.max_reflections})."
+        cumulative_decision = GuardrailDecision(action=GuardrailAction.ALLOW)
+        if (
+            st.total_calls >= cfg.cumulative_min_calls
+            and st.total_failures >= st.total_calls * cfg.cumulative_failure_ratio
+        ):
+            cumulative_decision = self._failure_intervention(
+                reason="cumulative_failure_rate",
+                count=st.total_failures,
+                detail=(
+                    f"{st.total_failures}/{st.total_calls} cumulative failures "
+                    f"this turn (ratio ≥ {cfg.cumulative_failure_ratio:.0%})"
                 ),
             )
 
+        return _strictest(window_decision, cumulative_decision)
+
+    def _failure_intervention(
+        self, *, reason: str, count: int, detail: str
+    ) -> GuardrailDecision:
+        """Shared warn/halt policy for failure-rate detectors."""
+        st = self.state
+        cfg = self.config
+        if st.forced_stop_count > 0 or st.reflection_count >= cfg.max_reflections:
+            return GuardrailDecision(
+                action=GuardrailAction.HALT,
+                reason=f"{reason}_exhausted",
+                count=count,
+                message=(
+                    f"Tool failures ({detail}) exceeded reflection budget "
+                    f"({st.reflection_count}/{cfg.max_reflections})."
+                ),
+            )
         return GuardrailDecision(
             action=GuardrailAction.WARN,
-            reason="failure_window",
-            count=failures,
+            reason=reason,
+            count=count,
             message=(
-                f"Recent tool window has {failures} failures out of "
-                f"{len(st.recent_failures)} calls. Change strategy or stop."
+                f"Tool failures ({detail}). Change strategy or stop."
             ),
         )
 
@@ -548,7 +684,112 @@ class ToolCallGuardrail:
         if self.state.recent_failures:
             keep = max(1, self.config.window_size // 2)
             self.state.recent_failures = self.state.recent_failures[-keep:]
+        # Clean slate for the cumulative-rate detector so a turn that
+        # recovers after the reflection is not halted by its rough start.
+        self.state.total_calls = 0
+        self.state.total_failures = 0
         return self.state.reflection_count
+
+    # ------------------------------------------------------------------
+    # Stagnation detection (success-loop defense)
+    # ------------------------------------------------------------------
+
+    def note_iteration(
+        self,
+        tool_calls: list[tuple[str, Any]],
+        *,
+        assistant_text: str = "",
+        had_file_mutation: bool = False,
+    ) -> None:
+        """Feed one iteration's tool batch into the stagnation tracker.
+
+        An iteration is *productive* when at least one of these holds:
+          - a file-mutation tool succeeded this iteration (real work landed);
+          - a non-wait tool was called with a tool+args signature never
+            seen before this turn (new information entered the context).
+
+        Additionally, if the assistant text is a byte-parrot of the
+        previous iteration's text, only a real file mutation counts as
+        progress — new-but-repetitive tool calls from a parroting model
+        do not reset the counter.
+
+        Iterations consisting solely of wait/polling tools (subagent
+        status checks) are neutral: they leave the counter untouched so
+        legitimate waits are never flagged.
+        """
+        if not self.config.enabled:
+            return
+        st = self.state
+        if tool_calls and all(name in _WAIT_NEUTRAL_TOOLS for name, _ in tool_calls):
+            return
+
+        new_info = had_file_mutation
+        for name, args in tool_calls:
+            if name in _WAIT_NEUTRAL_TOOLS:
+                continue
+            sig = f"{name}:{args_signature(args)}"
+            if sig not in st.seen_signatures:
+                st.seen_signatures.add(sig)
+                new_info = True
+
+        if assistant_text:
+            digest = hashlib.sha1(
+                assistant_text.strip().encode("utf-8", "ignore")
+            ).hexdigest()
+            if digest == st.last_assistant_hash:
+                # Parroting the previous iteration: only a real mutation
+                # counts as progress.
+                new_info = had_file_mutation
+            st.last_assistant_hash = digest
+
+        if new_info:
+            st.stagnant_iterations = 0
+        else:
+            st.stagnant_iterations += 1
+
+    def evaluate_stagnation(self) -> GuardrailDecision:
+        """Warn/halt when consecutive iterations produced no new progress.
+
+        Uses its OWN reflection budget (``stagnation_reflections``),
+        independent from the failure detectors', so a turn that already
+        exhausted failure reflections still receives one stagnation
+        warning before the halt.
+        """
+        if not self.config.enabled:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        st = self.state
+        cfg = self.config
+        n = st.stagnant_iterations
+        if n < cfg.stagnation_warn:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        if (
+            n >= cfg.stagnation_block
+            or st.stagnation_reflections >= cfg.max_reflections
+        ):
+            return GuardrailDecision(
+                action=GuardrailAction.HALT,
+                reason="stagnation_exhausted",
+                count=n,
+                message=(
+                    f"{n} consecutive iterations produced no new progress "
+                    "(repeated tool calls, no file changes). The task appears "
+                    "stuck in a successful-but-unproductive loop."
+                ),
+            )
+        return GuardrailDecision(
+            action=GuardrailAction.WARN,
+            reason="stagnation",
+            count=n,
+            message=(
+                f"{n} consecutive iterations produced no new progress. "
+                "Change strategy or report the blocker to the user."
+            ),
+        )
+
+    def note_stagnation_reflection(self) -> int:
+        """Record a stagnation reflection injection; return new count."""
+        self.state.stagnation_reflections += 1
+        return self.state.stagnation_reflections
 
     def note_forced_stop(self) -> int:
         self.state.forced_stop_count += 1
@@ -600,13 +841,18 @@ class ToolCallGuardrail:
         return GuardrailDecision(action=GuardrailAction.ALLOW)
 
     def is_call_blocked(self, tool_name: str, arguments: Any = None) -> bool:
-        """True when this tool (or exact signature) is blocked for the turn."""
+        """True when this tool (or exact/normalized signature) is blocked."""
         if tool_name in self.state.blocked_tools:
             return True
         if arguments is None:
             return False
-        key = f"{tool_name}:{args_signature(arguments)}"
-        return key in self.state.blocked_signatures
+        # exact_failure stores exact keys; no_progress stores normalized
+        # keys — check both or digit-bearing args would never match.
+        exact_key = f"{tool_name}:{args_signature(arguments)}"
+        if exact_key in self.state.blocked_signatures:
+            return True
+        norm_key = f"{tool_name}:{normalized_args_signature(arguments)}"
+        return norm_key in self.state.blocked_signatures
 
     def is_signature_blocked(self, tool_name: str, arguments: Any) -> bool:
         """Alias for callers that only care about exact-arg blocks."""
@@ -735,7 +981,9 @@ class ToolCallGuardrail:
     ) -> GuardrailDecision:
         if tool_name not in self.config.idempotent_tools:
             return GuardrailDecision(action=GuardrailAction.ALLOW)
-        sig = args_signature(arguments)
+        # Normalised signature: digit-only differences (offsets, line
+        # numbers, page indices) must not evade the loop detector.
+        sig = normalized_args_signature(arguments)
         if not sig:
             return GuardrailDecision(action=GuardrailAction.ALLOW)
         key = f"{tool_name}:{sig}"

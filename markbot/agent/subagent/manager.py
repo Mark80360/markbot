@@ -468,12 +468,20 @@ class SubagentManager:
 
                 window = child_guardrail.evaluate_failure_window()
                 if window.action is GuardrailAction.HALT:
+                    # Drive the escalation chain: without this the halt
+                    # condition (forced_stop_count > 0) can never fire and
+                    # the cumulative failure-rate counters never reset.
+                    child_guardrail.note_forced_stop()
                     residual_risk = window.message or "child guardrail halt"
                     final_result = (
                         f"Subagent halted by guardrail: {residual_risk}"
                     )
                     halt_child = True
                 elif window.action is GuardrailAction.WARN and window.message:
+                    # Count the reflection so the next window trigger
+                    # escalates to HALT (max_reflections=1 for children)
+                    # and cumulative failure-rate counters get reset.
+                    child_guardrail.note_reflection()
                     messages.append({
                         "role": "user",
                         "content": f"[System Warning — child guardrail]\n{window.message}",

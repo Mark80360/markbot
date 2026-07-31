@@ -38,6 +38,7 @@ from markbot.agent.tool_guardrails import (
     GuardrailConfig,
     PreblockedResult,
     ToolCallGuardrail,
+    _strictest,
     is_failure_result,
     is_preblocked_result,
 )
@@ -1673,12 +1674,15 @@ class IterationRunner:
             logger.warning("Failed to persist guardrail state: {}", e)
 
     def _phase_check_failure_loop(self, state: LoopState) -> IterationResult | None:
-        """Apply failure-window policy after a tool batch.
+        """Apply failure-window / stagnation policy after a tool batch.
 
         WARN → inject reflection (count toward max_reflections).
         HALT → force-stop the turn with a structured final message.
         """
-        decision = self._tool_guardrail.evaluate_failure_window()
+        decision = _strictest(
+            self._tool_guardrail.evaluate_failure_window(),
+            self._tool_guardrail.evaluate_stagnation(),
+        )
         if decision.action is GuardrailAction.ALLOW:
             return None
 
@@ -1687,13 +1691,14 @@ class IterationRunner:
         failure_count = decision.count
         window_len = len(gs.recent_failures)
         failed_methods = list(gs.failed_methods)
+        is_stagnation = decision.reason.startswith("stagnation")
 
         if decision.action is GuardrailAction.HALT:
             forced = self._tool_guardrail.note_forced_stop()
             self._persist_failure_state()
             logger.warning(
-                "Guardrail HALT ({} failures in last {} calls): {}",
-                failure_count, window_len, decision.message,
+                "Guardrail HALT ({}): {}",
+                decision.reason, decision.message,
             )
             if self.loop.guardrail_manager:
                 for skill_name in list(self.loop.guardrail_manager.active_skills):
@@ -1708,20 +1713,36 @@ class IterationRunner:
                 recent = failed_methods[-10:]
                 blacklist_text = "\n\n**已尝试但失败的方法（不要重复）：**\n"
                 blacklist_text += "\n".join(f"- {m}" for m in recent)
-            state.final_content = (
-                "我检测到任务陷入连续失败循环（最近多次 tool 调用均失败），"
-                f"已第 {forced} 次强制停止以避免无谓的 token 消耗。"
-                + blacklist_text
-                + "\n\n**可能的原因：**\n"
-                "- 当前环境缺少完成任务所需的依赖（如 ffmpeg、特定 Python 包等）\n"
-                "- 网络限制导致无法安装依赖或抓取外部资源\n"
-                "- 任务目标在当前环境下不可行（如 headless 环境缺少 GUI/扩展支持）\n\n"
-                "**建议：**\n"
-                "1. 检查上方「已尝试但失败的方法」清单，确认阻塞点\n"
-                "2. 手动安装缺失依赖或调整环境后重试\n"
-                "3. 或调整任务目标，避开当前环境限制\n"
-                "4. 如果继续重试，请先说明你打算用什么**不同**的方法"
-            )
+            if is_stagnation:
+                state.final_content = (
+                    f"我检测到任务陷入停滞循环（连续 {failure_count} 轮迭代没有产生"
+                    "新进展：重复相同的工具调用、没有文件变更），"
+                    f"已第 {forced} 次强制停止以避免无谓的 token 消耗。"
+                    + blacklist_text
+                    + "\n\n**可能的原因：**\n"
+                    "- 当前策略无法推进任务，但模型一直在重复相同的尝试\n"
+                    "- 任务所需的信息在当前环境中无法获取\n"
+                    "- 任务目标本身存在矛盾或缺失前提条件\n\n"
+                    "**建议：**\n"
+                    "1. 检查上方对话历史，确认卡在哪一步\n"
+                    "2. 换一种完全不同的方法，或把任务拆小\n"
+                    "3. 如果继续重试，请先说明你打算用什么**不同**的方法"
+                )
+            else:
+                state.final_content = (
+                    "我检测到任务陷入连续失败循环（最近多次 tool 调用均失败），"
+                    f"已第 {forced} 次强制停止以避免无谓的 token 消耗。"
+                    + blacklist_text
+                    + "\n\n**可能的原因：**\n"
+                    "- 当前环境缺少完成任务所需的依赖（如 ffmpeg、特定 Python 包等）\n"
+                    "- 网络限制导致无法安装依赖或抓取外部资源\n"
+                    "- 任务目标在当前环境下不可行（如 headless 环境缺少 GUI/扩展支持）\n\n"
+                    "**建议：**\n"
+                    "1. 检查上方「已尝试但失败的方法」清单，确认阻塞点\n"
+                    "2. 手动安装缺失依赖或调整环境后重试\n"
+                    "3. 或调整任务目标，避开当前环境限制\n"
+                    "4. 如果继续重试，请先说明你打算用什么**不同**的方法"
+                )
             state.messages = self.loop.context.add_assistant_message(
                 state.messages,
                 state.final_content,
@@ -1730,13 +1751,16 @@ class IterationRunner:
                 should_break=True, exit_reason=TurnExitReason.GUARDRAIL_HALT
             )
 
-        # WARN → reflection
-        reflection_n = self._tool_guardrail.note_reflection()
+        # WARN → reflection (stagnation uses its own budget so a turn that
+        # exhausted failure reflections still gets a stagnation warning)
+        if is_stagnation:
+            reflection_n = self._tool_guardrail.note_stagnation_reflection()
+        else:
+            reflection_n = self._tool_guardrail.note_reflection()
         self._persist_failure_state()
         logger.warning(
-            "Guardrail failure-window WARN ({} failures in last {} calls), "
-            "injecting reflection #{}",
-            failure_count, window_len, reflection_n,
+            "Guardrail WARN ({}): {} — injecting reflection #{}",
+            decision.reason, decision.message, reflection_n,
         )
         blacklist_section = ""
         if failed_methods:
@@ -1746,24 +1770,43 @@ class IterationRunner:
                 + "\n".join(f"- {m}" for m in recent)
                 + "\n\n如果你接下来要用的方法和上面任意一条相似，请立刻停止并告知用户。"
             )
-        reflection_text = (
-            "[System Warning — 连续失败检测]\n"
-            f"系统检测到你在最近 {window_len} 次 tool 调用中"
-            f"有 {failure_count} 次失败。这通常意味着当前策略遇到了"
-            "环境或依赖层面的硬性限制，继续用类似方式尝试只会浪费资源。"
-            + blacklist_section
-            + "\n\n请立即停下来反思：\n"
-            "1. **根因分析**：这些失败的共同原因是什么？"
-            "（缺少依赖？网络限制？权限问题？headless 环境限制？）\n"
-            "2. **可行性判断**：在当前环境下，这个任务是否真的能完成？"
-            "如果不能，请直接告知用户缺失了什么，而不是继续尝试。\n"
-            "3. **策略调整**：如果可行，换一种**完全不同**的方法；"
-            "如果不可行，明确告知用户并停止。\n\n"
-            "重要：这是第 "
-            f"{reflection_n}/{cfg.max_reflections} 次反思，"
-            "达到上限后将强制停止。不要再用相同或类似的方式重试。"
-            "如果任务在当前环境不可行，直接回复用户说明原因。"
-        )
+        if is_stagnation:
+            reflection_text = (
+                "[System Warning — 停滞检测]\n"
+                f"系统检测到你已经连续 {failure_count} 轮迭代没有产生新进展"
+                "（重复相同的工具调用、没有文件变更、没有新信息进入上下文）。"
+                "继续用相同方式尝试只会浪费资源。"
+                + blacklist_section
+                + "\n\n请立即停下来反思：\n"
+                "1. **进展评估**：这几轮迭代到底产出了什么新东西？"
+                "如果没有，为什么还在重复？\n"
+                "2. **策略调整**：换一种**完全不同**的方法，"
+                "或者基于已有信息直接给出当前最好的结论；\n"
+                "3. **及时止损**：如果任务在当前环境无法继续推进，"
+                "明确告知用户卡点并结束，而不是继续空转。\n\n"
+                "重要：这是第 "
+                f"{reflection_n}/{cfg.max_reflections} 次反思，"
+                "达到上限后将强制停止。"
+            )
+        else:
+            reflection_text = (
+                "[System Warning — 连续失败检测]\n"
+                f"系统检测到你在最近 {window_len} 次 tool 调用中"
+                f"有 {failure_count} 次失败。这通常意味着当前策略遇到了"
+                "环境或依赖层面的硬性限制，继续用类似方式尝试只会浪费资源。"
+                + blacklist_section
+                + "\n\n请立即停下来反思：\n"
+                "1. **根因分析**：这些失败的共同原因是什么？"
+                "（缺少依赖？网络限制？权限问题？headless 环境限制？）\n"
+                "2. **可行性判断**：在当前环境下，这个任务是否真的能完成？"
+                "如果不能，请直接告知用户缺失了什么，而不是继续尝试。\n"
+                "3. **策略调整**：如果可行，换一种**完全不同**的方法；"
+                "如果不可行，明确告知用户并停止。\n\n"
+                "重要：这是第 "
+                f"{reflection_n}/{cfg.max_reflections} 次反思，"
+                "达到上限后将强制停止。不要再用相同或类似的方式重试。"
+                "如果任务在当前环境不可行，直接回复用户说明原因。"
+            )
         self._append_hint_to_last_tool_result(state, "\n\n" + reflection_text)
         return None
 
@@ -2358,6 +2401,9 @@ class IterationRunner:
             len(response.tool_calls),
             [tc.name for tc in response.tool_calls],
         )
+        # Baseline for this iteration's stagnation check — any new file
+        # mutation recorded during this batch marks it as productive.
+        mutations_before = len(state.file_mutations)
 
         if self.on_stream and self.on_stream_end:
             had_content_filter = any(
@@ -2665,6 +2711,16 @@ class IterationRunner:
         )
 
         self._inject_pending_steer(state)
+
+        # Stagnation tracking: feed this iteration's tool batch into the
+        # guardrail's success-loop detector before the failure check below
+        # (which now also evaluates stagnation). Compared against the file
+        # mutation count captured before execution.
+        self._tool_guardrail.note_iteration(
+            [(tc.name, tc.arguments) for tc in response.tool_calls],
+            assistant_text=response.content or "",
+            had_file_mutation=len(state.file_mutations) > mutations_before,
+        )
 
         # 连续失败检测：在所有 tool 执行完毕后检查是否陷入失败循环
         failure_result = self._phase_check_failure_loop(state)

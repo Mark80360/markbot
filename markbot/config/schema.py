@@ -671,6 +671,43 @@ class GuardrailsConfig(Base):
     window_size: int = Field(default=6, ge=2, le=40)
     window_failure_threshold: int = Field(default=4, ge=2, le=40)
     max_reflections: int = Field(default=2, ge=0, le=10)
+    cumulative_min_calls: int = Field(
+        default=8,
+        ge=2,
+        le=200,
+        description=(
+            "Min tool calls in a turn before the cumulative failure-rate "
+            "detector arms (plugs the 'stable trickle of failures' hole "
+            "in the rolling window)"
+        ),
+    )
+    cumulative_failure_ratio: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=1.0,
+        description="Lifetime failure ratio in a turn that triggers warn/halt",
+    )
+    stagnation_warn: int = Field(
+        default=6,
+        ge=1,
+        le=40,
+        description=(
+            "Consecutive no-progress iterations (repeated tool calls, no "
+            "file mutation) before injecting a reflection — catches "
+            "successful-but-unproductive loops"
+        ),
+    )
+    stagnation_block: int = Field(
+        default=10,
+        ge=2,
+        le=80,
+        description=(
+            "Hard ceiling of consecutive no-progress iterations. Effective "
+            "halt usually comes earlier: stagnation_warn + max_reflections "
+            "(default ~8); this ceiling only binds when max_reflections "
+            "is configured larger"
+        ),
+    )
     failed_methods_cap: int = Field(
         default=30,
         ge=1,
@@ -751,15 +788,28 @@ class OutcomeGateConfigSchema(Base):
 
 
 class RuntimeBudgetAxesConfig(Base):
-    """Optional hard ceilings beyond CostTracker USD budget."""
+    """Hard ceilings beyond CostTracker USD budget.
+
+    Both axes are ON by default (engine defaults: 900s wall / 3M tokens
+    per turn) so a runaway loop halts before the iteration cap. Leave
+    unset (null) to inherit the engine default; set to 0 to disable an
+    axis explicitly.
+    """
 
     max_wall_seconds: float | None = Field(
         default=None,
-        description="Hard wall-clock limit for a single turn (seconds)",
+        description=(
+            "Hard wall-clock limit for a single turn in seconds. "
+            "null = engine default (900s), 0 = disabled"
+        ),
     )
     max_total_tokens: int | None = Field(
         default=None,
-        description="Hard total-token limit for a single turn",
+        description=(
+            "Hard total-token limit for a single turn (full prompt of "
+            "every LLM call counts, cache hits included). "
+            "null = engine default (3M), 0 = disabled"
+        ),
     )
 
 
