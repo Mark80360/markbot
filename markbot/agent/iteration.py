@@ -661,12 +661,23 @@ class IterationRunner:
     async def _execute_one_tool_call(self, tc: Any, ctx: ToolContext) -> Any:
         """Execute a single tool call, or return a pre-block denial without running it.
 
-        Pre-block is the single enforcement point for two layers:
+        Pre-block is the single enforcement point for three layers:
+          * ``ToolCallGuardrail.check_loop_cap`` — per-turn hard ceiling on
+            runaway-prone tools (web_search, web_fetch, browser_navigate,
+            delegate_task). Fires regardless of failure detection.
           * ``ToolCallGuardrail.blocked_tools`` / ``blocked_signatures``
             (loop-level failure-streak / no-progress defense)
           * ``SkillGuardrail`` error/critical violations (skill hard
             constraints such as "do not modify SOUL.md during a skill")
         """
+        cap_decision = self._tool_guardrail.check_loop_cap(tc.name)
+        if cap_decision.should_block:
+            logger.warning(
+                "Loop cap blocked tool={} count={}",
+                tc.name, cap_decision.count,
+            )
+            return PreblockedResult(cap_decision.message)
+
         if self._tool_guardrail.is_call_blocked(tc.name, tc.arguments):
             msg = self._tool_guardrail.block_message(tc.name, tc.arguments)
             logger.warning(
@@ -722,8 +733,16 @@ class IterationRunner:
 
         self._flush_current_inbound(state)
 
-        # Load cross-loop guardrail state (reflection / forced-stop / blacklist).
-        # Reset only on a brand-new user request via loop.reset_failure_state().
+        # Full reset of all guardrail state (failure window, streaks, caps,
+        # reflection / forced-stop / failed-methods blacklist). Cross-loop
+        # fields are then restored from the session store below.
+        # On a brand-new user request, loop.reset_failure_state() already
+        # zeroed the session store, so load_persisted() restores zeros.
+        # On compact / "继续", the session store retains accumulated state.
+        self._tool_guardrail.reset_for_turn()
+        self._guardrail_blocked.clear()
+
+        # Restore cross-loop guardrail state (reflection / forced-stop / blacklist).
         if self.session_key:
             try:
                 persisted = self.loop.get_failure_state(self.session_key)
@@ -740,11 +759,6 @@ class IterationRunner:
                     )
             except Exception as e:
                 logger.warning("Failed to load persisted guardrail state: {}", e)
-
-        # Turn-local counters (blocked tools/signatures, streaks) always start
-        # clean for this IterationRunner; only cross-loop fields persist.
-        self._tool_guardrail.reset_turn_local()
-        self._guardrail_blocked.clear()
         self._runtime_budget.reset()
 
         # Cache-safe turn boundary: apply any deferred mutations, then lock.
@@ -1319,9 +1333,13 @@ class IterationRunner:
                 last_msg.get("role"),
             )
 
-    def _is_tool_result_failure(self, result: Any) -> bool:
-        """Delegate to the single failure classifier in tool_guardrails."""
-        return is_failure_result(result)
+    def _is_tool_result_failure(self, result: Any, tool_name: str = "") -> bool:
+        """Delegate to the single failure classifier in tool_guardrails.
+
+        ``tool_name`` enables tool-aware classification: exec tools only fail
+        on non-zero exit_code, read tools never scan content for keywords, etc.
+        """
+        return is_failure_result(result, tool_name)
 
     def _record_tool_result(
         self, state: LoopState, result: Any, tool_name: str = "",
@@ -1392,7 +1410,7 @@ class IterationRunner:
         # _is_tool_result_failure so JSON-error results (e.g. write_file
         # returning ``{"error": "permission denied"}``) don't get recorded
         # as successful mutations and suppress the verify-on-stop nudge.
-        if self._is_tool_result_failure(result):
+        if self._is_tool_result_failure(result, lookup_name):
             return
         path = ""
         if isinstance(tool_call.arguments, dict):
@@ -2622,7 +2640,7 @@ class IterationRunner:
             # agrees with the guardrail's failure classifier — a tool
             # returning ``{"error": "..."}`` (JSON string) would otherwise
             # be flagged as failure for steering but reported as success here.
-            is_error = self._is_tool_result_failure(result)
+            is_error = self._is_tool_result_failure(result, tool_call.name)
             self._emit(
                 EventType.TOOL_COMPLETED,
                 {"tool": tool_call.name, "call_id": tool_call.id,

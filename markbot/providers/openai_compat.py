@@ -21,6 +21,7 @@ from markbot.providers.errors import (  # noqa: F401  (imported per Task 3 spec)
     ErrorType,
     classify_error,
 )
+from markbot.agent.error_classifier import classify_to_error_type
 
 if TYPE_CHECKING:
     from markbot.providers.registry import ProviderSpec
@@ -657,7 +658,7 @@ class OpenAICompatProvider(LLMProvider):
         return LLMResponse(
             content=msg,
             finish_reason="error",
-            error_type=classify_error(getattr(e, "status_code", None), repr(e)),
+            error_type=classify_to_error_type(getattr(e, "status_code", None), repr(e), e),
         )
 
     # ------------------------------------------------------------------

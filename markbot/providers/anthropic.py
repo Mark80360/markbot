@@ -11,7 +11,8 @@ from typing import Any
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from markbot.providers.errors import classify_error
+from markbot.providers.errors import classify_error  # noqa: F401 (re-export)
+from markbot.agent.error_classifier import classify_to_error_type
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -431,7 +432,7 @@ class AnthropicProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error calling LLM: {e}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(e)),
+                error_type=classify_to_error_type(None, repr(e)),
             )
 
     async def chat_stream(
@@ -460,7 +461,7 @@ class AnthropicProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error calling LLM: {e}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(e)),
+                error_type=classify_to_error_type(None, repr(e)),
             )
 
     def get_default_model(self) -> str:

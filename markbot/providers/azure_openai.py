@@ -12,7 +12,8 @@ import httpx
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from markbot.providers.errors import ErrorType, classify_error
+from markbot.providers.errors import ErrorType
+from markbot.agent.error_classifier import classify_to_error_type
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -157,7 +158,7 @@ class AzureOpenAIProvider(LLMProvider):
                     return LLMResponse(
                         content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
                         finish_reason="error",
-                        error_type=classify_error(response.status_code, response.text),
+                        error_type=classify_to_error_type(response.status_code, response.text),
                     )
 
                 response_data = response.json()
@@ -167,7 +168,7 @@ class AzureOpenAIProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error calling Azure OpenAI: {repr(e)}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(e)),
+                error_type=classify_to_error_type(None, repr(e)),
             )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
@@ -257,14 +258,14 @@ class AzureOpenAIProvider(LLMProvider):
                         return LLMResponse(
                             content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
                             finish_reason="error",
-                            error_type=classify_error(response.status_code, text.decode("utf-8", "ignore")),
+                            error_type=classify_to_error_type(response.status_code, text.decode("utf-8", "ignore")),
                         )
                     return await self._consume_stream(response, on_content_delta)
         except Exception as e:
             return LLMResponse(
                 content=f"Error calling Azure OpenAI: {repr(e)}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(e)),
+                error_type=classify_to_error_type(None, repr(e)),
             )
 
     async def _consume_stream(

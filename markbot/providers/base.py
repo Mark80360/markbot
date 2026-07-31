@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -11,7 +12,12 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.providers.errors import ErrorType, classify_error
+from markbot.providers.errors import ErrorType
+from markbot.agent.error_classifier import (
+    BackoffStrategy,
+    classify_api_error,
+    classify_to_error_type,
+)
 
 
 @dataclass
@@ -73,6 +79,26 @@ class GenerationSettings:
     temperature: float = 0.7
     max_tokens: int = 4096
     reasoning_effort: str | None = None
+
+
+def _compute_backoff(
+    base_seconds: float,
+    strategy: BackoffStrategy,
+    attempt: int,
+    default_delay: float,
+) -> float:
+    """Compute retry delay based on backoff strategy and attempt number.
+
+    - FIXED: constant delay (base_seconds)
+    - EXPONENTIAL: base * 2^(attempt-1)
+    - JITTERED: exponential with ±25% random jitter
+    """
+    base = base_seconds if base_seconds > 0 else default_delay
+    if strategy is BackoffStrategy.EXPONENTIAL:
+        return base * (2 ** (attempt - 1))
+    if strategy is BackoffStrategy.JITTERED:
+        return base * (2 ** (attempt - 1)) * (0.75 + random.random() * 0.5)
+    return base
 
 
 class LLMProvider(ABC):
@@ -214,7 +240,7 @@ class LLMProvider(ABC):
             return LLMResponse(
                 content=f"Error calling LLM: {exc}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(exc)),
+                error_type=classify_to_error_type(None, repr(exc), exc),
             )
 
     async def chat_stream(
@@ -254,7 +280,7 @@ class LLMProvider(ABC):
             return LLMResponse(
                 content=f"Error calling LLM: {exc}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(exc)),
+                error_type=classify_to_error_type(None, repr(exc), exc),
             )
 
     async def chat_stream_with_retry(
@@ -290,18 +316,29 @@ class LLMProvider(ABC):
                 return response
 
             if response.error_type != ErrorType.TRANSIENT:
-                stripped = self._strip_image_content(messages)
-                if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                # Use enhanced classifier for recovery action hints
+                cls = classify_api_error(None, response.content or "")
+                if cls.should_strip_images:
+                    stripped = self._strip_image_content(messages)
+                    if stripped is not None:
+                        logger.warning(
+                            "Non-transient LLM error ({}), retrying without images",
+                            cls.reason,
+                        )
+                        return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
+            # Use classifier's backoff hint when available
+            cls = classify_api_error(None, response.content or "")
+            smart_delay = _compute_backoff(
+                cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
+            )
             logger.warning(
-                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                "LLM transient error ({}), attempt {}/{}, retrying in {:.1f}s: {}",
+                cls.reason, attempt, len(self._CHAT_RETRY_DELAYS), smart_delay,
                 (response.content or "")[:120].lower(),
             )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(smart_delay)
 
         return await self._safe_chat_stream(**kw)
 
@@ -341,18 +378,29 @@ class LLMProvider(ABC):
                 return response
 
             if response.error_type != ErrorType.TRANSIENT:
-                stripped = self._strip_image_content(messages)
-                if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat(**{**kw, "messages": stripped})
+                # Use enhanced classifier for recovery action hints
+                cls = classify_api_error(None, response.content or "")
+                if cls.should_strip_images:
+                    stripped = self._strip_image_content(messages)
+                    if stripped is not None:
+                        logger.warning(
+                            "Non-transient LLM error ({}), retrying without images",
+                            cls.reason,
+                        )
+                        return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
+            # Use classifier's backoff hint when available
+            cls = classify_api_error(None, response.content or "")
+            smart_delay = _compute_backoff(
+                cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
+            )
             logger.warning(
-                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                "LLM transient error ({}), attempt {}/{}, retrying in {:.1f}s: {}",
+                cls.reason, attempt, len(self._CHAT_RETRY_DELAYS), smart_delay,
                 (response.content or "")[:120].lower(),
             )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(smart_delay)
 
         return await self._safe_chat(**kw)
 

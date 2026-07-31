@@ -13,7 +13,8 @@ from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from markbot.providers.errors import classify_error
+from markbot.providers.errors import classify_error  # noqa: F401 (re-export)
+from markbot.agent.error_classifier import classify_to_error_type
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "markbot"
@@ -87,7 +88,7 @@ class OpenAICodexProvider(LLMProvider):
             return LLMResponse(
                 content=f"Error calling Codex: {e}",
                 finish_reason="error",
-                error_type=classify_error(None, repr(e)),
+                error_type=classify_to_error_type(None, repr(e)),
             )
 
     async def chat(

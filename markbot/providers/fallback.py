@@ -8,7 +8,8 @@ from loguru import logger
 
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.providers.base import LLMProvider, LLMResponse
-from markbot.providers.errors import ErrorType, classify_error
+from markbot.providers.errors import ErrorType
+from markbot.agent.error_classifier import classify_to_error_type
 
 
 @dataclass
@@ -334,7 +335,7 @@ class FallbackManager:
                 )
                 attempts.append(attempt)
 
-                err_type = classify_error(None, str(e))
+                err_type = classify_to_error_type(None, str(e), e)
                 if err_type == ErrorType.TRANSIENT:
                     logger.warning(
                         "Model {} failed (retryable): {}. Trying next...",

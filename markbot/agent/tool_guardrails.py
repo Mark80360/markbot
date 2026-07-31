@@ -34,6 +34,23 @@ DEFAULT_WINDOW_FAILURE_THRESHOLD = 4
 DEFAULT_MAX_REFLECTIONS = 2
 DEFAULT_FAILED_METHODS_CAP = 30
 
+# Per-turn hard caps on runaway-prone tools. These are HARD ceilings that
+# fire regardless of failure detection — even if all calls succeed, hitting
+# the cap blocks further calls. A value of 0 disables the cap (unlimited).
+# Inspired by Claude Code v2.1.212 runaway-loop caps.
+DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 30
+DEFAULT_MAX_WEB_FETCHES_PER_TURN = 30
+DEFAULT_MAX_BROWSER_NAVIGATIONS_PER_TURN = 30
+DEFAULT_MAX_DELEGATIONS_PER_TURN = 30
+
+# Maps tool name → config attribute for loop caps.
+_LOOP_CAP_CONFIG_FIELDS: dict[str, str] = {
+    "web_search": "max_web_searches_per_turn",
+    "web_fetch": "max_web_fetches_per_turn",
+    "browser_navigate": "max_browser_navigations_per_turn",
+    "delegate_task": "max_delegations_per_turn",
+}
+
 # Read-only / idempotent tools: identical args + identical result ⇒ no progress.
 DEFAULT_IDEMPOTENT_TOOLS: frozenset[str] = frozenset({
     "read_file",
@@ -61,12 +78,16 @@ DEFAULT_IDEMPOTENT_TOOLS: frozenset[str] = frozenset({
     "think",
 })
 
-# Failure-string keywords (lowercase). Keep specific to avoid false positives
-# on normal page / log content.
+# Failure-string keywords (lowercase). STRICT set — only unambiguous error
+# signals that cannot appear in legitimate tool output (source code, API
+# responses, documentation, pip output, etc.).
+#
+# Removed (caused false positives): "error:", "cannot ", "can't ",
+# "is not installed", "failed to", "unable to", '"error":', '"status": 4',
+# '"status": 5', etc. JSON structural errors are now handled by _dict_has_error
+# via json.loads, not by substring matching on the serialized text.
 _FAILURE_KEYWORDS: tuple[str, ...] = (
-    "error:",
-    "traceback",
-    "no module named",
+    "traceback (most recent call last)",
     "modulenotfounderror",
     "filenotfounderror",
     "command not found",
@@ -75,32 +96,36 @@ _FAILURE_KEYWORDS: tuple[str, ...] = (
     "connection timed out",
     "timed out",
     "permission denied",
-    "access denied",
-    "execution denied",
     "exit code: 1",
     "exit code: 2",
     "exit code: 127",
-    "failed to",
-    "unable to",
-    "cannot ",
-    "can't ",
-    "is not installed",
-    "is not available",
-    "500 internal server error",
-    "fetch failed",
-    "readability extraction failed",
-    "readability failed",
-    "jina reader",
-    "forbidden origin",
-    '"error":',
-    '"errors":',
-    '"error_code":',
-    '"errcode":',
-    '"status_code": 4',
-    '"status_code": 5',
-    '"status": 4',
-    '"status": 5',
 )
+
+# Tools that return JSON with an exit_code field. Failure = exit_code != 0.
+# stdout/stderr content (including "Traceback") is NOT a failure signal —
+# the tool ran successfully, the subprocess's output is data.
+_EXEC_TOOL_NAMES: frozenset[str] = frozenset({
+    "exec", "shell", "run_command", "run_code", "terminal",
+})
+
+# File mutation tools. Failure = explicit error field in JSON result.
+# A plain string result or a JSON without error = success.
+_FILE_MUTATION_TOOL_NAMES: frozenset[str] = frozenset({
+    "write_file", "edit_file", "delete_file", "patch",
+})
+
+# Content-returning tools whose RESULT is external data (file contents, web
+# pages, search results). Their output may legitimately contain "error:",
+# "Traceback", "cannot ", etc. — that's the content being read, not a tool
+# failure. Only flag failure via JSON structural error or "Error:" prefix.
+_CONTENT_RETURNING_TOOLS: frozenset[str] = frozenset({
+    "read_file", "list_dir", "list_directory", "glob", "grep",
+    "search_files", "search_codebase", "find", "list",
+    "web_fetch", "web_search", "web_extract",
+    "browser_snapshot", "browser_navigate", "browser_get_images",
+    "memory_search", "memory_list",
+    "skills_list", "skill_view",
+})
 
 
 class GuardrailAction(str, Enum):
@@ -125,6 +150,11 @@ class GuardrailConfig:
     max_reflections: int = DEFAULT_MAX_REFLECTIONS
     idempotent_tools: frozenset[str] = DEFAULT_IDEMPOTENT_TOOLS
     failed_methods_cap: int = DEFAULT_FAILED_METHODS_CAP
+    # Per-turn loop caps (0 = unlimited)
+    max_web_searches_per_turn: int = DEFAULT_MAX_WEB_SEARCHES_PER_TURN
+    max_web_fetches_per_turn: int = DEFAULT_MAX_WEB_FETCHES_PER_TURN
+    max_browser_navigations_per_turn: int = DEFAULT_MAX_BROWSER_NAVIGATIONS_PER_TURN
+    max_delegations_per_turn: int = DEFAULT_MAX_DELEGATIONS_PER_TURN
     enabled: bool = True
 
     @classmethod
@@ -160,6 +190,18 @@ class GuardrailConfig:
             max_reflections=int(get("max_reflections", DEFAULT_MAX_REFLECTIONS)),
             idempotent_tools=tools,
             failed_methods_cap=int(get("failed_methods_cap", DEFAULT_FAILED_METHODS_CAP)),
+            max_web_searches_per_turn=int(
+                get("max_web_searches_per_turn", DEFAULT_MAX_WEB_SEARCHES_PER_TURN)
+            ),
+            max_web_fetches_per_turn=int(
+                get("max_web_fetches_per_turn", DEFAULT_MAX_WEB_FETCHES_PER_TURN)
+            ),
+            max_browser_navigations_per_turn=int(
+                get("max_browser_navigations_per_turn", DEFAULT_MAX_BROWSER_NAVIGATIONS_PER_TURN)
+            ),
+            max_delegations_per_turn=int(
+                get("max_delegations_per_turn", DEFAULT_MAX_DELEGATIONS_PER_TURN)
+            ),
         )
 
 
@@ -203,6 +245,8 @@ class GuardrailState:
     failed_methods: list[str] = field(default_factory=list)
     reflection_count: int = 0
     forced_stop_count: int = 0
+    # Per-turn loop cap counters: tool_name → call count this turn
+    turn_call_counts: dict[str, int] = field(default_factory=dict)
 
 
 def args_signature(arguments: Any, max_len: int = 200) -> str:
@@ -265,8 +309,17 @@ def is_preblocked_result(result: Any) -> bool:
     return isinstance(result, PreblockedResult)
 
 
-def is_failure_result(result: Any) -> bool:
+def is_failure_result(result: Any, tool_name: str = "") -> bool:
     """Single failure classifier used by the iteration runner and this engine.
+
+    Tool-aware classification (mirrors hermes-agent's ``_detect_tool_failure``):
+      - exec/shell/run_code: only ``exit_code != 0`` in JSON = failure
+        (stdout containing "Traceback" is data, not a tool failure)
+      - write_file/edit_file: only explicit ``error`` field in JSON = failure
+        (the tool ran; the file content is not scanned for keywords)
+      - read_file/grep/web_fetch/browser_navigate: only JSON structural error
+        or ``Error:`` prefix = failure (external content is never scanned)
+      - generic/unknown: JSON structural check + strict keywords (first 500 chars)
 
     Pre-blocked denials still classify as failures for metrics / TOOL_COMPLETED
     (they look like Error strings to the model). The iteration runner skips
@@ -283,19 +336,54 @@ def is_failure_result(result: Any) -> bool:
         return False
 
     text = result
+
+    # Universal: "Error:" prefix is always a failure (tool-level error message)
     if text.startswith("Error:") or text.lstrip().lower().startswith("error "):
         return True
 
+    # Parse JSON once for all structural checks below
     stripped = text.lstrip()
+    parsed: Any = None
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             parsed = json.loads(stripped)
         except (json.JSONDecodeError, ValueError):
             parsed = None
+
+    # File mutation tools: trust explicit success/error markers in JSON.
+    # A plain-string result (e.g. "File written to /path") = success.
+    if tool_name in _FILE_MUTATION_TOOL_NAMES:
+        if isinstance(parsed, dict):
+            return _dict_has_error(parsed)
+        return False  # non-JSON plain string = success
+
+    # Exec/shell/run_code: only exit_code != 0 is a failure.
+    # stdout/stderr content is DATA — "Traceback" in output means the
+    # subprocess raised, but the tool itself executed successfully.
+    if tool_name in _EXEC_TOOL_NAMES:
+        if isinstance(parsed, dict):
+            exit_code = parsed.get("exit_code")
+            if isinstance(exit_code, int) and exit_code != 0:
+                return True
+            # JSON result with exit_code == 0 or absent = success
+            return _dict_has_error(parsed)
+        # Plain-string exec output (no JSON wrapper) = success
+        return False
+
+    # Content-returning tools (read_file, web_fetch, grep, etc.):
+    # NEVER scan content for error keywords — the content is external data
+    # that may legitimately contain "error:", "Traceback", "cannot ", etc.
+    if tool_name in _CONTENT_RETURNING_TOOLS:
         if isinstance(parsed, dict) and _dict_has_error(parsed):
             return True
+        return False
 
-    lower = text.lower()
+    # Generic fallback (unknown tools, browser actions, MCP tools, etc.):
+    # JSON structural check + strict keyword matching on first 500 chars only.
+    if isinstance(parsed, dict) and _dict_has_error(parsed):
+        return True
+
+    lower = text[:500].lower()
     return any(kw in lower for kw in _FAILURE_KEYWORDS)
 
 
@@ -363,6 +451,23 @@ class ToolCallGuardrail:
         self.state.blocked_signatures.clear()
         self.state.blocked_tools.clear()
         self.state.tools_warned.clear()
+        self.state.turn_call_counts.clear()
+
+    def reset_for_turn(self) -> None:
+        """Full reset for a new user turn — clears ALL state including
+        cross-loop fields (reflection / forced_stop / failed_methods) and
+        loop-cap counters.
+
+        Called at the start of each new user message so a bad previous turn
+        does NOT poison the next turn. For compact / "继续" (same-task
+        continuation), use :meth:`reset_turn_local` instead — it preserves
+        cross-loop fields so the failure blacklist and reflection budget
+        accumulate across compact boundaries within the same task.
+        """
+        self.reset_turn_local()
+        self.state.reflection_count = 0
+        self.state.forced_stop_count = 0
+        self.state.failed_methods.clear()
 
     def observe(
         self,
@@ -381,7 +486,11 @@ class ToolCallGuardrail:
         if not self.config.enabled:
             return GuardrailDecision(action=GuardrailAction.ALLOW)
 
-        failed = is_failure_result(result) if is_failure is None else bool(is_failure)
+        failed = (
+            is_failure_result(result, tool_name)
+            if is_failure is None
+            else bool(is_failure)
+        )
         self.state.recent_failures.append(failed)
         if len(self.state.recent_failures) > self.config.window_size:
             self.state.recent_failures = self.state.recent_failures[-self.config.window_size :]
@@ -455,6 +564,40 @@ class ToolCallGuardrail:
             self.state.failed_methods = self.state.failed_methods[-(cap - 1) :]
         self.state.failed_methods.append(entry)
         return entry
+
+    def check_loop_cap(self, tool_name: str) -> GuardrailDecision:
+        """Check and advance the per-turn loop cap for a runaway-prone tool.
+
+        Returns a BLOCK decision when the cap is already reached. Otherwise
+        increments the counter and returns ALLOW. A cap of 0 means unlimited.
+
+        These are HARD ceilings that fire regardless of failure detection —
+        even if all calls succeed, hitting the cap blocks further calls.
+        Counters reset every turn via :meth:`reset_turn_local` /
+        :meth:`reset_for_turn`.
+        """
+        config_field = _LOOP_CAP_CONFIG_FIELDS.get(tool_name)
+        if not config_field:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        cap = getattr(self.config, config_field, 0)
+        if cap <= 0:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+
+        count = self.state.turn_call_counts.get(tool_name, 0)
+        if count >= cap:
+            return GuardrailDecision(
+                action=GuardrailAction.BLOCK,
+                reason="loop_cap",
+                tool_name=tool_name,
+                count=count,
+                message=(
+                    f"Tool `{tool_name}` has reached its per-turn cap of {cap} calls. "
+                    "This looks like a runaway loop. Work with the results you "
+                    "already have and give the user your answer."
+                ),
+            )
+        self.state.turn_call_counts[tool_name] = count + 1
+        return GuardrailDecision(action=GuardrailAction.ALLOW)
 
     def is_call_blocked(self, tool_name: str, arguments: Any = None) -> bool:
         """True when this tool (or exact signature) is blocked for the turn."""

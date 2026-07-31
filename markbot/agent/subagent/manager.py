@@ -410,6 +410,13 @@ class SubagentManager:
                             "subagent's capability token. Pick a tool from the "
                             "available set and try again."
                         )
+                    cap_decision = child_guardrail.check_loop_cap(tc.name)
+                    if cap_decision.should_block:
+                        logger.warning(
+                            "Subagent [{}] loop cap blocked tool={} count={}",
+                            task_id, tc.name, cap_decision.count,
+                        )
+                        return cap_decision.message
                     if child_guardrail.is_call_blocked(tc.name, tc.arguments):
                         return child_guardrail.block_message(tc.name, tc.arguments)
                     return await tools.execute(tc.name, tc.arguments, context=_sub_tool_ctx)
@@ -436,7 +443,7 @@ class SubagentManager:
                                 tool_call.name,
                                 tool_call.arguments,
                                 result,
-                                is_failure=is_failure_result(result),
+                                is_failure=is_failure_result(result, tool_call.name),
                             )
                     except Exception:
                         pass
