@@ -13,8 +13,8 @@ from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import classify_error  # noqa: F401 (re-export)
-from markbot.agent.error_classifier import classify_to_error_type
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "markbot"

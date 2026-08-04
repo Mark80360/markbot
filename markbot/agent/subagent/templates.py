@@ -121,6 +121,15 @@ def resolve_capability(
         got = get_template(template)
         if got is not None:
             return got
+    # A non-mapping, non-None payload (e.g. a bare string the LLM passed
+    # for an `object` parameter) is invalid input, not an absent
+    # capability. Callers catch TypeError/ValueError and fall back to
+    # read-only with an explanatory message; silently swallowing it here
+    # would hide the invalid payload from those fallback paths.
+    if capability is not None:
+        raise TypeError(
+            f"capability must be a mapping, got {type(capability).__name__}"
+        )
     return CapabilityToken.read_only()
 
 

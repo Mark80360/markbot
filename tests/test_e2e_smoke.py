@@ -11,12 +11,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from markbot.agent.anthropic_breakpoints import system_and_3
-from markbot.agent.cost import CostTracker, ModelPricing, PricingTable
 from markbot.agent.cache_protocol import (
     CanonicalUsage,
     CacheEvent,
 )
+from markbot.agent.cost import CostTracker, ModelPricing, PricingTable
 from markbot.agent.iteration import (
     IterationRunner,
     LoopState,
@@ -24,6 +23,7 @@ from markbot.agent.iteration import (
     normalise_usage,
 )
 from markbot.agent.turn_metadata import make_turn_metadata
+from markbot.providers.anthropic_breakpoints import system_and_3
 
 
 class _FakeLoop:

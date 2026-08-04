@@ -921,27 +921,6 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
 
         return "\n\n".join(parts) if parts else ""
 
-    def _load_minimal_bootstrap(self) -> str:
-        """Legacy: load all bootstrap files. Kept for backward compatibility."""
-        parts = []
-        for filename in self.BOOTSTRAP_FILES:
-            if filename == "SOUL.md":
-                continue
-            text = self._load_file_content(filename)
-            if text:
-                parts.append(f"## {filename}\n\n{text}")
-
-        feature_path = self.workspace / "feature_list.json"
-        if feature_path.exists():
-            try:
-                text = feature_path.read_text(encoding="utf-8").strip()
-                if text:
-                    parts.append(f"## feature_list.json\n\n```json\n{text}\n```")
-            except Exception as e:
-                logger.warning("Failed to load feature_list.json: {}", e)
-
-        return "\n\n".join(parts) if parts else ""
-
     async def build_messages(
         self,
         history: list[dict[str, Any]],

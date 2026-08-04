@@ -1319,7 +1319,6 @@ markbot/
 │   ├── tool_output.py      # Tool output offloading + head+tail collapse
 │   ├── stream.py           # Stream filtering (think-tag removal)
 │   ├── stream_scrubber.py  # Stream scrubber for memory-context fencing
-│   ├── anthropic_breakpoints.py # Anthropic cache_control breakpoint strategy
 │   ├── cache_chip.py       # Per-block cache chip / prefix-cache bookkeeping
 │   ├── cache_discipline.py # Cache discipline / TTL policy
 │   ├── cache_policy.py     # Cache policy resolution
@@ -1416,7 +1415,9 @@ markbot/
 │   ├── registry.py     # ProviderSpec registry (28 providers)
 │   ├── fallback.py     # FallbackManager with circuit breaker
 │   ├── errors.py       # Provider error taxonomy
+│   ├── error_classifier.py # Error classification & retry/fallback policy
 │   ├── anthropic.py    # Anthropic native SDK
+│   ├── anthropic_breakpoints.py # Anthropic cache_control breakpoint strategy
 │   ├── openai_compat.py # OpenAI-compatible provider
 │   ├── azure_openai.py # Azure OpenAI
 │   ├── openai_codex.py # OpenAI Codex (OAuth)

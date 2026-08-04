@@ -12,12 +12,12 @@ from typing import Any
 
 from loguru import logger
 
-from markbot.providers.errors import ErrorType
-from markbot.agent.error_classifier import (
+from markbot.providers.error_classifier import (
     BackoffStrategy,
     classify_api_error,
     classify_to_error_type,
 )
+from markbot.providers.errors import ErrorType
 
 
 @dataclass

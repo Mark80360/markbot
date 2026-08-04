@@ -17,11 +17,11 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import (  # noqa: F401  (imported per Task 3 spec)
     ErrorType,
     classify_error,
 )
-from markbot.agent.error_classifier import classify_to_error_type
 
 if TYPE_CHECKING:
     from markbot.providers.registry import ProviderSpec

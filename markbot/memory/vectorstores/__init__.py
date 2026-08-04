@@ -34,6 +34,15 @@ try:
 except ImportError:
     chromadb = None  # type: ignore[assignment]
     _HAS_CHROMA = False
+    # Fallback stubs keep the module importable without chromadb. The class
+    # bodies below reference these names at import time, so they must always
+    # exist; the ChromaVectorStore constructor raises a clear ImportError
+    # before any real usage when _HAS_CHROMA is False.
+    class EmbeddingFunction:  # type: ignore[no-redef]
+        pass
+
+    Documents = list  # type: ignore[misc]
+    Embeddings = list  # type: ignore[misc]
 
 
 class _EmbedderFunction(EmbeddingFunction):  # type: ignore[misc]

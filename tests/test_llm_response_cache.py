@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import unittest
 
-from markbot.agent.anthropic_breakpoints import (
+from markbot.agent.llm_response_cache import (
+    LLMResponseCache,
+    request_is_cacheable,
+)
+from markbot.providers.anthropic_breakpoints import (
     attach_system_breakpoints,
     attach_tool_breakpoints,
     attach_user_breakpoint,
     make_cache_control,
     system_and_3,
-)
-from markbot.agent.llm_response_cache import (
-    LLMResponseCache,
-    request_is_cacheable,
 )
 
 

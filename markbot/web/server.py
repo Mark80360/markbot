@@ -13,6 +13,10 @@ from typing import Any
 
 from starlette.routing import WebSocketRoute
 
+from fastapi import File, UploadFile
+
+from markbot.web.auth import get_token
+
 _log = logging.getLogger(__name__)
 
 WEB_DIST = Path(__file__).parent / "static"
@@ -431,10 +435,8 @@ def _build_app(workspace: str | Path | None = None):
         _upload_dir = d
         return d
 
-    from fastapi import File, UploadFile as FastAPIUploadFile
-
     @app.post("/api/upload")
-    async def upload_file(file: FastAPIUploadFile = File(...)):
+    async def upload_file(file: UploadFile = File(...)):
         upload_dir = await _ensure_upload_dir()
         # Sanitize filename: take basename and normalize any path separators
         # (POSIX "/" and Windows "\") so client-controlled filenames cannot

@@ -272,11 +272,14 @@ class TestWebSessionStore:
         store.add_message("s1", "assistant", "World")
         md = store.export_session_markdown("s1")
         assert md is not None
-        assert "# My Chat" in md
-        assert "Hello" in md
-        assert "World" in md
-        assert "You" in md
-        assert "Markbot" in md
+        # Returns (markdown, title) so callers skip a second lookup.
+        markdown, title = md
+        assert title == "My Chat"
+        assert "# My Chat" in markdown
+        assert "Hello" in markdown
+        assert "World" in markdown
+        assert "You" in markdown
+        assert "Markbot" in markdown
 
     def test_export_missing_session_returns_none(self, store):
         assert store.export_session_markdown("nope") is None
@@ -316,6 +319,29 @@ class TestWebSessionStore:
 
 
 class TestServerBuildApp:
+    @staticmethod
+    def _route_paths(app) -> list[str]:
+        """Collect route paths recursively.
+
+        Newer Starlette versions keep included routers as ``_IncludedRouter``
+        wrappers (path="") with the actual routes nested under ``.router``
+        instead of flattening them into ``app.routes``, so a flat scan misses
+        every router endpoint.
+        """
+
+        def walk(routes: list) -> list[str]:
+            out: list[str] = []
+            for r in routes:
+                p = getattr(r, "path", "")
+                if p:
+                    out.append(p)
+                sub = getattr(r, "router", None) or getattr(r, "original_router", None)
+                if sub is not None and getattr(sub, "routes", None):
+                    out.extend(walk(sub.routes))
+            return out
+
+        return walk(app.routes)
+
     def test_build_app_returns_fastapi_instance(self, monkeypatch):
         # Avoid actually creating the agent loop / cron at import time;
         # _build_app only instantiates agent lazily on ws/upload, so it's safe.
@@ -326,14 +352,14 @@ class TestServerBuildApp:
 
         assert isinstance(app, FastAPI)
         # status router registered and exempt
-        routes = [getattr(r, "path", "") for r in app.routes]
+        routes = self._route_paths(app)
         assert "/api/status" in routes
 
     def test_build_app_registers_routers(self, monkeypatch):
         from markbot.web.server import _build_app
 
         app = _build_app()
-        routes = {getattr(r, "path", "") for r in app.routes}
+        routes = set(self._route_paths(app))
         # A representative subset of registered endpoints
         for path in [
             "/api/status",

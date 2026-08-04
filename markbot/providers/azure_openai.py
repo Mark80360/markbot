@@ -12,8 +12,8 @@ import httpx
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import ErrorType
-from markbot.agent.error_classifier import classify_to_error_type
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 

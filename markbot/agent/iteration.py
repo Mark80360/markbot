@@ -687,7 +687,7 @@ class IterationRunner:
                 str(getattr(tc, "arguments", ""))[:120],
             )
             return PreblockedResult(msg)
-        skill_block_msg = self._guardrail_blocked.get(tc.id)
+        skill_block_msg = self._guardrail_blocked.get(getattr(tc, "id", ""))
         if skill_block_msg is not None:
             logger.warning(
                 "Skill guardrail blocked tool={} (violation: {})",

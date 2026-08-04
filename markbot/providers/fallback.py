@@ -8,8 +8,8 @@ from loguru import logger
 
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.providers.base import LLMProvider, LLMResponse
+from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import ErrorType
-from markbot.agent.error_classifier import classify_to_error_type
 
 
 @dataclass

@@ -11,8 +11,8 @@ from typing import Any
 import json_repair
 
 from markbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import classify_error  # noqa: F401 (re-export)
-from markbot.agent.error_classifier import classify_to_error_type
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -290,10 +290,10 @@ class AnthropicProvider(LLMProvider):
         tools: list[dict[str, Any]] | None,
     ) -> tuple[str | list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]] | None]:
         # Delegate to the canonical ``system_and_3`` strategy defined
-        # in :mod:`markbot.agent.anthropic_breakpoints`.  This keeps
+        # in :mod:`markbot.providers.anthropic_breakpoints`.  This keeps
         # the breakpoint policy in one place so the TUI / Langfuse
         # observers can introspect the same layout the provider used.
-        from markbot.agent.anthropic_breakpoints import system_and_3
+        from markbot.providers.anthropic_breakpoints import system_and_3
         return system_and_3(
             system=system,
             tools=tools,

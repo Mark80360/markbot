@@ -288,6 +288,12 @@ def _parse_choice(response: str) -> str:
         return "allow_all"
     if deny_label and deny_label in text:
         return "deny"
+    # Hyphenated "allow-all" contains the generic "allow" label as a
+    # substring, so the allow check below would shadow the allow-all intent.
+    # Handle it before the generic match (same normalization the English
+    # keyword fallback further down relies on).
+    if "allow-all" in text:
+        return "allow_all"
     if allow_label and allow_label in text:
         return "allow"
 
