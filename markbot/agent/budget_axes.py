@@ -1,7 +1,10 @@
-"""Three-axis runtime budget: tokens / dollars / wall-time.
+"""Three-axis runtime budget: tokens / dollars / inactivity.
 
-Complements CostTracker (USD) with iteration-local wall-time and optional
-token ceilings so long turns can halt cleanly with a residual summary.
+Replaces wall-time budget with inactivity-based timeout: the turn is killed
+only when the agent stops producing activity (LLM tokens, tool calls,
+progress callbacks) for the configured duration, not when the total turn
+wall-time exceeds a ceiling.  A separate watchdog thread polls the
+inactivity clock and requests interruption when the timeout fires.
 """
 
 from __future__ import annotations
@@ -11,19 +14,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-# Default per-turn ceilings. These are ON by default so a runaway loop
-# cannot burn unbounded time/tokens before the iteration cap fires —
-# previously both axes defaulted to None (disabled), leaving
-# ``max_iterations`` as the only backstop. Set the config value to 0
-# (or a negative number) to disable an axis explicitly.
-#
-# Tuning notes (post-audit): the token axis counts the FULL prompt of
-# every LLM call (cache hits included), so 1M was reachable after ~20
-# iterations on a 50k context — too aggressive for legitimate heavy
-# turns; 3M gives runaway loops a hard stop while leaving normal work
-# headroom. 600s wall was within reach of a single slow build/test run;
-# 900s covers that while still bounding true runaways.
-DEFAULT_MAX_WALL_SECONDS = 900.0
+# ---------------------------------------------------------------------------
+# Default per-turn ceilings
+# ---------------------------------------------------------------------------
+# 1800 s (30 min) of *inactivity* matches Hermes' gateway_timeout default.
+# A busy turn that produces tokens / tool calls / progress continuously
+# can run indefinitely; only a truly hung API call or deadlocked tool gets
+# killed.  Set to 0 (or a negative number) to disable.
+DEFAULT_MAX_INACTIVITY_SECONDS = 1800.0
 DEFAULT_MAX_TOTAL_TOKENS = 3_000_000
 
 
@@ -31,7 +29,7 @@ class BudgetAxis(str, Enum):
     NONE = "none"
     USD = "usd"
     TOKENS = "tokens"
-    WALL_TIME = "wall_time"
+    INACTIVITY = "inactivity"
     ITERATIONS = "iterations"
 
 
@@ -49,9 +47,17 @@ class BudgetAxisHit:
 
 @dataclass
 class RuntimeBudgetConfig:
-    """Hard limits evaluated each iteration (in addition to CostTracker)."""
+    """Hard limits evaluated each iteration.
 
-    max_wall_seconds: float | None = DEFAULT_MAX_WALL_SECONDS
+    ``max_inactivity_seconds``: turn is killed after this many seconds of
+    zero activity (LLM tokens, tool calls, progress callbacks).  A busy
+    turn that keeps producing activity runs indefinitely.
+
+    ``max_total_tokens``: hard ceiling on cumulative prompt+completion
+    tokens across all LLM calls in a single turn.
+    """
+
+    max_inactivity_seconds: float | None = DEFAULT_MAX_INACTIVITY_SECONDS
     max_total_tokens: int | None = DEFAULT_MAX_TOTAL_TOKENS
 
     @classmethod
@@ -61,14 +67,21 @@ class RuntimeBudgetConfig:
         if isinstance(settings, Mapping):
             get = settings.get
         else:
+
             def get(k, d=None):
                 return getattr(settings, k, d)
 
-        wall = get("max_wall_seconds", get("maxWallSeconds", None))
+        inactivity = get(
+            "max_inactivity_seconds", get("maxInactivitySeconds", None)
+        )
         tokens = get("max_total_tokens", get("maxTotalTokens", None))
         return cls(
-            max_wall_seconds=_ceiling_or_disabled(wall, DEFAULT_MAX_WALL_SECONDS),
-            max_total_tokens=_ceiling_or_disabled(tokens, DEFAULT_MAX_TOTAL_TOKENS),
+            max_inactivity_seconds=_ceiling_or_disabled(
+                inactivity, DEFAULT_MAX_INACTIVITY_SECONDS
+            ),
+            max_total_tokens=_ceiling_or_disabled(
+                tokens, DEFAULT_MAX_TOTAL_TOKENS
+            ),
         )
 
 
@@ -92,15 +105,44 @@ def _ceiling_or_disabled(value: Any, default: float) -> Any:
 
 @dataclass
 class RuntimeBudget:
-    """Per-turn wall-time / token ceiling tracker."""
+    """Per-turn inactivity / token ceiling tracker.
+
+    ``touch_activity()`` is called on every LLM token, tool call, and
+    progress callback.  ``evaluate()`` compares ``seconds_since_activity``
+    against the configured threshold, *not* the total wall time since
+    the turn started.
+
+    ``interrupt_requested`` is set by an external watchdog thread that
+    polls ``seconds_since_activity`` independently of the asyncio event
+    loop, so it fires even when a blocking tool call starves the loop.
+    """
 
     config: RuntimeBudgetConfig = field(default_factory=RuntimeBudgetConfig)
-    started_at: float = field(default_factory=time.monotonic)
+    _last_activity_at: float = field(default_factory=time.monotonic)
     total_tokens: int = 0
+    # Thread-safe flag for watchdog → agent loop communication.
+    # Set to True when the watchdog detects inactivity timeout.
+    interrupt_requested: bool = False
+
+    @property
+    def seconds_since_activity(self) -> float:
+        """Wall-clock seconds since the last ``touch_activity()`` call."""
+        return time.monotonic() - self._last_activity_at
+
+    def touch_activity(self) -> None:
+        """Refresh the activity clock.
+
+        Thread-safe: ``_last_activity_at`` is a C-level float write on
+        CPython (single store instruction on 64-bit), so worst case is a
+        stale read of a few ns — harmless for a 1800 s threshold.
+        """
+        self._last_activity_at = time.monotonic()
 
     def reset(self) -> None:
-        self.started_at = time.monotonic()
+        """Start a fresh turn: reset activity clock, tokens, and flags."""
+        self._last_activity_at = time.monotonic()
         self.total_tokens = 0
+        self.interrupt_requested = False
 
     def add_tokens(self, n: int) -> None:
         if n and n > 0:
@@ -108,19 +150,22 @@ class RuntimeBudget:
 
     def evaluate(self) -> BudgetAxisHit:
         cfg = self.config
-        if cfg.max_wall_seconds is not None:
-            elapsed = time.monotonic() - self.started_at
-            if elapsed >= cfg.max_wall_seconds:
+        if cfg.max_inactivity_seconds is not None:
+            idle = self.seconds_since_activity
+            if idle >= cfg.max_inactivity_seconds:
                 return BudgetAxisHit(
-                    axis=BudgetAxis.WALL_TIME,
+                    axis=BudgetAxis.INACTIVITY,
                     message=(
-                        f"Wall-time budget exceeded: {elapsed:.1f}s "
-                        f">= {cfg.max_wall_seconds:.1f}s"
+                        f"Inactivity timeout: {idle:.1f}s idle "
+                        f">= {cfg.max_inactivity_seconds:.1f}s"
                     ),
-                    current=elapsed,
-                    limit=cfg.max_wall_seconds,
+                    current=idle,
+                    limit=cfg.max_inactivity_seconds,
                 )
-        if cfg.max_total_tokens is not None and self.total_tokens >= cfg.max_total_tokens:
+        if (
+            cfg.max_total_tokens is not None
+            and self.total_tokens >= cfg.max_total_tokens
+        ):
             return BudgetAxisHit(
                 axis=BudgetAxis.TOKENS,
                 message=(

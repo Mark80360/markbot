@@ -790,17 +790,20 @@ class OutcomeGateConfigSchema(Base):
 class RuntimeBudgetAxesConfig(Base):
     """Hard ceilings beyond CostTracker USD budget.
 
-    Both axes are ON by default (engine defaults: 900s wall / 3M tokens
-    per turn) so a runaway loop halts before the iteration cap. Leave
-    unset (null) to inherit the engine default; set to 0 to disable an
-    axis explicitly.
+    The inactivity axis is ON by default (engine default: 1800 s of
+    *inactivity* per turn) — a busy turn that keeps producing LLM
+    tokens / tool calls / progress callbacks can run indefinitely.
+    Leave unset (null) to inherit the engine default; set to 0 to
+    disable an axis explicitly.
     """
 
-    max_wall_seconds: float | None = Field(
+    max_inactivity_seconds: float | None = Field(
         default=None,
         description=(
-            "Hard wall-clock limit for a single turn in seconds. "
-            "null = engine default (900s), 0 = disabled"
+            "Hard inactivity limit for a single turn in seconds. "
+            "A turn is killed only after this many seconds with no "
+            "LLM tokens, tool calls, or progress callbacks. "
+            "null = engine default (1800s), 0 = disabled"
         ),
     )
     max_total_tokens: int | None = Field(

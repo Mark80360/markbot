@@ -585,13 +585,14 @@ class TestCapabilityTemplates:
 
 
 class TestRuntimeBudget:
-    def test_wall_time_hit(self):
+    def test_inactivity_timeout_hit(self):
         from markbot.agent.budget_axes import BudgetAxis, RuntimeBudget, RuntimeBudgetConfig
 
-        b = RuntimeBudget(RuntimeBudgetConfig(max_wall_seconds=0.0))
+        # Set max_inactivity_seconds to 0 so evaluate() always hits.
+        b = RuntimeBudget(RuntimeBudgetConfig(max_inactivity_seconds=0.0))
         hit = b.evaluate()
         assert hit.hit
-        assert hit.axis is BudgetAxis.WALL_TIME
+        assert hit.axis is BudgetAxis.INACTIVITY
 
     def test_token_hit(self):
         from markbot.agent.budget_axes import BudgetAxis, RuntimeBudget, RuntimeBudgetConfig

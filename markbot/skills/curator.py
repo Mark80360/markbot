@@ -33,6 +33,7 @@ class CuratorReport:
     skills_scanned: int = 0
     transitions: list[dict[str, Any]] = field(default_factory=list)
     improvements: list[dict[str, Any]] = field(default_factory=list)
+    orphaned_usage_pruned: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -85,6 +86,11 @@ class CuratorService:
             skills = self._registry.list_all()
             report.skills_scanned = len(skills)
 
+            # Prune usage entries for skills that no longer exist on disk
+            # (deleted outside the official delete path — e.g. the directory
+            # removed by hand — or where the delete-side cleanup failed).
+            report.orphaned_usage_pruned = self._prune_orphaned_usage()
+
             # Scan for needed transitions
             skill_tuples = [(s.name, s.is_builtin) for s in skills]
             transition_reports = lifecycle.scan_all(skill_tuples)
@@ -134,6 +140,49 @@ class CuratorService:
         self._save_report(report)
 
         return report
+
+    def _prune_orphaned_usage(self) -> int:
+        """Remove usage entries for skills that no longer exist on disk.
+
+        Compares the keys in ``.skill_usage.json`` against the actual skill
+        directories (workspace skills incl. archived, plus builtin skills).
+        Returns the number of entries removed.
+        """
+        try:
+            existing = set()
+
+            skills_dir = self._workspace / "skills"
+            if skills_dir.exists():
+                for d in skills_dir.iterdir():
+                    if not d.is_dir() or d.name.startswith("."):
+                        continue
+                    if d.name == "archived":
+                        # Archived skills live one level deeper — their
+                        # usage entries must be preserved too.
+                        for sub in d.iterdir():
+                            if sub.is_dir() and not sub.name.startswith("."):
+                                existing.add(sub.name)
+                    else:
+                        existing.add(d.name)
+
+            from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
+            if BUILTIN_SKILLS_DIR.exists():
+                for d in BUILTIN_SKILLS_DIR.iterdir():
+                    if d.is_dir() and not d.name.startswith("."):
+                        existing.add(d.name)
+
+            usage_store = self._registry.usage_store
+            removed = 0
+            for name in list(usage_store.get_all()):
+                if name not in existing:
+                    usage_store.remove(name)
+                    removed += 1
+            if removed:
+                logger.info("Curator: pruned {} orphaned usage entries", removed)
+            return removed
+        except Exception as e:
+            logger.warning("Curator: orphaned usage prune failed: {}", e)
+            return 0
 
     def _evaluate_improvements(
         self,

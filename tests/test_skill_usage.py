@@ -1,5 +1,6 @@
 """Tests for skill usage tracking, lifecycle, curator, and improver."""
 
+import asyncio
 import time
 
 from markbot.skills.curator import CuratorReport, CuratorService
@@ -68,6 +69,57 @@ class TestSkillUsageStore:
         all_entries = store.get_all()
         assert "a" in all_entries
         assert "b" in all_entries
+
+    def test_bump_creates_missing_workspace_dir(self, tmp_path):
+        ws = tmp_path / "nested" / "ws"
+        store = SkillUsageStore(ws)
+        store.bump_view("x")
+        assert ws.exists()
+        assert (ws / ".skill_usage.json").exists()
+        assert SkillUsageStore(ws).get("x").view_count == 1
+
+
+class TestSkillUsageStoreConcurrency:
+    def test_two_instances_no_lost_update(self, tmp_path):
+        store1 = SkillUsageStore(tmp_path)
+        store2 = SkillUsageStore(tmp_path)
+        store1.bump_view("x")
+        store2.bump_view("x")
+        store1.bump_view("x")
+        assert SkillUsageStore(tmp_path).get("x").view_count == 3
+
+    def test_remove_sees_other_instance_bumps(self, tmp_path):
+        store1 = SkillUsageStore(tmp_path)
+        store1.bump_use("a")
+        store1.bump_use("b")
+        store2 = SkillUsageStore(tmp_path)
+        store2.remove("a")
+        assert store2.peek("a") is None
+        assert store2.peek("b") is not None
+        assert store1.get("b").use_count == 1
+
+    def test_threaded_bumps_no_lost_update(self, tmp_path):
+        import threading
+
+        per_thread = 15
+        errors = []
+
+        def worker():
+            try:
+                store = SkillUsageStore(tmp_path)
+                for _ in range(per_thread):
+                    store.bump_view("x")
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert SkillUsageStore(tmp_path).get("x").view_count == 2 * per_thread
 
 
 class TestSkillLifecycle:
@@ -165,6 +217,68 @@ class TestCuratorService:
         reports = curator.get_recent_reports()
         assert len(reports) == 1
         assert reports[0]["skills_scanned"] == 5
+
+    def test_prunes_orphaned_usage(self, tmp_path):
+        skills_dir = tmp_path / "skills" / "my_skill"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: my_skill\ndescription: t\nwhen_to_use: t\n---\nbody"
+        )
+
+        from markbot.skills.core.registry import SkillRegistry
+
+        registry = SkillRegistry(tmp_path)
+        registry.load_all()
+
+        usage = registry.usage_store
+        usage.bump_use("my_skill")
+        usage.bump_use("ghost_skill")
+
+        curator = CuratorService(tmp_path, registry)
+        report = curator.run_maintenance()
+
+        assert report.orphaned_usage_pruned == 1
+        assert usage.peek("ghost_skill") is None
+        assert usage.peek("my_skill") is not None
+
+    def test_prune_keeps_archived_skill_usage(self, tmp_path):
+        (tmp_path / "skills" / "my_skill").mkdir(parents=True)
+        (tmp_path / "skills" / "my_skill" / "SKILL.md").write_text(
+            "---\nname: my_skill\ndescription: t\nwhen_to_use: t\n---\nbody"
+        )
+        (tmp_path / "skills" / "archived" / "old_skill").mkdir(parents=True)
+        (tmp_path / "skills" / "archived" / "old_skill" / "SKILL.md").write_text(
+            "---\nname: old_skill\ndescription: t\nwhen_to_use: t\n---\nbody"
+        )
+
+        from markbot.skills.core.registry import SkillRegistry
+
+        registry = SkillRegistry(tmp_path)
+        registry.load_all()
+
+        usage = registry.usage_store
+        usage.bump_use("my_skill")
+        usage.bump_use("old_skill")
+        usage.set_state("old_skill", "archived")
+
+        curator = CuratorService(tmp_path, registry)
+        report = curator.run_maintenance()
+
+        assert report.orphaned_usage_pruned == 0
+        assert usage.peek("my_skill") is not None
+        assert usage.peek("old_skill") is not None
+
+    def test_view_nonexistent_skill_not_counted(self, tmp_path):
+        from markbot.skills.core.registry import SkillRegistry
+        from markbot.skills.core.tool import SkillViewTool
+
+        registry = SkillRegistry(tmp_path)
+        tool = SkillViewTool(registry)
+
+        result = asyncio.run(tool.execute({"name": "ghost_skill"}, None))
+
+        assert "not found" in result
+        assert registry.usage_store.peek("ghost_skill") is None
 
 
 class TestEvalResult:

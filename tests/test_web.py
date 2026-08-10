@@ -850,3 +850,65 @@ class TestLogsRouter:
         resp = client.get("/api/logs", headers={"x-markbot-session-token": "t"})
         assert resp.status_code == 200
         assert resp.json()["logs"] == []
+
+
+# ---------------------------------------------------------------------------
+# routers/skills.py
+# ---------------------------------------------------------------------------
+
+
+class TestSkillsRouterUsage:
+    def _make_skill(self, workspace, name):
+        from markbot.skills.core.loader import SkillLoader
+        from markbot.skills.usage import SkillUsageStore
+
+        skill_dir = workspace / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\nwhen_to_use: w\n---\nbody",
+            encoding="utf-8",
+        )
+        store = SkillUsageStore(workspace)
+        store.bump_view(name)
+        store.bump_use(name)
+        return SkillLoader
+
+    def test_list_skills_hydrates_usage(self, tmp_path, monkeypatch):
+        from markbot.skills.core.loader import SkillLoader
+        from markbot.web.routers import skills
+
+        self._make_skill(tmp_path, "demo")
+        monkeypatch.setattr(skills, "_get_loader", lambda: SkillLoader(workspace=tmp_path))
+        monkeypatch.setattr(skills, "_get_workspace", lambda: tmp_path)
+
+        import asyncio
+        import json
+
+        resp = asyncio.run(skills.list_skills())
+        body = json.loads(resp.body)
+        skill = body["skills"][0]
+        assert skill["view_count"] == 1
+        assert skill["use_count"] == 1
+
+    def test_list_skills_missing_usage_file_stays_zero(self, tmp_path, monkeypatch):
+        from markbot.skills.core.loader import SkillLoader
+        from markbot.web.routers import skills
+
+        skill_dir = tmp_path / "skills" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: d\nwhen_to_use: w\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(skills, "_get_loader", lambda: SkillLoader(workspace=tmp_path))
+        monkeypatch.setattr(skills, "_get_workspace", lambda: tmp_path)
+
+        import asyncio
+        import json
+
+        resp = asyncio.run(skills.list_skills())
+        body = json.loads(resp.body)
+        skill = body["skills"][0]
+        assert skill["view_count"] == 0
+        assert skill["use_count"] == 0
+        assert not (tmp_path / ".skill_usage.json").exists()

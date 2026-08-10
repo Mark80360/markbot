@@ -21,7 +21,13 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     msg = ctx.msg
     loop.clear_steer(msg.session_key)
-    tasks = loop._active_tasks.pop(msg.session_key, [])
+    session_key = msg.session_key
+
+    # Snapshot the in-flight tasks.  We must NOT pop the list here —
+    # _untrack_task (done-callback) needs to find the entry to properly
+    # clean up _session_locks when the last task completes.  In asyncio's
+    # single-threaded model this synchronous read is atomic.
+    tasks = list(loop._active_tasks.get(session_key, []))
     cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
     for t in tasks:
         try:
@@ -29,13 +35,17 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.opt(exception=True).warning("Active task raised an exception while being stopped")
-    sub_cancelled = await loop.subagents.cancel_by_session(msg.session_key)
+            logger.opt(exception=True).warning(
+                "Active task raised an exception while being stopped"
+            )
+    sub_cancelled = await loop.subagents.cancel_by_session(session_key)
     total = cancelled + sub_cancelled
-    session = loop.sessions.get_or_create(msg.session_key)
+    session = loop.sessions.get_or_create(session_key)
     loop.sessions.save(session)
     content = t("cmd.stop.stopped", count=total) if total else t("cmd.stop.none")
-    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id, content=content
+    )
 
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
@@ -219,7 +229,7 @@ async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
     # agent iteration.  If no task is running for this session, queueing
     # the instruction would silently sit in ``_pending_steer`` until the
     # next run starts, which is misleading.  Refuse instead.
-    tasks = loop._active_tasks.get(session_key, [])
+    tasks = list(loop._active_tasks.get(session_key, []))
     has_running = any(not t.done() for t in tasks)
     if not has_running:
         return OutboundMessage(
@@ -455,6 +465,40 @@ def build_builtin_catalog() -> "CommandCatalog":
             control_plane=True,
         ),
         CommandDef(
+            name="/mode",
+            handler=cmd_mode,
+            description="Show or set permission mode (default/plan/auto/bypass)",
+            tier=CommandTier.PRIORITY,
+            args_hint="[mode]",
+            category="runtime",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/profile",
+            handler=cmd_profile,
+            description="Show or set runtime profile (coding/assistant/unattended)",
+            tier=CommandTier.PRIORITY,
+            args_hint="[name]",
+            category="runtime",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/help",
+            handler=cmd_help,
+            description="Show available slash commands",
+            tier=CommandTier.PRIORITY,
+            category="general",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/compact_str",
+            handler=cmd_compact_str,
+            description="View current compressed summary",
+            tier=CommandTier.PRIORITY,
+            category="session",
+            control_plane=True,
+        ),
+        CommandDef(
             name="/new",
             handler=cmd_new,
             description="Start fresh session with memory summary",
@@ -467,36 +511,10 @@ def build_builtin_catalog() -> "CommandCatalog":
             category="session",
         ),
         CommandDef(
-            name="/compact_str",
-            handler=cmd_compact_str,
-            description="View current compressed summary",
-            category="session",
-        ),
-        CommandDef(
-            name="/mode",
-            handler=cmd_mode,
-            description="Show or set permission mode (default/plan/auto/bypass)",
-            args_hint="[mode]",
-            category="runtime",
-        ),
-        CommandDef(
-            name="/profile",
-            handler=cmd_profile,
-            description="Show or set runtime profile (coding/assistant/unattended)",
-            args_hint="[name]",
-            category="runtime",
-        ),
-        CommandDef(
             name="/clear",
             handler=cmd_clear,
             description="Clear history and compressed summary",
             category="session",
-        ),
-        CommandDef(
-            name="/help",
-            handler=cmd_help,
-            description="Show available slash commands",
-            category="general",
         ),
     )
     return catalog

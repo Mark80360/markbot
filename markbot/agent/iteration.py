@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -505,6 +507,68 @@ class IterationRunner:
                 getattr(tools_cfg, "runtime_budget", None) if tools_cfg else None
             )
         )
+        # Watchdog thread for inactivity detection (Hermes-style).
+        self._watchdog_stop: threading.Event | None = None
+        self._watchdog_thread: threading.Thread | None = None
+
+    def _start_watchdog(self) -> threading.Thread:
+        """Launch a daemon thread that monitors inactivity and requests
+        interrupt when the configured threshold is exceeded.
+
+        Uses ``threading.Event.wait`` for polling so the thread sleeps
+        without busy-waiting.  The thread reads
+        ``RuntimeBudget.seconds_since_activity`` — a C-level float that
+        is safe to read from any CPython thread.
+        """
+        budget = self._runtime_budget
+        max_idle = budget.config.max_inactivity_seconds
+        if max_idle is None:
+            # Axis disabled — no watchdog needed.
+            return None  # type: ignore[return-value]
+
+        self._watchdog_stop = threading.Event()
+        done = self._watchdog_stop
+        poll_interval = 5.0  # seconds
+
+        def _watchdog() -> None:
+            while not done.is_set():
+                done.wait(poll_interval)
+                if done.is_set():
+                    return
+                try:
+                    idle = budget.seconds_since_activity
+                    if idle >= max_idle:
+                        # Re-check done before setting the flag: the turn
+                        # may have ended while we were reading idle time.
+                        if done.is_set():
+                            return
+                        logger.warning(
+                            "Inactivity watchdog: {:.1f}s idle >= {:.1f}s "
+                            "threshold — requesting interrupt",
+                            idle, max_idle,
+                        )
+                        budget.interrupt_requested = True
+                        return
+                except Exception:
+                    # Budget access failure should not crash the thread.
+                    continue
+
+        t = threading.Thread(
+            target=_watchdog, daemon=True, name="budget-inactivity-watchdog",
+        )
+        t.start()
+        self._watchdog_thread = t
+        return t
+
+    def _stop_watchdog(self) -> None:
+        """Signal the watchdog thread to stop and wait for it."""
+        if self._watchdog_stop is None:
+            return
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=5.0)
+        self._watchdog_stop = None
+        self._watchdog_thread = None
 
     def _build_tool_guardrail(self) -> ToolCallGuardrail:
         """Build ToolCallGuardrail from ToolsConfig.guardrails."""
@@ -776,39 +840,61 @@ class IterationRunner:
             len(initial_messages),
         )
 
-        while state.iteration < self.loop.max_iterations:
-            state.iteration += 1
-            logger.info(
-                "=== Iteration {}/{} (channel={}, chat_id={}) ===",
-                state.iteration,
-                self.loop.max_iterations,
-                self.channel,
-                self.chat_id,
-            )
-            logger.info("Current message count: {}", len(state.messages))
+        # Start the inactivity watchdog thread (Hermes-style).  Runs a
+        # daemon thread that polls RuntimeBudget.seconds_since_activity
+        # every 5 s and sets interrupt_requested when the configured
+        # max_inactivity_seconds is exceeded.
+        self._start_watchdog()
 
-            # Wall-time axis must be checked before another LLM call so a
-            # long-running turn can halt cleanly without waiting for usage.
-            axis_hit = self._runtime_budget.evaluate()
-            if axis_hit.hit:
-                logger.error("Runtime budget axis hit: {}", axis_hit.message)
-                state.budget_exceeded = True
-                state.exit_reason = TurnExitReason.BUDGET_EXCEEDED
-                if state.final_content is None:
-                    state.final_content = (
-                        f"[Runtime Budget] {axis_hit.message}. "
-                        "Stopping turn with residual work open."
-                    )
-                break
+        try:
+            while state.iteration < self.loop.max_iterations:
+                state.iteration += 1
+                logger.info(
+                    "=== Iteration {}/{} (channel={}, chat_id={}) ===",
+                    state.iteration,
+                    self.loop.max_iterations,
+                    self.channel,
+                    self.chat_id,
+                )
+                logger.info("Current message count: {}", len(state.messages))
 
-            result = await self._run_one_iteration(state)
-            # Propagate exit reason from the iteration result to loop state.
-            # The last non-None exit_reason wins; for should_break this is the
-            # final exit reason, for should_continue it's telemetry only.
-            if result.exit_reason is not None:
-                state.exit_reason = result.exit_reason
-            if result.should_break:
-                break
+                # Check interrupt flag set by the inactivity watchdog thread.
+                # Double-validate: a stale flag from a previous turn's
+                # watchdog (race during _stop_watchdog join) could be True
+                # even though this turn just started.  Require both the
+                # flag AND actual idle time >= threshold before killing.
+                if self._runtime_budget.interrupt_requested:
+                    idle_seconds = self._runtime_budget.seconds_since_activity
+                    max_idle = self._runtime_budget.config.max_inactivity_seconds
+                    if max_idle is not None and idle_seconds >= max_idle:
+                        logger.error(
+                            "Inactivity timeout: {:.1f}s idle "
+                            "(watchdog trigger)",
+                            idle_seconds,
+                        )
+                        state.budget_exceeded = True
+                        state.exit_reason = TurnExitReason.BUDGET_EXCEEDED
+                        if state.final_content is None:
+                            state.final_content = (
+                                f"[Runtime Budget] Inactivity timeout: "
+                                f"{idle_seconds:.1f}s idle. "
+                                "Stopping turn with residual work open."
+                            )
+                        break
+                    # Stale flag — clear and continue.
+                    self._runtime_budget.interrupt_requested = False
+
+                result = await self._run_one_iteration(state)
+                # Propagate exit reason from the iteration result to loop state.
+                # The last non-None exit_reason wins; for should_break this is the
+                # final exit reason, for should_continue it's telemetry only.
+                if result.exit_reason is not None:
+                    state.exit_reason = result.exit_reason
+                if result.should_break:
+                    break
+
+        finally:
+            self._stop_watchdog()
 
         # If we exited the loop without an explicit break (i.e. hit the
         # max_iterations boundary), set the reason here.
@@ -821,6 +907,7 @@ class IterationRunner:
         return state.final_content, state.tools_used, state.messages, save_start
 
     async def _run_one_iteration(self, state: LoopState) -> IterationResult:
+        self._runtime_budget.touch_activity()
         # Bump the messages revision so the token estimate cache
         # knows to recompute on the next call.
         rev = getattr(self.loop, "_messages_revision", None)
@@ -866,6 +953,7 @@ class IterationRunner:
             return await self._phase_final_response(state, response)
 
     async def _phase_compact(self, state: LoopState) -> None:
+        self._runtime_budget.touch_activity()
         task_context = self.loop._gather_task_context()
         engine = getattr(self.loop, "context_engine", None)
 
@@ -1103,6 +1191,7 @@ class IterationRunner:
         logger.info("Memory context injected as standalone message")
 
     async def _phase_memory_compaction_hook(self, state: LoopState) -> None:
+        self._runtime_budget.touch_activity()
         if state.current_tokens <= self.loop.context_window_tokens * 0.6:
             return
         _skip_context_compact = state.last_compact_action in (
@@ -1848,9 +1937,43 @@ class IterationRunner:
         except Exception as e:
             logger.debug("Memory sync failed: {}", e)
 
+    @contextmanager
+    def _with_activity_stream(self):
+        """Context manager that wraps ``_stream_filter`` to call
+        ``touch_activity()`` on every content delta, then restores the
+        original upstream on exit.
+
+        Usage::
+
+            with self._with_activity_stream():
+                await llm_call_with_streaming()
+        """
+        _orig = self._stream_filter._upstream
+        _budget = self._runtime_budget
+
+        class _Wrapper:
+            __slots__ = ("_budget", "_orig")
+
+            def __init__(self, budget, orig):
+                self._budget = budget
+                self._orig = orig
+
+            def __call__(self, delta):
+                self._budget.touch_activity()
+                if self._orig is not None:
+                    return self._orig(delta)
+                return None
+
+        self._stream_filter._upstream = _Wrapper(_budget, _orig)
+        try:
+            yield
+        finally:
+            self._stream_filter._upstream = _orig
+
     async def _phase_call_llm(
         self, state: LoopState, tool_defs: list[dict]
     ) -> IterationResult | None:
+        self._runtime_budget.touch_activity()
         # If a previous model returned content_filter, the stream buffer may be
         # polluted. Discard it before starting a new LLM call.
         if self.on_stream and self.on_stream_end and state.last_attempts:
@@ -1880,19 +2003,22 @@ class IterationRunner:
             state.last_attempts = []
             return None
         try:
-            if self.on_stream:
-                logger.info("Calling LLM with streaming...")
-                response, attempts = await self.loop.fallback_manager.chat_stream_with_fallback(
-                    messages=state.messages,
-                    tools=tool_defs,
-                    on_content_delta=self._stream_filter,
-                )
-            else:
-                logger.info("Calling LLM without streaming...")
-                response, attempts = await self.loop.fallback_manager.chat_with_fallback(
-                    messages=state.messages,
-                    tools=tool_defs,
-                )
+            with self._with_activity_stream():
+                if self.on_stream:
+                    logger.info("Calling LLM with streaming...")
+                    response, attempts = await self.loop.fallback_manager.chat_stream_with_fallback(
+                        messages=state.messages,
+                        tools=tool_defs,
+                        on_content_delta=self._stream_filter,
+                    )
+                else:
+                    logger.info("Calling LLM without streaming...")
+                    # Still touch activity before a non-streaming call.
+                    self._runtime_budget.touch_activity()
+                    response, attempts = await self.loop.fallback_manager.chat_with_fallback(
+                        messages=state.messages,
+                        tools=tool_defs,
+                    )
             state.last_response = response
             state.last_attempts = attempts
             # Normalise the response usage and feed it to the cost tracker.
@@ -2161,17 +2287,19 @@ class IterationRunner:
             compact_result_ptl.tokens_after,
         )
         try:
-            if self.on_stream:
-                response, attempts = await self.loop.fallback_manager.chat_stream_with_fallback(
-                    messages=state.messages,
-                    tools=tool_defs,
-                    on_content_delta=self._stream_filter,
-                )
-            else:
-                response, attempts = await self.loop.fallback_manager.chat_with_fallback(
-                    messages=state.messages,
-                    tools=tool_defs,
-                )
+            with self._with_activity_stream():
+                if self.on_stream:
+                    response, attempts = await self.loop.fallback_manager.chat_stream_with_fallback(
+                        messages=state.messages,
+                        tools=tool_defs,
+                        on_content_delta=self._stream_filter,
+                    )
+                else:
+                    self._runtime_budget.touch_activity()
+                    response, attempts = await self.loop.fallback_manager.chat_with_fallback(
+                        messages=state.messages,
+                        tools=tool_defs,
+                    )
             state.last_response = response
             state.last_attempts = attempts
             self._emit_model_succeeded(response, attempts)
@@ -2396,6 +2524,7 @@ class IterationRunner:
     async def _phase_execute_tools(
         self, state: LoopState, response: Any, tool_defs: list[dict]
     ) -> IterationResult:
+        self._runtime_budget.touch_activity()
         logger.info(
             "LLM requested {} tool call(s): {}",
             len(response.tool_calls),
@@ -2540,6 +2669,7 @@ class IterationRunner:
         _active_tool_names = [tc.name for tc in response.tool_calls]
 
         def _report_progress(text: str, percent: float | None = None) -> None:
+            self._runtime_budget.touch_activity()
             try:
                 from markbot.bus.emitter import get_event_emitter
                 from markbot.bus.events import EventType
@@ -2704,6 +2834,8 @@ class IterationRunner:
                     await self.on_tool_complete(tool_call.id, tool_call.name, summary, error_msg)
                 except Exception as e:
                     logger.debug("on_tool_complete callback failed: {}", e)
+            # Keep the inactivity clock fresh after each tool result.
+            self._runtime_budget.touch_activity()
             self._flush_messages(state)
         logger.info(
             "Added {} tool results to messages, continue to next iteration",
@@ -2734,6 +2866,7 @@ class IterationRunner:
     async def _phase_final_response(
         self, state: LoopState, response: Any
     ) -> IterationResult:
+        self._runtime_budget.touch_activity()
         logger.info("LLM returned final response (no tool calls)")
 
         # The agent is done calling tools, so any active skill guardrails

@@ -201,7 +201,13 @@ class SkillViewTool(BaseTool):
         if not name:
             return "Error: 'name' parameter is required."
 
-        # Record view event
+        skill = self._registry.get(name)
+        if skill is None:
+            available = ", ".join(s.name for s in self._registry.list_all())
+            return f"Error: Skill '{name}' not found. Available skills: {available}"
+
+        # Record view event — only for skills that actually exist, so
+        # lookups of unknown names don't pollute the usage store.
         self._registry.bump_view(name)
 
         content = self._registry.load_skill_content(name)
@@ -209,7 +215,6 @@ class SkillViewTool(BaseTool):
             available = ", ".join(s.name for s in self._registry.list_all())
             return f"Error: Skill '{name}' not found. Available skills: {available}"
 
-        skill = self._registry.get(name)
         header = f"# Skill: {name}\n\n"
         if skill:
             header += f"**Description**: {skill.description}\n"

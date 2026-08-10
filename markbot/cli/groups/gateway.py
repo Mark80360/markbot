@@ -215,55 +215,84 @@ def run_gateway_foreground(port: int, workspace: str | None, config: str | None,
             agent_task = asyncio.create_task(agent.run())
             channels_task = asyncio.create_task(channels.start_all())
 
-            # Race the main loop against the sentinel watcher.  Whoever
-            # finishes first wins; if it's the sentinel, we trigger the
-            # graceful shutdown sequence (spawn detached restarter, then
-            # let the agent finish current work before cancelling).
-            done, pending = await asyncio.wait(
-                [agent_task, channels_task, sentinel_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Race the main loop against the sentinel watcher.  If the
+            # sentinel wins we trigger graceful shutdown; if the agent
+            # loop crashes unexpectedly we restart it instead of taking
+            # the entire gateway offline.
+            shutdown = False
+            while not shutdown:
+                done, pending = await asyncio.wait(
+                    [t for t in (agent_task, channels_task, sentinel_task)
+                     if t is not None and not t.done()],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            if sentinel_task in done and not sentinel_task.cancelled():
-                payload = sentinel_task.result()
-                if payload:
-                    mode = payload.get("mode", "restart")
-                    reason = payload.get("reason") or "unspecified"
-                    old_pid = read_pid()
-                    restarter_pid = None
-                    if mode == "restart":
-                        restarter_pid = spawn_detached_restarter(payload, old_pid)
-                        # Drop a marker so the new gateway instance
-                        # knows it followed a restart and can inject
-                        # a resume hint into the next session.
+                if sentinel_task is not None and sentinel_task in done and not sentinel_task.cancelled():
+                    payload = sentinel_task.result()
+                    if payload:
+                        mode = payload.get("mode", "restart")
+                        reason = payload.get("reason") or "unspecified"
+                        old_pid = read_pid()
+                        restarter_pid = None
+                        if mode == "restart":
+                            restarter_pid = spawn_detached_restarter(payload, old_pid)
+                            try:
+                                write_restart_marker(reason=reason)
+                            except Exception:
+                                pass
+                            logger.info(
+                                    "Restart sentinel detected (reason={}); detached "
+                                    "restarter spawned (pid={}), initiating graceful shutdown",
+                                    reason,
+                                    restarter_pid,
+                            )
+                        else:
+                            logger.info(
+                                    "Stop sentinel detected (reason={}); initiating "
+                                    "graceful shutdown (no restarter will be spawned)",
+                                    reason,
+                            )
+                        agent.stop()
                         try:
-                            write_restart_marker(reason=reason)
-                        except Exception:
+                            await asyncio.wait_for(agent_task, timeout=10.0)
+                        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                             pass
-                        logger.info(
-                            "Restart sentinel detected (reason={}); detached "
-                            "restarter spawned (pid={}), initiating graceful shutdown",
-                            reason,
-                            restarter_pid,
+                    shutdown = True
+                elif agent_task is not None and agent_task in done and not agent_task.cancelled():
+                    # Agent loop crashed outside of a sentinel-triggered
+                    # shutdown.  Restart it — a single agent crash should
+                    # not take channels, cron, and heartbeats offline.
+                    exc = agent_task.exception()
+                    if exc is not None:
+                        logger.exception(
+                            "AgentLoop.run() exited with exception (will restart): {}",
+                            exc,
+                        )
+                        console.print(
+                            f"[yellow]⚠ Agent loop crashed ({type(exc).__name__}), restarting...[/yellow]"
                         )
                     else:
-                        logger.info(
-                            "Stop sentinel detected (reason={}); initiating "
-                            "graceful shutdown (no restarter will be spawned)",
-                            reason,
+                        logger.warning(
+                            "AgentLoop.run() exited cleanly outside of sentinel path; restarting"
                         )
-                    # Signal the agent loop to stop accepting new work.
-                    # In-flight dispatches will continue to run; the
-                    # main ``while self._running`` loop will exit on its
-                    # next iteration.
-                    agent.stop()
-                    # Give the current iteration a brief window to
-                    # finish naturally so handoff/session state has a
-                    # chance to be persisted.
-                    try:
-                        await asyncio.wait_for(agent_task, timeout=10.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                        pass
+                        console.print(
+                            "[yellow]⚠ Agent loop exited unexpectedly, restarting...[/yellow]"
+                        )
+                    agent_task = asyncio.create_task(agent.run())
+                    # Loop back to wait again — only break on sentinel.
+                else:
+                    # channels_task completed (crash or clean exit).
+                    # Without channels the gateway can't receive messages,
+                    # so shut down — the finally block handles cleanup.
+                    if channels_task is not None and not channels_task.cancelled():
+                        exc = channels_task.exception()
+                        if exc is not None:
+                            logger.exception(
+                                "channels.start_all() exited with exception: {}", exc,
+                            )
+                        else:
+                            logger.warning("channels.start_all() exited unexpectedly")
+                    shutdown = True
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:

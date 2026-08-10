@@ -24,6 +24,28 @@ def _get_workspace() -> Path:
     return Path(config.workspace_path)
 
 
+def _hydrate_usage(skills: list[Any]) -> None:
+    """Copy persisted usage metrics onto freshly-loaded SkillDefinitions.
+
+    ``SkillLoader.load_all()`` returns definitions with zeroed usage
+    counters; the persisted counts live in ``.skill_usage.json``.
+    Uses ``peek`` so read-only listing never creates empty entries.
+    """
+    try:
+        from markbot.skills.usage import SkillUsageStore
+
+        store = SkillUsageStore(_get_workspace())
+        for skill in skills:
+            entry = store.peek(skill.name)
+            if entry is not None:
+                skill.view_count = entry.view_count
+                skill.use_count = entry.use_count
+                skill.last_activity_at = entry.last_activity_at
+                skill.state = entry.state
+    except Exception:
+        pass
+
+
 def _skill_to_dict(skill) -> dict[str, Any]:
     """Convert a SkillDefinition to a JSON-serializable dict."""
     return {
@@ -66,6 +88,7 @@ async def list_skills():
     try:
         loader = _get_loader()
         skills = loader.load_all()
+        _hydrate_usage(skills)
         return JSONResponse({"skills": [_skill_to_dict(s) for s in skills]})
     except Exception as e:
         return JSONResponse({"skills": [], "error": str(e)}, status_code=500)
@@ -81,6 +104,7 @@ async def get_skill_detail(name: str):
 
         # Load skill definition
         skills = loader.load_all()
+        _hydrate_usage(skills)
         skill = next((s for s in skills if s.name == name), None)
         if not skill:
             return JSONResponse({"error": "Skill not found"}, status_code=404)

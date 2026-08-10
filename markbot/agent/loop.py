@@ -535,6 +535,15 @@ class AgentLoop:
             logger.warning("Memory manager start failed: {}", e)
         logger.info("Agent loop started, total startup took {:.3f}s", time.time() - _run_start)
 
+        # Cancel any leftover idle checker from a previous run() call
+        # (e.g. after the gateway restarts a crashed agent loop).
+        if self._idle_task is not None and not self._idle_task.done():
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Background idle-session checker — runs on a 30s cadence so the
         # main loop can block on ``consume_inbound()`` indefinitely instead
         # of waking every second just to poll idle state.
@@ -553,35 +562,50 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            # Mark the session as active.
-            self._session_last_active[msg.session_key] = time.time()
+            try:
+                # Mark the session as active.
+                self._session_last_active[msg.session_key] = time.time()
 
-            raw = msg.content.strip()
-            if self.commands.is_priority(raw):
-                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
-                result = await self.commands.dispatch_priority(ctx)
-                if result:
-                    await self.bus.publish_outbound(result)
-                continue
+                raw = msg.content.strip()
+                if self.commands.is_priority(raw):
+                    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                    result = await self.commands.dispatch_priority(ctx)
+                    if result:
+                        await self.bus.publish_outbound(result)
+                    continue
 
-            # Permission / question replies must NOT take the per-session lock.
-            # Approval waits inside an in-flight turn that already holds the
-            # lock; if the reply also waits on that lock the turn deadlocks
-            # until the approval timeout. Resolve these short-circuit replies
-            # concurrently via the pipeline middleware only.
-            if self._is_pending_question_reply(msg):
-                task = asyncio.create_task(self._dispatch_unlocked(msg))
+                # Permission / question replies must NOT take the per-session lock.
+                # Approval waits inside an in-flight turn that already holds the
+                # lock; if the reply also waits on that lock the turn deadlocks
+                # until the approval timeout. Resolve these short-circuit replies
+                # concurrently via the pipeline middleware only.
+                if self._is_pending_question_reply(msg):
+                    task = asyncio.create_task(self._dispatch_unlocked(msg))
+                    self._track_task(msg.session_key, task)
+                    task.add_done_callback(
+                        lambda t, k=msg.session_key: self._untrack_task(k, t)
+                    )
+                    continue
+
+                task = asyncio.create_task(self._dispatch(msg))
                 self._track_task(msg.session_key, task)
                 task.add_done_callback(
                     lambda t, k=msg.session_key: self._untrack_task(k, t)
                 )
-                continue
-
-            task = asyncio.create_task(self._dispatch(msg))
-            self._track_task(msg.session_key, task)
-            task.add_done_callback(
-                lambda t, k=msg.session_key: self._untrack_task(k, t)
-            )
+            except asyncio.CancelledError:
+                # CancelledError during priority-command dispatch or task
+                # creation: let it propagate so the outer task can shut down
+                # cleanly.  This branch must NOT be triggered by normal
+                # /stop (which catches its own CancelledError internally).
+                raise
+            except Exception as e:
+                # Catch-all guard: an unhandled exception here would crash
+                # AgentLoop.run() and cascade to a full gateway shutdown in
+                # the parent finally block.  Log and continue instead.
+                logger.exception(
+                    "Unexpected error in main dispatch loop for session {}: {}",
+                    getattr(msg, "session_key", "?"), e,
+                )
 
     # ------------------------------------------------------------------
     # Task tracking helpers
