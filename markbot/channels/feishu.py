@@ -1208,13 +1208,23 @@ class FeishuChannel(BaseChannel):
         return json.dumps(post_body, ensure_ascii=False)
 
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
-    _AUDIO_EXTS = {".opus"}
-    _VIDEO_EXTS = {".mp4", ".mov", ".avi"}
+    _AUDIO_EXTS = {".opus", ".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac"}
+    _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"}
     _FILE_TYPE_MAP = {
         ".opus": "opus",
+        ".ogg": "opus",
+        ".mp3": "opus",
+        ".wav": "opus",
+        ".m4a": "opus",
+        ".aac": "opus",
+        ".flac": "opus",
         ".mp4": "mp4",
         ".mov": "mp4",
         ".avi": "mp4",
+        ".mkv": "mp4",
+        ".webm": "mp4",
+        ".m4v": "mp4",
+        ".3gp": "mp4",
         ".pdf": "pdf",
         ".doc": "doc",
         ".docx": "doc",
@@ -1354,39 +1364,61 @@ class FeishuChannel(BaseChannel):
     def _download_file_sync(
         self, message_id: str, file_key: str, resource_type: str = "file"
     ) -> tuple[bytes | None, str | None]:
-        """Download a file/audio/media from a Feishu message by message_id and file_key."""
+        """Download a file/audio/media from a Feishu message by message_id and file_key.
+
+        Tries multiple type values for the download API to increase reliability:
+        first the specific resource type, then ``"file"`` as fallback.
+        """
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
-        # Feishu resource download API only accepts 'image' or 'file' as type.
-        # Both 'audio' and 'media' (video) messages use type='file' for download.
-        if resource_type in ("audio", "media"):
-            resource_type = "file"
+        # Build the list of types to try.  The Feishu download endpoint
+        # officially accepts ``"image"`` or ``"file"``, but in practice some
+        # resources may only be reachable with a certain type value.
+        # We try the most specific type first and widen to ``"file"``.
+        types_to_try: list[str] = [resource_type]
+        if resource_type != "file":
+            types_to_try.append("file")
 
-        try:
-            request = (
-                GetMessageResourceRequest.builder()
-                .message_id(message_id)
-                .file_key(file_key)
-                .type(resource_type)
-                .build()
-            )
-            response = self._client.im.v1.message_resource.get(request)
-            if response.success():
-                file_data = response.file
-                if hasattr(file_data, "read"):
-                    file_data = file_data.read()
-                return file_data, response.file_name
-            else:
-                logger.error(
-                    "Failed to download {}: code={}, msg={}",
-                    resource_type,
-                    response.code,
-                    response.msg,
+        last_error: tuple[int, str] | None = None
+
+        for attempt_type in types_to_try:
+            try:
+                request = (
+                    GetMessageResourceRequest.builder()
+                    .message_id(message_id)
+                    .file_key(file_key)
+                    .type(attempt_type)
+                    .build()
                 )
-                return None, None
-        except Exception:
-            logger.exception("Error downloading {} {}", resource_type, file_key)
-            return None, None
+                response = self._client.im.v1.message_resource.get(request)
+                if response.success():
+                    file_data = response.file
+                    if hasattr(file_data, "read"):
+                        file_data = file_data.read()
+                    return file_data, response.file_name
+                else:
+                    last_error = (response.code, response.msg)
+                    logger.debug(
+                        "Failed to download {} as type={}: code={}, msg={}",
+                        resource_type,
+                        attempt_type,
+                        response.code,
+                        response.msg,
+                    )
+            except Exception:
+                logger.exception(
+                    "Error downloading {} {} as type={}", resource_type, file_key, attempt_type
+                )
+
+        code, msg = last_error or (-1, "unknown")
+        logger.error(
+            "Failed to download {}: code={}, msg={} (tried types={})",
+            resource_type,
+            code,
+            msg,
+            types_to_try,
+        )
+        return None, None
 
     async def _download_and_save_media(
         self, msg_type: str, content_json: dict, message_id: str | None = None
@@ -1551,6 +1583,47 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return False
 
+    @staticmethod
+    def _build_media_post(
+        text: str,
+        media_type: str,
+        media_key: str,
+        file_name: str = "",
+    ) -> str:
+        """Build a Feishu post message combining text and media (image/file/audio/video).
+
+        This allows sending a media file with a caption in a single message,
+        rather than two separate messages.
+
+        Args:
+            text: The caption text (becomes a text paragraph before the media).
+            media_type: One of "image", "audio", "media", "file".
+            media_key: The image_key (for images) or file_key (for others).
+            file_name: Display name for file/audio/video media tags.
+        """
+        paragraphs: list[list[dict]] = []
+
+        # Add text lines as paragraphs
+        if text.strip():
+            for line in text.strip().split("\n"):
+                if line.strip():
+                    paragraphs.append([{"tag": "text", "text": line}])
+                else:
+                    paragraphs.append([{"tag": "text", "text": ""}])
+
+        # Add media tag
+        if media_type == "image":
+            paragraphs.append([{"tag": "img", "image_key": media_key}])
+        else:
+            # audio / media (video) / file → use "media" tag in post
+            tag: dict = {"tag": "media", "file_key": media_key}
+            if file_name:
+                tag["file_name"] = file_name
+            paragraphs.append([tag])
+
+        post_body = {"zh_cn": {"content": paragraphs}}
+        return json.dumps(post_body, ensure_ascii=False)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         logger.info("=== send() ENTER ===")
@@ -1618,37 +1691,71 @@ class FeishuChannel(BaseChannel):
                 result = self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
                 logger.info("_do_send() result={}", result)
 
-            for file_path in msg.media:
-                if not os.path.isfile(file_path):
-                    logger.warning("Media file not found: {}", file_path)
-                    continue
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext in self._IMAGE_EXTS:
-                    key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
-                    if key:
-                        await loop.run_in_executor(
-                            None,
-                            _do_send,
-                            "image",
-                            json.dumps({"image_key": key}, ensure_ascii=False),
-                        )
-                else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
-                    if key:
-                        if ext in self._AUDIO_EXTS:
-                            media_type = "audio"
-                        elif ext in self._VIDEO_EXTS:
-                            media_type = "video"
-                        else:
-                            media_type = "file"
-                        await loop.run_in_executor(
-                            None,
-                            _do_send,
-                            media_type,
-                            json.dumps({"file_key": key}, ensure_ascii=False),
-                        )
+            # Track whether text was already sent combined with a single media file.
+            text_sent_via_post = False
 
-            if msg.content and msg.content.strip():
+            # When there is exactly one media file and text content, combine them
+            # into a single post message instead of sending two separate messages.
+            if len(msg.media) == 1 and msg.content and msg.content.strip():
+                file_path = msg.media[0]
+                if os.path.isfile(file_path):
+                    ext = os.path.splitext(file_path)[1].lower()
+                    file_name = os.path.basename(file_path)
+                    if ext in self._IMAGE_EXTS:
+                        key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                        if key:
+                            text_body = self._build_media_post(msg.content, "image", key)
+                            await loop.run_in_executor(None, _do_send, "post", text_body)
+                            text_sent_via_post = True
+                    else:
+                        key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                        if key:
+                            if ext in self._AUDIO_EXTS:
+                                media_type = "audio"
+                            elif ext in self._VIDEO_EXTS:
+                                media_type = "media"
+                            else:
+                                media_type = "file"
+                            text_body = self._build_media_post(
+                                msg.content, media_type, key, file_name=file_name
+                            )
+                            await loop.run_in_executor(None, _do_send, "post", text_body)
+                            text_sent_via_post = True
+                else:
+                    logger.warning("Media file not found: {}", file_path)
+            else:
+                # Multiple media files or no text — send each media as a separate message.
+                for file_path in msg.media:
+                    if not os.path.isfile(file_path):
+                        logger.warning("Media file not found: {}", file_path)
+                        continue
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in self._IMAGE_EXTS:
+                        key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                        if key:
+                            await loop.run_in_executor(
+                                None,
+                                _do_send,
+                                "image",
+                                json.dumps({"image_key": key}, ensure_ascii=False),
+                            )
+                    else:
+                        key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                        if key:
+                            if ext in self._AUDIO_EXTS:
+                                media_type = "audio"
+                            elif ext in self._VIDEO_EXTS:
+                                media_type = "media"
+                            else:
+                                media_type = "file"
+                            await loop.run_in_executor(
+                                None,
+                                _do_send,
+                                media_type,
+                                json.dumps({"file_key": key}, ensure_ascii=False),
+                            )
+
+            if msg.content and msg.content.strip() and not text_sent_via_post:
                 content_preview = msg.content.strip()[:200]
                 logger.info(
                     "content='{}...'",
