@@ -363,6 +363,20 @@ class AgentContext:
             compaction_config, context_window_tokens,
             timezone, tools, skill_registry,
         )
+        # Explicit DI: inject the primary-model resolver used by vision
+        # routing, replacing hidden per-call ``load_config()`` disk reads in
+        # the multimodal tool-result hot path.
+        from markbot.agent.context import set_primary_model_resolver
+
+        def _resolve_primary_model() -> tuple[str | None, str | None]:
+            ref = getattr(config, "primary_model_ref", None) if config else None
+            if not ref:
+                return None, None
+            provider_id = ref.split("/", 1)[0] if "/" in ref else None
+            _, model_cfg = config.resolve_model(ref)
+            return provider_id, (model_cfg.name or model_cfg.id)
+
+        set_primary_model_resolver(_resolve_primary_model)
         binder = cls._build_tool_binder(
             tools, workspace, restrict_to_workspace, resolved_configs, config,
             cron_service, subagents, memory_manager, skill_registry, timezone, bus, timings,

@@ -52,6 +52,17 @@ class ToolDefinition:
     # Optional service-gate label for docs / tooling (e.g. "requires BRAVE_API_KEY").
     # Actual availability is enforced by BaseTool.available_when / is_available().
     availability_hint: str = ""
+    # Declarative execution budget in milliseconds. Never sent to the model;
+    # enforced collaboratively by the tool pipeline (see tools/pipeline.py).
+    # None means "no declared budget" — the pipeline applies no timeout.
+    timeout_ms: Optional[int] = None
+    # Static parallel-safety declaration. Only an explicit True allows the
+    # call to join a concurrent batch (fail-closed). Dynamic per-args logic
+    # belongs in BaseTool.is_concurrency_safe(params).
+    concurrency_safe: bool = False
+    # Declares oversized-typical-output. Replaces the legacy ``_is_heavy_tool``
+    # attribute convention; heavy tools get a larger persistence budget.
+    heavy_output: bool = False
 
     def to_openai_schema(self) -> dict[str, Any]:
         properties = {}

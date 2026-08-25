@@ -387,15 +387,10 @@ def _dict_has_error(obj: Mapping[str, Any]) -> bool:
     return False
 
 
-class PreblockedResult(str):
-    """Synthetic tool result returned when a call was denied before execution.
-
-    Subclasses ``str`` so it remains a valid tool-result payload for the LLM,
-    while remaining distinguishable from a real executor failure so the
-    failure-window / blacklist are not inflated by re-observation.
-    """
-
-    __slots__ = ()
+# Canonical definition lives in markbot.tools.pipeline; re-exported here so
+# the historical import path keeps working and isinstance checks stay
+# consistent across both modules.
+from markbot.tools.pipeline import PreblockedResult  # noqa: E402
 
 
 def is_preblocked_result(result: Any) -> bool:

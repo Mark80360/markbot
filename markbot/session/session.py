@@ -13,6 +13,14 @@ from filelock import FileLock, Timeout
 from loguru import logger
 
 from markbot.config.paths import get_legacy_sessions_dir
+from markbot.session.events import (
+    EVENT_HISTORY_RESET,
+    EVENT_HISTORY_RETAINED,
+    derive_messages,
+    event_for_message,
+    make_event,
+    next_seq,
+)
 from markbot.utils.helpers import ensure_dir, safe_filename
 
 
@@ -26,6 +34,12 @@ class Session:
     Important: Messages are append-only for LLM cache efficiency.
     The tiered memory system (Hot/Warm/Cold) handles long-term storage
     but does NOT modify the messages list or get_history() output.
+
+    Alongside ``messages`` an append-only typed **event log** records the
+    same facts as durable events (see :mod:`markbot.session.events`). The
+    log is the reconstruction source for resume / fork / replay / audit;
+    model-visible history is recoverable via ``derive_messages()`` even if
+    derived state is lost.
     """
 
     key: str  # channel:chat_id
@@ -39,17 +53,81 @@ class Session:
     _dirty: bool = False
     # Tracks last_consolidated value persisted to disk; mismatch triggers full write
     _written_last_consolidated: int = 0
+    # Append-only typed event log (envelopes from markbot.session.events).
+    events: list[dict[str, Any]] = field(default_factory=list)
+    _written_event_count: int = 0  # Events already persisted to disk
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+        """Add a message to the session (logged as a typed event)."""
         msg = {
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
             **kwargs
         }
-        self.messages.append(msg)
+        self.append_message(msg)
+
+    def append_message(self, message: dict[str, Any]) -> None:
+        """Append a provider-format message and mirror it into the event log."""
+        self.messages.append(message)
+        self._log_message_event(message)
         self.updated_at = datetime.now()
+
+    def _log_message_event(self, message: dict[str, Any]) -> None:
+        try:
+            event_type, payload = event_for_message(message)
+        except Exception:  # noqa: BLE001 — logging must never break appending
+            return
+        self.events.append(make_event(next_seq(self.events), event_type, payload))
+
+    def append_event(
+        self,
+        event: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        ignorable: bool = False,
+    ) -> None:
+        """Append a non-message durable event (audit / lifecycle / control)."""
+        self.events.append(
+            make_event(next_seq(self.events), event, payload, ignorable=ignorable)
+        )
+        self.updated_at = datetime.now()
+
+    def derive_messages(self, upto_seq: int | None = None) -> list[dict[str, Any]]:
+        """Project model-visible history from the event log (see module docs)."""
+        return derive_messages(self.events, upto_seq=upto_seq)
+
+    def rebuild_messages_from_events(self) -> int:
+        """Rebuild ``messages`` from the event-log projection.
+
+        Recovery path for sessions whose message lines were lost or
+        corrupted while event lines survived. The projection honours
+        history boundaries (reset/retain), so an intentionally cleared
+        session projects empty and nothing is rebuilt.
+
+        Returns the number of messages restored (0 when messages already
+        exist or the projection is empty — never clobbers live state).
+        """
+        if self.messages:
+            return 0
+        projected = self.derive_messages()
+        if not projected:
+            return 0
+        self.messages.extend(projected)
+        # Everything in the log is now reflected in memory; force a full
+        # write so the repaired state hits disk with fresh message lines.
+        # (_dirty is required: without it a small repair would never be
+        # rewritten because the append path only writes new lines.)
+        self._written_count = len(self.messages)
+        self._written_event_count = len(self.events)
+        self._dirty = True
+        self.updated_at = datetime.now()
+        logger.info(
+            "Session {} rebuilt {} message(s) from its event log",
+            self.key,
+            len(projected),
+        )
+        return len(projected)
 
     @staticmethod
     def _strip_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -105,9 +183,13 @@ class Session:
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
+        previous_count = len(self.messages)
         self.messages = []
         self.last_consolidated = 0
         self._written_count = 0
+        # The event log is append-only: a reset is a durable fact, never an
+        # erasure. Projection consumers honour history_reset as a boundary.
+        self.append_event(EVENT_HISTORY_RESET, {"previous_message_count": previous_count})
         self._dirty = True
         self.updated_at = datetime.now()
 
@@ -141,6 +223,15 @@ class Session:
                 break
 
         dropped = len(self.messages) - len(retained)
+        # The projection boundary records the FINAL kept count, not the
+        # dropped count: every entry in ``messages`` is mirrored 1:1 by a
+        # model-visible event, so "keep the last N" aligns the projection
+        # with live state even when orphan-stripping removed messages from
+        # mid-list (a leading-count would then drop the wrong events).
+        self.append_event(
+            EVENT_HISTORY_RETAINED,
+            {"dropped": dropped, "retained_count": len(retained)},
+        )
         self.messages = retained
         self.last_consolidated = max(0, self.last_consolidated - dropped)
         self._written_count = 0
@@ -258,6 +349,7 @@ class SessionManager:
         """Read and parse a session JSONL file."""
         try:
             messages = []
+            events = []
             metadata = {}
             created_at = None
             last_consolidated = 0
@@ -278,10 +370,15 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                    elif data.get("_type") == "event":
+                        # Event log lines; sessions written by older versions
+                        # simply have none — both shapes load cleanly.
+                        if isinstance(data.get("seq"), int):
+                            events.append(data)
                     else:
                         messages.append(data)
 
-            return Session(
+            session = Session(
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
@@ -289,7 +386,20 @@ class SessionManager:
                 last_consolidated=last_consolidated,
                 _written_count=len(messages),
                 _written_last_consolidated=last_consolidated,
+                events=events,
+                _written_event_count=len(events),
             )
+            if not messages and events:
+                # Message lines lost/corrupted but the event log survived:
+                # reconstruct model-visible history from the projection.
+                try:
+                    session.rebuild_messages_from_events()
+                    # Persisted cursors were reset by the rebuild; mark dirty
+                    # so the next save rewrites the file with fresh lines.
+                    session._dirty = True
+                except Exception as exc:  # noqa: BLE001 — recovery is best-effort
+                    logger.warning("Event-log recovery failed for {}: {}", key, exc)
+            return session
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
@@ -334,18 +444,26 @@ class SessionManager:
 
         new_messages = session.messages[session._written_count:]
         append_count = len(new_messages)
+        new_events = session.events[session._written_event_count:]
+        event_append_count = len(new_events)
         metadata_changed = session.last_consolidated != session._written_last_consolidated
 
         # Skip only when there's nothing new AND metadata is unchanged AND
         # no structural change (clear/retain) flagged the session as dirty.
-        if append_count == 0 and not metadata_changed and not session._dirty and path.exists():
+        if (
+            append_count == 0
+            and event_append_count == 0
+            and not metadata_changed
+            and not session._dirty
+            and path.exists()
+        ):
             return
 
         lock = self._get_lock(session.key)
         try:
             with lock:
                 # Full write when: structural change, metadata changed, large
-                # append, or file doesn't exist. Otherwise append new messages.
+                # append, or file doesn't exist. Otherwise append new lines.
                 if (
                     session._dirty
                     or metadata_changed
@@ -355,10 +473,12 @@ class SessionManager:
                     self._full_write(session, path)
                     session._written_count = len(session.messages)
                     session._written_last_consolidated = session.last_consolidated
+                    session._written_event_count = len(session.events)
                     session._dirty = False
                 else:
-                    self._append_write(session, path, new_messages)
+                    self._append_write(session, path, new_messages, new_events)
                     session._written_count += append_count
+                    session._written_event_count += event_append_count
         except Timeout:
             logger.error(
                 "Failed to acquire lock for session {} within timeout, "
@@ -378,11 +498,19 @@ class SessionManager:
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat(),
                     "metadata": session.metadata,
-                    "last_consolidated": session.last_consolidated
+                    "last_consolidated": session.last_consolidated,
+                    "event_count": len(session.events),
                 }
                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                # Interleave messages and events in original append order by
+                # seq where available; message lines carry no seq, so they are
+                # written first followed by the event log (projection only
+                # reads event lines, ordering between the two streams is not
+                # semantically significant).
                 for msg in session.messages:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                for envelope in session.events:
+                    f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
 
             os.replace(temp_path, path)
         except BaseException:
@@ -393,11 +521,19 @@ class SessionManager:
                     logger.opt(exception=True).debug("Failed to clean up temp file during session write: {}", temp_path)
             raise
 
-    def _append_write(self, session: Session, path: Path, new_messages: list[dict[str, Any]]) -> None:
+    def _append_write(
+        self,
+        session: Session,
+        path: Path,
+        new_messages: list[dict[str, Any]],
+        new_events: list[dict[str, Any]] | None = None,
+    ) -> None:
         try:
             with open(path, "a", encoding="utf-8") as f:
                 for msg in new_messages:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                for envelope in new_events or []:
+                    f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
         except Exception:
             self._full_write(session, path)
 

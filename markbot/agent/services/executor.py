@@ -29,11 +29,20 @@ class ToolExecutor:
         self._tools = tools
 
     def get_truncation_limit(self, tool_name: str | None = None) -> int:
-        """Get max chars limit for tool result, with higher limit for heavy tools."""
+        """Get max chars limit for tool result, with higher limit for heavy tools.
+
+        Heavy status comes from the declarative ``ToolDefinition.heavy_output``
+        flag; the legacy ``_is_heavy_tool`` class attribute remains supported
+        as a fallback for tools not yet migrated.
+        """
         if tool_name:
             tool = self._tools.get(tool_name)
-            if tool and getattr(tool, '_is_heavy_tool', False):
-                return self.HEAVY_TOOL_MAX_CHARS
+            if tool:
+                definition = getattr(tool, "definition", None)
+                if getattr(definition, "heavy_output", False) or getattr(
+                    tool, "_is_heavy_tool", False
+                ):
+                    return self.HEAVY_TOOL_MAX_CHARS
         return self.DEFAULT_MAX_CHARS
 
     def sanitize_blocks(
@@ -161,7 +170,9 @@ class ToolExecutor:
             entry = self._sanitize_for_session(message)
             if entry is None:
                 continue
-            session.messages.append(entry)
+            # Route through append_message so every persisted message is also
+            # mirrored into the session's typed event log (model-visible ⟺ logged).
+            session.append_message(entry)
             saved += 1
         if saved:
             session.updated_at = datetime.now()

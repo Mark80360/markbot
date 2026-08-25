@@ -182,6 +182,14 @@ class AgentLoop:
         self._memory_search_tool = ctx.memory_search_tool
         self.question_tool = ctx.question_tool
 
+        # Audit bridge: pipeline events (approval asks/decisions, guard
+        # denials) land in the session's typed event log so they survive
+        # reloads — replaying the log reconstructs the approval trail.
+        if self.tools is not None and self.sessions is not None and hasattr(
+            self.tools, "set_event_sink"
+        ):
+            self.tools.set_event_sink(self._emit_tool_audit_event)
+
         logger.info("Agent has {} tools available", len(self.tools))
         self.commands = ctx.commands
         self.tool_executor = ctx.tool_executor
@@ -632,6 +640,38 @@ class AgentLoop:
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Get or create the per-session serial lock."""
         return self._session_locks.setdefault(session_key, asyncio.Lock())
+
+    # ------------------------------------------------------------------
+    # Tool audit bridge (pipeline events → session event log)
+    # ------------------------------------------------------------------
+
+    #: Pipeline sink names → session event vocabulary. Unmapped names pass
+    #: through with dots converted to underscores and ``ignorable=True``.
+    _AUDIT_EVENT_MAP = {
+        "approval.asked": "approval_asked",
+        "approval.decided": "approval_decided",
+        "guard.denied": "guard_denied",
+    }
+
+    def _emit_tool_audit_event(self, event_type: str, payload: dict) -> None:
+        """Persist a pipeline audit event into the target session's log.
+
+        Best-effort by design: audit failures must never break tool
+        execution. Sessions are usually cached already, so this is cheap.
+        """
+        if not isinstance(payload, dict):
+            return
+        session_key = payload.get("session_id") or ""
+        if not session_key:
+            return
+        mapped = self._AUDIT_EVENT_MAP.get(event_type, event_type.replace(".", "_"))
+        ignorable = event_type not in self._AUDIT_EVENT_MAP
+        try:
+            session = self.sessions.get_or_create(session_key)
+            trimmed = {k: v for k, v in payload.items() if k != "session_id"}
+            session.append_event(mapped, trimmed, ignorable=ignorable)
+        except Exception as exc:  # noqa: BLE001 — audit must not break tools
+            logger.debug("tool audit event {} dropped: {}", event_type, exc)
 
     # ------------------------------------------------------------------
     # Per-session failure-loop state (survives compact / "继续" / handoff)

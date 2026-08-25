@@ -12,9 +12,9 @@ from markbot.agent.cache_policy import CacheMutationPolicy
 from markbot.agent.iteration import (
     IterationRunner,
     LoopState,
-    _INTERNAL_CONTEXT_TAG,
 )
 from markbot.agent.services.executor import ToolExecutor
+from markbot.session.session import Session
 from markbot.tools.base import BaseTool
 from markbot.tools.registry import ToolRegistry
 from markbot.types.tool import ToolDefinition
@@ -50,7 +50,7 @@ class _FakeTools:
     def get(self, n):
         return self.map.get(n)
 
-    async def execute(self, name, params, context=None):
+    async def execute(self, name, params, context=None, **kwargs):
         return await self.map[name].execute(params, context)
 
 
@@ -70,16 +70,14 @@ def runner():
     tools.map["read"] = _Rot("read", True)
     tools.map["write"] = _Rot("write", False)
     loop = _Loop(tools)
-    session = MagicMock()
-    session.messages = []
+    session = Session(key="test:runner")
     return IterationRunner(loop, "cli", "c1", "m1", session=session), session, loop
 
 
 class TestSaveMessagesFiltering:
     def test_drops_verify_stop_nudge(self):
         ex = ToolExecutor(ToolRegistry())
-        s = MagicMock()
-        s.messages = []
+        s = Session(key="test:1")
         ex.save_messages(
             s,
             [
@@ -92,8 +90,7 @@ class TestSaveMessagesFiltering:
 
     def test_drops_todo_reinjection(self):
         ex = ToolExecutor(ToolRegistry())
-        s = MagicMock()
-        s.messages = []
+        s = Session(key="test:2")
         ex.save_messages(
             s,
             [
@@ -106,16 +103,14 @@ class TestSaveMessagesFiltering:
 
     def test_truncates_tool_result(self):
         ex = ToolExecutor(ToolRegistry())
-        s = MagicMock()
-        s.messages = []
+        s = Session(key="test:3")
         ex.save_messages(s, [{"role": "tool", "name": "exec", "content": "x" * 20000}])
         assert len(s.messages) == 1
         assert len(s.messages[0]["content"]) < 20000
 
     def test_save_turn_backward_compatible(self):
         ex = ToolExecutor(ToolRegistry())
-        s = MagicMock()
-        s.messages = []
+        s = Session(key="test:4")
         ex.save_turn(
             s,
             [

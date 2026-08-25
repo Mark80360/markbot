@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
+from markbot.errors import ErrorCode, MarkbotError, classify_exception
 from markbot.providers.base import LLMProvider, LLMResponse
 from markbot.providers.error_classifier import classify_to_error_type
 from markbot.providers.errors import ErrorType
@@ -27,7 +28,12 @@ class CircuitState:
 
 @dataclass
 class FallbackAttempt:
-    """Record of a single fallback attempt."""
+    """Record of a single fallback attempt.
+
+    ``error_code`` carries the machine-readable classification from
+    :mod:`markbot.errors` so telemetry / retry policy can dispatch on
+    codes instead of parsing ``error`` prose.
+    """
 
     model_ref: str
     provider: ProviderConfig | None = None
@@ -36,14 +42,22 @@ class FallbackAttempt:
     error: str | None = None
     response: LLMResponse | None = None
     circuit_skipped: bool = False
+    error_code: ErrorCode | None = None
 
 
-class AllModelsFailedError(Exception):
+class AllModelsFailedError(MarkbotError):
     """Raised when all models in the chain have failed."""
 
-    def __init__(self, message: str, attempts: list[FallbackAttempt], last_error: Exception | None):
-        super().__init__(message)
-        self.attempts = attempts
+    default_code = ErrorCode.ALL_MODELS_FAILED
+
+    def __init__(
+        self,
+        message: str,
+        attempts: list[FallbackAttempt] | None = None,
+        last_error: Exception | None = None,
+    ):
+        super().__init__(message, code=ErrorCode.ALL_MODELS_FAILED, cause=last_error)
+        self.attempts = attempts or []
         self.last_error = last_error
 
 
@@ -251,12 +265,14 @@ class FallbackManager:
 
                 if response.finish_reason == "error":
                     error_msg = response.content or "Unknown error"
+                    classified = classify_exception(Exception(error_msg))
                     attempt = FallbackAttempt(
                         model_ref=model_ref,
                         provider=provider_config,
                         model=model_config,
                         success=False,
                         error=error_msg,
+                        error_code=classified.code,
                     )
                     attempts.append(attempt)
 
@@ -332,6 +348,7 @@ class FallbackManager:
                     model=model_config,
                     success=False,
                     error=str(e),
+                    error_code=classify_exception(e).code,
                 )
                 attempts.append(attempt)
 

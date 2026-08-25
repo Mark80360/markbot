@@ -33,12 +33,12 @@ from markbot.agent.prefix_cache import (
     PrefixStabilityManager,
     system_prompt_text,
 )
+from markbot.agent.shell_classify import classify_shell_command as _classify_shell_command
 from markbot.agent.stream import StreamFilter
 from markbot.agent.tokens import token_count_with_estimation
 from markbot.agent.tool_guardrails import (
     GuardrailAction,
     GuardrailConfig,
-    PreblockedResult,
     ToolCallGuardrail,
     _strictest,
     is_failure_result,
@@ -197,139 +197,6 @@ _ACTION_COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
     "gateway 已启动",
     "飞书已连接", "已连接飞书", "websocket 已连接",
 )
-
-# Shell command classification: distinguish actions that produce side
-# effects (restart/install/pull/kill) from verifies that read state
-# (status/ps/curl/logs). Conflating them causes the "false completion"
-# failure mode where 'systemctl restart X' is treated as verification
-# when it is actually the thing needing verification.
-#
-# (first_token, second_token) pairs. Empty second token ("") matches any
-# second token. Matching is on the first segment of a chained command
-# (before && || ; |) and after stripping env prefixes (VAR=val, sudo).
-# Conservative: unrecognized commands default to "neutral".
-_SHELL_ACTION_PREFIXES: frozenset[tuple[str, str]] = frozenset({
-    ("systemctl", "restart"), ("systemctl", "start"), ("systemctl", "stop"),
-    ("systemctl", "reload"), ("systemctl", "try-restart"),
-    ("service", "restart"), ("service", "start"), ("service", "stop"),
-    ("service", "reload"),
-    ("launchctl", "kickstart"), ("launchctl", "load"), ("launchctl", "unload"),
-    ("pip", "install"), ("pip3", "install"),
-    ("npm", "install"), ("npm", "i"), ("npm", "add"),
-    ("pnpm", "add"), ("pnpm", "install"), ("pnpm", "i"),
-    ("yarn", "add"), ("yarn", "install"),
-    ("bun", "add"), ("bun", "install"),
-    ("brew", "install"), ("brew", "remove"), ("brew", "upgrade"),
-    ("apt", "install"), ("apt-get", "install"),
-    ("apt", "remove"), ("apt-get", "remove"),
-    ("yum", "install"), ("dnf", "install"),
-    ("git", "pull"), ("git", "push"), ("git", "checkout"),
-    ("git", "merge"), ("git", "reset"), ("git", "rebase"),
-    ("docker", "restart"), ("docker", "start"), ("docker", "stop"),
-    ("docker", "rm"), ("docker", "kill"),
-    ("pkill", ""), ("killall", ""),
-    ("rm", ""), ("mv", ""), ("chmod", ""), ("chown", ""),
-})
-
-_SHELL_VERIFY_PREFIXES: frozenset[tuple[str, str]] = frozenset({
-    ("systemctl", "is-active"), ("systemctl", "status"), ("systemctl", "is-enabled"),
-    ("service", "status"),
-    ("launchctl", "list"), ("launchctl", "print"),
-    ("ps", ""), ("pgrep", ""), ("pidof", ""),
-    ("ss", ""), ("netstat", ""), ("lsof", ""),
-    ("curl", ""), ("wget", ""),
-    ("journalctl", ""),
-    ("docker", "ps"), ("docker", "logs"), ("docker", "inspect"), ("docker", "stats"),
-    ("git", "log"), ("git", "status"), ("git", "diff"), ("git", "show"),
-    ("pip", "show"), ("pip3", "show"),
-    ("npm", "list"), ("npm", "ls"), ("npm", "info"),
-    ("pnpm", "list"), ("pnpm", "ls"),
-    ("cat", ""), ("head", ""), ("tail", ""), ("less", ""),
-    ("ls", ""), ("find", ""), ("tree", ""),
-    ("grep", ""), ("rg", ""),
-    ("test", ""),
-    ("pytest", ""), ("tox", ""), ("nox", ""),
-    ("ruff", ""), ("flake8", ""), ("mypy", ""), ("pyright", ""),
-    ("eslint", ""), ("tsc", ""),
-    ("make", "test"), ("make", "check"), ("make", "verify"), ("make", "lint"),
-    ("cargo", "test"), ("cargo", "check"), ("cargo", "clippy"),
-    ("go", "test"), ("go", "vet"),
-})
-
-# Verify tools that may appear as a subcommand (e.g. `python -m pytest`,
-# `python -m mypy`). When any of these appears as a token, the command is
-# classified as verify. This is conservative — false-verify (marking a
-# neutral command as verify) only sets verification_done=True, which is
-# safe; false-action would be the dangerous case, and this set does not
-# affect action classification.
-_KNOWN_VERIFY_TOOLS: frozenset[str] = frozenset({
-    "pytest", "tox", "nox", "unittest",
-    "ruff", "flake8", "mypy", "pyright", "pylint", "isort", "black",
-    "eslint", "tsc", "prettier",
-    "jest", "vitest", "mocha", "karma",
-})
-
-
-def _classify_shell_command(command: str) -> str:
-    """Classify a shell command as 'action', 'verify', or 'neutral'.
-
-    Used by ``_record_verification_call`` to avoid treating action commands
-    (restart/install/pull/kill) as verification. Treating an action as
-    verification is the 'false completion' failure mode: the model runs
-    ``systemctl restart X`` and the loop marks ``verification_done=True``,
-    so the verify-on-stop nudge never fires even though nobody confirmed
-    the service actually came up.
-
-    Conservative: unrecognized commands return 'neutral' (neither flag is
-    set in the caller's neutral branch, which preserves the existing
-    ``verification_done = True`` behavior to avoid regressing the
-    file-edit verify path — most exec calls in a coding session ARE
-    verification like pytest).
-    """
-    if not command or not isinstance(command, str):
-        return "neutral"
-    cmd = command.strip()
-    # Classify the first segment only (before && || ; |) — a chained
-    # command is classified by its leading action.
-    for sep in ("&&", "||", ";", "|"):
-        if sep in cmd:
-            cmd = cmd.split(sep, 1)[0].strip()
-    tokens = cmd.split()
-    # Strip leading env assignments: VAR=val cmd ...
-    while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
-        tokens = tokens[1:]
-    # Strip command prefixes: sudo / env / time / noglob
-    while tokens and tokens[0] in ("sudo", "env", "time", "noglob"):
-        tokens = tokens[1:]
-        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
-            tokens = tokens[1:]
-    if not tokens:
-        return "neutral"
-    first = tokens[0]
-    second = tokens[1] if len(tokens) > 1 else ""
-
-    # `service` 命令格式是 `service <name> <action>`，action 在第三个
-    # token（与 systemctl <action> <name> 相反）。特殊处理。
-    if first == "service" and len(tokens) >= 3:
-        third = tokens[2]
-        if third in ("restart", "start", "stop", "reload", "force-reload"):
-            return "action"
-        if third in ("status",):
-            return "verify"
-
-    if (first, second) in _SHELL_ACTION_PREFIXES or (first, "") in _SHELL_ACTION_PREFIXES:
-        return "action"
-    if (first, second) in _SHELL_VERIFY_PREFIXES or (first, "") in _SHELL_VERIFY_PREFIXES:
-        return "verify"
-
-    # 已知 verify 工具作为子命令出现（如 `python -m pytest`、
-    # `python -m mypy`）。保守判定：误判 neutral 为 verify 只会设
-    # verification_done=True，是安全的；不会误判为 action。
-    if any(t in _KNOWN_VERIFY_TOOLS for t in tokens):
-        return "verify"
-
-    return "neutral"
-
 
 # Todo 主动 reinjection 间隔（iteration 数）。
 # 长任务若不 compact，todo 长期不在上下文里；每 N 轮主动注入一次活跃 todo。
@@ -662,21 +529,45 @@ class IterationRunner:
         except Exception:
             return False
 
+    def _is_concurrency_safe_call(self, name: str, params: Any) -> bool:
+        """Whether a call may join a concurrent batch.
+
+        Fail-closed admission: read-only tools qualify as before, plus any
+        tool whose definition explicitly declares ``concurrency_safe`` (or
+        overrides :meth:`BaseTool.is_concurrency_safe`). Everything else
+        stays serial — an absent declaration is never treated as safe.
+        """
+        if self._is_read_only_call(name, params):
+            return True
+        tool = self.loop.tools.get(name)
+        if tool is None:
+            return False
+        try:
+            safe = getattr(tool, "is_concurrency_safe", None)
+            if callable(safe):
+                return bool(safe(params or {}))
+            definition = getattr(tool, "definition", None)
+            return bool(getattr(definition, "concurrency_safe", False))
+        except Exception:
+            return False
+
     def _plan_tool_batches(
         self, tool_calls: list[Any]
     ) -> list[list[int]]:
         """Group tool-call indices into sequential execution batches.
 
-        Consecutive read-only calls are collapsed into one concurrent batch;
-        every other call is its own serial batch. Byte order is preserved, so
-        appended results stay in the original tool-call order.
+        Consecutive concurrency-safe calls (read-only by default, or
+        declared via ``ToolDefinition.concurrency_safe``) are collapsed
+        into one concurrent batch; every other call is its own serial
+        batch. Byte order is preserved, so appended results stay in the
+        original tool-call order.
         """
         batches: list[list[int]] = []
         for i, tc in enumerate(tool_calls):
-            readonly = self._is_read_only_call(tc.name, tc.arguments)
-            if readonly and batches:
+            parallel_safe = self._is_concurrency_safe_call(tc.name, tc.arguments)
+            if parallel_safe and batches:
                 last = batches[-1]
-                if len(last) >= 1 and self._is_read_only_call(
+                if len(last) >= 1 and self._is_concurrency_safe_call(
                     tool_calls[last[-1]].name, tool_calls[last[-1]].arguments
                 ):
                     last.append(i)
@@ -726,7 +617,11 @@ class IterationRunner:
     async def _execute_one_tool_call(self, tc: Any, ctx: ToolContext) -> Any:
         """Execute a single tool call, or return a pre-block denial without running it.
 
-        Pre-block is the single enforcement point for three layers:
+        Pre-block enforcement is expressed as call-scoped monotonic guards
+        (``extra_guards``) so every denial flows through the same guarded
+        pipeline — with audit events and consistent ``PreblockedResult``
+        semantics (failure-window accounting skips re-observation) — for
+        three layers:
           * ``ToolCallGuardrail.check_loop_cap`` — per-turn hard ceiling on
             runaway-prone tools (web_search, web_fetch, browser_navigate,
             delegate_task). Fires regardless of failure detection.
@@ -735,33 +630,43 @@ class IterationRunner:
           * ``SkillGuardrail`` error/critical violations (skill hard
             constraints such as "do not modify SOUL.md during a skill")
         """
-        cap_decision = self._tool_guardrail.check_loop_cap(tc.name)
-        if cap_decision.should_block:
-            logger.warning(
-                "Loop cap blocked tool={} count={}",
-                tc.name, cap_decision.count,
-            )
-            return PreblockedResult(cap_decision.message)
+        tc_id = getattr(tc, "id", "")
 
-        if self._tool_guardrail.is_call_blocked(tc.name, tc.arguments):
-            msg = self._tool_guardrail.block_message(tc.name, tc.arguments)
-            logger.warning(
-                "Guardrail pre-blocked tool={} args={}",
-                tc.name,
-                str(getattr(tc, "arguments", ""))[:120],
-            )
-            return PreblockedResult(msg)
-        skill_block_msg = self._guardrail_blocked.get(getattr(tc, "id", ""))
-        if skill_block_msg is not None:
-            logger.warning(
-                "Skill guardrail blocked tool={} (violation: {})",
-                tc.name,
-                skill_block_msg[:120],
-            )
-            return PreblockedResult(
-                f"Blocked by skill guardrail: {skill_block_msg}"
-            )
-        return await self.loop.tools.execute(tc.name, tc.arguments, context=ctx)
+        def turn_guard(name: str, params: dict[str, Any], context: ToolContext) -> str | None:
+            cap_decision = self._tool_guardrail.check_loop_cap(tc.name)
+            if cap_decision.should_block:
+                logger.warning(
+                    "Loop cap blocked tool={} count={}",
+                    tc.name, cap_decision.count,
+                )
+                return cap_decision.message
+
+            if self._tool_guardrail.is_call_blocked(tc.name, tc.arguments):
+                msg = self._tool_guardrail.block_message(tc.name, tc.arguments)
+                logger.warning(
+                    "Guardrail pre-blocked tool={} args={}",
+                    tc.name,
+                    str(getattr(tc, "arguments", ""))[:120],
+                )
+                return msg
+
+            skill_block_msg = self._guardrail_blocked.get(tc_id)
+            if skill_block_msg is not None:
+                logger.warning(
+                    "Skill guardrail blocked tool={} (violation: {})",
+                    tc.name,
+                    skill_block_msg[:120],
+                )
+                return f"Blocked by skill guardrail: {skill_block_msg}"
+
+            return None
+
+        return await self.loop.tools.execute(
+            tc.name,
+            tc.arguments,
+            context=ctx,
+            extra_guards=[turn_guard],
+        )
 
     async def _execute_tool_calls_safely(
         self, tool_calls: list[Any], ctx: ToolContext

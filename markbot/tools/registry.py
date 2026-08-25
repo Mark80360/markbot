@@ -1,6 +1,9 @@
 """Tool registry with permission integration.
 
-Refactored to use new core types inspired by MarkBot.
+Execution is delegated to :class:`~markbot.tools.pipeline.ToolPipeline`,
+which owns the guarded five-stage flow (resolve → guards → pre-execute
+→ execute → post-execute → finalise). The registry keeps the public
+surface: registration, schema generation, and permission aggregation.
 """
 
 from __future__ import annotations
@@ -11,6 +14,15 @@ from typing import Any, Optional
 from loguru import logger
 
 from markbot.tools.base import BaseTool
+from markbot.tools.pipeline import (
+    AsyncGuard,
+    AsyncPostHook,
+    AsyncPreHook,
+    EventSink,
+    ToolPipeline,
+    soft_disabled_error,
+    unknown_tool_error,
+)
 from markbot.types.permission import PermissionDecision, PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext, ToolDefinition, _sanitize_tool_name
 
@@ -42,6 +54,105 @@ class ToolRegistry:
         self._permission_approver: Callable | None = None
         # Soft-disabled names stay registered but are hidden from model schema.
         self._soft_disabled: set[str] = set()
+        # Installed restriction filters (canonical name -> visible?).
+        self._restriction_filters: list[Callable[[str], bool]] = []
+        # Guarded execution pipeline (guards / hooks / timeout / audit).
+        self.pipeline = ToolPipeline()
+
+    # -- pipeline pass-throughs ------------------------------------------
+
+    def add_guard(self, guard: AsyncGuard) -> Callable[[], None]:
+        """Register a monotonic (deny-only) guard; returns its disposer."""
+        return self.pipeline.add_guard(guard)
+
+    def add_pre_execute_hook(self, hook: AsyncPreHook) -> Callable[[], None]:
+        """Register a pre-execute hook (allow/deny/ask); returns disposer."""
+        return self.pipeline.add_pre_execute_hook(hook)
+
+    def add_post_execute_hook(self, hook: AsyncPostHook) -> Callable[[], None]:
+        """Register a post-execute hook (observe/replace); returns disposer."""
+        return self.pipeline.add_post_execute_hook(hook)
+
+    def set_event_sink(self, sink: EventSink | None) -> None:
+        """Attach an audit sink receiving ``(event_type, payload)`` pairs."""
+        self.pipeline.set_event_sink(sink)
+
+    def restrict(
+        self,
+        *,
+        allowed: set[str] | None = None,
+        denied: set[str] | None = None,
+    ) -> Callable[[], None]:
+        """Install a scoped execution+schema restriction; returns disposer.
+
+        Restrictions stack: every installed filter must admit a tool before
+        it becomes callable / visible. ``allowed`` whitelists names;
+        ``denied`` blacklists them; a tool must pass both.
+
+        Unknown *allowed* names fail loud (ValueError) at install time —
+        a misspelled whitelist must never silently disable everything.
+        Re-invoke ``restrict`` after deferred registrations (MCP) if the
+        whitelist references late-arriving tools.
+
+        Enforcement points: model-facing schema (definitions) and a
+        monotonic pipeline guard, so a hidden name can never be executed
+        even if the model hallucinates it.
+        """
+        known = set(self._tools) | set(self._aliases)
+        # Defensive copies: later mutation of the caller's sets must not
+        # silently change what this restriction enforces.
+        allowed = set(allowed) if allowed else None
+        denied = set(denied) if denied else None
+        if allowed:
+            unknown = {n for n in allowed if n not in known}
+            if unknown:
+                raise ValueError(
+                    f"restrict(): unknown allowed tools: {sorted(unknown)}. "
+                    f"Known: {sorted(known)}"
+                )
+
+        def guard(name: str, params: dict[str, Any], context: ToolContext) -> str | None:
+            resolved = self.resolve_sanitised_name(name.strip())
+            canonical = self._aliases.get(resolved, resolved)
+            if denied and (canonical in denied or name in denied):
+                return (
+                    f"[TOOL_PERMISSION_DENIED] Tool '{name}' is forbidden in "
+                    f"this context."
+                )
+            if allowed and canonical not in allowed:
+                return (
+                    f"[TOOL_PERMISSION_DENIED] Tool '{name}' is not permitted "
+                    f"in this context. Allowed: {', '.join(sorted(allowed))}."
+                )
+            return None
+
+        dispose_guard = self.pipeline.add_guard(guard)
+
+        # Schema-level enforcement: restricted names leave the model-visible
+        # surface entirely, mirroring the execution guard.
+        def schema_filter(canonical_name: str) -> bool:
+            if denied and canonical_name in denied:
+                return False
+            if allowed and canonical_name not in allowed:
+                return False
+            return True
+
+        self._restriction_filters.append(schema_filter)
+        self._invalidate_cache()
+
+        def dispose() -> None:
+            try:
+                self._restriction_filters.remove(schema_filter)
+            except ValueError:
+                pass
+            dispose_guard()
+            self._invalidate_cache()
+
+        return dispose
+
+    def _passes_restrictions(self, canonical_name: str) -> bool:
+        """True when no installed restriction excludes *canonical_name*."""
+        return all(filt(canonical_name) for filt in self._restriction_filters)
 
     def _invalidate_cache(self) -> None:
         self._definitions_cache = None
@@ -65,6 +176,8 @@ class ToolRegistry:
         """True when the tool should appear in model-facing schema."""
         name = getattr(getattr(tool, "definition", None), "name", None) or ""
         if name and name in self._soft_disabled:
+            return False
+        if name and not self._passes_restrictions(name):
             return False
         try:
             if hasattr(tool, "is_available"):
@@ -232,32 +345,29 @@ class ToolRegistry:
         name: str,
         params: dict[str, Any],
         context: ToolContext | None = None,
+        *,
+        extra_guards: list[Callable[[str, dict[str, Any], ToolContext], Any]] | None = None,
     ) -> Any:
         """
-        Execute a tool with permission checking.
+        Execute a tool through the guarded pipeline.
 
         This is the main entry point for tool execution.
+
+        *extra_guards* are call-scoped deny-only guards (sync or async,
+        ``(name, params, context) -> denial_text | None``). Their denials
+        are returned as :class:`~markbot.tools.pipeline.PreblockedResult`
+        so turn runners can distinguish pre-blocks from real failures.
         """
         tool = self.get(name)
         if not tool:
-            available = ", ".join(sorted(self.tool_names))
-            return (
-                f"Error: Tool '{name}' does not exist. "
-                f"This may be a hallucinated tool name. "
-                f"Available tools: {available}. "
-                f"Use only the tools listed above."
-            )
+            return unknown_tool_error(name, self.tool_names)
 
         # Soft-disabled tools stay registered for hot re-enable, but must not
         # execute — defence-in-depth when the model hallucinates a hidden name.
         tool_name = getattr(getattr(tool, "definition", None), "name", name) or name
         if tool_name in self._soft_disabled:
-            available = ", ".join(sorted(t.definition.name for t in self._available_tools()))
-            return (
-                f"Error: Tool '{tool_name}' is soft-disabled by the current "
-                f"tool footprint / profile and cannot be executed. "
-                f"Available tools: {available or '(none)'}."
-            )
+            available = [t.definition.name for t in self._available_tools()]
+            return soft_disabled_error(tool_name, available)
 
         # Create default context if not provided
         if context is None:
@@ -269,54 +379,16 @@ class ToolRegistry:
                 is_non_interactive=True,
             )
 
-        # Check permission
         decision = await self.check_permission(tool, params, context)
-
-        if decision.behavior == "deny":
-            return f"Error: Tool '{name}' execution denied."
-
-        if decision.behavior == "ask":
-            reason = decision.reason or "This tool requires confirmation before running."
-            # Non-interactive callers (cron/autopilot/tests without approver)
-            # cannot block on a human; deny rather than silently allowing.
-            if context.is_non_interactive and self._permission_approver is None:
-                return (
-                    f"Error: Tool '{name}' requires confirmation but the session "
-                    f"is non-interactive. Reason: {reason}"
-                )
-            if self._permission_approver is None:
-                return (
-                    f"Permission required: Tool '{name}' was not executed. "
-                    f"Reason: {reason} "
-                    "No interactive approval channel is configured. "
-                    "Use /mode auto for unattended runs, or enable an approver."
-                )
-            try:
-                approved = self._permission_approver(name, params, context, reason)
-                if hasattr(approved, "__await__"):
-                    approved = await approved
-            except Exception as e:
-                logger.error("Permission approver failed for {}: {}", name, e)
-                return f"Error: Permission approval failed for '{name}': {e}"
-            if not approved:
-                return (
-                    f"Error: Tool '{name}' execution denied by user. "
-                    f"Reason: {reason}"
-                )
-            # User approved — fall through to execute.
-
-        # Update params if modified by permission check
-        if decision.updated_input:
-            params = decision.updated_input
-
-        # Execute
-        try:
-            logger.info("Executing tool: {}", name)
-            result = await tool.execute(params, context)
-            return result
-        except Exception as e:
-            logger.error("Tool execution failed: {}", e)
-            return f"Error executing {name}: {str(e)}"
+        return await self.pipeline.run(
+            tool,
+            name,
+            params,
+            context,
+            base_decision=decision,
+            approver=self._permission_approver,
+            extra_guards=extra_guards,
+        )
 
     def get_definitions_for_provider(self, provider: str = "openai") -> list[dict[str, Any]]:
         """Get tool definitions for specific provider format."""

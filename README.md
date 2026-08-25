@@ -117,7 +117,7 @@ A lightweight personal AI assistant framework. MarkBot excels at complex task pl
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Fallback Manager                                 │
 │          (Multi-Model Chain with Auto-Failover)                     │
-│  Circuit Breaker: 3 failures → open (60s cooldown)                  │
+│  Circuit Breaker: 6 failures → open (60s cooldown, per model_ref)   │
 │  Retryable: timeout, rate limit, 429, 529, 502-504, overloaded      │
 │  Unavailable: 401-403, 402, model not found, quota exceeded         │
 └─────────────────────────────────────────────────────────────────────┘

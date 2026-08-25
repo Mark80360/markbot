@@ -93,6 +93,20 @@ class BaseTool(ABC):
         """Check if tool performs irreversible operations. Defaults to False."""
         return self.definition.is_destructive
 
+    def is_concurrency_safe(self, params: dict[str, Any]) -> bool:
+        """Whether this call may run concurrently with adjacent safe calls.
+
+        Fail-closed: only an explicit True (declared ``concurrency_safe`` on
+        the definition or a per-args override here) admits the call into a
+        concurrent batch. Read-only tools are inherently safe and are
+        admitted by the batch planner independently of this flag.
+        """
+        return bool(self.definition.concurrency_safe)
+
+    def get_timeout_ms(self) -> int | None:
+        """Declared execution budget in ms; None means no enforced timeout."""
+        return self.definition.timeout_ms
+
     async def check_permission(
         self, params: dict[str, Any], context: ToolContext
     ) -> PermissionDecision:

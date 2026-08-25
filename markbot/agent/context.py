@@ -50,6 +50,51 @@ if TYPE_CHECKING:
 
 DEFAULT_SYSTEM_PROMPT_TOKEN_BUDGET = 16_000
 
+# ---------------------------------------------------------------------------
+# Primary-model resolver (explicit dependency injection seam)
+# ---------------------------------------------------------------------------
+
+#: Returns ``(provider_id, model_name)`` for the primary chat model, or
+#: ``(None, None)`` when unknown. Set once at runtime assembly
+#: (:meth:`AgentContext.build`) instead of re-reading config from disk on
+#: every multimodal tool result — the previous hidden ``load_config()`` call
+#: bypassed DI and did file I/O in the hot path.
+_primary_model_resolver: Any = None
+
+
+def set_primary_model_resolver(resolver: Any) -> None:
+    """Register the process-wide primary-model resolver (called at assembly)."""
+    global _primary_model_resolver
+    _primary_model_resolver = resolver
+
+
+def resolve_primary_model() -> tuple[Optional[str], Optional[str]]:
+    """Resolve the primary provider/model via the injected resolver.
+
+    Falls back to a single lazy config read only when nothing was injected
+    (e.g. bare unit-test construction), keeping behaviour correct without
+    making hidden I/O the normal path.
+    """
+    if _primary_model_resolver is not None:
+        try:
+            return _primary_model_resolver()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("primary model resolver failed: {}", exc)
+            return None, None
+    # Last-resort fallback: one lazy read (legacy behaviour).
+    try:
+        from markbot.config.loader import load_config
+
+        config = load_config()
+        if config and config.primary_model_ref:
+            ref = config.primary_model_ref
+            provider_id = ref.split("/", 1)[0] if "/" in ref else None
+            _, model_cfg = config.resolve_model(ref)
+            return provider_id, (model_cfg.name or model_cfg.id)
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
 @dataclass
 class PromptSection:
     """A named section of the system prompt with priority-based retention.
@@ -117,21 +162,7 @@ async def unwrap_multimodal_result_async(result: Any) -> str | list[dict[str, An
     # ``capabilities`` declarations and the built-in provider/model tables
     # are actually consulted. Without these arguments should_route_to_text_only
     # defaults to False (allow images) even for non-vision models.
-    primary_provider_id: str | None = None
-    primary_model_name: str | None = None
-    try:
-        from markbot.config.loader import load_config
-        config = load_config()
-        if config and config.primary_model_ref:
-            ref = config.primary_model_ref
-            # ref is "providerId/modelId" — split to get the provider id
-            # (ProviderConfig has no .id attribute, so we parse the ref).
-            if "/" in ref:
-                primary_provider_id = ref.split("/", 1)[0]
-            _, model_cfg = config.resolve_model(ref)
-            primary_model_name = model_cfg.name or model_cfg.id
-    except Exception:
-        pass
+    primary_provider_id, primary_model_name = resolve_primary_model()
 
     # Main model supports images — pass through unchanged.
     if not should_route_to_text_only(

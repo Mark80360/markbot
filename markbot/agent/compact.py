@@ -135,7 +135,18 @@ class CompactAttachment:
 
 
 def is_prompt_too_long_error(exc: Exception) -> bool:
-    """Check if an exception indicates the prompt exceeded the context window."""
+    """Check if an exception indicates the prompt exceeded the context window.
+
+    Typed :class:`~markbot.errors.MarkbotError` instances dispatch on their
+    machine code; legacy string exceptions fall back to pattern matching.
+    """
+    try:
+        from markbot.errors import ErrorCode, MarkbotError, is_prompt_too_long
+
+        if isinstance(exc, MarkbotError):
+            return exc.code == ErrorCode.CONTEXT_WINDOW_EXCEEDED or is_prompt_too_long(exc)
+    except ImportError:  # pragma: no cover — defensive only
+        pass
     text = str(exc).lower()
     return any(needle in text for needle in _PTL_ERROR_PATTERNS)
 

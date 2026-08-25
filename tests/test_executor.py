@@ -1,10 +1,9 @@
 """Tests for markbot.agent.services.executor — Tool result handling."""
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from markbot.agent.services.executor import ToolExecutor
+from markbot.session.session import Session
 from markbot.tools.registry import ToolRegistry
 
 
@@ -16,6 +15,11 @@ def tool_registry():
 @pytest.fixture
 def executor(tool_registry):
     return ToolExecutor(tool_registry)
+
+
+def _session() -> Session:
+    """Real Session (not a mock): save_turn must honour the actual contract."""
+    return Session(key="test:executor")
 
 
 class TestToolExecutor:
@@ -90,8 +94,7 @@ class TestToolExecutor:
 
 class TestSaveTurn:
     def test_save_user_message(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         messages = [
             {"role": "user", "content": "hello"},
         ]
@@ -101,8 +104,7 @@ class TestSaveTurn:
         assert session.messages[0]["content"] == "hello"
 
     def test_save_assistant_message(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         messages = [
             {"role": "assistant", "content": "hi there"},
         ]
@@ -110,8 +112,7 @@ class TestSaveTurn:
         assert len(session.messages) == 1
 
     def test_skip_system_messages(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         messages = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "hello"},
@@ -121,8 +122,7 @@ class TestSaveTurn:
         assert session.messages[0]["role"] == "user"
 
     def test_skip_empty_assistant(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         messages = [
             {"role": "assistant", "content": "", "tool_calls": []},
         ]
@@ -130,8 +130,7 @@ class TestSaveTurn:
         assert len(session.messages) == 0
 
     def test_tool_result_truncation(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         long_content = "x" * 20000
         messages = [
             {"role": "tool", "content": long_content, "name": "exec"},
@@ -140,8 +139,7 @@ class TestSaveTurn:
         assert len(session.messages[0]["content"]) < 20000
 
     def test_skip_internal_context(self, executor):
-        session = MagicMock()
-        session.messages = []
+        session = _session()
         from markbot.agent.iteration import _INTERNAL_CONTEXT_TAG
         messages = [
             {"role": "user", "content": f"{_INTERNAL_CONTEXT_TAG}internal data"},

@@ -598,6 +598,14 @@ class SubagentManager:
             if capability.allows(name):
                 tools.register(builder())
 
+        # Execution-layer enforcement of forbidden_tools. Registration
+        # gating above already keeps forbidden tools out; the restriction
+        # adds defence-in-depth (execution guard + schema filter) and
+        # fails loudly if a capability names unknown tools.
+        forbidden = {t for t in capability.forbidden_tools if t}
+        if forbidden:
+            tools.restrict(denied=forbidden)
+
     def _get_activity_description(self, tool_name: str, args: dict[str, Any]) -> str:
         """Generate a human-readable description for a tool activity."""
         descriptions = {
