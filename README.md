@@ -1,181 +1,143 @@
 # MarkBot 🦞
 
-A lightweight personal AI assistant framework. MarkBot excels at complex task planning and software development, combining the best features of modern AI assistants with specialized capabilities for technical workflows.
+一个**可自托管（self-hosted）的全功能个人 AI 助手框架**：将 LLM、聊天渠道、工具执行与长期记忆组装成单个进程即可运行的智能体（Agent）。MarkBot 擅长复杂任务规划与软件开发，支持多模型自动容错、多渠道接入、向量记忆、技能扩展、定时任务与全自动任务流水线。
 
-## Core Strengths
+核心设计取向：**单进程部署、零外部基础设施依赖（SQLite 向量库 + 文件存储）、一人可私有运维**——能力上是全功能的，部署上是轻量的。
 
-- **Multi-Model Support with Auto-Failover**: Configure multiple LLM providers in a priority chain. When the primary model fails or is overloaded, MarkBot automatically falls back to the next model.
-- **Task Planning & Orchestration**: Break down complex projects into manageable steps, track progress, and coordinate multiple sub-tasks autonomously
-- **Software Development**: Write, review, debug, and refactor code with deep understanding of project context and best practices
-- **Memory System**: Advanced memory management with compaction, summarization, and semantic search for context-aware responses
-- **Extensible Architecture**: Customize and extend capabilities through a powerful skills system with security scanning and guardrails
-- **Autopilot Pipeline**: Automated task execution with scoring, acceptance, verification, and self-repair capabilities
+- **协议**：AGPL-3.0
+- **运行时**：Python ≥ 3.11（Web 控制台为 React + Vite，微信桥接需要 Node.js ≥ 18）
+- **当前版本**：`20260824`
 
-## Features
+---
 
-### Core Capabilities
+## 目录
 
-- **Multiple LLM Providers**: Anthropic, OpenAI, Azure OpenAI, DeepSeek, OpenRouter, Gemini, Moonshot, Zhipu, DashScope, Groq, HuggingFace, xAI, NVIDIA NIM, and more (28 providers supported)
-- **Multi-Model Chain with Auto-Failover**: Configure multiple models in priority chain with automatic failover on errors or overload
-- **Multi-Channel Support**: DingTalk, Feishu, QQ, WeChat (Weixin), Email, with auto-reconnect, health monitoring, and auto-restart on failure
-- **OAuth Authentication**: Native support for OpenAI Codex and GitHub Copilot with OAuth flow
-- **Local Model Support**: Integration with vLLM, Ollama, and OVMS for local deployments
+- [功能总览](#功能总览)
+- [架构一览](#架构一览)
+- [部署指南](#部署指南)
+- [配置指南](#配置指南)
+- [CLI 命令速查](#cli-命令速查)
+- [会话内斜杠命令](#会话内斜杠命令)
+- [权限模式与安全](#权限模式与安全)
+- [开发指南](#开发指南)
 
-### Memory & Context
+---
 
-- **Memory System**: Advanced memory management with compaction, summarization, semantic search, and Dream optimization
-- **4-Tier Progressive Compaction**: Context Collapse → Micro-Compact → Auto-Compaction → History Snip, escalating only when needed
-- **Dream Service**: Periodic AI-driven memory optimization on a cron schedule for intelligent context management
+## 功能总览
 
-### Tool System
+### 多模型接入与自动容错
 
-- **Built-in Tools**: 40+ tools including Filesystem (read/write/edit/list/delete), Shell, Web (search/fetch/extract), Search (glob/grep), Code Execution, MCP, Memory (search/save/forget/list/dream), Todo, Think, Question, Message, Explore, Context Explorer, Cron, Subagent (spawn/check/list), Skills, Autopilot (7 tools), Computer Use, Browser (10 tools)
-- **MCP Support**: Model Context Protocol for seamless tool integration (stdio, SSE, streamable HTTP)
-- **Web Integration**: Built-in web browsing, content extraction, and search (Brave, Tavily, DuckDuckGo, SearXNG, Jina)
-- **Code Execution**: Sandboxed Python code execution with security scanning and resource limits
-- **Computer Use**: Cross-platform desktop control with screenshot capture, mouse/keyboard automation, and element-based interaction (cua-driver on macOS, pyautogui on Linux/Windows)
-- **Browser Automation**: Playwright-based browser control with navigate, snapshot, click, type, scroll, press, back, and vision tools
-- **Voice Transcription**: Audio transcription via Groq Whisper integration
+- **28 个内置 Provider**：Anthropic、OpenAI、Azure OpenAI、DeepSeek、Gemini、Moonshot(Kimi)、智谱 GLM、通义 DashScope、MiniMax、Mistral、阶跃星辰、xAI、NVIDIA NIM、Groq、HuggingFace，以及 OpenRouter / AiHubMix / 硅基流动 / 火山引擎(含 Coding Plan) / BytePlus(含 Coding Plan) 等网关服务。
+- **OAuth 登录**：原生支持 OpenAI Codex 与 GitHub Copilot（`markbot provider login`）。
+- **本地模型**：vLLM、Ollama、OVMS，以及任意 OpenAI 兼容端点（`custom`）。
+- **模型链自动降级**：`model_chain` 按优先级排列多个模型，超时 / 限流 / 过载时自动切换下一个；内置熔断器（连续 6 次失败熔断，60 秒冷却）。
+- **Prompt Caching**：Anthropic 与 OpenRouter 支持前缀缓存，缓存策略跨 Provider 统一管理。
 
-### Agent Architecture
+### 多渠道消息接入
 
-- **Sub-Agent System**: Delegate specialized tasks with capability-based delegation tokens (CapabilityToken) and budget/timeout controls
-- **Pipeline Engine**: Middleware-based message processing with pluggable pipeline stages (QuestionResponse, MemoryLifecycle)
-- **Token & Cost Tracking**: Real-time token usage monitoring with cache token support and per-model pricing
-- **Budget Control**: Configurable per-session budget caps with custom pricing overrides and warning thresholds
+- 内置 **钉钉、飞书/Lark、QQ 机器人、微信、Email(IMAP+SMTP)** 五类渠道，插件可自动发现注册。
+- 渠道健康检查、断线自动重连、异常自动重启；发送重试与死信记录。
+- 微信扫码登录（`markbot channels login weixin`）；邮件渠道带 DKIM/SPF 校验与附件限制。
+- 语音消息转写（Groq Whisper）。
 
-### Automation & Skills
+### 工具系统（40+ 内置工具）
 
-- **Skills System**: Modular skill framework with security scanning, guardrails, and sandboxed execution
-- **Cron Jobs**: Schedule and automate recurring tasks with precision
-- **Autopilot**: Automated task pipeline with Intake → Score → Accept → Execute → Verify → Repair workflow
-- **Permission System**: Configurable permission modes (default, plan, accept_edits, bypass, auto) with per-tool allow/deny/ask policies
+- **文件与搜索**：read / write / edit / list / delete（回收站式安全删除 + 自动备份）、glob、grep。
+- **执行**：Shell 命令（超时 / 正则白黑名单 / 危险命令拦截）、沙箱化 Python 代码执行（内存与依赖限制）。
+- **Web**：搜索（Brave / Tavily / DuckDuckGo / SearXNG / Jina）、网页抓取与正文抽取，支持 HTTP/SOCKS5 代理。
+- **桌面与浏览器自动化**：
+  - `computer_use` 跨平台桌面控制——截图 + 元素编号定位(SOM)、鼠标键盘操作；macOS 可用 cua-driver 后台驱动，Linux 支持 AT-SPI 无障碍栈，Windows 使用 pyautogui；
+  - `browser` 基于 Playwright 的浏览器控制（导航 / 快照 / 点击 / 输入等 10 个工具），域名黑白名单与会话隔离。
+- **规划与协作**：think（分析/规划/反思）、todo 任务跟踪、子代理（spawn/check/list，能力令牌委派）、ask_user_question、message（主动给渠道用户发消息）、explore 深度代码探索、上下文目录检索（catalog/search/load）。
+- **MCP**：Model Context Protocol 客户端，支持 stdio / SSE / streamable HTTP，工具自动注册。
 
-### Developer Experience
+### 记忆系统
 
-- **Slash Commands**: Built-in commands like `/new`, `/compact`, `/compact_str`, `/clear`, `/stop`, `/steer`, `/status`, `/mode`, `/profile`, `/restart`, `/help`
-- **Event Bus**: Event-driven architecture for message passing and component communication
-- **Context Explorer**: Explore project context with semantic search and catalog (explore_context_catalog, search_context, load_context)
-- **Todo Management**: Built-in persistent todo tracking tool for task management
-- **Codebase Exploration**: Understand project structure and code context with deep exploration tools (AST parsing, multi-file analysis)
-- **Interaction Logging**: Full audit trail of LLM request/response pairs with incremental deduplication for analysis
-- **Doctor Diagnostics**: Built-in diagnostic tool for environment checks and issue resolution
+- **混合语义检索**：向量 + 关键词双路召回，RRF 融合排序。分层 Embedder 自动降级：OpenAI 兼容 API → 本地 sentence-transformers → 零依赖哈希。
+- **向量库可插拔**：默认 SQLite（零额外依赖），可切换 ChromaDB；支持第三方记忆 Provider 插件（entry points / 命名约定发现）。
+- **四级渐进式上下文压缩**：Context Collapse → Micro-Compact → Auto-Compaction → History Snip，按需逐级升级；超长工具输出自动落盘并保留预览。
+- **Dream 服务**：按 cron 定时用 AI 整理记忆——向量去重（余弦合并）、重要性时间衰减、高频记忆自动晋升 `MEMORY.md`。
+- **每日日志**：`memory/daily/*.md` 按天归档；API Key、JWT、连接串等敏感信息在摘要前自动脱敏。
 
-## Architecture
+### 技能（Skills）系统
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Channels (Inbound)                          │
-│           (DingTalk, Feishu, QQ, WeChat, Email, etc.)               │
-│                  ↓ publish_inbound(msg)                             │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Message Bus                                  │
-│  ┌──────────────────────┐      ┌──────────────────────────┐         │
-│  │   Inbound Queue      │      │    Outbound Queue        │         │
-│  │  (Channel→Agent)     │      │   (Agent→ChannelManager) │         │
-│  └──────────────────────┘      └──────────────────────────┘         │
-└─────────────────────────────────────────────────────────────────────┘
-          │ consume_inbound()                        ▲
-          ▼                                          │ publish_outbound()
-┌─────────────────────────────────────────────────────────────────────┐
-│                       Agent Loop                                    │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │  Message Pipeline (Middleware Chain)                        │    │
-│  │  QuestionResponseMW → MemoryLifecycleMW → Main Handler      │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │  Context Builder → Memory Manager → Compactor → LLM         │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐       │
-│  │    Tools        │  │  Tool Executor  │  │   Subagent     │       │
-│  │ (Filesystem,    │  │  (Truncation,   │  │   Manager      │       │
-│  │  Shell, Web,    │  │   Sanitization, │  │ (Capability-   │       │
-│  │  Search, MCP,   │  │   Persistence)  │  │  based Token)  │       │
-│  │  Think, etc.)   │  │                 │  │                │       │
-│  └─────────────────┘  └─────────────────┘  └────────────────┘       │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                      Memory System                          │    │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────────┐       │    │
-│  │  │  Compressed  │  │  Summary   │  │    Search      │       │    │
-│  │  │   Summary    │  │   Task     │  │  (Embedding)   │       │    │
-│  │  └──────────────┘  └────────────┘  └────────────────┘       │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │        Token & Cost Management                              │    │
-│  │  ┌─────────────────┐  ┌────────────────────────────────┐    │    │
-│  │  │  Token Tracker  │  │   Multi-Level Compactor        │    │    │
-│  │  │  + Cost Tracker │  │  (4-tier progressive)          │    │    │
-│  │  │  + Budget Cap   │  │                                │    │    │
-│  │  └─────────────────┘  └────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Fallback Manager                                 │
-│          (Multi-Model Chain with Auto-Failover)                     │
-│  Circuit Breaker: 6 failures → open (60s cooldown, per model_ref)   │
-│  Retryable: timeout, rate limit, 429, 529, 502-504, overloaded      │
-│  Unavailable: 401-403, 402, model not found, quota exceeded         │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Providers                                      │
-│  (Anthropic, OpenAI, Azure, DeepSeek, Gemini, Local Models, etc.)   │
-│         Anthropic/OpenRouter support prompt caching                 │
-└─────────────────────────────────────────────────────────────────────┘
-          │
-          │ consume_outbound()
-          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Channel Manager                                 │
-│              (Route to appropriate channel)                         │
-│         (Auto-discovery + health monitoring + auto-restart)         │
-└─────────────────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Channels (Outbound)                          │
-│           (DingTalk, Feishu, QQ, WeChat, Email, etc.)               │
-└─────────────────────────────────────────────────────────────────────┘
-```
+- 内置技能：weather、summarize、surprise-me、tmux、github、clawhub（技能市场）、skill-creator、memory、cron。
+- 加载前安全扫描、护栏策略、沙箱执行；使用计数与生命周期管理（30 天未用转 stale，90 天归档）。
+- CuratorService 后台巡检 + SkillImprover 质量评估与 LLM 改进建议。
 
-## Supporting Services (Background)
+### 自动化
+
+- **Cron 定时任务**：cron 表达式调度提醒与周期任务，失败重试 + 死信保留。
+- **Heartbeat 心跳**：网关模式下定期巡检工作区触发器（默认每 30 分钟）。
+- **Autopilot 自动任务流水线**：Intake → Score → Accept → Execute → Verify → Repair，验证失败自动修复，全程留痕 journal。
+
+### 安全与权限
+
+- 5 种权限模式（default / plan / accept_edits / auto / bypass_permissions），3 种运行档案（coding / assistant / unattended）。
+- 文件系统与 Shell 默认限制在工作区内；SSRF 防护（云元数据地址硬黑名单 + 私网段拦截）；工具循环 guardrails 防止死循环烧钱。
+- 会话预算控制（USD 上限 + 告警阈值 + 自定义单价）与 token 用量实时统计。
+
+### Web 控制台
+
+自托管单用户聊天与管理界面（React SPA + FastAPI WebSocket），十个页面：
+
+| 页面 | 功能 |
+|------|------|
+| Chat | 对话（流式输出、工具调用可视化、Markdown 渲染） |
+| Models | 模型与提供商管理 |
+| Channels | 渠道状态与启停 |
+| MCP | MCP 服务器管理 |
+| Skills | 技能浏览与管理 |
+| Cron | 定时任务管理 |
+| Config | 配置文件在线编辑（JSON 编辑器） |
+| Env | 环境变量查看 |
+| Logs | 运行日志查看 |
+| System | 系统 / 运行状态 |
+
+### 可观测性
+
+- Token / 成本实时统计（含缓存命中 token），按模型累计费用。
+- 全量 LLM 请求-响应交互日志（增量去重），日志自动脱敏。
+- `markbot doctor` 环境体检与常见问题自动修复。
+
+---
+
+## 架构一览
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────┐       │
-│  │ CronService │  │ Heartbeat    │  │  DreamService         │       │
-│  │ (Scheduled  │  │  Service     │  │  (Memory Optimisation)│       │
-│  │    Tasks)   │  │ (Monitoring) │  │  (Cron-based)         │       │
-│  └─────────────┘  └──────────────┘  └───────────────────────┘       │
-│  ┌───────────────────────┐  ┌──────────────────────────────┐        │
-│  │    SessionManager     │  │  InteractionLogger           │        │
-│  │    (Session State)    │  │  (Audit Trail)               │        │
-│  └───────────────────────┘  └──────────────────────────────┘        │
-│  ┌───────────────────────┐  ┌──────────────────────────────┐        │
-│  │   CuratorService      │  │  SkillImprover               │        │
-│  │   (Skill Maintenance) │  │  (Quality Evaluation)        │        │
-│  └───────────────────────┘  └──────────────────────────────┘        │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                    Autopilot Service                        │    │
-│  │  Intake → Score → Accept → Execute → Verify → Repair        │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
+渠道 (钉钉/飞书/QQ/微信/Email)
+        │  publish_inbound
+        ▼
+   Message Bus ──────────► Agent Loop
+                            │  Pipeline 中间件 (QuestionResponse / MemoryLifecycle)
+                            │  Context Builder → 记忆系统 → 四级压缩
+                            │  Tool Registry (40+ 工具) / 子代理 / MCP
+                            │  Guardrails + 权限检查 + 预算控制
+                            ▼
+                      Fallback Manager（模型链熔断降级）
+                            ▼
+                    Providers (28 家 / OAuth / 本地模型)
+        ┌───────────────────┘
+        ▼
+   Channel Manager（健康检查 / 自动重启）──► 渠道回发消息
+
+后台服务：CronService · Heartbeat · Dream · Autopilot · Curator/SkillImprover
 ```
 
-## Installation
+---
 
-### Prerequisites
+## 部署指南
 
-- Python 3.11 or higher
-- pip package manager
+### 环境要求
 
-### Install from Source
+| 组件 | 要求 | 说明 |
+|------|------|------|
+| Python | ≥ 3.11 | 必需 |
+| Node.js | ≥ 18 | 仅微信渠道扫码登录的桥接服务需要 |
+| Chromium | — | 浏览器自动化需要（`playwright install chromium`） |
+| 系统包（Linux 桌面控制） | python3-tk、python3-xlib、scrot、at-spi2-core、wmctrl/xdotool | 仅 `computer_use` 需要 |
+
+### 安装
 
 ```bash
 git clone https://github.com/mickletang/markbot.git
@@ -183,642 +145,281 @@ cd markbot
 pip install -e .
 ```
 
-### Development Installation
+可选扩展（按需安装）：
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[web]"               # Web 控制台后端 (FastAPI + uvicorn)
+pip install -e ".[chroma]"            # ChromaDB 向量记忆后端
+pip install -e ".[local-embeddings]"  # 本地 sentence-transformers 向量化（离线记忆）
+pip install -e ".[desktop]"           # 桌面控制 computer_use (pyautogui/Pillow)
+pip install -e ".[desktop-linux]"     # 同上，Linux 别名（附加 pyatspi）
+pip install -e ".[desktop-macos]"     # 同上，macOS 别名
+pip install -e ".[desktop-windows]"   # 同上，Windows 别名
+pip install -e ".[weixin]"            # 微信二维码登录 (qrcode/pycryptodome)
+pip install -e ".[langsmith]"         # LangSmith 追踪
+pip install -e ".[dev]"               # 开发依赖 (pytest/ruff)
+
+# 浏览器自动化（Playwright 独立安装）
+pip install playwright && playwright install chromium
 ```
 
-### Optional Dependencies
+> macOS 桌面控制如需后台静默操作（不抢焦点），另行安装 cua-driver：
+> `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"`，
+> 并在「系统设置 → 隐私与安全性」中授予辅助功能与屏幕录制权限。
+
+### 初始化（onboard）
 
 ```bash
-pip install -e ".[weixin]"            # WeChat integration (qrcode, pycryptodome)
-pip install -e ".[langsmith]"         # LangSmith tracing
-pip install -e ".[chroma]"            # ChromaDB vector memory provider
-pip install -e ".[local-embeddings]"  # Local sentence-transformers embedder (offline long-term memory)
-pip install -e ".[desktop]"           # Computer Use desktop control (pyautogui, Pillow) — umbrella
-pip install -e ".[desktop-macos]"     # Computer Use extras for macOS (pyautogui, Pillow)
-pip install -e ".[desktop-linux]"     # Computer Use extras for Linux (adds pyatspi)
-pip install -e ".[desktop-windows]"   # Computer Use extras for Windows (pyautogui, Pillow)
-pip install -e ".[web]"               # Web UI server (FastAPI, uvicorn)
-pip install playwright && playwright install chromium  # Browser automation
+markbot onboard              # 已有配置则询问覆盖/保留，否则写入默认配置
+markbot onboard --guided     # 分步引导式初始化（首次使用推荐）
+markbot onboard --wizard     # 菜单驱动的交互向导
+markbot onboard --defaults   # 全默认值非交互初始化（脚本/Docker 场景）
+
+markbot onboard --workspace /srv/markbot --config /etc/markbot/config.json
 ```
 
-> **Tip**: The `desktop-*` extras all resolve to the same Python deps today; pick whichever matches the host. On Linux you also need system packages (`python3-tk`, `python3-xlib`, `scrot`, `at-spi2-core`, `wmctrl`/`xdotool`) and a reachable display. See the [Computer Use](#computer-use) section below for the full setup.
+onboard 会创建配置文件与工作区目录，并把内置模板（SOUL.md、MEMORY.md 等）同步到工作区。
 
-## Quick Start
+### 三种运行模式
 
-### Basic Usage
+三种模式读取同一份配置文件，共享同一工作区（技能、记忆通用），可随时切换或并用。
+
+#### 1. 交互式 CLI（REPL）—— 本地开发 / 临时会话
 
 ```bash
-# Initialize configuration and workspace
-markbot onboard
-
-# Interactive wizard setup
-markbot onboard --wizard
-
-# Guided step-by-step setup (recommended for first-time users)
-markbot onboard --guided
-
-# Non-interactive defaults (for scripts/Docker)
-markbot onboard --defaults
-
-# Start interactive mode (REPL)
-markbot agent
-
-# Start with specific workspace
-markbot agent --workspace /path/to/workspace
-
-# Single-shot message (non-interactive)
-markbot agent -m "Hello!"
-
-# Run as gateway server
-markbot gateway start
+markbot agent                          # 默认工作区 ~/.markbot/workspace
+markbot agent --workspace /path/to/ws  # 指定工作区
+markbot agent --config /path/config.json
+markbot agent -m "你好"                # 单次执行（无 TTY 也可用）
 ```
 
-### CLI Commands
+Rich REPL 流式渲染回复；`Ctrl+C` 或 `/stop` 中断正在进行的迭代。
+
+#### 2. Gateway 网关 —— 生产常驻服务（挂载聊天渠道）
 
 ```bash
-# Onboarding and setup
-markbot onboard                  # Initialize config and workspace
-markbot onboard --wizard         # Interactive menu-driven wizard
-markbot onboard --guided         # Linear step-by-step guided setup
-markbot onboard --defaults       # Non-interactive defaults
+markbot gateway start                 # 守护进程方式启动（默认）
+markbot gateway start --foreground    # 前台运行（配合 systemd）
+markbot gateway start --port 18790 --workspace /srv/markbot
+markbot gateway status                # 健康状态 + 运行时长
+markbot gateway restart
+markbot gateway stop                  # (--force 强杀)
+```
 
-# Agent (interactive REPL or single-shot)
-markbot agent                    # Start interactive chat (requires a TTY)
-markbot agent -m "Hello!"        # Single-shot message (non-interactive)
-markbot agent --workspace /path  # Use a specific workspace
-markbot agent --config file.json # Use a specific config file
+- PID 文件位于 `~/.markbot/gateway/`；守护日志 `~/.markbot/gateway/gateway.log`，Agent 事件日志 `~/.markbot/logs/agent.log`。
+- 启动时预检端口占用。相关配置键：`gateway.host`（默认 `127.0.0.1`）、`gateway.port`（默认 `18790`）、`gateway.heartbeat.*`、`channels.<name>.enabled`。
+- 网关同时承载 Cron、Heartbeat、Dream、Autopilot 等后台服务。
 
-# Gateway management
-markbot gateway start            # Start gateway server (daemonized by default)
-markbot gateway start --foreground  # Run in the foreground
-markbot gateway stop             # Stop gateway server (--force to hard-kill)
-markbot gateway restart          # Restart gateway server
-markbot gateway status           # Check gateway status
+#### 3. Web 控制台 —— 浏览器访问
 
-# Web UI server
-markbot web                      # Start web UI (default http://127.0.0.1:9120)
+```bash
+pip install -e ".[web]"
+markbot web                           # 默认 http://127.0.0.1:9120
 markbot web --host 0.0.0.0 --port 8080
-
-# Skill management
-markbot skills list              # List all available skills
-markbot skills info <skill-name> # Show detailed skill information
-markbot skills scan <skill> <script>  # Scan a script for security issues
-
-# Autopilot tasks
-markbot autopilot list           # List all autopilot tasks
-markbot autopilot add "Title"    # Add a new task (--body, --source, --labels)
-markbot autopilot show <task-id> # Show detailed task info
-markbot autopilot tick           # Run the next queued task
-markbot autopilot reject <id>    # Reject a task (--reason)
-markbot autopilot requeue <id>   # Requeue a failed/rejected task
-markbot autopilot stats          # Show autopilot statistics
-markbot autopilot journal        # Show the autopilot journal
-
-# Other command groups
-markbot status                   # Show process / workspace / runtime status
-markbot config get|set|list|show # Inspect and edit config values
-markbot channels status|login    # Channel health and OAuth login
-markbot provider login           # Provider OAuth login (e.g. Codex, Copilot)
-markbot plugins list             # List discovered skill plugins
-
-# Doctor diagnostics
-markbot doctor                   # Check environment and configuration
-markbot doctor fix               # Auto-fix common issues
+markbot web --config /etc/markbot/config.json --workspace /srv/markbot
 ```
 
-### Slash Commands (in chat)
+- 认证：启动时生成会话 token，CLI 打印带 `?token=…` 的完整 URL；后续请求也可携带 `x-markbot-session-token` 请求头。token 在进程生命周期内有效，重启轮换。
+- Web 复用网关的工具栈。**Gateway + Web 可并存**：先启动 gateway，再在另一端口运行 `markbot web`。
 
-| Command | Description |
-|---------|-------------|
-| `/new` | Start fresh session with memory summary |
-| `/compact` | Force manual context compaction |
-| `/compact_str` | View current compressed summary |
-| `/clear` | Clear history and compressed summary |
-| `/stop` | Cancel all active tasks and subagents |
-| `/steer` | Inject mid-task instruction into running agent |
-| `/status` | Show session status, token usage, and statistics |
-| `/mode [mode]` | Show or set permission mode (default/plan/accept_edits/auto/bypass) |
-| `/profile [name]` | Show or set runtime profile (coding/assistant/unattended) |
-| `/restart` | Restart the agent process |
-| `/help` | Show available slash commands |
+### 生产部署（systemd / Docker）
 
-## Supported LLM Providers
+```ini
+# /etc/systemd/system/markbot.service
+[Unit]
+Description=MarkBot Gateway
+After=network-online.target
 
-MarkBot supports 28 LLM providers out of the box:
+[Service]
+ExecStart=/usr/local/bin/markbot gateway start --foreground --config /etc/markbot/config.json --workspace /var/lib/markbot
+Restart=on-failure
+User=markbot
+WorkingDirectory=/var/lib/markbot
 
-### Direct Providers
-| Provider | Models | Authentication | Prompt Caching |
-|----------|--------|----------------|----------------|
-| **Anthropic** | Claude 4.5 Sonnet/Haiku, Claude 4 Sonnet, Claude 3.5/3.7 Sonnet, Claude 3 Opus | API Key | ✅ |
-| **OpenAI** | GPT-4o, GPT-4, GPT-3.5 | API Key | — |
-| **OpenAI Codex** | GPT-5.1 Codex | OAuth | — |
-| **GitHub Copilot** | Copilot models | OAuth | — |
-| **Azure OpenAI** | GPT-4, GPT-3.5 | Azure credentials | — |
-| **DeepSeek** | DeepSeek-V3, DeepSeek-R1, DeepSeek-Coder | API Key | — |
-| **Gemini** | Gemini 2.5 Pro/Flash (and newer) | API Key | — |
-| **Moonshot** | Kimi K2, K2.5, K2-Turbo-Preview, K1.5 | API Key | — |
-| **Zhipu (智谱)** | GLM-4, GLM-3 | API Key | — |
-| **DashScope (通义)** | Qwen2.5, Qwen-Coder | API Key | — |
-| **MiniMax** | MiniMax M2.7 / M3 (and newer) | API Key | — |
-| **Mistral** | Mistral Large, Medium, Small (OpenAI-compatible API) | API Key | — |
-| **Step Fun (阶跃星辰)** | Step models | API Key | — |
-| **xAI** | Grok models | API Key | — |
-| **NVIDIA NIM** | Nemotron and other NVIDIA models | API Key | — |
-| **Groq** | Groq models (Whisper, LLM) | API Key | — |
+[Install]
+WantedBy=multi-user.target
+```
 
-### Gateway Services
-| Provider | Description | Prompt Caching |
-|----------|-------------|----------------|
-| **OpenRouter** | Universal gateway to 200+ models | ✅ |
-| **AiHubMix** | OpenAI-compatible gateway | — |
-| **SiliconFlow (硅基流动)** | Chinese model gateway | — |
-| **VolcEngine (火山引擎)** | ByteDance cloud models | — |
-| **VolcEngine Coding Plan** | ByteDance coding-enhanced models | — |
-| **BytePlus** | VolcEngine international gateway | — |
-| **BytePlus Coding Plan** | BytePlus coding-enhanced models | — |
-| **HuggingFace** | HuggingFace Inference API | — |
+```dockerfile
+# 最小 Dockerfile
+FROM python:3.12-slim
+RUN pip install markbot[web,chroma]
+COPY config.json /etc/markbot/config.json
+EXPOSE 9120
+CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/markbot/config.json"]
+```
 
-### OAuth-Based Providers
+---
 
-The two providers below are listed above as well (in **Direct Providers**); the
-rows here are just a quick reference for their auth model. Both use OAuth
-flows via the `oauth-cli-kit` package — no API key is stored on disk.
+## 配置指南
 
-| Provider | Backend | Notes |
-|----------|---------|-------|
-| **OpenAI Codex** | OpenAI Responses API (`chatgpt.com/backend-api`) | Default model: `openai-codex/gpt-5.1-codex` |
-| **GitHub Copilot** | OpenAI-compatible (`api.githubcopilot.com`) | Uses GitHub device flow |
+### 配置文件位置与规则
 
-### Direct / Bring-Your-Own Endpoint
+- 默认路径：`~/.markbot/config.json`，可用 `--config` 指定其他文件，`--workspace` 覆盖工作区。
+- 键名同时接受 **camelCase 与 snake_case**（如 `apiKey` 与 `api_key` 等价）。
+- API Key 直接以字面量写入配置文件，**不做 `${VAR}` 环境变量插值**。请勿将 config.json 提交进版本库。
+- 运行时数据（logs、gateway PID、代码执行临时目录等）存放在配置文件同级目录下。
 
-`custom` is registered as `is_direct=true` — the user supplies the
-`api_base` (and optionally an `apiKey`) themselves. It is the recommended
-choice when you have an OpenAI-compatible HTTP endpoint that does not
-match any of the named providers above. Aliases: `custom`, `ollama`,
-`local`, `vllm`, `llamacpp`.
-
-### Local Deployment
-
-These providers are matched by config key (not by `api_base`) and are
-flagged `is_local=true`. They all speak the OpenAI Chat Completions
-protocol, so you can plug in a `custom` block instead if you prefer.
-
-| Provider | Description |
-|----------|-------------|
-| **vLLM** | High-throughput LLM serving engine |
-| **Ollama** | Local model runner (default `http://localhost:11434/v1`) |
-| **OVMS** | OpenVINO Model Server (`http://localhost:8000/v3`) |
-
-### Provider Aliases
-
-Each provider supports alias-based lookup via `find_by_name()`. For example:
-- `anthropic` can also be referenced as `claude`
-- `gemini` accepts `google` or `google-gemini`
-- `custom` covers `ollama`, `local`, `vllm`, `llamacpp` (see *Direct / Bring-Your-Own Endpoint* above)
-- `dashscope` accepts `alibaba`, `alibaba-cloud`, `qwen-dashscope`
-
-Provider metadata includes `description` and `signup_url` for guided setup wizards.
-
-## Configuration
-
-MarkBot uses a JSON configuration file located at `~/.markbot/config.json` by default.
-
-### Basic Configuration Example
+### 完整配置示例
 
 ```json
 {
   "agents": {
     "defaults": {
       "model_chain": [
-        "anthropic/claude-sonnet-4-5-20250514",
-        "openai/gpt-4o",
+        "anthropic/claude-sonnet-4-5",
         "deepseek/deepseek-chat"
       ],
       "max_tokens": 8192,
+      "context_window_tokens": 65536,
       "temperature": 0.1,
       "timezone": "Asia/Shanghai",
+      "profile": "coding",
       "defaultPermissionMode": "auto",
       "workspace": "~/.markbot/workspace",
       "auxiliaryVision": {
         "forceTextOnly": false,
         "provider": "openai",
-        "model": "gpt-4o"
+        "model": "gpt-4o-mini"
       }
     }
   },
   "providers": {
     "anthropic": {
-      "apiKey": "YOUR_ANTHROPIC_API_KEY",
+      "apiKey": "sk-ant-xxx",
       "models": [
         {
-          "id": "claude-sonnet-4-20250514",
-          "name": "claude-sonnet-4-20250514",
+          "id": "claude-sonnet-4-5",
+          "name": "claude-sonnet-4-5",
           "max_tokens": 8192,
           "context_window": 200000,
-          "capabilities": ["image"]
+          "capabilities": ["text", "image"]
         }
       ]
     },
     "deepseek": {
-      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiKey": "sk-xxx",
       "models": [
-        {
-          "id": "deepseek-chat",
-          "name": "deepseek-chat",
-          "capabilities": []
-        }
+        { "id": "deepseek-chat", "name": "deepseek-chat", "capabilities": [] }
       ]
     }
   },
   "channels": {
-    "dingtalk": {
-      "enabled": true
-    }
+    "dingtalk": { "enabled": true, "client_id": "...", "client_secret": "..." }
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 18790,
+    "heartbeat": { "enabled": true, "interval_s": 1800 }
   },
   "tools": {
+    "restrictToWorkspace": true,
     "web": {
-      "search": {
-        "provider": "brave",
-        "apiKey": "YOUR_BRAVE_API_KEY"
-      }
+      "search": { "provider": "brave", "apiKey": "", "max_results": 5 }
     },
     "exec": {
       "enable": true,
-      "timeout": 60
+      "timeout": 60,
+      "restrictToWorkspace": true
     },
     "filesystem": {
       "backup_dir": "~/.markbot/.markbot_backups",
       "safeDelete": true
     },
-    "code_execution": {
-      "enable": true,
-      "timeout": 60,
-      "maxMemoryMb": 256
-    },
+    "code_execution": { "enable": true, "timeout": 60, "maxMemoryMb": 256 },
     "memory": {
-      "embedding_backend": "openai",
-      "memorySummaryEnabled": true,
-      "contextCompactEnabled": true,
+      "longTermEnabled": true,
+      "vectorBackend": "sqlite",
+      "embeddingBackend": "openai",
       "dreamCron": "0 23 * * *"
-    }
+    },
+    "computer_use": { "enable": false },
+    "browser": { "enable": true, "headless": true },
+    "mcp_servers": {}
   },
   "compaction": {
-    "collapseToolResultChars": 4000,
-    "microCompactKeepTurns": 6,
-    "autoCompactKeepRecent": 5,
-    "thresholdRatio": 0.85
+    "threshold_ratio": 0.85,
+    "collapse_tool_result_chars": 4000
   },
   "budget": {
     "enabled": true,
     "maxBudgetUsd": null,
     "warnThresholdUsd": 0.5
-  }
+  },
+  "display": { "language": "zh" }
 }
 ```
 
-### API Keys & Secrets
-
-API keys are entered directly in `config.json` under
-`providers.<name>.apiKey` (and `tools.web.search.apiKey` for web search).
-MarkBot does **not** interpolate `${VAR_NAME}` placeholders — paste the
-literal key value. To avoid committing secrets, keep `config.json` outside
-version control, or point MarkBot at a separate file with `--config`.
-
-Config-file path and workspace are overridden via CLI flags, not env vars:
-
-```bash
-markbot agent --config /etc/markbot/config.json --workspace /var/lib/markbot
-markbot gateway start --config /etc/markbot/config.json
-markbot web --config /etc/markbot/config.json
-```
-
-## Built-in Tools
-
-### Filesystem & Search
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Read File** | `read_file` | Read file contents with image detection and encoding support |
-| **Write File** | `write_file` | Write/create files with automatic backup |
-| **Edit File** | `edit_file` | Search-and-replace file editing with diff support |
-| **List Dir** | `list_dir` | List directory contents with ignore patterns |
-| **Delete File** | `delete_file` | Delete files with safe-delete (recycle bin) support |
-| **Glob** | `glob` | Fast file pattern matching (find files by name) |
-| **Grep** | `grep` | Content search with regex, binary detection, and context lines |
-
-### Web & Search
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Web Search** | `web_search` | Multi-provider web search (Brave, Tavily, DuckDuckGo, SearXNG, Jina) |
-| **Web Fetch** | `web_fetch` | Fetch and extract content from a URL |
-| **Web Extract** | `web_extract` | Enhanced URL content extraction with LLM summarization |
-
-### Execution
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Shell** | `exec` | Command execution with timeout, rate limiting, and safety controls |
-| **Run Code** | `run_code` | Sandboxed Python code execution with security scanning |
-
-Shell and code execution respect `restrictToWorkspace` (default `true`). When enabled,
-commands referencing paths outside the workspace directory are blocked. Use the
-`allowedInternalIps` list to permit specific internal addresses for SSRF-restricted
-commands like `curl` and `wget`.
-
-```json
-{
-  "tools": {
-    "exec": {
-      "enable": true,
-      "timeout": 60,
-      "restrictToWorkspace": true,
-      "allowedInternalIps": ["127.0.0.1"]
-    }
-  }
-}
-```
-
-### Memory & Context
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Memory Search** | `memory_search` | Semantic/full-text search in memory files |
-| **Memory Save** | `memory_save` | Save important information to long-term memory |
-| **Memory Forget** | `memory_forget` | Remove information from long-term memory |
-| **Memory List** | `memory_list` | List all memory entries with optional tag filtering |
-| **Dream** | `dream` | Trigger AI-driven memory optimization |
-| **Explore Catalog** | `explore_context_catalog` | View available context sources (table of contents) |
-| **Search Context** | `search_context` | Search within specific context sources |
-| **Load Context** | `load_context` | Load full content from a specific context entry |
-
-### Agent & Planning
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Think** | `think` | Unified cognitive tool: analyze, plan, reflect, code-analysis, research-plan |
-| **Todo** | `todo` | Persistent task tracking with status and priority |
-| **Message** | `message` | Send messages to users on chat channels |
-| **Ask Question** | `ask_user_question` | Ask users structured questions with predefined options |
-| **Explore** | `explore` | Deep code exploration with AST parsing and multi-file analysis |
-
-### Subagent
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Spawn** | `spawn` | Spawn a subagent with capability-based delegation token |
-| **Check Subagent** | `check_subagent` | Check status of a spawned subagent |
-| **List Subagents** | `list_subagents` | List all active subagents |
-
-### Scheduling & Automation
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Cron** | `cron` | Schedule reminders and recurring tasks |
-
-### Skills & Autopilot
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **Skills List** | `skills_list` | List available skills |
-| **Skill View** | `skill_view` | View skill details and instructions |
-| **Skill Manage** | `skill_manage` | Install, uninstall, and manage skills |
-| **Autopilot Tools** | `autopilot_*` | Intake, score, accept, execute, verify, and repair tasks |
-
-### Integration
-
-| Tool | Name | Description |
-|------|------|-------------|
-| **MCP** | `mcp_*` | Model Context Protocol tools (auto-registered from MCP servers) |
-
-## Skills System
-
-MarkBot features a modular skill framework that allows you to extend functionality:
-
-### Built-in Skills
-
-- **weather**: Weather information lookup
-- **summarize**: Text summarization
-- **surprise-me**: Random fun interactions
-- **tmux**: Terminal session management
-- **github**: GitHub integration
-- **clawhub**: Skill marketplace access
-- **skill-creator**: Create and manage custom skills
-- **memory**: Advanced memory operations
-- **cron**: Scheduled task management
-
-### Skill Features
-
-- **Security Scanning**: Automatic vulnerability detection before loading
-- **Guardrails**: Configurable safety policies per skill
-- **Sandboxed Execution**: Isolated execution environment
-- **Conditional Activation**: Load skills based on requirements and configuration
-- **Config Resolution**: Per-skill configuration with inheritance
-- **Usage Tracking**: View/use counters and last activity timestamps per skill, persisted to `.skill_usage.json`
-- **Lifecycle Management**: Automatic state transitions — `active` → `stale` (30 days inactive) → `archived` (90 days)
-- **Curator Service**: Background maintenance agent that auto-archives stale skills and evaluates quality
-- **Self-Improvement**: SkillImprover runs heuristic quality evaluations and generates improvement suggestions via LLM
-
-## Autopilot System
-
-The Autopilot system provides automated task execution with intelligence:
-
-### Pipeline Stages
-
-1. **Intake**: Receive and parse task definitions
-2. **Score**: Evaluate task complexity and priority
-3. **Accept**: Determine if task should be executed
-4. **Execute**: Run the task with AI assistance via AgentLoop.process_direct()
-5. **Verify**: Validate results against verification steps and acceptance criteria
-6. **Repair**: Automatically fix issues if verification fails
-7. **Complete/Fail**: Finalize task status with verification report
-
-### Use Cases
-
-- Automated code review and fixes
-- Repository maintenance tasks
-- Test generation and execution
-- Documentation updates
-- Dependency management
-
-## Permission System
-
-Granular control over agent actions through configurable permission modes.
-The permission system works in two layers: **static capability** (config.json) controls
-which tools are registered and visible to the model, and **runtime mode** (`/mode` command)
-controls whether a registered tool can execute without confirmation.
-
-### Runtime Modes
-
-Use `/mode` during a chat session to show or switch the active permission mode.
-The mode is stored in app state and consulted by every tool execution, so it takes
-effect immediately for the next tool call. The choice is also persisted to
-`agents.defaults.default_permission_mode` in `config.json`, so it survives
-restarts — see [Default Permission Mode](#default-permission-mode-in-configjson)
-below.
-
-| Mode | Description | Read-only tools | Destructive/exec tools |
-|------|-------------|----------------|----------------------|
-| `default` | Confirm before destructive operations (needs UI handler) | Auto-allow | **Ask — returns "Permission required" without a UI handler** |
-| `plan` | Read-only only, blocks all mutations | Auto-allow | **Deny** |
-| `accept_edits` | Allow file edits, still confirm destructive ops | Auto-allow | Edits allow; destructive **ask** |
-| `auto` | Allow all tools without confirmation (recommended) | Auto-allow | Auto-allow |
-| `bypass` | Bypass all permission checks | Auto-allow | Auto-allow |
-
-> **Important**: The schema default is `auto` so the agent works out of the box.
-> The agent loop reads the current app-state permission mode for every tool call,
-> rather than hardcoding `auto` as in previous versions. In `default` mode the
-> iteration → registry path has no interactive confirmation dialog yet, so
-> non-read-only tools return a "Permission required" message — the model must
-> surface it to the user. Switch to `default` only after wiring a UI confirmation
-> handler for the `ask` decision; until then prefer `auto` (or `accept_edits`
-> for software development).
-
-```
-# In a chat session:
-/mode              # Show current mode
-/mode default      # Confirmation-first (needs UI handler — otherwise deny)
-/mode plan         # Read-only only (analysis, code review)
-/mode accept_edits # Allow file edits (software development)
-/mode auto         # Fully autonomous (recommended out of the box)
-/mode bypass       # Bypass all checks (dangerous, debugging only)
-```
-
-### Safe Defaults in config.json
-
-The following configuration defaults changed from permissive to conservative.
-Existing `config.json` files with explicit values are preserved; unset fields
-adopt the new safe defaults automatically.
-
-| Field | Old default | New default | Effect |
-|------|------------|-------------|--------|
-| `gateway.host` | `"0.0.0.0"` | `"127.0.0.1"` | Only listen on localhost |
-| `tools.exec.restrictToWorkspace` | _(absent)_ | `true` | Block shell commands referencing paths outside workspace |
-| `tools.restrictToWorkspace` | `false` | `true` | Restrict filesystem tools to workspace directory |
-
-### Tool-Level Policies
-
-Each tool can have individual allow/deny/ask policies in `ToolPermissionContext`
-for fine-grained, programmatic control. These are checked before the mode-level
-decision and take priority.
-
-### Default Permission Mode in config.json
-
-The `agents.defaults.defaultPermissionMode` field sets the permission mode
-applied at gateway startup. This is the mode interactive turns (CLI / web / chat
-channels) start in after a restart.
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "defaultPermissionMode": "auto"
-    }
-  }
-}
-```
-
-Allowed values: `default` | `plan` | `accept_edits` | `auto` | `bypass_permissions`.
-Defaults to `auto` when unset — the agent iteration → tool registry path has
-no interactive confirmation dialog yet, so in `default` mode non-read-only
-tools would return `Permission required` and the agent could not mutate files
-or run shell commands. Switch to `default` only after wiring a UI confirmation
-handler for the `ask` permission decision.
-
-`/mode` runtime switches also persist to this field, so you rarely need to edit
-it by hand — set it once via `/mode auto` and it sticks across restarts. Edit
-the field directly when you want to pin a mode without running the gateway first
-(e.g. provisioning a fresh install).
-
-**Unattended paths (cron / autopilot / heartbeat) always run in `auto` mode**
-regardless of this field — they have no interactive user to confirm tool calls,
-so they force `PermissionMode.AUTO` via `process_direct(permission_mode=...)`.
-This field only governs interactive turns.
-
-### Permission Mode vs config.json — How They Work Together
-
-`config.json` controls **whether a tool is registered** (e.g. `"exec": {"enable": false}`
-means the shell tool is not available at all). `/mode` controls **whether a registered
-tool can run without confirmation** (e.g. in `default` mode, shell is registered but
-blocked until confirmed). This two-layer design lets you safely expose powerful tools
-while keeping a human gate on their execution.
-
-**Safe chat mode** (read-only, no local machine access):
-
-```json
-{
-  "tools": {
-    "exec": { "enable": false },
-    "codeExecution": { "enable": false },
-    "computerUse": { "enable": false },
-    "browser": { "enable": false },
-    "restrictToWorkspace": true
-  }
-}
-```
-
-Run with `/mode default` (or `plan` for strict read-only).
-
-**Local dev assistant** (write code, run tests, workspace-bound):
-
-```json
-{
-  "tools": {
-    "exec": { "enable": true, "restrictToWorkspace": true },
-    "codeExecution": { "enable": true },
-    "computerUse": { "enable": false },
-    "browser": { "enable": false },
-    "restrictToWorkspace": true
-  }
-}
-```
-
-Run with `/mode accept_edits` or `/mode auto`.
-
-**Full desktop control** (trusted tasks, agent operates the computer):
-
-```json
-{
-  "tools": {
-    "exec": { "enable": true, "restrictToWorkspace": false },
-    "computerUse": { "enable": true },
-    "browser": { "enable": true },
-    "restrictToWorkspace": false
-  }
-}
-```
-
-Run with `/mode auto` or `/mode bypass`.
-
-## Memory System
-
-Advanced built-in memory management:
-
-### Features
-
-- **Hybrid Semantic Search (Long-Term Memory)**: Vector-based similarity search that recalls content *by meaning, not just keywords*. Uses a layered embedder (OpenAI-compatible API → local sentence-transformers → zero-dependency hashing fallback) so it works in every environment. Results are fused with keyword search via Reciprocal Rank Fusion. Turn histories, memory writes, and subagent delegations are all indexed automatically.
-- **Vector Consolidation**: Periodic dedup (cosine-based near-duplicate merging), importance decay, and auto-promotion of frequently-recalled memories into `MEMORY.md`. Keeps the index from growing without bound.
-- **4-Tier Progressive Compaction**: Context Collapse → Micro-Compact → Auto-Compaction → History Snip, escalating only when needed
-- **Head+Tail Context Collapse**: Preserves both beginning and end of content during truncation
-- **CompactAttachment**: Preserves key context across compaction rounds
-- **Tool Output Offloading**: Oversized tool results offloaded to files with inline previews
-- **PTL Retry**: Prompt-Too-Long retry with head truncation
-- **Summarization**: Extract durable facts into daily logs + vector index (curated MEMORY.md only on explicit save / dream promotion)
-- **Dream Optimization**: Periodic AI-driven memory reorganization on cron schedule (includes vector consolidation)
-- **Daily Logs**: Time-based memory organization in `memory/daily/*.md`
-- **Main-session MEMORY gate**: Always-on MEMORY.md injection is limited to private surfaces (cli/web/api/local); shared messaging channels use on-demand search only
-- **Security Scanner**: Injection and exfiltration detection for memory content
-- **Sensitive Data Redaction**: Automatic scrubbing of API keys, tokens, passwords, JWTs, and connection strings before LLM summarization
-- **Context Fencing**: `<memory-context>` tags with streaming scrubber
-- **Pluggable Vector Backends**: SQLite (default, zero extra deps) or ChromaDB (`pip install markbot[chroma]`)
-- **Plugin Discovery**: External memory providers via entry points, naming convention (`markbot_memory_*`), or manual registration
-
-### Long-Term Memory Configuration
-
-Long-term (vector) memory is **enabled by default** and requires zero configuration — it auto-selects the best available embedder and uses the built-in SQLite vector store. To tune it:
+### 各模块配置详解
+
+#### agents.defaults —— Agent 默认行为
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `workspace` | `~/.markbot/workspace` | Agent 工作区目录 |
+| `model_chain` | `[]` | 模型链，格式 `"provider/model"`，按优先级自动降级 |
+| `max_tokens` | `8192` | 单次输出上限 |
+| `context_window_tokens` | `65536` | 上下文窗口（影响压缩触发时机） |
+| `temperature` | `0.1` | 温度 |
+| `max_tool_iterations` | `40` | 单回合最大工具迭代次数 |
+| `reasoning_effort` | null | `low / medium / high`，开启思考模式 |
+| `timezone` | `UTC` | IANA 时区（影响 cron 与日志时间） |
+| `profile` | `coding` | 运行档案：`coding`(开发) / `assistant`(助理，需确认) / `unattended`(无人值守) |
+| `defaultPermissionMode` | 继承 profile | 启动时的权限模式，见[权限模式与安全](#权限模式与安全) |
+| `auxiliaryVision.forceTextOnly` | `false` | 强制所有多模态结果降级为纯文本 |
+| `auxiliaryVision.provider/model` | 空 | 辅助识图模型：主模型不支持图片时由它描述截图 |
+
+#### providers.<name> —— 模型提供商
+
+每个 provider 支持：`apiKey`、`apiBase`（自定义端点）、`extraHeaders`、`models[]`。
+
+模型条目字段：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 模型引用 ID（`model_chain` 中使用） |
+| `name` | 传给 API 的实际模型名 |
+| `maxTokens` / `contextWindow` | 输出上限 / 上下文窗口 |
+| `temperature` / `reasoningEffort` | 覆盖全局默认 |
+| `capabilities` | 能力声明，可选 `text` `image` `image_edit` `image_generate` `video` `audio` `music` `embedding` `tool_use`；驱动能力感知路由（主模型无 `image` 能力时截图自动转辅助识图描述） |
+
+内置 provider 标识（可直接作为键名）：`anthropic`、`openai`、`openai_codex`(OAuth)、`github_copilot`(OAuth)、`azure_openai`、`openrouter`、`deepseek`、`groq`、`zhipu`、`dashscope`、`gemini`、`moonshot`、`minimax`、`mistral`、`stepfun`、`xai`、`nvidia`、`huggingface`、`aihubmix`、`siliconflow`、`volcengine`、`volcengine_coding_plan`、`byteplus`、`byteplus_coding_plan`、`vllm`、`ollama`、`ovms`、`custom`（任意 OpenAI 兼容端点）。部分 provider 支持别名查找（如 `anthropic`=`claude`、`gemini`=`google`、`dashscope`=`alibaba`/`qwen-dashscope`）。
+
+#### channels —— 渠道
+
+全局键：`send_progress`(true，向渠道推送进度)、`send_tool_hints`(false)、`sendMaxRetries`(3)。各渠道以 `enabled: true` 开启：
+
+| 渠道 | 关键配置 |
+|------|----------|
+| `dingtalk` | `client_id`、`client_secret`（钉钉开放平台应用凭证） |
+| `feishu` | `app_id`、`app_secret`，可选 `verification_token` / `encrypt_key`、`domain`(`feishu`/`lark`)、群聊策略 `group_policy`、`done_emoji` 等 |
+| `qq` | `app_id`、`secret`（QQ 开放平台机器人）、`msg_format` |
+| `weixin` | 无需手工配置，运行 `markbot channels login weixin` 扫码登录后 token 自动保存 |
+| `email` | 收信 `imap_host/port/username/password/mailbox/use_ssl`；发信 `smtp_host/port/username/password/use_tls`；`from_address`；**`consent_granted: true` 必填**（自动回信授权）；`verify_dkim` / `verify_spf`(默认 true)；`poll_interval_seconds` 等 |
+
+#### tools.* —— 工具开关与安全
+
+| 子键 | 要点 |
+|------|------|
+| `restrictToWorkspace` | 总开关（默认 `true`）：所有工具限制在工作区内访问 |
+| `web.proxy` | HTTP/SOCKS5 代理，如 `http://127.0.0.1:7890` |
+| `web.search` | `provider`: `brave/tavily/duckduckgo/searxng/jina`；`apiKey`；SearXNG 另填 `base_url`；`maxResults`(5) |
+| `exec` | Shell：`enable`、`timeout`(60s)、`restrictToWorkspace`、`requireAllowlist` + `allowPatterns`/`denyPatterns` 正则白黑名单、`allowedInternalIps`（放行 SSRF 检查的内网 IP） |
+| `filesystem` | `backupDir` 备份目录、`maxBackups`(50)、`safeDelete`(true=移入回收站而非直接删除) |
+| `codeExecution` | 沙箱 Python：`enable`、`timeout`(5–300s)、`maxMemoryMb`(64–4096)、`allowedDependencies`(pip 包白名单) |
+| `memory` | 见下方[记忆配置](#记忆配置) |
+| `computerUse` | `enable`、`backend`(`cua/atspi/pyautogui/noop`)、`captureAfterActions`、`maxElements`、`blockedKeyCombos`、`blockedTypePatterns` |
+| `browser` | `enable`、`backend`(`playwright/browserbase`)、`headless`、`recordSession`(.webm 录制)、`defaultTimeout`、`snapshotMaxChars`、`blockedDomains` / `allowedDomains`(glob) |
+| `skills` | `minScore` 质量门槛（0 关闭）、`hideStale`(true 隐藏过期技能) |
+| `mcpServers` | 见下方 [MCP 配置](#mcp-配置) |
+| `guardrails` | 工具循环护栏阈值（重复失败告警/熔断、无进展检测、停滞上限等） |
+| `delegation` | 子代理控制：`maxSpawnDepth`(1)、`maxConcurrentChildren`(3)、`blockedTools` 黑名单、`allowNestedSpawn`(false) |
+| `outcomeGate` | 完成前验证门：`enabled`、`maxNudges`(2)、对变更/副作用强制验证 |
+| `runtimeBudget` | 单回合硬顶：`maxInactivitySeconds`(引擎默认 1800s，0 关闭)、`maxTotalTokens`(引擎默认 3M) |
+
+#### 记忆配置
+
+长期向量记忆**默认开启且零配置**（自动选择最优 Embedder + SQLite 向量库）。常用调优项：
 
 ```json
 {
@@ -829,734 +430,235 @@ Long-term (vector) memory is **enabled by default** and requires zero configurat
       "vectorMaxRecords": 50000,
       "vectorMinScore": 0.15,
       "embeddingBackend": "openai",
-      "embeddingApiKey": "sk-...",
-      "embeddingModelName": "text-embedding-3-small"
+      "embeddingApiKey": "",
+      "embeddingBaseUrl": "",
+      "embeddingModelName": "",
+      "memorySummaryEnabled": true,
+      "contextCompactEnabled": true,
+      "dreamCron": "0 23 * * *",
+      "consolidationEnabled": true,
+      "consolidationDedupThreshold": 0.95,
+      "dailyLogRetentionDays": 30,
+      "autoSummaryToCurated": false
     }
   }
 }
 ```
 
-**Embedding backends** (auto-selected by priority):
-1. `openai` — when `embeddingApiKey` is set (best quality, needs network). Point `embeddingBaseUrl` at any OpenAI-compatible service.
-2. Local `sentence-transformers` — when installed via `pip install 'markbot[local-embeddings]'` (multilingual, offline after first download).
-3. Hashing fallback — always available, zero dependencies.
+Embedding 后端按优先级自动选择：① OpenAI 兼容 API（设置 `embeddingApiKey` 后启用，质量最佳）；② 本地 sentence-transformers（安装 `.[local-embeddings]`，离线可用）；③ 零依赖哈希兜底。
 
-**Vector stores**:
-- `sqlite` (default): standard library only, cosine ranking in memory. Handles up to ~50k vectors.
-- `chroma`: `pip install 'markbot[chroma]'` then set `"vectorBackend": "chroma"`. Uses our embedder (not Chroma's bundled model) for consistency.
+外部记忆 Provider 插件：设置 `tools.memory.provider`（如 `"chroma"`）+ `providerConfig`；支持 entry points（`markbot.memory_providers`）、命名约定（`markbot_memory_*` 包）与手动注册三种发现方式。
 
-To **disable** long-term memory (keyword search only): `"longTermEnabled": false`.
-
-### Memory Provider Plugins
-
-MarkBot supports pluggable memory providers through the `MemoryProvider` ABC. External providers are discovered automatically:
-
-1. **Entry Points**: Packages declaring `markbot.memory_providers` in their `pyproject.toml`
-2. **Naming Convention**: Installed packages matching `markbot_memory_*` or `markbot-memory-*`
-3. **Manual Registration**: Via `MemoryPluginDiscovery.register()`
-
-Configuration in `config.json`:
+#### MCP 配置
 
 ```json
 {
   "tools": {
-    "memory": {
-      "provider": "chroma",
-      "provider_config": {
-        "host": "localhost",
-        "port": 8000
+    "mcpServers": {
+      "filesystem": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+        "env": {},
+        "toolTimeout": 30,
+        "enabledTools": ["*"],
+        "enabled": true
+      },
+      "remote": {
+        "type": "streamableHttp",
+        "url": "https://example.com/mcp",
+        "headers": {}
       }
     }
   }
 }
 ```
 
-The built-in ChromaDB provider (`markbot.memory.providers.chroma`) supports both local persistent and remote HTTP modes. Install with `pip install -e ".[chroma]"`.
-
-### Configuration
-
-```json
-{
-  "tools": {
-    "memory": {
-      "embedding_backend": "openai",
-      "embedding_apiKey": "",
-      "embedding_base_url": "",
-      "embedding_model_name": "",
-      "memory_compact_threshold": 0,
-      "memory_compact_reserve": 10000,
-      "memory_summary_enabled": true,
-      "context_compact_enabled": true,
-      "dream_cron": "0 23 * * *"
-    }
-  },
-  "compaction": {
-    "collapse_tool_result_chars": 4000,
-    "collapse_head_chars": 900,
-    "collapse_tail_chars": 500,
-    "micro_compact_keep_turns": 6,
-    "auto_compact_keep_recent": 5,
-    "snip_keep_messages": 10,
-    "threshold_ratio": 0.85,
-    "max_compact_output_tokens": 4000,
-    "tool_output_inline_chars": 16000,
-    "tool_output_preview_chars": 3000,
-    "system_prompt_token_budget": 16000
-  }
-}
-```
-
-## Computer Use & Browser Automation
-
-MarkBot includes two powerful automation capabilities for desktop and web interaction.
-
-### Computer Use
-
-Cross-platform desktop control tool that lets the AI agent interact with your computer:
-
-- **Screenshot Capture**: Take screenshots with numbered element overlays (SOM mode) for precise interaction
-- **Mouse Control**: Click, double-click, right-click, middle-click, drag, and scroll by element index or pixel coordinates
-- **Keyboard Input**: Type text, press key combinations, and use keyboard shortcuts
-- **App Management**: List running applications, focus specific apps
-- **Element-Based Interaction**: Click by element index (e.g., `element=14`) for reliability — much more robust than pixel coordinates
-- **Safety Features**: Blocked destructive key combinations and type patterns, permission-based access control
-
-**Backend Selection** (automatic by default):
-- **macOS + cua-driver**: Background operation without stealing the user's cursor or keyboard focus
-- **Linux + AT-SPI** (`pyatspi` + `pyautogui`): Foreground operation with real element bounds — preferred when an a11y stack is available
-- **Linux/Windows + pyautogui**: Foreground fallback with coordinate-only targeting when AT-SPI is unavailable
-- **Override**: Set `MARKBOT_COMPUTER_USE_BACKEND` environment variable (`cua`, `atspi`, `pyautogui`, or `noop`)
-
-**Installation**:
-
-`pyproject.toml` ships the umbrella `.[desktop]` extra plus three
-platform-specific aliases (`desktop-macos` / `desktop-linux` /
-`desktop-windows`). They all resolve to the same Python deps today; pick
-whichever matches your host. Each platform additionally needs a few
-system-level packages and (on macOS) a separate binary driver.
-
-```bash
-# Cross-platform Python deps — works on macOS, Linux, and Windows
-pip install -e ".[desktop]"
-# Or pick the platform-specific alias:
-pip install -e ".[desktop-linux]"     # adds pyatspi on Linux
-pip install -e ".[desktop-macos]"     # macOS only
-pip install -e ".[desktop-windows]"   # Windows only
-```
-
-**macOS extras** (for the `cua` background backend — optional; if skipped,
-markbot falls back to the `pyautogui` backend automatically):
-
-```bash
-# cua-driver: ships a private SkyLight-based driver (not Apple-public)
-#   Ref: https://github.com/trycua/cua
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
-
-# Or point markbot at an existing binary
-export MARKBOT_CUA_DRIVER_CMD=/absolute/path/to/cua-driver
-```
-
-After install, the binary is auto-detected via `shutil.which('cua-driver')`.
-Grant the running Terminal / markbot process **Accessibility** and
-**Screen Recording** permissions in *System Settings → Privacy & Security*
-or the `capture` action will return empty results.
-
-**Linux extras**:
-
-```bash
-# Debian / Ubuntu
-sudo apt-get update
-sudo apt-get install -y \
-    python3-tk python3-xlib scrot \
-    at-spi2-core at-spi2-atk \
-    wmctrl xdotool
-
-# Fedora / RHEL
-sudo dnf install -y python3-tkinter python3-xlibb scrot \
-                   at-spi2-core at-spi2-atk wmctrl xdotool
-
-# Arch / Manjaro
-sudo pacman -S tk python-xlib scrot at-spi2-core wmctrl xdotool
-```
-
-- A reachable display is required: set `$DISPLAY` (X11) or `$WAYLAND_DISPLAY`,
-  or run under `Xvfb` (markbot auto-probes `Xvfb` on `:99` when neither is set).
-- The `atspi` backend needs a running AT-SPI registry daemon — typically
-  provided by GNOME, KDE, or `at-spi2-core` plus a session bus.
-- `wmctrl` *or* `xdotool` is used by `list_apps`; install at least one.
-- Force a specific backend with `MARKBOT_COMPUTER_USE_BACKEND=atspi` /
-  `pyautogui` (the former hard-errors if the a11y stack is missing).
-
-**Windows extras**:
-
-- No additional system packages required — `pyautogui` and PowerShell are
-  pre-installed on supported Windows versions.
-- `list_apps` enumerates processes via PowerShell's `Get-Process`; make sure
-  the markbot process has a desktop session (not running headless as a
-  Windows service).
-- The markbot backend runs **in the foreground** (real cursor / active
-  window) and only supports coordinate-based targeting; SOM overlays and
-  element indexing are unavailable.
-
-**Configuration** in `config.json`:
-
-```json
-{
-  "tools": {
-    "computer_use": {
-      "enable": true,
-      "backend": "cua",
-      "capture_after_actions": true,
-      "max_elements": 200,
-      "blocked_key_combos": ["cmd+shift+backspace", "cmd+option+escape"],
-      "blocked_type_patterns": ["sudo rm -rf /", "rm -rf ~"]
-    }
-  }
-}
-```
-
-#### Vision Routing & Auxiliary Vision Model
-
-Computer Use and Browser tools return screenshots as multimodal content
-(text + image blocks). When the primary model in `model_chain` **cannot**
-process images (e.g. DeepSeek, Groq text-only models), MarkBot must
-downgrade the screenshot to text-only to avoid provider errors.
-
-Three strategies are available, applied in priority order:
-
-1. **Auxiliary vision model** (recommended) — the screenshot is sent to a
-   separate vision-capable model for description, and the resulting text is
-   fed back to the primary model. This preserves visual information without
-   requiring the primary model to support image input.
-
-2. **`text_summary` fallback** (default) — the tool's built-in text summary
-   (element list, coordinates, active window title) is used as a lossy
-   substitute. No extra model call is made.
-
-3. **`force_text_only`** — explicitly disable image passing for all models,
-   even vision-capable ones. Useful for debugging or cost control.
-
-**How the primary model's vision capability is detected** (in order):
-
-- Per-model `capabilities` declaration in `config.json` (preferred — see below)
-- Built-in provider/model pattern tables (e.g. `anthropic` → vision, `groq` → no vision)
-- Default: assume vision is supported
-
-**Configure an auxiliary vision model** under `agents.defaults` in `config.json`:
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "auxiliaryVision": {
-        "forceTextOnly": false,
-        "provider": "openai",
-        "model": "gpt-4o"
-      }
-    }
-  }
-}
-```
-
-**Declare per-model capabilities** so MarkBot knows whether the primary
-model can ingest images directly:
-
-```json
-{
-  "providers": {
-    "deepseek": {
-      "apiKey": "YOUR_DEEPSEEK_API_KEY",
-      "models": [
-        {
-          "id": "deepseek-chat",
-          "name": "deepseek-chat",
-          "capabilities": []
-        },
-        {
-          "id": "deepseek-vl",
-          "name": "deepseek-vl",
-          "capabilities": ["image"]
-        }
-      ]
-    }
-  }
-}
-```
-
-When the primary model lacks the `image` capability and an auxiliary vision
-model is configured, the flow is:
-
-```
-tool returns screenshot
-    ↓
-primary model supports image? ──yes──→ pass image to primary model
-    ↓ no
-auxiliary vision configured? ──no───→ use text_summary (lossy fallback)
-    ↓ yes
-auxiliary model describes image ────→ feed text description to primary model
-```
-
-> **Tip**: Pair a fast, cheap vision model (e.g. `gpt-4o-mini`,
-> `qwen2.5-vl-72b-instruct`) as the auxiliary with a strong reasoning model
-> (e.g. `deepseek-chat`, `groq/llama-3.3-70b`) as the primary to keep costs
-> low while preserving visual context.
-
-### Browser Automation
-
-Playwright-based browser control for web page interaction:
-
-- **Navigate**: Open URLs and initialize browser sessions
-- **Snapshot**: Get accessibility tree with interactive element references
-- **Click/Type**: Interact with elements by their ref IDs (e.g., `element='e5'`)
-- **Scroll/Press**: Scroll pages and press keyboard shortcuts
-- **Vision**: Visual verification with screenshots for CAPTCHAs or visual content
-- **Session Isolation**: Each task gets an isolated browser session with auto-cleanup
-- **Domain Filtering**: Block or allow specific domains via glob patterns
-
-**Installation**:
-
-```bash
-pip install playwright
-playwright install chromium
-```
-
-**Configuration** in `config.json`:
-
-```json
-{
-  "tools": {
-    "browser": {
-      "enable": true,
-      "backend": "playwright",
-      "headless": true,
-      "record_session": false,
-      "default_timeout": 30,
-      "snapshot_max_chars": 8000,
-      "blocked_domains": [],
-      "allowed_domains": []
-    }
-  }
-}
-```
-
-## Monitoring & Diagnostics
-
-### Health Checks
-
-Automatic health monitoring for all channels with auto-reconnect and configurable intervals.
-
-### Status Command
-
-Real-time statistics including:
-- Model information and context window usage
-- Token usage (input, output, cache creation, cache read)
-- Cumulative cost tracking per model
-- Active tasks and sessions
-- API call counts
-- Subagent status
-
-### Doctor Tool
-
-Comprehensive diagnostics:
-
-```bash
-# Check environment and configuration
-markbot doctor
-
-# Auto-fix common issues
-markbot doctor fix
-```
-
-Checks include:
-- Python version compatibility
-- Configuration validity and model chain verification
-- File system permissions
-- Provider authentication
-- Channel configuration
-- Workspace integrity
-
-## Deployment
-
-MarkBot can be run in three modes, depending on the use case. All three
-read the same `~/.markbot/config.json`, so you can switch modes without
-touching your model/key configuration.
-
-### 1. Interactive CLI (REPL)
-
-Best for local development and one-off sessions.
-
-```bash
-markbot agent                       # default workspace (~/.markbot/workspace)
-markbot agent --workspace /path/to/ws
-markbot agent -m "Hello!"           # single-shot (non-interactive, no TTY needed)
-```
-
-The CLI loads the agent loop, reads the model chain from
-`agents.defaults.model_chain`, and prompts for input in a Rich REPL.
-Press `Ctrl+C` (or send `/stop`) to break out of an in-flight iteration.
-
-### 2. Gateway (background service with channels)
-
-Best for production: long-lived daemon that holds all your chat
-channels (DingTalk / Feishu / QQ / WeChat / Email) and a Heartbeat
-service that watches the workspace for triggers. The daemon is
-controlled by `markbot gateway` and stores its PID under
-`~/.markbot/gateway/`.
-
-```bash
-markbot gateway start             # daemonize (default)
-markbot gateway start --foreground # run in the foreground
-markbot gateway start --port 18790 --workspace /srv/markbot
-markbot gateway status            # health summary + uptime
-markbot gateway stop
-markbot gateway restart
-```
-
-`markbot gateway start` honours the following env vars and config keys:
-
-| Source | Key | Default | Purpose |
-|--------|-----|---------|---------|
-| CLI | `--port` | `18790` | Diagnostic / control port advertised to peers |
-| YAML | `gateway.host` | `0.0.0.0` | Bind address for embedded services |
-| YAML | `gateway.heartbeat.enabled` | `true` | Enable the workspace heartbeat service |
-| YAML | `gateway.heartbeat.interval_s` | `1800` | Heartbeat interval (seconds) |
-| YAML | `channels.<name>.enabled` | `false` | Toggle each channel individually |
-
-Logs are written to `~/.markbot/gateway/gateway.log` (or
-`./markbot-gateway.log` when run in the foreground). The agent loop's
-per-event log lives at `~/.markbot/logs/agent.log`. Use
-`markbot doctor` if the gateway fails to start.
-
-### 3. Web UI server (FastAPI + WebSocket)
-
-Best for self-hosting a single-user chat UI in the browser. The web
-server reuses the same agent loop and tool registry as the gateway,
-but exposes a SPA over a WebSocket channel plus a small REST surface
-(`/api/status`, `/api/sessions`, `/api/skills`, `/api/cron`, …).
-
-```bash
-pip install -e ".[web]"            # install FastAPI + uvicorn
-markbot web                        # default: http://127.0.0.1:9120
-markbot web --host 0.0.0.0 --port 8080
-markbot web --config /etc/markbot/config.json --workspace /srv/markbot
-```
-
-Authentication is a single session token that the server generates at
-startup. The CLI prints the URL together with the token on first
-boot — paste the `?token=…` value (or send the
-`x-markbot-session-token` header) to authenticate subsequent
-requests. The token persists for the lifetime of the process; call
-`markbot web` with a fresh restart to rotate it.
-
-The web server reuses the gateway's tool stack (web tools, browser,
-computer use, MCP) and the same `~/.markbot/workspace` directory, so
-skills and memory are shared between modes. To run **gateway + web
-side by side**, start the gateway first, then run `markbot web` on a
-different port.
-
-### Docker / systemd tips
-
-A minimal `Dockerfile` and a `markbot.service` unit are not shipped
-out of the box, but the daemon maps cleanly onto either:
-
-```bash
-# systemd unit (drop into /etc/systemd/system/markbot.service)
-[Service]
-ExecStart=/usr/local/bin/markbot gateway start --foreground --config /etc/markbot/config.json --workspace /var/lib/markbot
-Restart=on-failure
-User=markbot
-WorkingDirectory=/var/lib/markbot
-```
-
-```dockerfile
-# minimal Dockerfile
-FROM python:3.12-slim
-RUN pip install markbot[web,desktop-linux,chroma]
-COPY config.json /etc/markbot/config.json
-EXPOSE 9120
-CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/markbot/config.json"]
-```
-
-### Environment variables
-
-These tune runtime behavior; they are **not** used for config-file or API-key
-substitution (use the `--config` / `--workspace` flags and the `apiKey` fields
-in `config.json` for those).
-
-| Variable | Effect |
-|----------|--------|
-| `MARKBOT_COMPUTER_USE_BACKEND` | Force `cua` / `atspi` / `pyautogui` / `noop` |
-| `MARKBOT_CUA_DRIVER_CMD` | Path to a pre-installed `cua-driver` binary |
-| `MARKBOT_CUA_DRIVER_VERSION` | Pin the `cua-driver` version (default `0.5.0`) |
-| `MARKBOT_VISION_FORCE_TEXT_ONLY` | `1`/`true` = force all multimodal tool results to text-only (skip images); `0`/`false` = allow images. Overrides `agents.defaults.auxiliaryVision.forceTextOnly` |
-| `MARKBOT_MAX_CONCURRENT_REQUESTS` | Max concurrent in-flight LLM requests per loop (default `3`) |
-| `MARKBOT_PRODUCTION` | `1`/`true` tightens shell-tool safety restrictions |
-| `MARKBOT_ARTIFACT_DIR` | Override the directory used for offloaded tool-output artifacts |
-| `MARKBOT_IMAGE_TOKEN_ESTIMATE` | Override the per-image token cost estimate used for budgeting |
-
-## Development
-
-### Project Structure
-
-```
-markbot/
-├── agent/              # Core agent loop and processing
-│   ├── loop.py             # Main agent processing engine
-│   ├── iteration.py        # Iteration runner for agent loop
-│   ├── outcome.py          # Iteration outcome / result types
-│   ├── tool_binder.py      # Tool registration and binding
-│   ├── tool_guardrails.py  # Tool failure-loop detection & guardrails
-│   ├── permission_approval.py # Permission approval / ask handling
-│   ├── compact.py          # 4-tier progressive compaction
-│   ├── context.py          # Context builder for agent prompts
-│   ├── context_engine.py   # Context engine (assembly orchestration)
-│   ├── coding_context.py   # Coding context (project facts / manifests)
-│   ├── container.py        # Agent context container
-│   ├── cost.py             # Token & cost tracking with budget control
-│   ├── budget_axes.py      # Budget axes (token/cost/turn limits)
-│   ├── footprint.py        # Tool footprint profile / status ladder
-│   ├── tokens.py           # Token estimation
-│   ├── tool_output.py      # Tool output offloading + head+tail collapse
-│   ├── stream.py           # Stream filtering (think-tag removal)
-│   ├── stream_scrubber.py  # Stream scrubber for memory-context fencing
-│   ├── cache_chip.py       # Per-block cache chip / prefix-cache bookkeeping
-│   ├── cache_discipline.py # Cache discipline / TTL policy
-│   ├── cache_policy.py     # Cache policy resolution
-│   ├── cache_protocol.py   # Provider-agnostic cache protocol types
-│   ├── prefix_cache.py     # Cross-provider prefix-cache helpers
-│   ├── llm_response_cache.py # LLM response cache
-│   ├── token_estimate_cache.py # Memoized token estimates
-│   ├── prompt_persist.py   # Persist & restore raw prompt payloads
-│   ├── turn_metadata.py    # Per-turn metadata (cache hits, usage, etc.)
-│   ├── pipeline/           # Message pipeline middleware
-│   │   ├── engine.py       # Pipeline engine
-│   │   └── middleware.py   # Built-in middleware (QuestionResponse, MemoryLifecycle)
-│   ├── subagent/           # Background task delegation
-│   │   ├── capability.py   # CapabilityToken for delegation
-│   │   ├── manager.py      # Subagent manager
-│   │   ├── policy.py       # Subagent policy (budget/timeout/caps)
-│   │   ├── progress.py     # Progress tracking
-│   │   ├── spawn.py        # Spawn tool
-│   │   ├── templates.py    # Subagent prompt templates
-│   │   └── tools.py        # Check/List subagent tools
-│   ├── mcp/                # MCP protocol support
-│   │   └── manager.py      # MCP connection manager
-│   ├── hooks/              # Agent lifecycle hooks
-│   │   ├── bootstrap.py    # Bootstrap hooks
-│   │   └── compaction.py   # Compaction hooks
-│   └── services/           # Agent services
-│       ├── executor.py     # Tool execution service
-│       └── interaction.py  # Interaction logger
-├── channels/           # Multi-channel messaging
-│   ├── base.py         # BaseChannel ABC
-│   ├── manager.py      # ChannelManager (health checks + auto-restart)
-│   ├── discovery.py    # Auto-discovery for built-in + plugins
-│   ├── dingtalk.py     # DingTalk integration
-│   ├── feishu.py       # Feishu/Lark integration
-│   ├── qq.py           # QQ Bot integration
-│   ├── weixin.py       # WeChat integration
-│   └── email.py        # Email (IMAP+SMTP) support
-├── tools/              # Built-in tool implementations
-│   ├── base.py         # BaseTool and Tool ABC
-│   ├── registry.py     # ToolRegistry with permission integration
-│   ├── filesystem.py   # File read/write/edit/list/delete
-│   ├── shell.py        # Shell execution with safety
-│   ├── web.py          # Web search/fetch/extract
-│   ├── search.py       # Glob and Grep
-│   ├── code.py         # Sandboxed code execution
-│   ├── memory.py       # Memory search
-│   ├── memory_tools.py # Memory save/forget/list/dream
-│   ├── think.py        # Unified cognitive tool
-│   ├── todo.py         # Persistent task tracking
-│   ├── question.py     # Ask user questions
-│   ├── message.py      # Message sending
-│   ├── explore.py      # Deep code exploration
-│   ├── context_explorer.py # Context catalog/search/load
-│   ├── cron.py         # Cron scheduling
-│   ├── mcp.py          # MCP client tool wrapper
-│   ├── browser.py      # Playwright browser automation (10 tools)
-│   └── computer_use/   # Cross-platform desktop control
-│       ├── tool.py             # ComputerUseTool
-│       ├── backend.py          # Abstract backend interface
-│       ├── cua_backend.py      # macOS cua-driver backend
-│       ├── pyautogui_backend.py # Cross-platform pyautogui backend
-│       ├── atspi_backend.py    # Linux AT-SPI a11y backend
-│       ├── noop_backend.py     # Testing stub backend
-│       ├── schema.py           # Tool schema definition
-│       └── vision_routing.py   # Vision model routing
-├── skills/             # Skill system
-│   ├── core/           # Skill framework
-│   │   ├── loader.py   # Skill loading
-│   │   ├── registry.py # Skill registry
-│   │   ├── scanner.py  # Security scanning
-│   │   ├── guardrail.py # Safety guardrails
-│   │   ├── sandbox.py  # Sandboxed execution
-│   │   ├── config.py   # Config resolution
-│   │   ├── preamble.py # Skill preamble injection
-│   │   ├── manage.py   # Skill management tool
-│   │   ├── tool.py     # Skill tools (list/view)
-│   │   └── helpers.py  # Skill helpers
-│   ├── usage.py        # Skill usage tracking (SkillUsageStore)
-│   ├── lifecycle.py    # Lifecycle state machine (active→stale→archived)
-│   ├── curator.py      # Background maintenance service
-│   ├── improve.py      # Self-improvement evaluations
-│   └── builtin/        # Built-in skills
-│       ├── weather/    # Weather lookup
-│       ├── summarize/  # Text summarization
-│       ├── surprise-me/# Fun interactions
-│       ├── tmux/       # Terminal session management
-│       ├── github/     # GitHub integration
-│       ├── clawhub/    # Skill marketplace
-│       ├── skill-creator/ # Custom skill creation
-│       ├── memory/     # Advanced memory operations
-│       └── cron/       # Scheduled task management
-├── providers/          # LLM provider integrations
-│   ├── base.py         # LLMProvider ABC
-│   ├── registry.py     # ProviderSpec registry (28 providers)
-│   ├── fallback.py     # FallbackManager with circuit breaker
-│   ├── errors.py       # Provider error taxonomy
-│   ├── error_classifier.py # Error classification & retry/fallback policy
-│   ├── anthropic.py    # Anthropic native SDK
-│   ├── anthropic_breakpoints.py # Anthropic cache_control breakpoint strategy
-│   ├── openai_compat.py # OpenAI-compatible provider
-│   ├── azure_openai.py # Azure OpenAI
-│   ├── openai_codex.py # OpenAI Codex (OAuth)
-│   └── transcription.py # Groq Whisper transcription
-├── config/             # Configuration management
-│   ├── schema.py       # Pydantic config schema
-│   ├── loader.py       # Config loading/saving
-│   ├── paths.py        # Path resolution
-│   ├── profile.py      # Runtime profiles (coding/assistant/unattended)
-│   └── validator.py    # Config validation
-├── runtime/            # Declarative loop & side-service assembly
-│   └── factory.py      # Builds AgentLoop + Cron/Channels/Heartbeat from config
-├── memory/             # Memory system
-│   ├── base.py         # BaseMemoryManager ABC
-│   ├── manager.py      # Main MemoryManager (file-backed + vector index)
-│   ├── longterm.py     # Long-term vector memory (hybrid semantic search)
-│   ├── consolidation.py # Vector consolidation (dedup, decay, promotion)
-│   ├── provider.py     # MemoryProvider ABC
-│   ├── daily_log.py    # Daily log management
-│   ├── encoder.py      # Encoding helpers
-│   ├── embedder.py     # Layered embedder (openai / sentence-transformers / hashing)
-│   ├── vectorstore.py          # Vector store protocol
-│   ├── vectorstore_factory.py  # Vector store factory (sqlite / chroma)
-│   ├── scanner.py      # Security scanner
-│   ├── fencing.py      # Context fencing
-│   ├── tool.py         # MemoryStore
-│   ├── plugins/        # Memory plugin discovery
-│   │   └── discovery.py # MemoryPluginDiscovery (entry points, naming, manual)
-│   ├── providers/      # Memory provider implementations
-│   │   └── chroma.py   # ChromaDB vector memory provider
-│   └── vectorstores/   # Built-in vector store implementations
-├── bus/                # Event bus infrastructure
-│   ├── events.py       # Event types (28 event types)
-│   ├── queue.py        # MessageBus (inbound/outbound)
-│   └── emitter.py      # Event emitter
-├── session/            # Session management
-│   ├── session.py      # Session data model
-│   ├── store.py        # Session persistence
-│   ├── app_state.py    # Application state
-│   ├── bootstrap.py    # Session bootstrap
-│   ├── handoff.py      # Session handoff
-│   ├── integrity.py    # Session integrity checks
-│   ├── task_tracker.py # Task tracking
-│   └── types.py        # Session types
-├── schedule/           # Cron and scheduling
-│   ├── cron.py         # CronService
-│   ├── dream.py        # DreamService
-│   ├── heartbeat.py    # HeartbeatService
-│   └── evaluator.py    # Schedule evaluator
-├── autopilot/          # Automated task pipeline
-│   ├── service.py      # AutopilotService
-│   ├── store.py        # Task store
-│   ├── tools.py        # Autopilot tools (7 tools)
-│   ├── types.py        # Task types
-│   └── verification.py # Verification system
-├── cli/                # Command-line interface
-│   ├── commands.py     # Main CLI entry point
-│   ├── runtime.py      # Provider/factory wiring used by subcommands
-│   ├── daemon.py       # Gateway daemonization (start/stop/status)
-│   ├── ui.py           # Rich UI helpers + banner
-│   ├── stream.py       # Stream rendering
-│   ├── progress.py     # Progress indicators
-│   ├── onboard.py      # Interactive onboarding
-│   ├── doctor.py       # Diagnostic commands
-│   ├── skills.py       # Skill management commands
-│   ├── autopilot.py    # Autopilot commands
-│   ├── models.py       # Model suggestions
-│   ├── slash_commands/ # Slash command routing
-│   │   ├── router.py   # CommandRouter
-│   │   ├── command_def.py # CommandDef / CommandCatalog
-│   │   └── builtin.py  # Built-in commands
-│   └── groups/         # Top-level command groups
-│       ├── agent.py        # `markbot agent` subcommands
-│       ├── channels.py     # `markbot channels` subcommands
-│       ├── config.py       # `markbot config` subcommands
-│       ├── gateway.py      # `markbot gateway` lifecycle
-│       ├── onboard.py      # `markbot onboard` wizard
-│       ├── plugins.py      # `markbot plugins` (skill plugins)
-│       ├── provider.py     # `markbot provider` subcommands
-│       ├── status.py       # `markbot status`
-│       └── web.py          # `markbot web` UI server
-├── web/                # Web UI server (FastAPI)
-│   ├── server.py       # App factory + WebSocket chat
-│   ├── auth.py         # Token-based auth middleware
-│   ├── store.py        # Web session store
-│   ├── routers/        # REST routers (status/config/sessions/...)
-│   └── static/         # Compiled SPA assets
-├── types/              # Type definitions
-│   ├── exceptions.py   # Custom exceptions
-│   ├── permission.py   # Permission types
-│   ├── protocols.py    # Protocol definitions
-│   ├── skill.py        # Skill types
-│   └── tool.py         # Tool types
-├── utils/              # Utility functions
-│   ├── constants.py    # Shared constants
-│   ├── helpers.py      # Helper functions
-│   ├── tokens.py       # Token utilities
-│   ├── atomic.py       # Atomic file write helpers
-│   ├── network.py      # Network helpers (proxy / connectivity)
-│   ├── ssrf.py         # SSRF guard for outbound HTTP
-│   └── website_policy.py # Per-domain website policy (allow/deny/proxy)
-├── log/                # Logging
-│   ├── core.py         # Core logging (loguru)
-│   ├── filter.py       # Log filters
-│   ├── format.py       # Log formatters
-│   └── redact.py       # Sensitive-data redaction
-└── templates/          # Prompt templates
-    ├── SOUL.md         # Agent personality
-    ├── TOOLS.md        # Tool descriptions
-    ├── MEMORY.md       # Memory instructions
-    ├── ARCHITECTURE.md # Architecture context
-    └── agents/         # Agent-specific templates
-```
-
-### Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Code Quality
-
-```bash
-# Run linting
-ruff check .
-
-# Run tests
-pytest
-
-# Run tests with coverage
-pytest --cov=markbot
-```
-
-## License
-
-This project is licensed under the GNU Affero General Public License v3 (AGPL-3.0) - see the LICENSE file for details.
+`type` 支持 `stdio` / `sse` / `streamableHttp`（缺省自动探测）；`enabledTools` 控制注册哪些工具（`["*"]` 全部）。
+
+#### 其他模块
+
+| 模块 | 要点 |
+|------|------|
+| `compaction` | 四级压缩参数：`thresholdRatio`(0.85 触发阈值)、`collapseToolResultChars`(4000)、`collapseHead/TailChars`(900/500)、`microCompactKeepTurns`(6)、`autoCompactKeepRecent`(5)、`snipKeepMessages`(10)、`toolOutputInlineChars`(16000，超出落盘)、`systemPromptTokenBudget`(16000) 等 |
+| `budget` | 成本控制：`enabled`、`maxBudgetUsd`(会话 USD 上限，null 不限)、`warnThresholdUsd`(0.5 告警)、`customPricing`(按模型覆盖单价) |
+| `reliability` | 后台任务可靠性：`cronMaxRetries`(2)、`cronRetryDelayS`(5)、`deadLetterKeep`(50)、`notifyOnFailure`(true) |
+| `display.language` | 静态界面文案语言：`en` / `zh`（不影响 Agent 回复语言） |
+| `ssrf` | 出站请求防护：`blockedHostnames`、`alwaysBlockedIps`(云元数据等)、`blockedNetworks`(私网段列表) |
+
+### 环境变量
+
+环境变量只调优运行行为，不用于配置文件或 API Key 的替换。
+
+| 变量 | 效果 |
+|------|------|
+| `MARKBOT_COMPUTER_USE_BACKEND` | 强制桌面控制后端：`cua` / `atspi` / `pyautogui` / `noop` |
+| `MARKBOT_CUA_DRIVER_CMD` | 指定已安装 cua-driver 二进制路径 |
+| `MARKBOT_CUA_DRIVER_VERSION` | 固定 cua-driver 版本（默认 `0.5.0`） |
+| `MARKBOT_VISION_FORCE_TEXT_ONLY` | `1` 强制多模态工具结果纯文本化（覆盖 config） |
+| `MARKBOT_MAX_CONCURRENT_REQUESTS` | 单循环最大并发 LLM 请求数（默认 3） |
+| `MARKBOT_PRODUCTION` | `1` 收紧 Shell 工具安全限制 |
+| `MARKBOT_ARTIFACT_DIR` | 覆写工具输出落盘目录 |
+| `MARKBOT_IMAGE_TOKEN_ESTIMATE` | 覆写单张图片的 token 预估成本 |
+
+此外，配置项也可通过 `MARKBOT_` 前缀 + 双下划线嵌套的环境变量覆盖（Pydantic Settings，如 `MARKBOT_AGENTS__DEFAULTS__TEMPERATURE=0.5`）。
 
 ---
 
-**MarkBot** 🦞 - Your personal AI assistant for development and automation.
+## CLI 命令速查
+
+```bash
+# 初始化
+markbot onboard [--wizard|--guided|--defaults]
+
+# Agent
+markbot agent                     # 交互 REPL（需要 TTY）
+markbot agent -m "Hello!"         # 单次执行
+markbot agent --workspace /path   # 指定工作区
+markbot agent --config file.json  # 指定配置
+
+# Gateway
+markbot gateway start|stop|restart|status
+
+# Web UI
+markbot web [--host H] [--port P]
+
+# 技能
+markbot skills list               # 列出技能
+markbot skills info <name>        # 技能详情
+markbot skills scan <skill> <script>  # 安全扫描脚本
+
+# Autopilot
+markbot autopilot list            # 任务列表
+markbot autopilot add "标题"      # 新建任务 (--body --source --labels)
+markbot autopilot show <id>       # 任务详情
+markbot autopilot tick            # 执行下一个排队任务
+markbot autopilot reject <id>     # 拒绝任务 (--reason)
+markbot autopilot requeue <id>    # 重新入队
+markbot autopilot stats           # 统计
+markbot autopilot journal         # 执行日志
+markbot autopilot context         # 当前上下文
+
+# 渠道 / 提供商
+markbot channels status           # 渠道健康状态
+markbot channels login weixin     # 微信扫码登录
+markbot provider login openai-codex    # Codex OAuth 登录
+markbot provider login github-copilot  # Copilot OAuth 登录
+
+# 配置与诊断
+markbot status                    # 进程 / 工作区 / 运行时状态
+markbot config get|set|list|show  # 查看与修改配置
+markbot plugins list              # 已发现的技能插件
+markbot doctor                    # 环境体检
+markbot doctor fix                # 自动修复常见问题
+markbot --version
+```
+
+---
+
+## 会话内斜杠命令
+
+| 命令 | 说明 |
+|------|------|
+| `/new` | 开启新会话（携带记忆摘要） |
+| `/compact` | 手动触发上下文压缩 |
+| `/compact_str` | 查看当前压缩摘要内容 |
+| `/clear` | 清空历史与压缩摘要 |
+| `/stop` | 取消所有活动任务与子代理 |
+| `/steer` | 向运行中的 Agent 注入中途指令 |
+| `/status` | 会话状态、token 用量与统计 |
+| `/mode [mode]` | 查看/切换权限模式 |
+| `/profile [name]` | 查看/切换运行档案 |
+| `/restart` | 重启 Agent 进程 |
+| `/help` | 显示可用命令 |
+
+---
+
+## 权限模式与安全
+
+权限系统分两层：**静态能力**（config.json 的 `tools.<x>.enable`）决定工具是否注册可见；**运行时模式**（`/mode`）决定已注册工具是否免确认执行。`/mode` 的切换会持久化到 `agents.defaults.defaultPermissionMode`，重启后仍生效。
+
+| 模式 | 行为 |
+|------|------|
+| `default` | 危险操作前确认（当前无交互确认 UI 时，非只读工具返回 Permission required） |
+| `plan` | 只读模式，阻止一切变更操作 |
+| `accept_edits` | 允许文件编辑，破坏性操作仍需确认 |
+| `auto` | 所有工具免确认（推荐，schema 默认） |
+| `bypass_permissions` | 绕过全部权限检查（仅调试用） |
+
+要点：
+
+- Cron / Autopilot / Heartbeat 等无人值守路径**始终以 auto 模式**运行。
+- 三种典型配置范式：
+  - **安全聊天**（只读）：关闭 `exec` / `codeExecution` / `computerUse` / `browser`，配合 `/mode plan`；
+  - **本地开发助手**：开启 exec + 代码执行但 `restrictToWorkspace: true`，配合 `/mode accept_edits`；
+  - **完全桌面托管**：放开所有限制，配合 `/mode auto` 或 `bypass`。
+- 安全默认值：`gateway.host` 默认仅监听 `127.0.0.1`；Shell 与文件工具默认限制在工作区内；删除默认进入回收站目录。
+
+---
+
+## 开发指南
+
+### 目录结构
+
+```
+markbot/
+├── agent/            # Agent 循环：iteration、压缩、上下文构建、成本跟踪、
+│   │                 #   前缀缓存、pipeline 中间件、subagent、MCP 管理器
+├── channels/         # 渠道：dingtalk / feishu / qq / weixin / email + 管理器
+├── tools/            # 内置工具实现（文件系统/Shell/Web/记忆/browser/computer_use…）
+├── skills/           # 技能框架（loader/scanner/guardrail/sandbox）+ 内置技能
+├── providers/        # 28 家 LLM Provider + FallbackManager(熔断) + OAuth
+├── config/           # Pydantic 配置 schema / loader / 路径 / 运行档案
+├── runtime/          # 声明式装配工厂（CLI/Gateway/Web 共用）
+├── memory/           # 记忆系统：长期向量库、整合、每日日志、脱敏、插件发现
+├── bus/              # 消息总线（inbound/outbound 队列 + 事件）
+├── session/          # 会话持久化、完整性校验、任务跟踪
+├── schedule/         # CronService / DreamService / HeartbeatService
+├── autopilot/        # 自动任务流水线（Intake→Verify→Repair）
+├── cli/              # Typer CLI：onboard/agent/gateway/web/skills/autopilot/doctor
+├── web/              # FastAPI 服务端（WebSocket 聊天 + REST 路由）
+├── templates/        # 工作区模板（SOUL.md / MEMORY.md 等）
+└── log/              # loguru 日志核心与敏感信息脱敏
+web/                  # Web 控制台前端（React 19 + Vite + Tailwind 4）
+tests/                # pytest 测试套件
+```
+
+### 常用开发命令
+
+```bash
+# 后端
+pip install -e ".[dev]"
+ruff check .                      # 代码检查
+pytest                            # 运行测试
+pytest --cov=markbot              # 带覆盖率
+
+# 前端（Web 控制台）
+cd web
+npm install
+npm run dev                       # Vite 开发服务器
+npm run build                     # 构建产物输出到后端静态目录
+
+# 调试运行（走真实 runtime 装配路径）
+python run_debug.py
+```
+
+### 贡献流程
+
+1. Fork 仓库并创建特性分支（`git checkout -b feature/amazing-feature`）
+2. 提交改动（`git commit -m 'Add amazing feature'`）
+3. 推送分支并发起 Pull Request
+
+---
+
+## License
+
+本项目基于 **GNU Affero General Public License v3 (AGPL-3.0)** 开源。
+
+---
+
+**MarkBot** 🦞 — 面向开发者与效率用户的个人 AI 助手。
+
+
+
+
