@@ -45,6 +45,12 @@
     "clear": {
       "done": "历史已清除。压缩摘要已重置。"
     },
+    "moa": {
+      "no_question": "未提供问题。使用 /moa <你的问题>，或让最近一条用户消息作为问题。",
+      "no_advisors": "MoA 没有可用的顾问模型。请配置 agents.defaults.moa.advisors 或添加 provider API 密钥。",
+      "failed": "MoA 失败：{error}",
+      "reply": "{answer}\n\n— _MoA · {advisors} 个顾问_"
+    },
     "steer": {
       "usage": "用法：/steer <指令>\n示例：/steer 专注于错误处理",
       "no_running": "当前会话没有正在运行的代理循环。",

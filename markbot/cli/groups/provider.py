@@ -23,7 +23,7 @@ def login(
     provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
 ):
     """Authenticate with an OAuth provider."""
-    from markbot.providers.registry import PROVIDERS
+    from markbot.providers.registry import list_specs
 
     markbot_banner()
 
@@ -31,12 +31,13 @@ def login(
 
     console.print()
 
+    specs = list_specs()
     key = provider.replace("-", "_")
-    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
+    spec = next((s for s in specs if s.name == key and s.is_oauth), None)
     if not spec:
         section("Error", "red")
         console.print(f"  [red]✗[/red] Unknown OAuth provider: [cyan]{provider}[/cyan]")
-        kv("Supported", ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth))
+        kv("Supported", ", ".join(s.name.replace("_", "-") for s in specs if s.is_oauth))
         divider()
         console.print()
         raise typer.Exit(1)

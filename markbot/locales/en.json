@@ -45,6 +45,12 @@
     "clear": {
       "done": "History cleared. Compressed summary reset."
     },
+    "moa": {
+      "no_question": "No question provided. Use /moa <your question> or let your latest user message be the question.",
+      "no_advisors": "MoA has no advisors available. Configure agents.defaults.moa.advisors or add provider API keys.",
+      "failed": "MoA failed: {error}",
+      "reply": "{answer}\n\n— _MoA · {advisors} advisors_"
+    },
     "steer": {
       "usage": "Usage: /steer <instruction>\nExample: /steer focus on error handling",
       "no_running": "No agent loop is currently running for this session.",

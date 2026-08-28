@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -19,8 +20,9 @@ from pydantic import Field
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
 from markbot.channels.base import BaseChannel
-from markbot.config.paths import get_media_dir
+from markbot.config.paths import get_media_dir, get_runtime_subdir
 from markbot.config.schema import Base
+from markbot.utils.atomic import atomic_write_json
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
@@ -43,6 +45,11 @@ FEISHU_WS_BACKOFF_FACTOR = 2
 
 # Streaming card element ID
 _STREAM_ELEMENT_ID = "streaming_md"
+
+# Dedup cache: how long a seen message ID stays "fresh" (24h), so re-delivered
+# messages after a WS reconnect / process restart are dropped.
+_FEISHU_DEDUP_TTL_SECONDS = 24 * 60 * 60
+_FEISHU_DEDUP_CACHE_SIZE = 1000
 
 
 @dataclass
@@ -309,7 +316,8 @@ class FeishuChannel(BaseChannel):
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
-        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_message_ids: OrderedDict[str, float] = OrderedDict()  # msg_id -> seen_at (time.time()); persistent dedup cache
+        self._dedup_state_path: Path | None = None  # lazily resolved, or injected in tests
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_reactions: dict[
             str, str
@@ -338,6 +346,7 @@ class FeishuChannel(BaseChannel):
 
         self._running = True
         self._loop = asyncio.get_running_loop()
+        self._load_seen_message_ids()
 
         # Create Lark client for sending messages
         domain = LARK_DOMAIN if self.config.domain == "lark" else FEISHU_DOMAIN
@@ -1860,6 +1869,97 @@ class FeishuChannel(BaseChannel):
                     message_id in self._cleaned_reactions if message_id else False,
                 )
 
+    # ------------------------------------------------------------------
+    # Deduplication — persistent seen-message-ID cache (survives restarts)
+    # ------------------------------------------------------------------
+
+    def _state_path(self) -> Path:
+        """Return (and lazily resolve) the persisted dedup-state file path."""
+        if self._dedup_state_path is None:
+            self._dedup_state_path = get_runtime_subdir("feishu") / "seen_message_ids.json"
+        return self._dedup_state_path
+
+    def _load_seen_message_ids(self) -> None:
+        """Load persisted seen-message IDs so dedup survives process restarts."""
+        try:
+            payload = json.loads(self._state_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "Feishu: failed to load persisted dedup state from {}",
+                self._state_path(),
+                exc_info=True,
+            )
+            return
+        seen_data = payload.get("message_ids", {}) if isinstance(payload, dict) else {}
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        # Backward-compat: an old format stored a plain list of IDs (no timestamps).
+        if isinstance(seen_data, list):
+            entries: dict[str, float] = {
+                str(item).strip(): 0.0 for item in seen_data if str(item).strip()
+            }
+        elif isinstance(seen_data, dict):
+            entries = {}
+            for key, value in seen_data.items():
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                try:
+                    entries[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        else:
+            return
+        # Drop TTL-expired entries. Legacy entries (ts==0.0) survive one load
+        # cycle so old data is not nuked on the first upgrade.
+        valid = {
+            msg_id: ts
+            for msg_id, ts in entries.items()
+            if ts == 0.0 or ttl <= 0 or now - ts < ttl
+        }
+        # Keep the most recently seen IDs, capped.
+        sorted_ids = sorted(valid, key=valid.get, reverse=True)[:_FEISHU_DEDUP_CACHE_SIZE]
+        self._processed_message_ids = OrderedDict(
+            (msg_id, valid[msg_id]) for msg_id in sorted_ids
+        )
+
+    def _persist_seen_message_ids(self) -> None:
+        """Atomically persist recent seen-message IDs with their timestamps."""
+        try:
+            recent = list(self._processed_message_ids.items())[-_FEISHU_DEDUP_CACHE_SIZE:]
+            atomic_write_json(
+                self._state_path(),
+                {"message_ids": {mid: ts for mid, ts in recent}},
+                indent=None,
+            )
+        except OSError:
+            logger.warning(
+                "Feishu: failed to persist dedup state to {}",
+                self._state_path(),
+                exc_info=True,
+            )
+
+    def _is_duplicate(self, message_id: str) -> bool:
+        """Check whether *message_id* was already handled; record it if new.
+
+        New IDs are recorded with the current wall-clock timestamp and
+        persisted immediately, so the check also works across restarts.
+        """
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        seen_at = self._processed_message_ids.get(message_id)
+        # ts==0.0 marks legacy (pre-timestamp) entries: keep them effective for
+        # one migration cycle instead of re-admitting the same message.
+        if seen_at is not None and (seen_at == 0.0 or ttl <= 0 or now - seen_at < ttl):
+            return True
+        # Record with current timestamp so TTL filtering works across restarts.
+        self._processed_message_ids[message_id] = now
+        while len(self._processed_message_ids) > _FEISHU_DEDUP_CACHE_SIZE:
+            self._processed_message_ids.popitem(last=False)
+        self._persist_seen_message_ids()
+        return False
+
     def _on_message_sync(self, data: Any) -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
@@ -1889,15 +1989,10 @@ class FeishuChannel(BaseChannel):
             message = event.message
             sender = event.sender
 
-            # Deduplication check
+            # Deduplication check (persistent 24h TTL, survives restarts/reconnects)
             message_id = message.message_id
-            if message_id in self._processed_message_ids:
+            if self._is_duplicate(message_id):
                 return
-            self._processed_message_ids[message_id] = None
-
-            # Trim cache
-            while len(self._processed_message_ids) > 1000:
-                self._processed_message_ids.popitem(last=False)
 
             # Skip bot messages
             if sender.sender_type == "bot":

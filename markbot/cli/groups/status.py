@@ -19,7 +19,7 @@ def status(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         return
     from markbot.config.loader import get_config_path, load_config
-    from markbot.providers.registry import PROVIDERS
+    from markbot.providers.registry import list_specs
 
     config_path = get_config_path()
     config = load_config()
@@ -53,7 +53,7 @@ def status(ctx: typer.Context):
 
     # ─ Providers ─────────────────────────────────────────────────────────────
     section("Providers", "magenta")
-    for spec in PROVIDERS:
+    for spec in list_specs():
         p = getattr(config.providers, spec.name, None)
         if p is None:
             continue
@@ -65,7 +65,7 @@ def status(ctx: typer.Context):
             else:
                 kv(spec.label, "[dim]not set[/dim]")
         else:
-            has_key = bool(p.api_key)
+            has_key = bool(p.credential_keys)
             kv(spec.label, "[green]✓[/green]" if has_key else "[dim]not set[/dim]")
 
     divider()

@@ -10,15 +10,46 @@ For providers with non-trivial request quirks (thinking mode, reasoning
 effort, extra_body fields), subclass ProviderSpec and override the hook
 methods (prepare_messages, build_extra_body, build_api_kwargs_extras).
 
+Provider plugins: third-party specs can also be registered at runtime —
+either programmatically via :func:`register_provider_spec`, or by dropping
+a ``*.py`` file into ``<data dir>/providers/`` that calls it at import
+time (see FILESYSTEM note below). User specs override bundled ones of the
+same name (last-writer-wins) without editing this file; brand-new user
+providers are appended after the bundled list.
+
 Order matters — it controls match priority and fallback. Gateways first.
 Every entry writes out all fields so you can copy-paste as a template.
+
+=== FILESYSTEM ===
+User provider plugins live in ``<data dir>/providers/*.py`` (data dir is
+``~/.markbot/`` unless a custom config path is set). A plugin is any
+Python module that calls ``register_provider_spec(...)`` at import time,
+e.g. adding a "mycloud" OpenAI-compatible endpoint::
+
+    # ~/.markbot/providers/mycloud.py
+    from markbot.providers.registry import ProviderSpec, register_provider_spec
+
+    register_provider_spec(ProviderSpec(
+        name="mycloud",
+        keywords=("mycloud",),
+        env_key="MYCLOUD_API_KEY",
+        display_name="MyCloud",
+        default_api_base="https://api.mycloud.example/v1",
+    ))
+
+Discovery is lazy (first lookup), idempotent, and failure-tolerant: a
+broken plugin logs a warning and never blocks the other plugins or the
+bundled registry.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -970,6 +1001,117 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# User provider plugins — externally registered / filesystem-discovered specs
+# ---------------------------------------------------------------------------
+
+_EXTRA_SPECS: dict[str, ProviderSpec] = {}
+_USER_PLUGINS_SCANNED = False
+
+
+def register_provider_spec(spec: ProviderSpec) -> None:
+    """Register a provider spec from outside the bundled ``PROVIDERS`` list.
+
+    Later registrations with the same name replace earlier ones
+    (last-writer-wins), so user plugins can override any bundled profile
+    without editing repo code.
+    """
+    _EXTRA_SPECS[spec.name] = spec
+
+
+def _user_plugins_dir() -> Path | None:
+    """Return the user plugins directory when it actually contains plugins.
+
+    Resolves to ``<data dir>/providers``. Discovery never creates the
+    directory — it only scans when the user already has plugin files there.
+    """
+    try:
+        from markbot.config.loader import get_config_path
+
+        plugins_dir = get_config_path().parent / "providers"
+        return plugins_dir if plugins_dir.is_dir() else None
+    except Exception:
+        return None
+
+
+def _discover_user_plugins() -> None:
+    """Import every ``*.py`` in the user plugins dir.
+
+    Each plugin registers itself by calling :func:`register_provider_spec`
+    at import time. Runs at most once per process and is failure-tolerant:
+    a broken plugin logs a warning and never blocks the other plugins or
+    the bundled registry.
+    """
+    global _USER_PLUGINS_SCANNED
+    if _USER_PLUGINS_SCANNED:
+        return
+    _USER_PLUGINS_SCANNED = True
+
+    plugins_dir = _user_plugins_dir()
+    if plugins_dir is None:
+        return
+
+    for child in sorted(plugins_dir.iterdir()):
+        if not child.is_file() or not child.name.endswith(".py"):
+            continue
+        if child.name.startswith("_"):  # private / helper modules are opt-in
+            continue
+        module_name = f"_markbot_user_provider_{child.stem}"
+        if module_name in sys.modules:
+            continue
+        try:
+            mod_spec = importlib.util.spec_from_file_location(module_name, child)
+            if mod_spec is None or mod_spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(mod_spec)
+            sys.modules[module_name] = module
+            mod_spec.loader.exec_module(module)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load user provider plugin {}: {}", child.name, exc
+            )
+            sys.modules.pop(module_name, None)
+
+
+def list_specs() -> list[ProviderSpec]:
+    """Return every provider spec — bundled + user plugins — in priority order.
+
+    Bundled ``PROVIDERS`` keep their declared order (= match priority and
+    fallback). A user spec that overrides a bundled name replaces it *in
+    place* so the priority slot is preserved; brand-new user providers are
+    appended at the end (lowest priority).
+    """
+    _discover_user_plugins()
+
+    merged: dict[str, ProviderSpec] = {}
+    order: list[str] = []
+    for spec in PROVIDERS:
+        merged[spec.name] = spec
+        order.append(spec.name)
+    for name, spec in _EXTRA_SPECS.items():
+        if name in merged:
+            merged[name] = spec  # replace in place, keep the priority slot
+        else:
+            order.append(name)
+            merged[name] = spec
+    return [merged[name] for name in order]
+
+
+def _reset_provider_registry() -> None:
+    """Test hook: clear registered specs and re-enable plugin discovery.
+
+    Unused outside tests. Also evicts imported user-plugin modules so a
+    subsequent discovery pass (under a different data dir) re-imports them.
+    """
+    global _USER_PLUGINS_SCANNED
+    _EXTRA_SPECS.clear()
+    _USER_PLUGINS_SCANNED = False
+    for mod_name in [
+        m for m in sys.modules if m.startswith("_markbot_user_provider_")
+    ]:
+        sys.modules.pop(mod_name, None)
+
+
+# ---------------------------------------------------------------------------
 # Lookup helpers
 # ---------------------------------------------------------------------------
 
@@ -978,14 +1120,16 @@ def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name or alias.
 
     Checks name first, then aliases. Name matching normalizes hyphens
-    to underscores and applies snake_case conversion.
+    to underscores and applies snake_case conversion. Consults user
+    plugins as well as the bundled registry.
     """
     normalized = to_snake(name.replace("-", "_"))
-    for spec in PROVIDERS:
+    specs = list_specs()
+    for spec in specs:
         if spec.name == normalized:
             return spec
     name_lower = name.lower()
-    for spec in PROVIDERS:
+    for spec in specs:
         if name_lower in spec.aliases:
             return spec
     return None

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+import socket
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +15,163 @@ from loguru import logger
 
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
+
+
+class SendErrorKind(str, Enum):
+    """Outbound send failure categories (mirrors hermes-agent gateway)."""
+
+    TOO_LONG = "too_long"
+    BAD_FORMAT = "bad_format"
+    FORBIDDEN = "forbidden"
+    NOT_FOUND = "not_found"
+    RATE_LIMITED = "rate_limited"
+    TRANSIENT = "transient"
+    UNKNOWN = "unknown"
+
+
+class SendError(RuntimeError):
+    """Raised by channels on delivery failure with a structured classification.
+
+    Channels that can distinguish failure reasons should raise this instead of
+    a bare RuntimeError so the channel manager can apply the right policy:
+
+    - ``rate_limited`` with ``retry_after`` → wait server-authoritative seconds.
+    - ``not_found`` / ``forbidden`` with ``chat_level=True`` → mark chat dead.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: SendErrorKind = SendErrorKind.UNKNOWN,
+        retry_after: float | None = None,
+        chat_level: bool = True,
+    ):
+        super().__init__(message)
+        self.kind = SendErrorKind(kind)
+        self.retry_after = retry_after
+        self.chat_level = chat_level
+
+
+@dataclass
+class SendErrorInfo:
+    """Classification result for an arbitrary send exception."""
+
+    kind: SendErrorKind
+    retry_after: float | None = None
+    chat_level: bool = True
+
+    @classmethod
+    def of(cls, exc: Exception) -> "SendErrorInfo":
+        return classify_send_error(exc)
+
+
+def _matches(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+_RATE_LIMIT_PATTERNS = (
+    "rate.limit",
+    "too.many.requests",
+    "flood",
+    "retry.after",
+    "throttl",
+    "frequen",
+    "\\b429\\b",
+)
+_FORBIDDEN_PATTERNS = (
+    "forbidden",
+    "permission.denied",
+    "banned",
+    "denied",
+    "not.authorized",
+    "unauthorized",
+    "no permission",
+)
+_NOT_FOUND_PATTERNS = (
+    "not.found",
+    "\\b404\\b",
+    "does.not.exist",
+    "invalid.chat",
+    "conversation.*not",
+    "chat.*not.found",
+    "user.*not.found",
+)
+_TOO_LONG_PATTERNS = (
+    "too.long",
+    "too.large",
+    "exceeds.*limit",
+    "max.*length",
+    "\\b413\\b",
+    "too many bytes",
+)
+
+
+def _extract_retry_after(exc: Exception) -> float | None:
+    if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
+        header = exc.response.headers.get("Retry-After")
+    else:
+        header = None
+    if header:
+        try:
+            return max(float(header), 0.0)
+        except ValueError:
+            pass
+    return None
+
+
+def classify_send_error(exc: Exception) -> SendErrorInfo:
+    """Best-effort classification of an outbound send exception.
+
+    Channels should prefer raising :class:`SendError` with an explicit kind;
+    this is a heuristic fallback for arbitrary exceptions (SDK errors, bare
+    RuntimeError, httpx failures, ...).
+    """
+    if isinstance(exc, SendError):
+        return SendErrorInfo(exc.kind, exc.retry_after, exc.chat_level)
+
+    text = f"{type(exc).__name__}: {exc}"
+
+    # Timeouts: unambiguous transient failures.
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return SendErrorInfo(SendErrorKind.TRANSIENT)
+
+    if httpx is not None:
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            if code == 403:
+                return SendErrorInfo(SendErrorKind.FORBIDDEN)
+            if code == 404:
+                return SendErrorInfo(SendErrorKind.NOT_FOUND, chat_level=True)
+            if code == 413:
+                return SendErrorInfo(SendErrorKind.TOO_LONG)
+            if code == 429:
+                return SendErrorInfo(
+                    SendErrorKind.RATE_LIMITED,
+                    retry_after=_extract_retry_after(exc),
+                )
+            if 400 <= code < 500:
+                return SendErrorInfo(SendErrorKind.BAD_FORMAT)
+            if 500 <= code < 600:
+                return SendErrorInfo(SendErrorKind.TRANSIENT)
+        elif isinstance(exc, httpx.TransportError):
+            # Connect/read/write/pool errors: no response, safe to retry.
+            return SendErrorInfo(SendErrorKind.TRANSIENT)
+
+    if _matches(text, _RATE_LIMIT_PATTERNS):
+        return SendErrorInfo(SendErrorKind.RATE_LIMITED)
+    if _matches(text, _FORBIDDEN_PATTERNS):
+        return SendErrorInfo(SendErrorKind.FORBIDDEN)
+    if _matches(text, _NOT_FOUND_PATTERNS):
+        return SendErrorInfo(SendErrorKind.NOT_FOUND)
+    if _matches(text, _TOO_LONG_PATTERNS):
+        return SendErrorInfo(SendErrorKind.TOO_LONG)
+    return SendErrorInfo(SendErrorKind.UNKNOWN)
 
 
 class BaseChannel(ABC):

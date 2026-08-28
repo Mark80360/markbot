@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 from typing import Any
 
 from loguru import logger
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
+from markbot.channels.base import (
+    BaseChannel,
+    SendErrorKind,
+    classify_send_error,
+)
 from markbot.config.schema import Config
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
+
+# Cap on server-provided retry_after (seconds) to avoid unbounded stalls.
+_MAX_RETRY_AFTER_S = 300
+
+# Dead-target entries are forgotten after this long (self-healing fallback).
+_DEAD_TARGET_TTL_S = 3600
 
 # Health check interval in seconds
 _HEALTH_CHECK_INTERVAL_S = 60
@@ -42,6 +54,11 @@ class ChannelManager:
         self._consecutive_failures: dict[str, int] = {}
         self._last_restart: dict[str, float] = {}
         self._restarting: dict[str, bool] = {}
+
+        # Dead-target registry: (channel_name, chat_id) -> {ts, reason}.
+        # Chats that no longer exist or are forbidden are skipped until a
+        # send succeeds again (self-heal) or the entry expires.
+        self._dead_targets: dict[tuple[str, str], dict[str, Any]] = {}
 
         self._init_channels()
 
@@ -213,6 +230,14 @@ class ChannelManager:
         Stream delta/end messages are sent without retry to avoid out-of-order
         delivery, since they are ordered and must arrive in sequence.
 
+        Failures are classified (markbot.channels.base.classify_send_error):
+
+        - ``rate_limited`` / ``transient`` / ``unknown`` → retried with backoff
+          (server-provided ``retry_after`` takes precedence when supplied);
+        - ``too_long`` / ``bad_format`` → dropped immediately (non-retryable);
+        - ``forbidden`` / chat-level ``not_found`` → chat marked dead and
+          skipped until a later send succeeds (auto heal).
+
         Note: CancelledError is re-raised to allow graceful shutdown.
         """
         # Stream deltas are ordered; retrying would cause out-of-order delivery.
@@ -230,15 +255,56 @@ class ChannelManager:
                 )
             return
 
+        # Chats previously marked forbidden/not_found are skipped entirely so
+        # we don't burn rate-limit budget or spam error logs for dead chats.
+        if self._is_dead_target(channel.name, msg.chat_id):
+            logger.info(
+                "Skipping {}/{} — dead target (previously forbidden/not_found)",
+                channel.name,
+                msg.chat_id,
+            )
+            return
+
         max_attempts = max(self.config.channels.send_max_retries, 1)
+        delay_index = 0
 
         for attempt in range(max_attempts):
             try:
                 await self._send_once(channel, msg)
+                # A successful delivery proves the chat is alive again.
+                self._clear_dead_target(channel.name, msg.chat_id)
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
+                info = classify_send_error(e)
+
+                if (
+                    info.kind in (SendErrorKind.FORBIDDEN, SendErrorKind.NOT_FOUND)
+                    and info.chat_level
+                ):
+                    self._mark_dead_target(channel.name, msg.chat_id, str(e))
+                    logger.error(
+                        "Dropped send to {}/{} (dead target, {}): {} - {}",
+                        msg.channel,
+                        msg.chat_id,
+                        info.kind.value,
+                        type(e).__name__,
+                        e,
+                    )
+                    return
+
+                if info.kind in (SendErrorKind.TOO_LONG, SendErrorKind.BAD_FORMAT):
+                    logger.error(
+                        "Dropped send to {}/{} (non-retryable {}): {} - {}",
+                        msg.channel,
+                        msg.chat_id,
+                        info.kind.value,
+                        type(e).__name__,
+                        e,
+                    )
+                    return
+
                 if attempt == max_attempts - 1:
                     logger.error(
                         "Failed to send to {} after {} attempts: {} - {}",
@@ -248,19 +314,55 @@ class ChannelManager:
                         e,
                     )
                     return
-                delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
+
+                if info.retry_after is not None:
+                    delay = min(info.retry_after, _MAX_RETRY_AFTER_S)
+                else:
+                    delay = _SEND_RETRY_DELAYS[min(delay_index, len(_SEND_RETRY_DELAYS) - 1)]
+                    delay_index += 1
+                    # Small jitter to avoid synchronized retry storms.
+                    delay += random.uniform(0, 0.5)
                 logger.warning(
-                    "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
+                    "Send to {} failed (attempt {}/{}): {} ({}), retrying in {:.1f}s",
                     msg.channel,
                     attempt + 1,
                     max_attempts,
                     type(e).__name__,
+                    info.kind.value,
                     delay,
                 )
                 try:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation during sleep
+
+    # -- Dead-target registry ---------------------------------------------
+
+    def _is_dead_target(self, channel_name: str, chat_id: str) -> bool:
+        key = (channel_name, chat_id)
+        entry = self._dead_targets.get(key)
+        if not entry:
+            return False
+        if time.monotonic() - entry["ts"] > _DEAD_TARGET_TTL_S:
+            self._dead_targets.pop(key, None)  # Forget after TTL (self-heal)
+            return False
+        return True
+
+    def _mark_dead_target(self, channel_name: str, chat_id: str, reason: str) -> None:
+        self._dead_targets[(channel_name, chat_id)] = {
+            "ts": time.monotonic(),
+            "reason": reason[:200],
+        }
+
+    def _clear_dead_target(self, channel_name: str, chat_id: str) -> None:
+        self._dead_targets.pop((channel_name, chat_id), None)
+
+    def get_dead_targets(self) -> list[dict[str, str]]:
+        """Expose current dead targets (useful for diagnostics)."""
+        return [
+            {"channel": name, "chat_id": chat_id, "reason": entry.get("reason", "")}
+            for (name, chat_id), entry in self._dead_targets.items()
+        ]
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

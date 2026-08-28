@@ -246,7 +246,7 @@ class TestContentFilterDoesNotTripCircuit:
     async def test_content_filter_does_not_record_failure(self):
         mgr = self._make_manager()
         # Stub out provider creation — the mock caller ignores the provider.
-        mgr._get_or_create_provider = lambda pc, pn: object()
+        mgr._get_or_create_provider = lambda pc, pn, api_key=None, credential_variant=0: object()
 
         call_count = 0
 
@@ -282,7 +282,7 @@ class TestContentFilterDoesNotTripCircuit:
         """Even after many content_filter hits, the circuit stays closed —
         the provider is healthy, it just keeps refusing this content."""
         mgr = self._make_manager()
-        mgr._get_or_create_provider = lambda pc, pn: object()
+        mgr._get_or_create_provider = lambda pc, pn, api_key=None, credential_variant=0: object()
 
         async def mock_caller(provider, model_config, mt, temp, reasoning, msgs):
             # Both models always refuse
@@ -320,7 +320,7 @@ class TestContentFilterDoesNotTripCircuit:
         model out of the chain forever.
         """
         mgr = self._make_manager()
-        mgr._get_or_create_provider = lambda pc, pn: object()
+        mgr._get_or_create_provider = lambda pc, pn, api_key=None, credential_variant=0: object()
 
         # Put anthropic/sonnet into half-open, simulating the state
         # after 6 failures + cooldown elapsed. _check_circuit will add

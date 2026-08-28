@@ -19,6 +19,8 @@ from markbot.providers.registry import (
     ProviderSpec,
     create_provider,
     find_by_name,
+    list_specs,
+    register_provider_spec,
 )
 
 __all__ = [
@@ -43,6 +45,8 @@ __all__ = [
     "_OMIT_TEMPERATURE",
     "find_by_name",
     "create_provider",
+    "list_specs",
+    "register_provider_spec",
 ]
 
 _LAZY_IMPORTS = {

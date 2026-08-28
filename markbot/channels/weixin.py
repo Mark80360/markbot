@@ -709,47 +709,74 @@ class WeixinChannel(BaseChannel):
     # Outbound  (matches send.ts buildTextMessageReq + sendMessageWeixin)
     # ------------------------------------------------------------------
 
+    def _new_http_client(self) -> httpx.AsyncClient:
+        """Create the shared HTTP client with the channel's timeouts."""
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.poll_timeout + 10, connect=30),
+            follow_redirects=True,
+        )
+
     async def send(self, msg: OutboundMessage) -> None:
-        if not self._client or not self._token:
-            logger.warning("WeChat client not initialized or not authenticated")
+        """Send a message, working even without the long-poll loop running.
+
+        Direct-send path (e.g. cron / immediate CLI sends that fire before the
+        channel's ``start()`` or after a restart):
+        1. Reuse the live poll-loop client when the channel is running;
+        2. otherwise lazily create a temporary client (token and context tokens
+           are restored from ``account.json``), send, then tear the temp client
+           down so the next ``start()`` is unaffected.
+        """
+        if not self._token and not self._load_state():
+            logger.warning("WeChat not authenticated; cannot send")
             return
+
+        direct_temp = False
+        if not self._client:
+            self._client = self._new_http_client()
+            direct_temp = True
+
         try:
-            self._assert_session_active()
-        except RuntimeError as e:
-            logger.warning("WeChat send blocked: {}", e)
-            return
-
-        content = msg.content.strip()
-        ctx_token = self._context_tokens.get(msg.chat_id, "")
-        if not ctx_token:
-            logger.warning(
-                "WeChat: no context_token for chat_id={}, cannot send",
-                msg.chat_id,
-            )
-            return
-
-        for media_path in (msg.media or []):
             try:
-                await self._send_media_file(msg.chat_id, media_path, ctx_token)
-            except Exception as e:
-                filename = Path(media_path).name
-                logger.error("Failed to send WeChat media {}: {}", media_path, e)
-                # Notify user about failure via text
-                await self._send_text(
-                    msg.chat_id, f"[Failed to send: {filename}]", ctx_token,
+                self._assert_session_active()
+            except RuntimeError as e:
+                logger.warning("WeChat send blocked: {}", e)
+                return
+
+            content = msg.content.strip()
+            ctx_token = self._context_tokens.get(msg.chat_id, "")
+            if not ctx_token:
+                logger.warning(
+                    "WeChat: no context_token for chat_id={}, cannot send",
+                    msg.chat_id,
                 )
+                return
 
-        # --- Send text content ---
-        if not content:
-            return
+            for media_path in (msg.media or []):
+                try:
+                    await self._send_media_file(msg.chat_id, media_path, ctx_token)
+                except Exception as e:
+                    filename = Path(media_path).name
+                    logger.error("Failed to send WeChat media {}: {}", media_path, e)
+                    # Notify user about failure via text
+                    await self._send_text(
+                        msg.chat_id, f"[Failed to send: {filename}]", ctx_token,
+                    )
 
-        try:
-            chunks = split_message(content, WEIXIN_MAX_MESSAGE_LEN)
-            for chunk in chunks:
-                await self._send_text(msg.chat_id, chunk, ctx_token)
-        except Exception as e:
-            logger.error("Error sending WeChat message: {}", e)
-            raise
+            # --- Send text content ---
+            if not content:
+                return
+
+            try:
+                chunks = split_message(content, WEIXIN_MAX_MESSAGE_LEN)
+                for chunk in chunks:
+                    await self._send_text(msg.chat_id, chunk, ctx_token)
+            except Exception as e:
+                logger.error("Error sending WeChat message: {}", e)
+                raise
+        finally:
+            if direct_temp and not self._running:
+                await self._client.aclose()
+                self._client = None
 
     async def _send_text(
         self,

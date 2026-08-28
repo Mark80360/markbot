@@ -125,7 +125,7 @@ def check_primary_provider_configured(cfg: Config) -> tuple[bool, str]:
             return False, f"{provider_name}: api_base is required for direct providers"
         return True, f"{provider_name} (direct, api_base configured)"
 
-    if not provider_cfg.api_key:
+    if not provider_cfg.credential_keys:
         env_key = spec.env_key if spec else ""
         if env_key:
             env_val = os.getenv(env_key, "")
@@ -148,7 +148,7 @@ def check_all_providers_credentials(cfg: Config) -> list[str]:
             continue
         if not provider_cfg.models:
             continue
-        if not provider_cfg.api_key and not provider_cfg.api_base:
+        if not provider_cfg.credential_keys and not provider_cfg.api_base:
             from markbot.providers.registry import find_by_name
 
             spec = find_by_name(field_name)
@@ -1219,7 +1219,7 @@ def _check_provider_connectivity(cfg: Config) -> None:
         _note("OAuth provider skipping connectivity check")
         return
 
-    if not provider_cfg.api_key:
+    if not provider_cfg.credential_keys:
         env_key = spec.env_key if spec else ""
         if env_key:
             env_val = os.getenv(env_key, "")

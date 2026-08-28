@@ -684,7 +684,7 @@ def _try_auto_fill_context_window(model: BaseModel, new_model_name: str) -> None
 @lru_cache(maxsize=1)
 def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
     """Get provider info from registry (cached)."""
-    from markbot.providers.registry import PROVIDERS
+    from markbot.providers.registry import list_specs
 
     return {
         spec.name: (
@@ -693,7 +693,7 @@ def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
             spec.is_local,
             spec.default_api_base,
         )
-        for spec in PROVIDERS
+        for spec in list_specs()
         if not spec.is_oauth
     }
 
@@ -802,7 +802,7 @@ def _configure_models_for_provider(config: Config, provider_name: str, display_n
         return
 
     is_local = provider_name in ("ollama", "vllm", "ovms")
-    if not is_local and not provider_config.api_key:
+    if not is_local and not provider_config.credential_keys:
         console.print("[yellow]Please configure API key first before adding models.[/yellow]")
         return
 
@@ -1156,9 +1156,9 @@ def _configure_providers(config: Config) -> None:
         choices = []
         for name, display in _get_provider_names().items():
             provider = getattr(config.providers, name, None)
-            if provider and provider.api_key and provider.models:
+            if provider and provider.credential_keys and provider.models:
                 choices.append(f"{display} * ({len(provider.models)} models)")
-            elif provider and provider.api_key:
+            elif provider and provider.credential_keys:
                 choices.append(f"{display} * (0 models)")
             else:
                 choices.append(display)
@@ -1355,7 +1355,7 @@ def _show_summary(config: Config) -> None:
     provider_rows = []
     for name, display in _get_provider_names().items():
         provider = getattr(config.providers, name, None)
-        status = "[green]configured[/green]" if (provider and provider.api_key) else "[dim]not configured[/dim]"
+        status = "[green]configured[/green]" if (provider and provider.credential_keys) else "[dim]not configured[/dim]"
         provider_rows.append((display, status))
     _print_summary_panel(provider_rows, "LLM Providers")
 

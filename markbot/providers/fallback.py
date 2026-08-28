@@ -9,7 +9,7 @@ from loguru import logger
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.errors import ErrorCode, MarkbotError, classify_exception
 from markbot.providers.base import LLMProvider, LLMResponse
-from markbot.providers.error_classifier import classify_to_error_type
+from markbot.providers.error_classifier import classify_api_error, classify_to_error_type
 from markbot.providers.errors import ErrorType
 
 
@@ -137,8 +137,25 @@ class FallbackManager:
                 circuit_key, circuit.failure_count,
             )
 
-    def _get_or_create_provider(self, provider_config: ProviderConfig, provider_name: str) -> LLMProvider:
-        cache_key = provider_name
+    def _get_or_create_provider(
+        self,
+        provider_config: ProviderConfig,
+        provider_name: str,
+        api_key: str | None = None,
+        credential_variant: int = 0,
+    ) -> LLMProvider:
+        """Get (or build + cache) a provider for the given credential slot.
+
+        ``credential_variant == 0`` is the canonical provider cached under
+        ``provider_name``; higher variants come from ``ProviderConfig.api_keys``
+        and are cached under a suffixed key so every credential gets its own
+        client instance (API key is fixed at construction time).
+        """
+        cache_key = (
+            provider_name
+            if credential_variant == 0
+            else f"{provider_name}::credential{credential_variant}"
+        )
         if cache_key not in self._providers_cache:
             from markbot.providers.registry import create_provider, find_by_name
 
@@ -147,7 +164,7 @@ class FallbackManager:
 
             self._providers_cache[cache_key] = create_provider(
                 backend=backend,
-                api_key=provider_config.api_key,
+                api_key=api_key or None,
                 api_base=provider_config.api_base,
                 extra_headers=provider_config.extra_headers,
                 spec=spec,
@@ -239,7 +256,7 @@ class FallbackManager:
 
             try:
                 provider_config, model_config = self.config.resolve_model(model_ref)
-                provider = self._get_or_create_provider(provider_config, provider_name)
+                credential_keys = provider_config.credential_keys or [""]
 
                 _max_tokens = max_tokens or model_config.max_tokens or defaults.max_tokens
                 _temperature = (
@@ -258,90 +275,141 @@ class FallbackManager:
                     messages, provider_name, model_config,
                 )
 
-                logger.info("Trying model: {}", model_ref)
-                response = await caller(
-                    provider, model_config, _max_tokens, _temperature, _reasoning, model_messages,
-                )
+                # Try every credential for this model before giving up and
+                # moving to the next model in the chain. Credential-specific
+                # failures — per-key rate limits (429), credit exhaustion
+                # (402/432), auth failures — rotate to the next credential,
+                # so a healthy model with one dead key does not trip its
+                # circuit breaker.
+                last_error: Exception | None = None
+                content_filter_hit = False
+                for key_index, credential in enumerate(credential_keys):
+                    provider = self._get_or_create_provider(
+                        provider_config, provider_name,
+                        api_key=credential, credential_variant=key_index,
+                    )
+                    logger.info(
+                        "Trying model: {} (credential {}/{})",
+                        model_ref, key_index + 1, len(credential_keys),
+                    )
+                    try:
+                        response = await caller(
+                            provider, model_config, _max_tokens, _temperature, _reasoning, model_messages,
+                        )
+                    except Exception as e:
+                        last_error = e
+                        if key_index < len(credential_keys) - 1:
+                            logger.warning(
+                                "Model {} threw with credential {}/{}: {}. "
+                                "Rotating to next credential...",
+                                model_ref, key_index + 1, len(credential_keys), e,
+                            )
+                            continue
+                        break
 
-                if response.finish_reason == "error":
-                    error_msg = response.content or "Unknown error"
-                    classified = classify_exception(Exception(error_msg))
+                    if response.finish_reason == "error":
+                        error_msg = response.content or "Unknown error"
+                        classified = classify_api_error(None, error_msg)
+                        last_error = Exception(error_msg)
+                        if key_index < len(credential_keys) - 1 and (
+                            classified.retryable or classified.should_fallback
+                        ):
+                            logger.warning(
+                                "Model {} error ({}): rotating to next credential",
+                                model_ref, classified.reason,
+                            )
+                            continue
+                        break
+
+                    if response.finish_reason == "content_filter":
+                        logger.warning(
+                            "Model {} returned content_filter, trying next model...",
+                            model_ref,
+                        )
+                        attempt = FallbackAttempt(
+                            model_ref=model_ref,
+                            provider=provider_config,
+                            model=model_config,
+                            success=False,
+                            error="content_filter",
+                        )
+                        attempts.append(attempt)
+                        last_error = Exception("content_filter")
+                        content_filter_hit = True
+                        # content_filter is a content-specific refusal, not a
+                        # provider outage — the same provider serves other
+                        # requests fine. Recording it as a failure would open
+                        # the circuit on a healthy provider and take down
+                        # every model that shares it. But we MUST still release
+                        # the half-open probe so the next request gets a chance
+                        # to probe this model — otherwise a single content_filter
+                        # during a half-open probe would permanently lock the
+                        # model out of the chain.
+                        self._half_open_probes.discard(model_ref)
+                        break
+
+                    self._record_success(model_ref)
+                    attempt = FallbackAttempt(
+                        model_ref=model_ref,
+                        provider=provider_config,
+                        model=model_config,
+                        success=True,
+                        response=response,
+                    )
+                    attempts.append(attempt)
+                    logger.info(
+                        "Model {} succeeded (credential {}/{})",
+                        model_ref, key_index + 1, len(credential_keys),
+                    )
+                    return response, attempts
+
+                # Every credential for this model failed — record one attempt
+                # with the last error, then move to the next model.
+                if content_filter_hit:
+                    # attempt already recorded inline; move to next model
+                    continue
+                if last_error is not None:
+                    error_msg = str(last_error)
                     attempt = FallbackAttempt(
                         model_ref=model_ref,
                         provider=provider_config,
                         model=model_config,
                         success=False,
                         error=error_msg,
-                        error_code=classified.code,
+                        error_code=classify_exception(last_error).code,
                     )
                     attempts.append(attempt)
 
-                    if response.error_type == ErrorType.TRANSIENT:
+                    err_type = classify_to_error_type(None, error_msg, last_error)
+                    if err_type == ErrorType.TRANSIENT:
                         logger.warning(
-                            "Model {} returned error (retryable): {}. Trying next...",
+                            "Model {} failed (retryable): {}. Trying next...",
                             model_ref, error_msg,
                         )
-                    elif response.error_type == ErrorType.UNAVAILABLE:
+                    elif err_type == ErrorType.UNAVAILABLE:
                         logger.warning(
                             "Model {} unavailable: {}. Trying next...",
                             model_ref, error_msg,
                         )
                     else:
                         logger.error(
-                            "Model {} returned error (non-retryable): {}. Trying next...",
+                            "Model {} failed (non-retryable): {}. Trying next...",
                             model_ref, error_msg,
                         )
-                    last_error = Exception(error_msg)
                     # TRANSIENT errors (429/5xx/timeout) are temporary and
                     # should not trip the circuit breaker — only persistent
                     # failures (UNAVAILABLE/UNKNOWN) indicate a real problem.
-                    if response.error_type != ErrorType.TRANSIENT:
+                    if err_type != ErrorType.TRANSIENT:
                         self._record_failure(model_ref)
                     else:
                         # Still release the half-open probe so the next
                         # request can retry this provider.
                         self._half_open_probes.discard(model_ref)
-                    continue
-
-                if response.finish_reason == "content_filter":
-                    logger.warning(
-                        "Model {} returned content_filter, trying next model...",
-                        model_ref,
-                    )
-                    attempt = FallbackAttempt(
-                        model_ref=model_ref,
-                        provider=provider_config,
-                        model=model_config,
-                        success=False,
-                        error="content_filter",
-                    )
-                    attempts.append(attempt)
-                    last_error = Exception("content_filter")
-                    # content_filter is a content-specific refusal, not a
-                    # provider outage — the same provider serves other
-                    # requests fine. Recording it as a failure would open
-                    # the circuit on a healthy provider and take down
-                    # every model that shares it. But we MUST still release
-                    # the half-open probe so the next request gets a chance
-                    # to probe this model — otherwise a single content_filter
-                    # during a half-open probe would permanently lock the
-                    # model out of the chain.
-                    self._half_open_probes.discard(model_ref)
-                    continue
-
-                self._record_success(model_ref)
-                attempt = FallbackAttempt(
-                    model_ref=model_ref,
-                    provider=provider_config,
-                    model=model_config,
-                    success=True,
-                    response=response,
-                )
-                attempts.append(attempt)
-                logger.info("Model {} succeeded", model_ref)
-                return response, attempts
+                continue
 
             except Exception as e:
+                # Infrastructure / resolution failure (e.g. invalid model
+                # reference in the chain) — record and move to next model.
                 attempt = FallbackAttempt(
                     model_ref=model_ref,
                     provider=provider_config,

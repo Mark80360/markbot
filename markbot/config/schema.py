@@ -63,6 +63,21 @@ class AgentDefaults(Base):
         default_factory=lambda: AuxiliaryVisionConfig(),
         description="Auxiliary vision model for non-vision primary models",
     )
+    auxiliary: "dict[str, AuxiliaryTaskConfig]" = Field(
+        default_factory=dict,
+        description=(
+            "Per-task auxiliary model overrides, keyed by task name "
+            "(e.g. 'web_extract'). Consumed by markbot.agent.auxiliary; "
+            "omitted tasks use automatic resolution."
+        ),
+    )
+    moa: "MoAConfig" = Field(
+        default_factory=lambda: MoAConfig(),
+        description=(
+            "Mixture-of-Agents settings: parallel advisors + aggregator "
+            "used by the /moa command."
+        ),
+    )
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -140,12 +155,35 @@ class ProviderConfig(Base):
     """LLM provider configuration (V2)."""
 
     api_key: str = ""
+    api_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional API keys for credential rotation/failover. When the "
+            "primary key hits per-key rate limits, credit exhaustion, or an "
+            "auth failure, the fallback chain retries the same model with "
+            "the next key before moving to another model."
+        ),
+    )
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None
     models: list[ModelConfig] = Field(
         default_factory=list,
         description="List of models available under this provider"
     )
+
+    @property
+    def credential_keys(self) -> list[str]:
+        """All usable API keys: primary + extras, deduplicated, non-empty.
+
+        Order is significant — it is the rotation order used by the
+        fallback chain (``api_key`` first, then ``api_keys`` in order).
+        """
+        seen: list[str] = []
+        for raw in [self.api_key, *self.api_keys]:
+            key = (raw or "").strip()
+            if key and key not in seen:
+                seen.append(key)
+        return seen
 
     def get_model(self, model_id: str) -> ModelConfig | None:
         """Get model config by ID."""
@@ -571,6 +609,69 @@ class BrowserConfig(Base):
     allowed_domains: list[str] = Field(
         default_factory=list,
         description="If non-empty, only these domains are allowed (glob patterns); takes precedence over blocked_domains",
+    )
+
+
+class AuxiliaryTaskConfig(Base):
+    """Per-task auxiliary model override for side tasks.
+
+    Keyed by task name in ``agents.defaults.auxiliary`` (e.g.
+    ``{"web_extract": {"provider": "deepseek", "model": "deepseek-chat"}}``).
+    Setting a task entry pins that task to the given provider/model;
+    leaving the map empty (or omitting a task) uses the automatic
+    resolution chain in ``markbot.agent.auxiliary``.
+    """
+
+    provider: str = Field(
+        default="",
+        description=(
+            "Provider ID for this task's auxiliary model (e.g. 'deepseek', "
+            "'openrouter'). Must match a configured provider in `providers`. "
+            "Empty = auto resolution."
+        ),
+    )
+    model: str = Field(
+        default="",
+        description=(
+            "Model name for this task's auxiliary call (e.g. 'deepseek-chat', "
+            "'gemini-2.5-flash'). Empty = auto resolution."
+        ),
+    )
+
+
+class MoAConfig(Base):
+    """Mixture-of-Agents configuration: parallel advisors + aggregator.
+
+    Advisors run in parallel over the same question and their answers are
+    synthesized by the aggregator model. Advisors are cheap text models —
+    ``default_aux_model`` providers are auto-picked when no explicit advisor
+    list is given.
+    """
+
+    advisors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit advisor model references, e.g. "
+            "['deepseek/deepseek-chat', 'zhipu/glm-4-flash']. Empty = auto "
+            "derive from configured providers' default_aux_model (capped by "
+            "num_advisors)."
+        ),
+    )
+    num_advisors: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        description=(
+            "Max advisors to run (only applies to auto-derived advisors)."
+        ),
+    )
+    aggregator: str = Field(
+        default="",
+        description=(
+            "Model reference used to synthesize the final answer, e.g. "
+            "'deepseek/deepseek-reasoner'. Empty = use the main model "
+            "(agents.defaults.model_chain[0])."
+        ),
     )
 
 

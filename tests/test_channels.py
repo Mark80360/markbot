@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
+from collections import OrderedDict
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +17,11 @@ from markbot.bus.queue import MessageBus
 from markbot.channels import BaseChannel, ChannelManager
 from markbot.channels import discovery
 from markbot.channels.base import BaseChannel as BaseChannelAlias
+from markbot.channels.base import (
+    SendError,
+    SendErrorKind,
+    classify_send_error,
+)
 from markbot.channels.manager import ChannelManager as ChannelManagerAlias
 
 
@@ -504,6 +512,128 @@ class TestChannelManager:
         assert ch.send.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_send_with_retry_rate_limited_uses_retry_after(self, bus, monkeypatch):
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        ch = AsyncMock()
+        ch.send.side_effect = [
+            SendError("flood", kind=SendErrorKind.RATE_LIMITED, retry_after=0.001),
+            None,
+        ]
+        sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+        msg = OutboundMessage(channel="x", chat_id="c", content="hi")
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send.await_count == 2
+        # Server-provided retry_after is honored (no jitter on that path).
+        assert sleep.await_args.args[0] == 0.001
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_not_found_marks_dead_and_skips(self, bus, monkeypatch):
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        ch = AsyncMock()
+        ch.name = "x"
+        ch.send.side_effect = RuntimeError("chat not found")
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        msg = OutboundMessage(channel="x", chat_id="c", content="hi")
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send.await_count == 1  # no retry for dead target
+        assert mgr._is_dead_target("x", "c")
+
+        # Subsequent messages to the same chat are skipped outright.
+        ch2 = AsyncMock()
+        ch2.name = "x"
+        await mgr._send_with_retry(ch2, msg)
+        assert ch2.send.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_success_clears_dead_target(self, bus, monkeypatch):
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        ch = AsyncMock()
+        ch.name = "x"
+        msg = OutboundMessage(channel="x", chat_id="c", content="hi")
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send.await_count == 1
+        assert not mgr._is_dead_target("x", "c")
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_dead_target_expires_and_recovers(self, bus):
+        from markbot.channels.manager import _DEAD_TARGET_TTL_S
+
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        # Simulate an entry older than the TTL → treated as alive again.
+        mgr._dead_targets[("x", "c")] = {
+            "ts": time.monotonic() - _DEAD_TARGET_TTL_S - 1,
+            "reason": "probe",
+        }
+        ch = AsyncMock()
+        ch.name = "x"
+        msg = OutboundMessage(channel="x", chat_id="c", content="hi")
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send.await_count == 1
+        assert not mgr._is_dead_target("x", "c")
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_bad_format_no_retry(self, bus, monkeypatch):
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        ch = AsyncMock()
+        ch.send.side_effect = SendError(
+            "invalid payload", kind=SendErrorKind.BAD_FORMAT
+        )
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        msg = OutboundMessage(channel="x", chat_id="c", content="hi")
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send.await_count == 1  # no retry
+
+    def test_classify_send_error_kinds(self):
+        assert classify_send_error(RuntimeError("boom")).kind is SendErrorKind.UNKNOWN
+        info = classify_send_error(RuntimeError("Rate limit exceeded, retry later"))
+        assert info.kind is SendErrorKind.RATE_LIMITED
+        info = classify_send_error(RuntimeError("conversation not found"))
+        assert info.kind is SendErrorKind.NOT_FOUND
+        info = classify_send_error(RuntimeError("content too long"))
+        assert info.kind is SendErrorKind.TOO_LONG
+        info = classify_send_error(
+            SendError("nope", kind=SendErrorKind.FORBIDDEN, chat_level=True)
+        )
+        assert info.kind is SendErrorKind.FORBIDDEN
+        assert info.chat_level is True
+
+    def test_classify_send_error_http_status(self):
+        import httpx
+
+        def make_error(status_code: int, headers: dict | None = None):
+            request = httpx.Request("POST", "https://example.com/api")
+            response = httpx.Response(status_code, request=request, headers=headers or {})
+            return httpx.HTTPStatusError(
+                f"status {status_code}", request=request, response=response
+            )
+
+        assert classify_send_error(make_error(404)).kind is SendErrorKind.NOT_FOUND
+        assert classify_send_error(make_error(403)).kind is SendErrorKind.FORBIDDEN
+        assert classify_send_error(make_error(413)).kind is SendErrorKind.TOO_LONG
+        info = classify_send_error(make_error(429, {"Retry-After": "30"}))
+        assert info.kind is SendErrorKind.RATE_LIMITED
+        assert info.retry_after == 30.0
+        assert classify_send_error(make_error(400)).kind is SendErrorKind.BAD_FORMAT
+        assert classify_send_error(make_error(500)).kind is SendErrorKind.TRANSIENT
+
+    def test_classify_send_error_transient_types(self):
+        import httpx
+
+        assert classify_send_error(httpx.ConnectError("refused")).kind is SendErrorKind.TRANSIENT
+        assert classify_send_error(asyncio.TimeoutError()).kind is SendErrorKind.TRANSIENT
+
+    @pytest.mark.asyncio
     async def test_try_restart_channel_respects_cooldown(self, bus, monkeypatch):
         cfg = self._make_config({})
         mgr = ChannelManager(cfg, bus)
@@ -879,6 +1009,92 @@ class TestFeishuChannel:
         assert dc["enabled"] is False
         assert dc["streaming"] is True
 
+    @pytest.mark.asyncio
+    async def test_persistent_dedup_survives_restart(self, bus, tmp_path, monkeypatch):
+        """Seen message IDs persist across instances (restart / WS reconnect)."""
+        from markbot.channels.feishu import FeishuChannel
+
+        state_file = tmp_path / "seen_message_ids.json"
+
+        first = FeishuChannel.__new__(FeishuChannel)
+        first.config = None
+        first.bus = bus
+        first._processed_message_ids = OrderedDict()
+        first._dedup_state_path = state_file
+
+        assert first._is_duplicate("om_a1b2c3") is False
+        assert first._is_duplicate("om_a1b2c3") is True  # same process dedup
+        assert state_file.exists()
+
+        # Simulate a restart: fresh instance loads from disk.
+        second = FeishuChannel.__new__(FeishuChannel)
+        second.config = None
+        second.bus = bus
+        second._processed_message_ids = OrderedDict()
+        second._dedup_state_path = state_file
+        second._load_seen_message_ids()
+
+        assert second._is_duplicate("om_a1b2c3") is True  # known from before restart
+        assert second._is_duplicate("om_new") is False
+
+    @pytest.mark.asyncio
+    async def test_persistent_dedup_expires_after_ttl(self, bus, tmp_path, monkeypatch):
+        """Entries older than the 24h TTL are dropped on load and re-admitted."""
+        from markbot.channels.feishu import (
+            FeishuChannel,
+            _FEISHU_DEDUP_TTL_SECONDS,
+        )
+
+        state_file = tmp_path / "seen_message_ids.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "message_ids": {
+                        "om_old": time.time() - _FEISHU_DEDUP_TTL_SECONDS - 10,
+                        "om_fresh": time.time() - 60,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        ch = FeishuChannel.__new__(FeishuChannel)
+        ch.config = None
+        ch.bus = bus
+        ch._processed_message_ids = OrderedDict()
+        ch._dedup_state_path = state_file
+        ch._load_seen_message_ids()
+
+        assert ch._is_duplicate("om_fresh") is True
+        assert "om_old" not in ch._processed_message_ids
+        # The expired ID is re-admitted as a new message.
+        assert ch._is_duplicate("om_old") is False
+
+    def test_persistent_dedup_migrates_legacy_list(self, bus, tmp_path):
+        """Legacy plain-list format migrates to timestamps without data loss."""
+        from markbot.channels.feishu import FeishuChannel
+
+        state_file = tmp_path / "seen_message_ids.json"
+        state_file.write_text(
+            json.dumps({"message_ids": ["om_legacy"]}), encoding="utf-8"
+        )
+
+        ch = FeishuChannel.__new__(FeishuChannel)
+        ch.config = None
+        ch.bus = bus
+        ch._processed_message_ids = OrderedDict()
+        ch._dedup_state_path = state_file
+        ch._load_seen_message_ids()
+
+        assert ch._is_duplicate("om_legacy") is True
+        # A new (non-duplicate) ID triggers a persist; from then on the file
+        # uses the new dict shape (migration) and still keeps the legacy ID.
+        assert ch._is_duplicate("om_new") is False
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert isinstance(saved["message_ids"], dict)
+        assert "om_legacy" in saved["message_ids"]
+        assert "om_new" in saved["message_ids"]
+
 
 # ---------------------------------------------------------------------------
 # qq.py — pure-logic helpers
@@ -911,6 +1127,74 @@ class TestQQChannel:
         assert _guess_send_file_type("photo.jpg") == QQ_FILE_TYPE_IMAGE
         assert _guess_send_file_type("file.pdf") == QQ_FILE_TYPE_FILE
         assert _guess_send_file_type("file.bin") == QQ_FILE_TYPE_FILE
+
+    def test_compute_file_hashes(self):
+        import hashlib
+
+        from markbot.channels.qq import _QQ_MD5_10M_SIZE, _compute_file_hashes
+
+        data = b"hello world" * 1000
+        md5, sha1, md5_10m = _compute_file_hashes(data)
+        assert md5 == hashlib.md5(data).hexdigest()
+        assert sha1 == hashlib.sha1(data).hexdigest()
+        assert md5_10m == hashlib.md5(data[:_QQ_MD5_10M_SIZE]).hexdigest()
+
+    def test_chunked_upload_threshold_and_slicing(self, bus, monkeypatch):
+        """Large files go through the chunked path; per-part slices are contiguous."""
+        import markbot.channels.qq as qq_module
+        from markbot.channels.qq import _CHUNKED_UPLOAD_THRESHOLD, QQChannel, QQConfig
+
+        class FakeRoute:
+            def __init__(self, method, path, **kwargs):
+                self.method = method
+                self.path = path
+
+        monkeypatch.setattr(qq_module, "Route", FakeRoute)
+
+        cfg = QQConfig(app_id="id", secret="sec", allow_from=["*"])
+        monkeypatch.setattr(QQChannel, "_init_media_root", lambda self: MagicMock())
+        ch = QQChannel(cfg, bus)
+
+        fake = MagicMock()
+        fake.api._http.request = AsyncMock()
+        ch._client = fake
+        ch._http = MagicMock()
+
+        # A buffer larger than the inline-base64 threshold (>10MiB).
+        big = bytes(range(256)) * (_CHUNKED_UPLOAD_THRESHOLD // 256 + 1)
+
+        parts = [
+            {"index": 0, "presigned_url": "https://cos.example/0", "block_size": str(_CHUNKED_UPLOAD_THRESHOLD)},
+            {"index": 1, "presigned_url": "https://cos.example/1", "block_size": str(_CHUNKED_UPLOAD_THRESHOLD)},
+        ]
+
+        def request(route, json=None):
+            if route.path.endswith("/upload_prepare"):
+                return {
+                    "upload_id": "uid-1",
+                    "block_size": str(_CHUNKED_UPLOAD_THRESHOLD),
+                    "parts": parts,
+                    "upload_config": {"concurrency": 1, "retry_delay": 0},
+                }
+            if route.path.endswith("/upload_part_finish"):
+                return {}
+            return {"file_uuid": "fu", "file_info": "fi"}
+
+        fake.api._http.request.side_effect = request
+
+        put_slices = []
+
+        async def fake_put(url: str, chunk: bytes):
+            put_slices.append(chunk)
+        ch._put_to_cos = fake_put
+
+        media = asyncio.run(
+            ch._chunked_upload("u1", False, 4, "big.bin", big)
+        )
+        assert media == {"file_uuid": "fu", "file_info": "fi"}
+        assert len(put_slices) == 2
+        # Slices concatenate to the original payload, in order.
+        assert b"".join(put_slices) == big
 
     def test_qq_config_defaults(self):
         from markbot.channels.qq import QQConfig
@@ -1079,6 +1363,40 @@ class TestWeixinChannel:
         msg = {"message_type": MESSAGE_TYPE_BOT, "from_user_id": "x"}
         asyncio.get_event_loop().run_until_complete(ch._process_message(msg)) if False else None
         ch._processed_ids = {}
+
+    @pytest.mark.asyncio
+    async def test_send_direct_without_poll_loop(self, bus, monkeypatch):
+        """send() works even before the long-poll loop starts (cron/direct path)."""
+        from markbot.channels.weixin import WeixinChannel, WeixinConfig
+
+        cfg = WeixinConfig(token="tok", allow_from=["*"])
+        monkeypatch.setattr(WeixinChannel, "_get_state_dir", lambda self: MagicMock())
+        monkeypatch.setattr(WeixinChannel, "_load_state", lambda self: True)
+        monkeypatch.setattr(WeixinChannel, "_send_media_file", AsyncMock())
+
+        ch = WeixinChannel.__new__(WeixinChannel)
+        ch.config = cfg
+        ch.bus = bus
+        ch._running = False
+        ch._session_pause_until = 0.0
+        ch._token = "tok"
+        ch._context_tokens = {"u1": "ctx-1"}
+        ch._client = None
+
+        sent: list = []
+
+        async def fake_send_text(to_user_id: str, text: str, context_token: str):
+            sent.append((to_user_id, text, context_token))
+
+        # Patch on the instance, not the class, to avoid implicit `self` binding.
+        monkeypatch.setattr(ch, "_send_text", fake_send_text)
+
+        msg = OutboundMessage(channel="weixin", chat_id="u1", content="hello")
+        await ch.send(msg)
+        assert sent == [("u1", "hello", "ctx-1")]
+
+        # Temp client was created for the direct send, then torn down.
+        assert ch._client is None
 
 
 # ---------------------------------------------------------------------------

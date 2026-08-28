@@ -92,7 +92,7 @@ def _check_provider_cross_fields(config: "Config") -> ValidationResult:
         if not pc.models:
             continue
 
-        if not pc.api_key and not pc.api_base:
+        if not pc.credential_keys and not pc.api_base:
             is_referenced = provider_name in referenced_providers
             result.add(
                 f"providers.{provider_name}",

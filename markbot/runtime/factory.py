@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
+from markbot.agent.model_metadata import resolve_context_window
 from markbot.bus.queue import MessageBus
 from markbot.config.paths import get_cron_dir
 from markbot.config.schema import Config
@@ -316,7 +317,7 @@ def build_runtime(
         config=config,
         workspace=config.workspace_path,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        context_window_tokens=resolve_context_window(config),
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,

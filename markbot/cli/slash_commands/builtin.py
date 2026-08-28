@@ -214,6 +214,74 @@ async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _message_text(message: dict) -> str:
+    """Extract plain text from a session message dict."""
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content
+
+
+def _history_to_text(history: list[dict], limit: int = 12) -> str:
+    """Render the tail of history as plain text for advisor context."""
+    lines: list[str] = []
+    for message in history[-limit:]:
+        role = message.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        text = _message_text(message).strip()
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n".join(lines)
+
+
+def _last_user_message(history: list[dict]) -> str:
+    """Most recent non-empty user message (used when /moa has no args)."""
+    for message in reversed(history):
+        if message.get("role") != "user":
+            continue
+        text = _message_text(message).strip()
+        if text:
+            return text
+    return ""
+
+
+async def cmd_moa(ctx: CommandContext) -> OutboundMessage:
+    """Run Mixture-of-Agents over the recent conversation."""
+    loop = ctx.loop
+    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    history = session.get_history(max_messages=0) or []
+
+    question = ctx.args or _last_user_message(history)
+    if not question:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=t("cmd.moa.no_question"),
+        )
+
+    from markbot.agent.moa import run_moa
+
+    result = await run_moa(question=question, history=_history_to_text(history))
+    if result.final_answer is None:
+        if not result.advisors_total:
+            content = t("cmd.moa.no_advisors")
+        else:
+            reason = result.advisor_failures[-1] if result.advisor_failures else "unknown"
+            content = t("cmd.moa.failed", error=reason)
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
+        )
+
+    content = t(
+        "cmd.moa.reply",
+        answer=result.final_answer,
+        advisors=f"{result.advisors_ok}/{result.advisors_total}",
+    )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
+    )
+
+
 async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
     """Inject a mid-task instruction into the running agent loop."""
     loop = ctx.loop
@@ -515,6 +583,13 @@ def build_builtin_catalog() -> "CommandCatalog":
             handler=cmd_clear,
             description="Clear history and compressed summary",
             category="session",
+        ),
+        CommandDef(
+            name="/moa",
+            handler=cmd_moa,
+            description="Mixture-of-Agents: parallel advisors + aggregator",
+            args_hint="[question]",
+            category="general",
         ),
     )
     return catalog

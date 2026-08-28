@@ -231,7 +231,7 @@ async def describe_image_via_auxiliary(
         from markbot.providers.registry import create_provider, find_by_name
         config = load_config()
         provider_cfg = config.providers.get_provider(provider_id)
-        if provider_cfg is None or not provider_cfg.api_key:
+        if provider_cfg is None or not provider_cfg.credential_keys:
             logger.warning(
                 f"Auxiliary vision provider {provider_id!r} not configured with "
                 f"API key; falling back to text_summary"
@@ -247,7 +247,7 @@ async def describe_image_via_auxiliary(
         backend = spec.backend if spec else "openai_compat"
         provider = create_provider(
             backend=backend,
-            api_key=provider_cfg.api_key,
+            api_key=provider_cfg.credential_keys[0],
             api_base=provider_cfg.api_base,
             extra_headers=provider_cfg.extra_headers,
             spec=spec,

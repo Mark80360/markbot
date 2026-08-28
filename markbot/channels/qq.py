@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import mimetypes
 import os
 import re
@@ -58,6 +59,28 @@ if TYPE_CHECKING:
 # (2=voice, 3=video are restricted; we only use image vs file)
 QQ_FILE_TYPE_IMAGE = 1
 QQ_FILE_TYPE_FILE = 4
+
+# QQ chunked upload: inline base64 file_data is capped around 10MB; use the
+# presigned-COS chunked flow above that. Docs: md5_10m = md5 of the first
+# 10_002_432 bytes (~10MB); files over 200MB are rejected by the platform.
+_CHUNKED_UPLOAD_THRESHOLD = 10 * 1024 * 1024
+_QQ_MD5_10M_SIZE = 10_002_432
+_MAX_QQ_MEDIA_BYTES = 200 * 1024 * 1024
+
+# Part PUT / finish tuning
+_UPLOAD_PART_TIMEOUT_S = 60
+_UPLOAD_PART_MAX_RETRIES = 2
+_UPLOAD_FINISH_MAX_RETRIES = 3
+
+
+def _compute_file_hashes(data: bytes) -> tuple[str, str, str]:
+    """Return (md5, sha1, md5_10m) as hex strings for QQ upload_prepare."""
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    md5.update(data)
+    sha1.update(data)
+    md5_10m = hashlib.md5(data[:_QQ_MD5_10M_SIZE])
+    return md5.hexdigest(), sha1.hexdigest(), md5_10m.hexdigest()
 
 _IMAGE_EXTS = {
     ".png",
@@ -315,16 +338,32 @@ class QQChannel(BaseChannel):
 
         try:
             file_type = _guess_send_file_type(filename)
-            file_data_b64 = base64.b64encode(data).decode()
+            if len(data) > _MAX_QQ_MEDIA_BYTES:
+                logger.error(
+                    "QQ media too large ({} bytes > 200MB): {}",
+                    len(data),
+                    filename,
+                )
+                return False
 
-            media_obj = await self._post_base64file(
-                chat_id=chat_id,
-                is_group=is_group,
-                file_type=file_type,
-                file_data=file_data_b64,
-                file_name=filename,
-                srv_send_msg=False,
-            )
+            if len(data) >= _CHUNKED_UPLOAD_THRESHOLD:
+                media_obj = await self._chunked_upload(
+                    chat_id=chat_id,
+                    is_group=is_group,
+                    file_type=file_type,
+                    filename=filename,
+                    data=data,
+                )
+            else:
+                file_data_b64 = base64.b64encode(data).decode()
+                media_obj = await self._post_base64file(
+                    chat_id=chat_id,
+                    is_group=is_group,
+                    file_type=file_type,
+                    file_data=file_data_b64,
+                    file_name=filename,
+                    srv_send_msg=False,
+                )
             if not media_obj:
                 logger.error("QQ media upload failed: empty response")
                 return False
@@ -437,6 +476,162 @@ class QQChannel(BaseChannel):
         }
         route = Route("POST", endpoint, **{id_key: chat_id})
         return await self._client.api._http.request(route, json=payload)
+
+    # https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/send-receive/chunked-upload.html
+    async def _chunked_upload(
+        self,
+        chat_id: str,
+        is_group: bool,
+        file_type: int,
+        filename: str,
+        data: bytes,
+    ) -> dict[str, Any] | None:
+        """Upload a large file via QQ chunked upload (presigned COS parts).
+
+        Flow: upload_prepare → PUT each part to its presigned_url →
+        upload_part_finish per part → complete via /files with upload_id.
+        Returns the media object (dict with file_uuid/file_info) or None.
+        """
+        if not self._client:
+            return None
+
+        md5, sha1, md5_10m = _compute_file_hashes(data)
+        if is_group:
+            id_key = "group_openid"
+            resource = "/v2/groups/{group_openid}"
+        else:
+            id_key = "openid"
+            resource = "/v2/users/{openid}"
+        path_kwargs = {id_key: chat_id}
+
+        # Step 1: request the upload task
+        try:
+            prepare = await self._client.api._http.request(
+                Route("POST", f"{resource}/upload_prepare", **path_kwargs),
+                json={
+                    id_key: chat_id,
+                    "file_type": file_type,
+                    "file_name": filename,
+                    "file_size": str(len(data)),
+                    "md5": md5,
+                    "sha1": sha1,
+                    "md5_10m": md5_10m,
+                },
+            )
+        except Exception as e:
+            logger.error("QQ chunked upload_prepare failed filename={} err={}", filename, e)
+            return None
+
+        if not prepare or not prepare.get("upload_id"):
+            logger.error("QQ chunked upload_prepare missing upload_id: {}", prepare)
+            return None
+
+        upload_id = prepare["upload_id"]
+        parts = prepare.get("parts") or []
+        if not parts:
+            logger.error("QQ chunked upload_prepare returned no parts: {}", prepare)
+            return None
+
+        upload_config = prepare.get("upload_config") or {}
+        concurrency = min(int(upload_config.get("concurrency") or 1), 4)
+        retry_delay = float(upload_config.get("retry_delay") or 1.0)
+        default_block = int(prepare.get("block_size") or 0) or len(data)
+
+        # Step 2+3: PUT each part to its presigned URL, then notify finish.
+        async def upload_part(part: dict[str, Any]) -> bool:
+            index = int(part.get("index") or 0)
+            block_size = int(part.get("block_size") or default_block)
+            start = index * block_size
+            end = min(start + block_size, len(data))
+            chunk = data[start:end]
+            if not chunk:
+                return False
+            part_md5 = hashlib.md5(chunk).hexdigest()
+
+            for attempt in range(_UPLOAD_PART_MAX_RETRIES + 1):
+                try:
+                    await self._put_to_cos(part["presigned_url"], chunk)
+                except Exception as e:
+                    if attempt < _UPLOAD_PART_MAX_RETRIES:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                    logger.error("QQ chunk part {} upload failed: {}", index, e)
+                    return False
+
+                try:
+                    await self._client.api._http.request(
+                        Route("POST", f"{resource}/upload_part_finish", **path_kwargs),
+                        json={
+                            "upload_id": upload_id,
+                            "part_index": index,
+                            "block_size": str(len(chunk)),
+                            "md5": part_md5,
+                        },
+                    )
+                    return True
+                except Exception as e:
+                    if attempt < _UPLOAD_PART_MAX_RETRIES:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                    logger.error("QQ chunk part {} finish failed: {}", index, e)
+                    return False
+            return False
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def guarded(part: dict[str, Any]) -> bool:
+            async with sem:
+                return await upload_part(part)
+
+        results = await asyncio.gather(*(guarded(p) for p in parts), return_exceptions=True)
+        if not results or not all(r is True for r in results):
+            logger.error(
+                "QQ chunked upload failed for {} ({} parts succeeded/total)",
+                filename,
+                sum(1 for r in results if r is True),
+                len(parts),
+            )
+            return None
+
+        # Step 4: complete via the /files endpoint carrying upload_id.
+        try:
+            media_obj = await self._client.api._http.request(
+                Route("POST", resource, **path_kwargs),
+                json={
+                    id_key: chat_id,
+                    "file_type": file_type,
+                    "file_name": filename,
+                    "upload_id": upload_id,
+                    "srv_send_msg": False,
+                },
+            )
+        except Exception as e:
+            logger.error("QQ chunked upload complete failed filename={} err={}", filename, e)
+            return None
+
+        if not media_obj or not media_obj.get("file_info"):
+            logger.error("QQ chunked upload complete missing file_info: {}", media_obj)
+            return None
+        logger.info("QQ chunked media uploaded: {} ({} bytes)", filename, len(data))
+        return media_obj
+
+    async def _put_to_cos(self, url: str, chunk: bytes) -> None:
+        """PUT a raw part to a presigned COS URL (no API-gateway body limit)."""
+        if not self._http:
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_UPLOAD_PART_TIMEOUT_S)
+            )
+        async with self._http.put(
+            url,
+            data=chunk,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=aiohttp.ClientTimeout(total=_UPLOAD_PART_TIMEOUT_S),
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise RuntimeError(
+                    f"COS PUT failed status={resp.status} body={body[:200]}"
+                )
 
     # ---------------------------
     # Inbound (receive)

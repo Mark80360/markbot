@@ -10,6 +10,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from markbot.agent.model_metadata import resolve_context_window
+
 app = typer.Typer(
     name="autopilot",
     help="Manage the autopilot automation pipeline.",
@@ -182,7 +184,7 @@ def tick(
         config=runtime_config,
         workspace=ws,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
-        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        context_window_tokens=resolve_context_window(runtime_config),
         web_search_config=runtime_config.tools.web.search,
         web_proxy=runtime_config.tools.web.proxy or None,
         exec_config=runtime_config.tools.exec,

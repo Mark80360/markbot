@@ -3,6 +3,7 @@
 import asyncio
 import json
 import mimetypes
+from collections import deque
 import os
 import time
 from pathlib import Path
@@ -124,6 +125,15 @@ class MarkbotDingTalkHandler(CallbackHandler):
 
             logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
 
+            # Stable unique id for dedup: prefer the platform message id,
+            # fall back to the SDK field, then to the stream event id.
+            message_id = (
+                message.data.get("msgId")
+                or message.data.get("messageId")
+                or getattr(chatbot_msg, "msg_id", None)
+                or message.headers.get("eventId")
+            )
+
             # Forward to MarkBot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
@@ -133,6 +143,7 @@ class MarkbotDingTalkHandler(CallbackHandler):
                     sender_name,
                     conversation_type,
                     conversation_id,
+                    message_id=message_id,
                 )
             )
             self.channel._background_tasks.add(task)
@@ -190,6 +201,9 @@ class DingTalkChannel(BaseChannel):
 
         # Hold references to background tasks to prevent GC
         self._background_tasks: set[asyncio.Task] = set()
+
+        # Inbound message dedup (DingTalk redelivers on stream reconnect)
+        self._processed_ids: deque[str] = deque(maxlen=1000)
 
     async def start(self) -> None:
         """Start the DingTalk bot with Stream Mode."""
@@ -513,6 +527,7 @@ class DingTalkChannel(BaseChannel):
         sender_name: str,
         conversation_type: str | None = None,
         conversation_id: str | None = None,
+        message_id: str | None = None,
     ) -> None:
         """Handle incoming message (called by MarkbotDingTalkHandler).
 
@@ -520,6 +535,12 @@ class DingTalkChannel(BaseChannel):
         permission checks before publishing to the bus.
         """
         try:
+            if message_id and message_id in self._processed_ids:
+                logger.debug("DingTalk duplicate message, skipping: {}", message_id)
+                return
+            if message_id:
+                self._processed_ids.append(message_id)
+
             logger.info("DingTalk inbound: {} from {}", content, sender_name)
             is_group = conversation_type == "2" and conversation_id
             chat_id = f"group:{conversation_id}" if is_group else sender_id

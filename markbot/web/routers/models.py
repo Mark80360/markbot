@@ -68,7 +68,7 @@ async def model_options():
 
         options.append({
             "provider": pid,
-            "has_api_key": bool(provider.api_key),
+            "has_api_key": bool(provider.credential_keys),
             "api_base": provider.api_base,
             "is_configured": provider.is_configured if hasattr(provider, "is_configured") else False,
             "models": models,
