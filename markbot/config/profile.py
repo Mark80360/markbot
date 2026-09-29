@@ -26,20 +26,20 @@ TOOL_GROUPS: dict[str, frozenset[str]] = {
         "explore", "explore_context_catalog", "search_context", "load_context",
     }),
     "memory": frozenset({
-        "memory_search", "memory_save", "memory_forget", "memory_list", "memory_dream",
+        "memory_search", "memory_save", "memory_forget", "memory_list",
     }),
     "skills": frozenset({"skill_view", "skills_list", "skill_manage"}),
     "schedule": frozenset({"cron"}),
     "autopilot": frozenset({
-        "autopilot_intake", "autopilot_score", "autopilot_accept",
-        "autopilot_run_next", "autopilot_verify", "autopilot_status",
+        "autopilot_intake", "autopilot_list", "autopilot_pick_next",
+        "autopilot_verify", "autopilot_status",
         "autopilot_reject", "autopilot_requeue",
     }),
     "desktop": frozenset({"computer_use"}),
     "browser": frozenset({
         "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
-        "browser_scroll", "browser_press", "browser_back", "browser_forward",
-        "browser_wait", "browser_screenshot", "browser_close",
+        "browser_scroll", "browser_press", "browser_back",
+        "browser_vision", "browser_console", "browser_get_images",
     }),
 }
 

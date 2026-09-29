@@ -448,8 +448,8 @@ class MemoryCompactionHook:
         """Filter out messages that have already been compacted."""
         return [
             m for m in messages
-            if not m.get("metadata", {}).get(_COMPACTED_MARKER, False)
             if isinstance(m, dict)
+            if not m.get("metadata", {}).get(_COMPACTED_MARKER, False)
         ]
 
     @staticmethod

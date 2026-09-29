@@ -314,7 +314,8 @@ class TestCommandCatalog:
         register_builtin_commands(router)
         assert "/stop" in router._priority
         assert "/steer" in router._priority
-        assert "/help" in router._exact
+        # /help is a control-plane command: dispatched without the session lock.
+        assert "/help" in router._priority
         assert "/new" in router._exact
         catalog = getattr(router, "catalog", None)
         assert catalog is not None

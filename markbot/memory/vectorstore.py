@@ -410,10 +410,16 @@ class SQLiteVectorStore(VectorStore):
         vec = _normalize(record.vector)
         vec_blob = np.asarray(vec, dtype=np.float32).tobytes()
         created_at = record.created_at or time.time()
-        # Preserve original created_at on re-upsert so LRU isn't reset.
+        # Preserve original created_at/access_count on re-upsert so that an
+        # idempotent re-index neither resets LRU age nor wipes the importance
+        # signal accumulated from prior recalls.
         existing = self.get(record.id)
-        if existing is not None and not record.created_at:
-            created_at = existing.created_at
+        access_count = record.access_count
+        if existing is not None:
+            if not record.created_at:
+                created_at = existing.created_at
+            if not record.access_count:
+                access_count = existing.access_count
         meta = dict(record.metadata)
         meta["_embedding_sig"] = self.embedding_sig or ""
         meta_json = json.dumps(meta, ensure_ascii=False, default=str)
@@ -432,7 +438,7 @@ class SQLiteVectorStore(VectorStore):
                 """,
                 (
                     record.id, record.content, vec_blob, record.source,
-                    meta_json, created_at, record.access_count,
+                    meta_json, created_at, access_count,
                 ),
             )
             self._write_conn.commit()
@@ -507,7 +513,12 @@ class SQLiteVectorStore(VectorStore):
             cur = conn.execute(
                 "SELECT id, content, vector, source, metadata, created_at, access_count "
                 f"FROM records{where_sql} "
-                "ORDER BY access_count DESC, created_at DESC LIMIT ?",
+                # access_count is a coarse importance tiebreaker only; ranking
+                # the scan primarily by it would drop semantically relevant
+                # records whose ids were merely never recalled. Order by
+                # recency (and stable id) so the scan cap is content-neutral;
+                # the subsequent in-memory cosine sort picks the true top-k.
+                "ORDER BY created_at DESC, id ASC LIMIT ?",
                 (*params, self._max_scan_records),
             )
             rows = cur.fetchall()

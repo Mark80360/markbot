@@ -690,7 +690,7 @@ class AgentContext:
         # Optional override: allow auto summaries into curated MEMORY.md.
         if hasattr(memory_manager, "auto_summary_to_curated"):
             memory_manager.auto_summary_to_curated = bool(
-                getattr(memory_cfg, "auto_summary_to_curated", False)
+                getattr(memory_cfg, "auto_summary_to_curated", True)
             )
         timings["memory_manager"] = time.time() - _t0
         return memory_manager

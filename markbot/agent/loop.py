@@ -19,7 +19,12 @@ from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
 from markbot.agent.stream_scrubber import ScrubberPool
-from markbot.bus.events import InboundMessage, OutboundMessage, make_session_key
+from markbot.bus.events import (
+    InboundMessage,
+    OutboundMessage,
+    derive_is_group,
+    make_session_key,
+)
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
@@ -165,11 +170,9 @@ class AgentLoop:
         # callers would look "idle" while still mutating memory / tools.
         self._direct_inflight: int = 0
         self._session_locks: dict[str, asyncio.Lock] = {}
-        # Serialises mutations to ``_active_tasks`` / ``_session_locks``.
-        # In single-threaded asyncio the individual dict ops are atomic,
-        # but multi-step sequences (track → dispatch → cleanup) benefit
-        # from an explicit guard so future refactors stay safe.
-        self._tasks_lock = asyncio.Lock()
+        # Strong references to fire-and-forget tasks so they are not
+        # garbage-collected mid-flight and their exceptions are logged.
+        self._background_tasks: set[asyncio.Task] = set()
         _max = int(os.environ.get("MARKBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
@@ -339,7 +342,14 @@ class AgentLoop:
             now=now,
         )
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        *,
+        is_group: bool | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
@@ -358,7 +368,7 @@ class AgentLoop:
             if compactor is not None and hasattr(compactor, "set_todo_tool"):
                 compactor.set_todo_tool(todo_tool)
         if self._memory_search_tool:
-            self._memory_search_tool.set_session_context(channel, chat_id)
+            self._memory_search_tool.set_session_context(channel, chat_id, is_group=is_group)
         # Propagate channel privacy context to curated memory tools and
         # context-explorer tools so shared channels cannot list/load
         # MEMORY.md / PROFILE.md content.
@@ -372,7 +382,7 @@ class AgentLoop:
         ):
             tool = self.tools.get(name) if self.tools else None
             if tool is not None and hasattr(tool, "set_session_context"):
-                tool.set_session_context(channel, chat_id)
+                tool.set_session_context(channel, chat_id, is_group=is_group)
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -402,6 +412,7 @@ class AgentLoop:
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         permission_mode_override: PermissionMode | None = None,
         session_key: str | None = None,
+        is_group: bool | None = None,
     ) -> tuple[str | None, list[str], list[dict], int]:
         from markbot.agent.iteration import IterationRunner
 
@@ -424,6 +435,7 @@ class AgentLoop:
             on_tool_start=on_tool_start,
             on_tool_complete=on_tool_complete,
             permission_mode_override=permission_mode_override,
+            is_group=is_group,
         )
         return await runner.run(initial_messages)
 
@@ -770,7 +782,24 @@ class AgentLoop:
                     "Session {} idle for {:.0f}s (>{:.0f}s), timing out",
                     session_key, elapsed, idle_seconds,
                 )
-                asyncio.ensure_future(self._notify_idle_timeout(session_key))
+                self._spawn_background(self._notify_idle_timeout(session_key))
+
+    def _spawn_background(self, coro: Awaitable[Any]) -> asyncio.Task:
+        """Fire-and-forget *coro*, keeping a strong reference and logging
+        failures so the task is not lost or GC'd silently."""
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def _log_failure(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning("Background task failed: {}", exc)
+
+        task.add_done_callback(_log_failure)
+        return task
 
     async def _notify_idle_timeout(self, session_key: str) -> None:
         """Send an idle-timeout notification for *session_key*.
@@ -1121,6 +1150,7 @@ class AgentLoop:
             session_key=key,
             channel=channel,
             chat_id=chat_id,
+            is_group=derive_is_group(msg.metadata, chat_id),
             permission_mode_override=permission_mode_override,
         )
 
@@ -1153,13 +1183,16 @@ class AgentLoop:
         channel = ctx.channel
         chat_id = ctx.chat_id
         key = ctx.session_key
+        is_group = ctx.is_group
 
         if channel == "system":
             logger.info("Processing system message from {}", msg.sender_id)
             session = self.sessions.get_or_create(key)
             ctx.session = session
 
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel, chat_id, msg.metadata.get("message_id"), is_group=is_group
+            )
             history = session.get_history(max_messages=200)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             from markbot.agent.turn_metadata import make_turn_metadata as _make_meta_sys
@@ -1173,6 +1206,7 @@ class AgentLoop:
                 session_key=key,
                 session=session,
                 turn_meta=_sys_meta,
+                is_group=is_group,
             )
             try:
                 final_content, _, all_msgs, _new_start = await self._run_agent_loop(
@@ -1185,6 +1219,7 @@ class AgentLoop:
                     on_tool_complete=on_tool_complete,
                     permission_mode_override=ctx.permission_mode_override,
                     session_key=key,
+                    is_group=is_group,
                 )
                 self.tool_executor.save_turn(session, all_msgs, _new_start)
                 self.sessions.save(session)
@@ -1246,7 +1281,9 @@ class AgentLoop:
             # "继续"指令和 compact 内部触发都不重置（它们是同一任务的延续）。
             self.reset_failure_state(key)
 
-        self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            channel, chat_id, msg.metadata.get("message_id"), is_group=is_group
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -1268,6 +1305,7 @@ class AgentLoop:
             session_key=key,
             session=session,
             turn_meta=_meta,
+            is_group=is_group,
         )
 
         # Bootstrap hook: prepend guidance on first interaction
@@ -1309,6 +1347,7 @@ class AgentLoop:
                 on_tool_complete=on_tool_complete,
                 permission_mode_override=ctx.permission_mode_override,
                 session_key=key,
+                is_group=is_group,
             )
 
             logger.info(

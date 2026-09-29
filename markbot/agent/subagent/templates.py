@@ -63,8 +63,8 @@ _TEMPLATES: dict[str, CapabilityToken] = {
             "web_search", "web_fetch", "web_extract",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_press",
-            "browser_back", "browser_forward", "browser_wait",
-            "browser_screenshot", "browser_close",
+            "browser_back", "browser_vision", "browser_console",
+            "browser_get_images",
         ),
         forbidden_tools=(
             "exec", "write_file", "edit_file", "delete_file",

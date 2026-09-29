@@ -477,10 +477,12 @@ class MemoryToolsConfig(Base):
         ),
     )
     auto_summary_to_curated: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "If true, automatic conversation summaries may write into curated "
-            "MEMORY.md. Default false: summaries go to daily logs + vector index only."
+            "If true, automatic conversation summaries also write into curated "
+            "MEMORY.md (chunked [auto-summary] entries, oldest evicted on overflow) "
+            "so lessons survive session restarts. Set false to keep summaries in "
+            "daily logs + vector index only."
         ),
     )
     # -- Force-search knobs (previously orphaned getattr defaults) ---------

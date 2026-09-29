@@ -66,7 +66,7 @@ read_when:
 
 每隔几天，用一次心跳来：
 
-1. 读取最近的 `memory/YYYY-MM-DD.md` 文件
+1. 读取最近的 `memory/daily/YYYY-MM-DD.md` 文件
 2. 识别值得长期保留的重要事件、教训或洞察
 3. 更新 `MEMORY.md` 中的精炼内容
 4. 删除 `MEMORY.md` 中不再相关的过时信息

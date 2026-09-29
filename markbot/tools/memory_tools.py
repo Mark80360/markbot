@@ -26,10 +26,14 @@ class MemorySaveTool(Tool):
         self._memory_manager = memory_manager
         self._channel: str | None = None
         self._chat_id: str | None = None
+        self._is_group: bool | None = None
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     @property
     def name(self) -> str:
@@ -92,7 +96,7 @@ class MemorySaveTool(Tool):
             session_id = f"{self._channel}:{self._chat_id}" if self._channel and self._chat_id else None
             if hasattr(self._memory_manager, "allow_curated_memory"):
                 if not self._memory_manager.allow_curated_memory(
-                    self._channel, session_id=session_id
+                    self._channel, session_id=session_id, is_group=self._is_group
                 ):
                     return (
                         "Curated MEMORY.md / PROFILE.md edits are only available in "
@@ -105,6 +109,7 @@ class MemorySaveTool(Tool):
                 target=target,
                 channel=self._channel,
                 session_id=session_id,
+                is_group=self._is_group,
             )
             if not result:
                 return (
@@ -129,10 +134,14 @@ class MemoryForgetTool(Tool):
         self._memory_manager = memory_manager
         self._channel: str | None = None
         self._chat_id: str | None = None
+        self._is_group: bool | None = None
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     @property
     def name(self) -> str:
@@ -179,7 +188,7 @@ class MemoryForgetTool(Tool):
             return "Error: target must be 'memory' or 'user'."
         try:
             from markbot.utils.constants import is_main_memory_session
-            if not is_main_memory_session(self._channel):
+            if not is_main_memory_session(self._channel, is_group=self._is_group):
                 return (
                     "Curated MEMORY.md / PROFILE.md edits are only available in "
                     "main/private sessions (cli/web/api/local)."
@@ -188,6 +197,7 @@ class MemoryForgetTool(Tool):
                 memory_id=memory_id,
                 target=target,
                 channel=self._channel,
+                is_group=self._is_group,
             )
             if not result:
                 return f"No entry containing '{memory_id[:40]}' found in {target}."
@@ -206,10 +216,14 @@ class MemoryListTool(Tool):
         self._memory_manager = memory_manager
         self._channel: str | None = None
         self._chat_id: str | None = None
+        self._is_group: bool | None = None
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     @property
     def name(self) -> str:
@@ -253,7 +267,7 @@ class MemoryListTool(Tool):
             return "Error: target must be 'memory' or 'user'."
         try:
             from markbot.utils.constants import is_main_memory_session
-            if not is_main_memory_session(self._channel):
+            if not is_main_memory_session(self._channel, is_group=self._is_group):
                 return (
                     "Curated MEMORY.md / PROFILE.md listing is only available in "
                     "main/private sessions. Use memory_search for this conversation's "
@@ -263,6 +277,7 @@ class MemoryListTool(Tool):
                 limit=limit,
                 target=target,
                 channel=self._channel,
+                is_group=self._is_group,
             )
             if not memories:
                 return f"No {target} entries found."

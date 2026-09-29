@@ -730,7 +730,11 @@ class MultiLevelCompactor:
                 attachments=attachments,
             )
 
-        self._record_compaction_failure()
+        # The LLM summary ran but was insufficient; history snip still gets us
+        # under the threshold, so this is a successful (degraded) compaction —
+        # do NOT arm the failure cooldown, which would otherwise disable future
+        # auto-compaction even though snip worked.
+        self._mark_compaction_success()
         messages = self._apply_history_snip(messages, task_context=task_context)
         tokens_after_snip = _estimate_messages_tokens(messages)
         self._record_savings(tokens_before, tokens_after_snip)

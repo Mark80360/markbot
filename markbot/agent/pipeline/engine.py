@@ -25,6 +25,11 @@ class ProcessContext:
     session: Any = None
     channel: str = ""
     chat_id: str = ""
+    # Whether the conversation is a group/multi-party surface. Derived from
+    # the inbound message metadata; ``None`` means "unknown" (fail closed for
+    # shared channels). Used to decide whether curated MEMORY.md/PROFILE.md
+    # may be injected / written in this session.
+    is_group: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     # Per-turn override for the active permission mode. When set (e.g. by
     # cron / autopilot / heartbeat callers via ``process_direct``), the

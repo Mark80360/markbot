@@ -106,7 +106,11 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
                 if text is None:
                     text = ""
                 parts.append(text)
-            elif btype == "image":
+            elif btype in ("image", "image_url"):
+                # Internal messages carry OpenAI-style ``image_url`` blocks
+                # (the Anthropic/other providers convert them to ``image``
+                # later), so counting only ``"image"`` under-counted every
+                # vision capture by the whole image token budget.
                 image_count += 1
             elif btype == "tool_use":
                 parts.append(json.dumps(block.get("input", {}), ensure_ascii=False))

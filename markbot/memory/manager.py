@@ -439,12 +439,18 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             return channel.strip(), chat_id.strip()
         return raw, ""
 
-    def allow_curated_memory(self, channel: str | None = None, *, session_id: str | None = None) -> bool:
+    def allow_curated_memory(
+        self,
+        channel: str | None = None,
+        *,
+        session_id: str | None = None,
+        is_group: bool | None = None,
+    ) -> bool:
         """Whether curated MEMORY/PROFILE may be read for this session."""
         ch = channel
         if ch is None and session_id:
             ch, _ = self._parse_session_parts(session_id)
-        return is_main_memory_session(ch)
+        return is_main_memory_session(ch, is_group=is_group)
 
 
     def _cached_vector_search(
@@ -490,7 +496,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             self._vector_cache[key] = (results, now)
         return results
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", is_group: bool | None = None) -> str:
         """Recall relevant context for the upcoming turn.
 
         This is the **automatic** recall path — the agent loop calls it
@@ -528,7 +534,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         # Shared messaging channels must not auto-inject curated private
         # MEMORY.md facts. They may still recall same-session turn history.
-        allow_curated_auto = self.allow_curated_memory(channel or None)
+        allow_curated_auto = self.allow_curated_memory(channel or None, is_group=is_group)
 
         # De-dup by content so the same memory from two recall paths
         # (vector vs keyword) isn't shown twice.
@@ -806,8 +812,30 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if isinstance(system_prompt, str) and system_prompt:
             total_tokens += estimate_tokens(system_prompt)
 
-        threshold = int(self.max_input_length * self.memory_compact_ratio)
+        # Callers (e.g. the compaction hook) may supply an explicit token
+        # budget that already accounts for the system prompt and the rolling
+        # summary. Honour it instead of the manager's ratio-based default,
+        # otherwise the hook's carefully computed threshold is discarded.
+        raw_threshold = kwargs.get("memory_compact_threshold")
+        default_threshold = int(self.max_input_length * self.memory_compact_ratio)
+        try:
+            threshold = int(raw_threshold) if raw_threshold is not None else default_threshold
+        except (TypeError, ValueError):
+            threshold = default_threshold
+        if threshold <= 0:
+            threshold = default_threshold
+
         reserve_ratio = max(0.0, min(self.memory_reserve_ratio, 0.9))
+
+        # Optional explicit token reserve (hook-supplied); when present it
+        # takes precedence over the fractional reserve for the tail cap.
+        raw_reserve = kwargs.get("memory_compact_reserve")
+        try:
+            reserve_tokens = int(raw_reserve) if raw_reserve is not None else 0
+        except (TypeError, ValueError):
+            reserve_tokens = 0
+        if reserve_tokens < 0:
+            reserve_tokens = 0
 
         if total_tokens <= threshold:
             return [], messages, True
@@ -828,7 +856,19 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             # untouched so the model has at least one fresh turn to read.
             compact_count = max(len(messages) - 1, 0)
 
-        compact_count = min(compact_count, int(len(messages) * (1 - reserve_ratio)))
+        # Cap the compacted prefix so at least one recent turn (and, when
+        # supplied, an explicit token reserve) remains in the live window.
+        reserve_count = int(len(messages) * reserve_ratio)
+        if reserve_tokens > 0:
+            tail_tokens = 0
+            tail_count = 0
+            for j in range(len(messages) - 1, -1, -1):
+                tail_tokens += estimate_messages_tokens([messages[j]])
+                tail_count += 1
+                if tail_tokens >= reserve_tokens:
+                    break
+            reserve_count = max(reserve_count, tail_count)
+        compact_count = min(compact_count, len(messages) - reserve_count)
         if compact_count <= 0:
             return [], messages, True
 
@@ -949,11 +989,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 summary = redact_sensitive_text(summary)
 
                 if summary:
-                    # Durable facts extracted from conversation are indexed for
-                    # semantic recall and daily-log search. They are NOT written
-                    # into curated MEMORY.md by default — that store is reserved
-                    # for explicit memory_save / dream promotion / high-confidence
-                    # encoder entries so always-on context stays high-signal.
+                    # Durable facts extracted from conversation are always indexed
+                    # for semantic recall and daily-log search. When
+                    # auto_summary_to_curated is enabled they are also chunked
+                    # into curated MEMORY.md so cross-session lessons persist.
                     self._persist_summary_facts(summary, to_curated=self.auto_summary_to_curated)
 
                 return summary
@@ -978,6 +1017,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         *,
         channel: str | None = None,
         chat_id: str | None = None,
+        is_group: bool | None = None,
     ) -> Any:
         """Search stored memories for relevant content.
 
@@ -990,6 +1030,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             min_score: Minimum relevance score.
             channel: Optional channel filter.
             chat_id: Optional chat ID filter.
+            is_group: Whether the caller is a group/multi-party session.
 
         Returns:
             List of result dicts, or empty list.
@@ -997,7 +1038,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         results: list[dict] = []
         # Shared messaging channels must not surface private curated memory
         # (MEMORY.md / PROFILE.md) or the global main-session summary.
-        allow_curated = is_main_memory_session(channel)
+        allow_curated = is_main_memory_session(channel, is_group=is_group)
 
         # 1. Search daily logs (session-scoped when channel/chat_id provided)
         if self._daily_log:
@@ -1122,6 +1163,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         *,
         channel: str | None = None,
         session_id: str | None = None,
+        is_group: bool | None = None,
     ) -> bool:
         """Add a memory entry (for MemorySaveTool).
 
@@ -1131,11 +1173,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             target: 'memory' or 'user'.
             channel: Optional channel for privacy gating.
             session_id: Optional session key used when channel is omitted.
+            is_group: Whether the caller is a group/multi-party session.
 
         Returns:
             True if successful.
         """
-        if not self.allow_curated_memory(channel, session_id=session_id):
+        if not self.allow_curated_memory(channel, session_id=session_id, is_group=is_group):
             return False
         if not self._memory_store:
             return False
@@ -1151,6 +1194,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         *,
         channel: str | None = None,
         session_id: str | None = None,
+        is_group: bool | None = None,
     ) -> bool:
         """Delete a memory entry (for MemoryForgetTool compatibility).
 
@@ -1159,11 +1203,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             target: 'memory' or 'user'.
             channel: Optional channel for privacy gating.
             session_id: Optional session key used when channel is omitted.
+            is_group: Whether the caller is a group/multi-party session.
 
         Returns:
             True if successful.
         """
-        if not self.allow_curated_memory(channel, session_id=session_id):
+        if not self.allow_curated_memory(channel, session_id=session_id, is_group=is_group):
             return False
         if not self._memory_store:
             return False
@@ -1179,6 +1224,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         *,
         channel: str | None = None,
         session_id: str | None = None,
+        is_group: bool | None = None,
     ) -> list[dict]:
         """List recent memory entries (for MemoryListTool compatibility).
 
@@ -1187,11 +1233,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             target: 'memory' or 'user'.
             channel: Optional channel for privacy gating.
             session_id: Optional session key used when channel is omitted.
+            is_group: Whether the caller is a group/multi-party session.
 
         Returns:
             List of dicts with id, content, tags keys.
         """
-        if not self.allow_curated_memory(channel, session_id=session_id):
+        if not self.allow_curated_memory(channel, session_id=session_id, is_group=is_group):
             return []
         if not self._memory_store:
             return []
@@ -1588,6 +1635,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         session_key: str | None = None,
         channel: str | None = None,
         include_curated: bool = False,
+        is_group: bool | None = None,
     ) -> str:
         """Get formatted memory context for per-turn injection.
 
@@ -1613,7 +1661,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             ch = channel
             if ch is None and ":" in session_key:
                 ch = session_key.split(":", 1)[0]
-            if is_main_memory_session(ch):
+            if is_main_memory_session(ch, is_group=is_group):
                 summary = self._compressed_summary
         if summary:
             parts.append(f"## Compressed Summary\n\n{summary}")
@@ -1622,7 +1670,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             ch = channel
             if ch is None and session_key and ":" in session_key:
                 ch = session_key.split(":", 1)[0]
-            if is_main_memory_session(ch):
+            if is_main_memory_session(ch, is_group=is_group):
                 # Live snapshot (refreshed on writes) — not the raw file.
                 snap = self._memory_store.format_memory_prompt_block(
                     include_memory=True,
@@ -2022,16 +2070,26 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
 
         path = self._session_summary_path_daily(session_key)
         path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        channel, _, chat_id = session_key.partition(":")
+        session_tag = f" `{chat_id}`" if chat_id else ""
+        channel_tag = f" via {channel}" if channel else ""
+        section = (
+            f"## [{now.strftime('%H:%M:%S')}]{session_tag}{channel_tag}\n\n"
+            f"{summary}\n"
+        )
         try:
             existing = path.read_text(encoding="utf-8") if path.exists() else ""
-            new_content = existing + "\n\n----------\n\n" + summary
+            if not existing:
+                existing = f"# Daily Log: {now.strftime('%Y-%m-%d')}\n\n"
+            new_content = existing + "\n" + section
             if len(new_content) > MAX_COMPRESSED_SUMMARY_CHARS:
                 keep = new_content[-MAX_COMPRESSED_SUMMARY_CHARS:]
-                # Cut at the nearest delimiter boundary to avoid splitting mid-summary
-                delimiter = "\n\n----------\n\n"
-                cutoff = keep.find(delimiter)
-                if cutoff >= 0:
-                    keep = keep[cutoff + len(delimiter):]
+                # Cut at the nearest section boundary so a summary is never
+                # split mid-entry and stays attributable to its session.
+                boundary = keep.find("\n## [")
+                if boundary >= 0:
+                    keep = keep[boundary + 1:]
                 new_content = keep
             path.write_text(new_content, encoding="utf-8")
         except Exception as e:

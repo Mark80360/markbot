@@ -24,9 +24,9 @@ if TYPE_CHECKING:
     from ..memory.base import BaseMemoryManager
 
 
-def _session_allows_curated(channel: str | None) -> bool:
+def _session_allows_curated(channel: str | None, is_group: bool | None = None) -> bool:
     """Whether curated MEMORY/PROFILE may be listed/loaded for this channel."""
-    return is_main_memory_session(channel)
+    return is_main_memory_session(channel, is_group=is_group)
 
 
 class ExploreContextCatalogTool(Tool):
@@ -84,9 +84,12 @@ class ExploreContextCatalogTool(Tool):
         self._chat_id: str | None = None
         self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     async def _legacy_execute(
         self,
@@ -136,7 +139,9 @@ class ExploreContextCatalogTool(Tool):
         lines.append("These configuration files define your identity, preferences, and guidelines.\n")
 
         has_files = False
-        allow_curated = _session_allows_curated(getattr(self, '_channel', None))
+        allow_curated = _session_allows_curated(
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+        )
         for filename in self.BOOTSTRAP_FILES:
             if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
                 continue
@@ -166,7 +171,9 @@ class ExploreContextCatalogTool(Tool):
         lines = ["## Memory Entries (Persistent Knowledge)\n"]
         lines.append("Contains user preferences, project history, decisions, and learned facts.\n")
 
-        if not _session_allows_curated(getattr(self, '_channel', None)):
+        if not _session_allows_curated(
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+        ):
             lines.append(
                 "*Curated MEMORY.md / PROFILE.md catalog is unavailable on shared channels. "
                 "Use memory_search for this conversation's logs/summaries.*"
@@ -332,9 +339,12 @@ class SearchContextTool(Tool):
         self._chat_id: str | None = None
         self.BOOTSTRAP_FILES = BOOTSTRAP_FILES
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     async def _legacy_execute(
         self,
@@ -411,7 +421,9 @@ class SearchContextTool(Tool):
                         'score': r.get('score'),
                         'full_content': r.get('content', ''),
                     })
-            elif _session_allows_curated(getattr(self, '_channel', None)):
+            elif _session_allows_curated(
+                getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            ):
                 memory_file = self.workspace / MEMORY_FILENAME
                 if memory_file.exists():
                     content = memory_file.read_text(encoding='utf-8')
@@ -442,7 +454,9 @@ class SearchContextTool(Tool):
         if not self.workspace or not self.workspace.exists():
             return results
 
-        allow_curated = _session_allows_curated(getattr(self, '_channel', None))
+        allow_curated = _session_allows_curated(
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+        )
         for filename in self.BOOTSTRAP_FILES:
             if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
                 continue
@@ -591,9 +605,12 @@ class LoadContextTool(Tool):
         self._chat_id: str | None = None
         self._search_cache: dict[str, dict] = {}
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     async def _legacy_execute(
         self,
@@ -637,7 +654,9 @@ class LoadContextTool(Tool):
 
     async def _load_memory(self, context_id: str) -> tuple[str | None, str]:
         """Load memory entry."""
-        if not _session_allows_curated(getattr(self, '_channel', None)):
+        if not _session_allows_curated(
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+        ):
             return (
                 "Curated MEMORY.md entries are unavailable on shared channels. "
                 "Use memory_search for this conversation's logs/summaries.",
@@ -663,7 +682,9 @@ class LoadContextTool(Tool):
         except Exception as e:
             logger.warning("Failed to load memory {}: {}", context_id, e)
 
-        if _session_allows_curated(getattr(self, '_channel', None)):
+        if _session_allows_curated(
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+        ):
             memory_file = self.workspace / MEMORY_FILENAME
             if memory_file.exists():
                 return memory_file.read_text(encoding='utf-8'), 'memory'
@@ -691,7 +712,7 @@ class LoadContextTool(Tool):
         filename = filename_map.get(context_id, context_id.replace('_', '.'))
 
         if filename in (MEMORY_FILENAME, USER_FILENAME) and not _session_allows_curated(
-            getattr(self, '_channel', None)
+            getattr(self, '_channel', None), getattr(self, '_is_group', None)
         ):
             return (
                 f"*{filename} is unavailable on shared channels.*",

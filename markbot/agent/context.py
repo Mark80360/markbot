@@ -9,6 +9,7 @@ truncated to preserve space for conversation history.
 
 from dataclasses import dataclass
 
+import hashlib
 import json
 import mimetypes
 import platform
@@ -94,6 +95,24 @@ def resolve_primary_model() -> tuple[Optional[str], Optional[str]]:
     except Exception:  # noqa: BLE001
         pass
     return None, None
+
+
+def _strip_soul_frontmatter(content: str) -> str:
+    """Drop a leading YAML frontmatter block from SOUL.md content.
+
+    Workspace templates ship ``SOUL.md`` with a ``---`` … ``---`` header. If it
+    is kept, the metadata leaks into the system prompt and the content no
+    longer starts with a markdown heading, which previously caused the
+    Runtime/Workspace injection to be skipped entirely.
+    """
+    if not content.startswith("---"):
+        return content
+    lines = content.split("\n")
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[i + 1:]).lstrip("\n")
+    return content
+
 
 @dataclass
 class PromptSection:
@@ -318,6 +337,7 @@ You have browser tools for web page interaction. Use them when you need to inter
         skill_names: list[str] | None = None,
         *,
         channel: str | None = None,
+        is_group: bool | None = None,
     ) -> str:
         """Build the system prompt using priority-based sections.
 
@@ -328,9 +348,15 @@ You have browser tools for web page interaction. Use them when you need to inter
           Priority 3 (STANDARD): Skills index, conditional guidance.
           Priority 4 (REFERENCE): On-demand docs (TOOLS.md, ARCHITECTURE.md).
         """
+        # The curated bootstrap files (MEMORY.md / PROFILE.md) are embedded in
+        # the prompt body, so their content must participate in the cache key;
+        # otherwise a freshly-saved lesson stays invisible for the whole TTL
+        # (or the entire session under a frozen snapshot).
         cache_key = (
             f"system_prompt_{sorted(skill_names) if skill_names else ''}"
             f"_ch_{str(channel or '').lower()}"
+            f"_g_{is_group!r}"
+            f"_fp_{self._curated_content_fingerprint(channel, is_group=is_group)}"
         )
         cached = self._context_cache.get(cache_key)
         if cached and (time.monotonic() - cached[0]) < self._cache_ttl:
@@ -361,14 +387,14 @@ You have browser tools for web page interaction. Use them when you need to inter
         ))
 
         # Priority 2: Essential bootstrap (AGENTS.md + PROFILE.md on main sessions)
-        essential = self._load_essential_bootstrap(channel=channel)
+        essential = self._load_essential_bootstrap(channel=channel, is_group=is_group)
         if essential:
             sections.append(PromptSection(
                 content=essential, name="bootstrap_essential", priority=2,
             ))
         # Priority 2: Conditional bootstrap (MEMORY.md) — main sessions only.
         # Shared messaging channels must not receive private long-term memory.
-        conditional = self._load_conditional_bootstrap(channel=channel)
+        conditional = self._load_conditional_bootstrap(channel=channel, is_group=is_group)
         if conditional:
             sections.append(PromptSection(
                 content=conditional, name="bootstrap_conditional", priority=2,
@@ -541,8 +567,15 @@ Skills are mandatory procedural workflows — not suggestions. When a skill matc
             else:
                 available = budget - used_tokens
                 if available > 300:
+                    # A raw chars-per-token heuristic (×4) over-sizes CJK
+                    # content, where ~1 char ≈ 1 token, so the "truncated"
+                    # section could still blow the budget. Start from the
+                    # heuristic, then shrink until the real estimate fits.
                     char_budget = available * 4
                     truncated_text = section.content[:char_budget]
+                    while char_budget > 1 and estimate_tokens(truncated_text) > available:
+                        char_budget = int(char_budget * 0.8)
+                        truncated_text = section.content[:char_budget]
                     if len(truncated_text) < len(section.content):
                         truncated_text += "\n\n[... section truncated to fit token budget ...]"
                     kept.append(PromptSection(
@@ -695,36 +728,39 @@ Recent commits:
 - Prefer UTF-8 and standard shell tools; prefer file tools when simpler
 """
 
-        # Replace or inject runtime section
+        # Drop the workspace template's YAML frontmatter and normalise
+        # whitespace before injecting anything.
+        soul_content = _strip_soul_frontmatter(soul_content).strip()
+
+        import re
+
         _skills_info = self._build_skills_path_info(workspace_path)
+        runtime_block = (
+            f"## Runtime\n{runtime}\n\n"
+            f"## Workspace\nPath: {workspace_path}\n"
+            f"- Sessions: {workspace_path}/sessions/\n"
+            f"- Daily logs: {workspace_path}/memory/daily/YYYY-MM-DD.md\n"
+            f"{_skills_info}"
+        )
+
         if "## Runtime" in soul_content:
             # Replace existing runtime section
-            import re
-
             soul_content = re.sub(
                 r"## Runtime\n.*?(?=\n## |\Z)",
-                f"""## Runtime
-{runtime}
-
-## Workspace
-Path: {workspace_path}
-- Sessions: {workspace_path}/sessions/
-- Daily logs: {workspace_path}/memory/YYYY-MM-DD.md
-{_skills_info}
-""",
+                runtime_block + "\n",
                 soul_content,
                 flags=re.DOTALL,
             )
         else:
-            # Add runtime section after title
+            # Insert after the first markdown heading when there is one,
+            # otherwise prepend. Templates without a leading ``#`` (or with
+            # only frontmatter) previously received no Runtime/Workspace
+            # section at all.
             if soul_content.startswith("#"):
-                # Insert after first heading
-                lines = soul_content.split("\n", 1)
-                soul_content = (
-                    lines[0]
-                    + f"\n\n## Runtime\n{runtime}\n\n## Workspace\nPath: {workspace_path}\n- Sessions: {workspace_path}/sessions/\n- Daily logs: {workspace_path}/memory/YYYY-MM-DD.md\n{_skills_info}"
-                    + (f"\n{lines[1]}" if len(lines) > 1 else "")
-                )
+                first_line, _sep, rest = soul_content.partition("\n")
+                soul_content = f"{first_line}\n\n{runtime_block}\n{rest}"
+            else:
+                soul_content = f"{runtime_block}\n\n{soul_content}"
 
         # Replace or inject platform policy
         if "## Platform" not in soul_content:
@@ -759,7 +795,7 @@ You are MarkBot, an AI assistant focused on software development and task automa
 ## Workspace
 Path: {workspace_path}
 - Sessions: {workspace_path}/sessions/
-- Daily logs: {workspace_path}/memory/YYYY-MM-DD.md
+- Daily logs: {workspace_path}/memory/daily/YYYY-MM-DD.md
 {self._build_skills_path_info(workspace_path)}
 
 {platform_policy}
@@ -831,6 +867,32 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             logger.warning("Failed to load {}: {}", filename, e)
             return None
 
+    def _curated_content_fingerprint(
+        self,
+        channel: str | None,
+        *,
+        is_group: bool | None = None,
+    ) -> str:
+        """Content hash of curated bootstrap files for the prompt cache key.
+
+        Returns an empty string when the session is not allowed to receive
+        curated memory (so group/shared sessions don't pay the read cost).
+        """
+        from markbot.utils.constants import (
+            MEMORY_FILENAME,
+            USER_FILENAME,
+            is_main_memory_session,
+        )
+
+        if not is_main_memory_session(channel, is_group=is_group):
+            return ""
+        parts: list[str] = []
+        for filename in (USER_FILENAME, MEMORY_FILENAME):
+            raw = self._load_file_content(filename) or ""
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+            parts.append(f"{filename}:{digest}")
+        return "|".join(parts)
+
     def _format_curated_entries(
         self,
         raw: str,
@@ -852,14 +914,22 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             body = body[: max(max_chars - 80, 0)].rstrip() + (
                 "\n\n...[memory truncated to budget]..."
             )
-        return (
+        body_text = (
             "══════════════════════════════════════════════\n"
             f"{title} [~{pct}% — {used}/{char_limit} chars]\n"
             "══════════════════════════════════════════════\n"
             f"{body}"
         )
+        # Curated memory is injected into the system prompt; fence it so the
+        # model treats it as reference data rather than instructions. Without
+        # this, poisoned MEMORY.md/PROFILE.md entries act as prompt injection.
+        from markbot.memory.fencing import fence_context
 
-    def _load_essential_bootstrap(self, *, channel: str | None = None) -> str:
+        return fence_context(body_text, system_note=True)
+
+    def _load_essential_bootstrap(
+        self, *, channel: str | None = None, is_group: bool | None = None
+    ) -> str:
         """Load essential bootstrap (Priority 2): AGENTS.md, PROFILE.md.
 
         SOUL.md is handled by _get_identity().
@@ -877,7 +947,7 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             if filename == "SOUL.md":
                 continue
             if filename == USER_FILENAME:
-                if not is_main_memory_session(channel):
+                if not is_main_memory_session(channel, is_group=is_group):
                     continue
                 raw = self._load_file_content(filename)
                 if not raw:
@@ -896,7 +966,9 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
                 parts.append(text)
         return "\n\n".join(parts) if parts else ""
 
-    def _load_conditional_bootstrap(self, *, channel: str | None = None) -> str:
+    def _load_conditional_bootstrap(
+        self, *, channel: str | None = None, is_group: bool | None = None
+    ) -> str:
         """Load conditional bootstrap (Priority 2): curated MEMORY.md.
 
         Only main/private sessions receive always-on MEMORY.md.
@@ -909,7 +981,7 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             MEMORY_FILENAME,
             is_main_memory_session,
         )
-        if not is_main_memory_session(channel):
+        if not is_main_memory_session(channel, is_group=is_group):
             return ""
 
         parts: list[str] = []
@@ -965,6 +1037,7 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
         session_key: str | None = None,
         session: Any = None,
         turn_meta: TurnMetadata | None = None,
+        is_group: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call.
 
@@ -985,7 +1058,9 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
                 the leading user text byte-identical across turns so
                 the server-side prefix cache can hit on it.
         """
-        system_content = self.build_system_prompt(skill_names, channel=channel)
+        system_content = self.build_system_prompt(
+            skill_names, channel=channel, is_group=is_group
+        )
 
         if extra_system_context:
             system_content = f"{system_content}\n\n{extra_system_context}"

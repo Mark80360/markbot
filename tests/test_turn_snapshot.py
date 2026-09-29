@@ -192,7 +192,14 @@ class HarnessLoop:
     def drain_steer(self, session_key: str) -> list[Any]:
         return []
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        *,
+        is_group: bool | None = None,
+    ) -> None:
         pass
 
     @staticmethod

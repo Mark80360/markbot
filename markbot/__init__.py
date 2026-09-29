@@ -2,5 +2,5 @@
 MarkBot - An advanced AI-powered automation and development assistant designed for developers and power users. 
 """
 
-__version__ = "20260828"
+__version__ = "20260928"
 __logo__ = "🦞"

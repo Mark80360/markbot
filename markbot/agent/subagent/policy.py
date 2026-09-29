@@ -8,10 +8,13 @@ boundaries without hard-coding them into CapabilityToken itself.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from markbot.agent.subagent.capability import CapabilityToken
+
+logger = logging.getLogger(__name__)
 
 # Tools that must never be available to subagents by default (prevent
 # recursive spawn storms, outbound spam, and schedule side-effects).
@@ -76,22 +79,39 @@ class DelegationPolicy:
         )
 
     def default_capability(self) -> CapabilityToken:
+        """Build the default child capability from the configured factory.
+
+        ``default_capability_factory`` currently recognises a single value,
+        ``"read_only"``.  Any other value is a configuration error: warn
+        loudly and fall back to read-only instead of silently returning the
+        same token (which made the setting a no-op).
+        """
         if self.default_capability_factory == "read_only":
             return CapabilityToken.read_only()
+        logger.warning(
+            "Unknown default_capability_factory {!r}; falling back to read_only",
+            self.default_capability_factory,
+        )
         return CapabilityToken.read_only()
 
     def harden_capability(self, capability: CapabilityToken | None) -> CapabilityToken:
         """Merge policy blocked tools into a capability token.
-        
-        Note: allow_nested_spawn / max_spawn_depth are intentionally not
-        enforced here because the subagent tool registry (manager.py) does
-        not include the spawn tool — subagents cannot recursively spawn,
-        making the depth and nesting controls unreachable.
+
+        Depth/nesting caps are enforced by :meth:`check_can_spawn`; this
+        method only folds the tool-level denylist into the token.  When
+        ``allow_nested_spawn`` is True the ``spawn`` tool is left out of the
+        denylist so an orchestrator child can delegate further — still
+        bounded by ``max_spawn_depth`` at spawn time.
         """
         if capability is None:
             capability = self.default_capability()
+        blocked = self.blocked_tools
+        if self.allow_nested_spawn:
+            # Blocked-tools defaults include "spawn"; drop it so the
+            # allow_nested_spawn flag is not a silent no-op.
+            blocked = blocked - {"spawn"}
         merged_forbidden = tuple(
-            dict.fromkeys([*capability.forbidden_tools, *sorted(self.blocked_tools)])
+            dict.fromkeys([*capability.forbidden_tools, *sorted(blocked)])
         )
         if not self.allow_nested_spawn and "spawn" not in merged_forbidden:
             merged_forbidden = (*merged_forbidden, "spawn")

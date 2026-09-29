@@ -230,14 +230,20 @@ class DailyLogManager:
                 header_line = section.split("\n", 1)[0]
                 match = _SECTION_HEADER_RE.match("## [" + header_line)
 
+                sec_channel = ""
+                sec_chat_id = ""
                 if match:
                     sec_channel = match.group("channel") or ""
                     sec_chat_id = match.group("chat_id") or ""
 
-                    if channel and sec_channel != channel:
-                        continue
-                    if chat_id and sec_chat_id != chat_id:
-                        continue
+                # Session-scoped search must not leak: when a filter is
+                # requested, sections without a matching (or with no) session
+                # header — e.g. the file preamble or headerless summary
+                # blocks — are excluded rather than treated as wildcards.
+                if channel and sec_channel != channel:
+                    continue
+                if chat_id and sec_chat_id != chat_id:
+                    continue
 
                 section_text = section.lower()
                 section_tokens = set(tokenize_for_search(section_text))

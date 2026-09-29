@@ -51,6 +51,56 @@ class Event:
     session_key: str = ""
 
 
+# Chat-type tokens indicating a multi-party (group) surface.
+_GROUP_CHAT_TYPES: frozenset[str] = frozenset({
+    "group",
+    "channel",
+    "guild",
+    "forum",
+    "topic",
+    "topic_group",
+    "room",
+})
+
+# Chat-type tokens indicating an explicit 1:1 private surface.
+_PRIVATE_CHAT_TYPES: frozenset[str] = frozenset({
+    "p2p",
+    "dm",
+    "direct",
+    "private",
+    "single",
+    "c2c",
+    "im",
+})
+
+
+def derive_is_group(
+    metadata: dict[str, Any] | None,
+    chat_id: str | None = None,
+) -> bool | None:
+    """Best-effort detection of whether an inbound message is from a group chat.
+
+    Returns ``True`` for group / multi-party surfaces, ``False`` for explicit
+    1:1 private surfaces, and ``None`` when the channel does not expose enough
+    information (callers should fail closed for shared channels).
+    """
+    meta = metadata or {}
+    explicit = meta.get("is_group")
+    if isinstance(explicit, bool):
+        return explicit
+    raw = meta.get("chat_type")
+    if raw is not None:
+        value = str(raw).strip().lower()
+        if value in _GROUP_CHAT_TYPES:
+            return True
+        if value in _PRIVATE_CHAT_TYPES:
+            return False
+    # DingTalk encodes group chats as ``group:<conversation_id>``.
+    if chat_id and str(chat_id).startswith("group:"):
+        return True
+    return None
+
+
 def make_session_key(channel: str | None, chat_id: str | None) -> str | None:
     """Build the canonical ``channel:chat_id`` session key.
 

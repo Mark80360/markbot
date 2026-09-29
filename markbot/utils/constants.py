@@ -287,8 +287,9 @@ DREAM_BACKUP_KEEP: int = 5
 SINGLE_ENTRY_SOFT_LIMIT: int = 1500
 
 # Whether auto session summaries may write into curated MEMORY.md.
-# Default False: summaries belong in daily logs / compressed handoff.
-MEMORY_AUTO_SUMMARY_TO_CURATED: bool = False
+# Default True: lessons/facts from auto summaries persist across session
+# restarts (chunked [auto-summary] entries, oldest evicted on overflow).
+MEMORY_AUTO_SUMMARY_TO_CURATED: bool = True
 
 # Agent idle timeout in minutes. When no inbound message is received for
 # any session within this window, a timeout notification is sent back and
@@ -297,21 +298,34 @@ MEMORY_AUTO_SUMMARY_TO_CURATED: bool = False
 AGENT_IDLE_TIMEOUT_MINUTES: int = 30
 
 
-def is_main_memory_session(channel: str | None) -> bool:
+def is_main_memory_session(
+    channel: str | None,
+    *,
+    is_group: bool | None = None,
+) -> bool:
     """Return True when curated MEMORY.md may be always-on injected.
 
     Main/local surfaces (cli/web/api/test/local) are trusted private sessions.
-    Explicit shared/messaging channels are rejected. Empty/None channels default
-    to main-session behaviour for local tooling compatibility. Any other
-    unrecognized channel name fails closed (no curated always-on / search).
+    Explicit shared/messaging channels are rejected by default, but a 1:1
+    private chat (``is_group is False``) on a messaging channel is also
+    treated as a trusted private session so that per-user long-term memory
+    keeps working in direct messages. Group chats (``is_group is True``) always
+    fail closed. Empty/None channels default to main-session behaviour for
+    local tooling compatibility. Any other unrecognized channel name fails
+    closed (no curated always-on / search).
     """
+    if is_group is True:
+        # Group / multi-party surfaces are never trusted private sessions.
+        return False
     if not channel:
         return True
     name = str(channel).strip().lower()
     if not name:
         return True
     if name in SHARED_MEMORY_CHANNELS:
-        return False
+        # Explicit 1:1 private chat on a messaging channel is trusted;
+        # unknown group-ness (None) fails closed.
+        return is_group is False
     if name in MAIN_MEMORY_CHANNELS:
         return True
     # Unrecognized names are treated as shared/untrusted.

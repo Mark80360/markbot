@@ -38,10 +38,14 @@ class MemorySearchTool(Tool):
         self._memory_manager = memory_manager
         self._channel: str | None = None
         self._chat_id: str | None = None
+        self._is_group: bool | None = None
 
-    def set_session_context(self, channel: str | None, chat_id: str | None) -> None:
+    def set_session_context(
+        self, channel: str | None, chat_id: str | None, is_group: bool | None = None
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_group = is_group
 
     @property
     def name(self) -> str:
@@ -101,6 +105,7 @@ class MemorySearchTool(Tool):
                 min_score=min_score,
                 channel=self._channel,
                 chat_id=self._chat_id,
+                is_group=self._is_group,
             )
             if not results:
                 return f"No memories found for query: '{query}'"
@@ -136,6 +141,7 @@ class MemorySearchTool(Tool):
                 min_score=min_s,
                 channel=self._channel,
                 chat_id=self._chat_id,
+                is_group=self._is_group,
             )
 
             if not results:

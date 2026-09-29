@@ -61,19 +61,6 @@ logger = logging.getLogger(__name__)
 
 _SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps"})
 
-_BLOCKED_KEY_COMBOS = {
-    # macOS
-    frozenset({"cmd", "shift", "backspace"}),
-    frozenset({"cmd", "option", "backspace"}),
-    frozenset({"cmd", "ctrl", "q"}),
-    frozenset({"cmd", "shift", "q"}),
-    frozenset({"cmd", "option", "shift", "q"}),
-    # Windows/Linux
-    frozenset({"ctrl", "alt", "delete"}),
-    frozenset({"ctrl", "shift", "esc"}),
-    frozenset({"ctrl", "alt", "del"}),
-}
-
 _KEY_ALIASES = {"command": "cmd", "control": "ctrl", "alt": "option", "\u2318": "cmd", "\u2325": "option"}
 
 
@@ -81,6 +68,26 @@ def _canon_key_combo(keys: str) -> frozenset:
     parts = [p.strip().lower() for p in re.split(r"\s*\+\s*", keys) if p.strip()]
     parts = [_KEY_ALIASES.get(p, p) for p in parts]
     return frozenset(parts)
+
+
+# Declared as raw strings and normalised through ``_canon_key_combo`` so that
+# aliases (e.g. "alt" -> "option") cannot smuggle a blocked shortcut past the
+# blacklist. Hard-coding frozensets here previously let "ctrl+alt+delete"
+# normalise to {ctrl, option, delete} and evade the {ctrl, alt, delete} entry.
+_BLOCKED_KEY_COMBO_SPECS = (
+    # macOS
+    "cmd+shift+backspace",
+    "cmd+option+backspace",
+    "cmd+ctrl+q",
+    "cmd+shift+q",
+    "cmd+option+shift+q",
+    # Windows/Linux
+    "ctrl+alt+delete",
+    "ctrl+alt+del",
+    "ctrl+shift+esc",
+)
+
+_BLOCKED_KEY_COMBOS = {_canon_key_combo(spec) for spec in _BLOCKED_KEY_COMBO_SPECS}
 
 
 _BLOCKED_TYPE_PATTERNS = [
@@ -223,7 +230,7 @@ def _dispatch(
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action in {"click", "double_click", "right_click", "middle_click"}:
         button = args.get("button")
@@ -244,7 +251,7 @@ def _dispatch(
             x=x, y=y, button=button or "left", click_count=click_count,
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action == "drag":
         has_elements = args.get("from_element") is not None and args.get("to_element") is not None
@@ -261,7 +268,7 @@ def _dispatch(
             button=args.get("button", "left"),
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action == "scroll":
         coord = args.get("coordinate") or (None, None)
@@ -273,22 +280,22 @@ def _dispatch(
             y=coord[1] if coord and coord[1] is not None else None,
             modifiers=args.get("modifiers"),
         )
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action == "type":
         res = backend.type_text(args.get("text", ""))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action == "key":
         res = backend.key(args.get("keys", ""))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     if action == "set_value":
         value = args.get("value")
         if value is None:
             return json.dumps({"error": "set_value requires `value`"})
         res = backend.set_value(value=str(value), element=args.get("element"))
-        return _maybe_follow_capture(backend, res, capture_after)
+        return _maybe_follow_capture(backend, res, capture_after, max_elements_default)
 
     return json.dumps({"error": f"unknown action {action!r}"})
 
@@ -347,7 +354,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         _mime = "image/jpeg" if _b64_prefix.startswith("/9j/") else "image/png"
 
         if _should_route_to_text_only():
-            return _maybe_route_to_text_only(cap, summary)
+            return _maybe_route_to_text_only(cap, summary, max_elements)
 
         return {
             "_multimodal": True,
@@ -390,14 +397,19 @@ def _should_route_to_text_only() -> bool:
         return False
 
 
-def _maybe_route_to_text_only(cap: CaptureResult, summary: str) -> Any:
+def _maybe_route_to_text_only(
+    cap: CaptureResult, summary: str, max_elements: int = _DEFAULT_MAX_ELEMENTS,
+) -> Any:
+    # Respect ``max_elements`` here too: routing to text-only must not dump the
+    # entire (untruncated) element list into the payload.
+    visible_elements = cap.elements[:max_elements]
     payload: Dict[str, Any] = {
         "mode": cap.mode,
         "width": cap.width,
         "height": cap.height,
         "app": cap.app,
         "window_title": cap.window_title,
-        "elements": [_element_to_dict(e) for e in cap.elements],
+        "elements": [_element_to_dict(e) for e in visible_elements],
         "total_elements": len(cap.elements),
         "summary": summary,
         "vision_routed_to_text_only": True,
@@ -407,6 +419,7 @@ def _maybe_route_to_text_only(cap: CaptureResult, summary: str) -> Any:
 
 def _maybe_follow_capture(
     backend: ComputerUseBackend, res: ActionResult, do_capture: bool,
+    max_elements: int = _DEFAULT_MAX_ELEMENTS,
 ) -> Any:
     if not do_capture:
         return _text_response(res)
@@ -418,7 +431,7 @@ def _maybe_follow_capture(
     except Exception as e:
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)
-    resp = _capture_response(cap)
+    resp = _capture_response(cap, max_elements=max_elements)
     if isinstance(resp, dict) and resp.get("_multimodal"):
         prefix = f"[{res.action}] ok={res.ok}" + (f" — {res.message}" if res.message else "")
         resp["content"][0]["text"] = prefix + "\n\n" + resp["content"][0]["text"]
@@ -560,7 +573,12 @@ class ComputerUseTool(Tool):
         return (params.get("action", "") or "").strip().lower() in _SAFE_ACTIONS
 
     def is_destructive(self, params: Dict[str, Any]) -> bool:
-        return False
+        # Any action that mutates desktop state (click, type, key, scroll, open…)
+        # is treated as destructive for ACCEPT_EDITS-mode confirmation. This
+        # previously returned a hardcoded False, which let confirmation-required
+        # modes run desktop actions without asking.
+        action = (params.get("action", "") or "").strip().lower()
+        return action not in _SAFE_ACTIONS
 
     async def check_permission(
         self, params: Dict[str, Any], context: ToolContext
@@ -614,7 +632,11 @@ class ComputerUseTool(Tool):
                 })
 
         try:
-            backend = _get_backend(self._config)
+            # ``_get_backend`` lazily instantiates AND starts the backend on
+            # first use, which can block for many seconds (spawning the
+            # cua-driver subprocess). Run it in a worker thread so it does not
+            # freeze the agent event loop.
+            backend = await asyncio.to_thread(_get_backend, self._config)
         except Exception as e:
             return json.dumps({
                 "error": f"computer_use backend unavailable: {e}",

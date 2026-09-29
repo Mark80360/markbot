@@ -334,6 +334,7 @@ class IterationRunner:
         on_tool_start: Callable[[str, str, str | None], Awaitable[None]] | None = None,
         on_tool_complete: Callable[[str, str, str | None, str | None], Awaitable[None]] | None = None,
         permission_mode_override: PermissionMode | None = None,
+        is_group: bool | None = None,
     ) -> None:
         self.loop = loop
         self.channel = channel
@@ -349,6 +350,9 @@ class IterationRunner:
         self._stream_filter = StreamFilter(on_stream)
         self._bootstrap_report: Any | None = None
         self.permission_mode_override = permission_mode_override
+        # Whether this turn belongs to a group/multi-party surface. ``None``
+        # means unknown (fail closed for shared channels).
+        self.is_group = is_group
         # Single control-plane decision engine (config-driven).
         self._tool_guardrail = self._build_tool_guardrail()
         # Skill-guardrail hard-constraint block map: tc.id -> violation message.
@@ -687,6 +691,11 @@ class IterationRunner:
                     return_exceptions=True,
                 )
                 for i, res in zip(batch, gathered):
+                    if isinstance(res, asyncio.CancelledError):
+                        # Cancellation must not be masked as a tool result:
+                        # otherwise /stop cannot interrupt a concurrent batch,
+                        # while the single-call path above still propagates it.
+                        raise res
                     out[i] = res
         return out
 
@@ -1049,7 +1058,9 @@ class IterationRunner:
         if memory_manager and hasattr(memory_manager, "prefetch"):
             try:
                 session_id = self.session_key or ""
-                prefetch_ctx = memory_manager.prefetch(user_text, session_id=session_id)
+                prefetch_ctx = memory_manager.prefetch(
+                    user_text, session_id=session_id, is_group=self.is_group
+                )
                 if prefetch_ctx and prefetch_ctx.strip() and not _is_duplicate_block(prefetch_ctx):
                     context_parts.append(prefetch_ctx)
                     _remember_snippet(prefetch_ctx)
@@ -1067,6 +1078,7 @@ class IterationRunner:
                     session_key=self.session_key,
                     channel=self.channel,
                     include_curated=False,
+                    is_group=self.is_group,
                 )
                 if memory_ctx and memory_ctx.strip() and not _is_duplicate_block(memory_ctx):
                     context_parts.append(memory_ctx)
@@ -1235,6 +1247,13 @@ class IterationRunner:
     def _phase_active_memory_encoding(self, state: LoopState) -> None:
         encoder = getattr(self.loop, "memory_encoder", None)
         if encoder is None:
+            return
+        # Curated PROFILE.md / MEMORY.md are *private* long-term stores. Only
+        # promote detected preferences from trusted private sessions; group
+        # chats and other shared surfaces must never leak into them.
+        from markbot.utils.constants import is_main_memory_session
+
+        if not is_main_memory_session(self.channel, is_group=self.is_group):
             return
         try:
             matches = encoder.scan_messages(state.messages)
@@ -2484,7 +2503,9 @@ class IterationRunner:
             safe_args = args_str[:200].replace("{", "{{").replace("}", "}}")
             logger.info("Tool call: {}({})", tc.name, safe_args)
 
-        self.loop._set_tool_context(self.channel, self.chat_id, self.message_id)
+        self.loop._set_tool_context(
+            self.channel, self.chat_id, self.message_id, is_group=self.is_group
+        )
 
         invalid_tool_calls = self._detect_and_repair_hallucinated_tools(response)
         if invalid_tool_calls:
