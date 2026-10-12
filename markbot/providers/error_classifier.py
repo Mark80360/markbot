@@ -137,7 +137,8 @@ _PAYLOAD_TOO_LARGE_RE = re.compile(
 # Model not found patterns (body-level, overrides 5xx from aggregators).
 _MODEL_NOT_FOUND_RE = re.compile(
     r"is[\s_]?not[\s_]?a[\s_]?valid[\s_]?model|invalid[\s_]?model|"
-    r"model[\s_]?not[\s_]?found|model_not_found|does[\s_]?not[\s_]?exist|"
+    r"model[\s_]?not[\s_]?found|model[\s_]?is[\s_]?not[\s_]?found|model_not_found|"
+    r"does[\s_]?not[\s_]?exist|"
     r"no[\s_]?such[\s_]?model|unknown[\s_]?model|unsupported[\s_]?model|"
     r"no[\s_]?endpoints[\s_]?found",
     re.IGNORECASE,
@@ -150,7 +151,8 @@ _BILLING_RE = re.compile(
     r"payment[\s_]?required|billing[\s_]?hard[\s_]?limit|"
     r"exceeded[\s_]?your[\s_]?current[\s_]?quota|account[\s_]?is[\s_]?deactivated|"
     r"plan[\s_]?does[\s_]?not[\s_]?include|out[\s_]?of[\s_]?(?:extra[\s_]?usage|funds)|"
-    r"balance_depleted|not[\s_]?available[\s_]?on[\s_]?the[\s_]?free[\s_]?tier",
+    r"balance_depleted|not[\s_]?available[\s_]?on[\s_]?the[\s_]?free[\s_]?tier|"
+    r"quota[\s_]?exceed",
     re.IGNORECASE,
 )
 
@@ -167,7 +169,7 @@ _AUTH_RE = re.compile(
 _OVERLOADED_RE = re.compile(
     r"overloaded|temporarily[\s_]?overloaded|service[\s_]?is[\s_]?temporarily|"
     r"server[\s_]?is[\s_]?overloaded|service[\s_]?overloaded|"
-    r"at[\s_]?capacity|over[\s_]?capacity",
+    r"at[\s_]?capacity|over[\s_]?capacity|\bbusy\b",
     re.IGNORECASE,
 )
 
@@ -176,13 +178,15 @@ _RATE_LIMIT_RE = re.compile(
     r"rate[\s_]?limit|rate_limit|too[\s_]?many[\s_]?requests|throttl|"
     r"requests[\s_]?per[\s_]?(?:minute|day)|tokens[\s_]?per[\s_]?minute|"
     r"try[\s_]?again[\s_]?in|please[\s_]?retry[\s_]?after|resource_exhausted|"
-    r"too[\s_]?many[\s_]?concurrent",
+    r"too[\s_]?many[\s_]?concurrent|"
+    r"rpm[\s_]?exhaust|tpm[\s_]?/?rpm|(?:rpm|tpm)[\s_]?limit|"
+    r"exceeds[\s_]?(?:tpm|rpm|rpm[\s_]?/?[\s_]?tpm)",
     re.IGNORECASE,
 )
 
 # Content policy / safety filter (deterministic — don't retry unchanged).
 _CONTENT_POLICY_RE = re.compile(
-    r"content_filter|content[\s_]?policy|safety[\s_]?filter|"
+    r"content_filter|content[\s_]?filter|content[\s_]?policy|safety[\s_]?filter|"
     r"content[\s_]?management[\s_]?policy|triggered[\s_]?safety",
     re.IGNORECASE,
 )
@@ -253,6 +257,7 @@ def classify_api_error(
     """Classify an API error with recovery action hints.
 
     Resolution order (most-specific first):
+      0.  HTTP 429 (authoritative rate limit — transient, before body markers)
       1.  SSL certificate verification (deterministic — fail fast)
       2.  Context overflow (deterministic — should_compress)
       3.  Content policy / safety filter (deterministic — should_fallback)
@@ -295,6 +300,22 @@ def classify_api_error(
             should_strip_images=should_strip_images,
             backoff_seconds=backoff_seconds,
             backoff_strategy=backoff_strategy,
+        )
+
+    # 0. HTTP 429 is authoritative for rate limiting. A spent rpm/tpm or quota
+    # window is transient by nature and must NOT be re-labelled as a permanent
+    # billing failure just because the body carries ``quota_exceeded_error``.
+    # (Body markers still win over 5xx for non-429 statuses, where aggregators
+    # proxy permanent failures such as model_not_found / no available channel.)
+    if status_code == 429:
+        if _OVERLOADED_RE.search(msg):
+            return _result(
+                "overloaded", ErrorCategory.TRANSIENT,
+                backoff_seconds=3.0, backoff_strategy=BackoffStrategy.EXPONENTIAL,
+            )
+        return _result(
+            "rate_limit", ErrorCategory.TRANSIENT,
+            backoff_seconds=5.0, backoff_strategy=BackoffStrategy.JITTERED,
         )
 
     # 1. SSL certificate verification — deterministic, fail fast

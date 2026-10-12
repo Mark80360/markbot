@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 from markbot.bus.events import make_session_key
-
 from markbot.utils.constants import (
     DEFAULT_CONSOLIDATION_PROMOTE_ACCESS,
     MAX_COMPRESSED_SUMMARY_CHARS,
@@ -38,10 +37,35 @@ from markbot.utils.constants import (
 
 from .base import BaseMemoryManager
 from .daily_log import DailyLogManager, tokenize_for_search
-from .fencing import fence_context
+from .fencing import (
+    MEMORY_TRUST_DERIVED,
+    fence_context,
+)
 from .provider import MemoryProvider
 from .scanner import MemorySecurityScanner
 from .tool import MemoryStore
+
+#: Vector-store source prefix for records the security scanner rejected.
+#:
+#: The scanner used to guard only the 2200-character curated store, while
+#: the far larger vector index and the daily logs — both *retrieval* sources
+#: — accepted everything unscanned. A web page carrying an injection payload
+#: therefore survived: the assistant quoted it, ``sync_turn`` indexed it, and
+#: the next turn's prefetch handed it back to the model. Quarantined records
+#: are still written (a user's own transcript must not be silently
+#: destroyed) but are excluded from automatic recall and, when surfaced by
+#: an explicit search, are fenced as untrusted data.
+QUARANTINE_PREFIX = "quarantined/"
+
+
+def is_quarantined_source(source: str) -> bool:
+    """True when a vector-store record came from a scanner-rejected write.
+
+    Sources are persisted inconsistently (``vector/<source>`` in some paths,
+    bare ``<source>`` in others), so both spellings are checked.
+    """
+    s = (source or "").lower()
+    return s.startswith(QUARANTINE_PREFIX) or f"/{QUARANTINE_PREFIX}" in s
 
 if TYPE_CHECKING:
     pass
@@ -350,9 +374,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         gracefully to keyword-only when the vector layer can't start.
         """
         try:
+            from .consolidation import ConsolidationConfig, Consolidator
             from .embedder import build_embedder
             from .longterm import LongTermConfig, LongTermMemory
-            from .consolidation import ConsolidationConfig, Consolidator
             from .vectorstore_factory import build_vectorstore
 
             vs_config = {
@@ -578,6 +602,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                     if not content or content in seen_content:
                         continue
                     source = str(r.get("source", "")).lower()
+                    # Scanner-rejected content is never auto-injected. It is
+                    # still retrievable through an explicit memory_search,
+                    # which fences it as untrusted data.
+                    if is_quarantined_source(source):
+                        logger.debug("Prefetch skipped quarantined record: {}", source)
+                        continue
                     # On shared channels, skip curated/private memory sources
                     # in automatic injection. Explicit memory_search remains
                     # available for intentional recall.
@@ -627,7 +657,11 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         context = "## Prefetched Memory\n\n" + "\n".join(
             line for _, line in lines[:MAX_PREFETCH_RESULTS * 2]
         )
-        return fence_context(context, system_note=True)
+        # The prefetch corpus is conversation history and anything the agent
+        # read along the way — not curated facts. Label it accordingly so the
+        # model treats it as its own earlier recollection rather than as
+        # ground truth.
+        return fence_context(context, system_note=True, trust=MEMORY_TRUST_DERIVED)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.
@@ -646,6 +680,25 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         with self._vector_cache_lock:
             self._vector_cache.clear()
 
+    def _quarantine_reason(self, content: str) -> str | None:
+        """Return the scanner's rejection reason for *content*, or None.
+
+        The scanner is a blocklist, so it is not a security boundary on its
+        own (a determined attacker rephrases). Its value is catching the
+        common accidental case — a pasted article, a cloned README, a
+        quoted log line — and, more importantly, ensuring such text never
+        comes back as *trusted* memory. Failures are treated as "clean"
+        rather than quarantining every turn, because a scanner bug must not
+        silently destroy the user's history.
+        """
+        if not content:
+            return None
+        try:
+            return MemorySecurityScanner.scan(content)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Memory security scan failed, storing as-is: {}", exc)
+            return None
+
     def sync_turn(
         self,
         user_content: str,
@@ -658,6 +711,20 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         # turn's queries don't reuse this turn's (possibly different) results.
         with self._vector_cache_lock:
             self._vector_cache.clear()
+
+        # Scan before persisting. The daily log is itself a retrieval source
+        # (``daily_log.search``), so unscanned transcripts were a poisoning
+        # path even without the vector index.
+        user_flag = self._quarantine_reason(user_content)
+        assistant_flag = self._quarantine_reason(assistant_content)
+        if user_flag or assistant_flag:
+            logger.warning(
+                "Memory quarantine on turn {}: user={} assistant={}",
+                session_id or "?",
+                bool(user_flag),
+                bool(assistant_flag),
+            )
+
         if self._daily_log:
             channel, chat_id = self._parse_session_parts(session_id)
             self._daily_log.append_turn(
@@ -665,15 +732,25 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 assistant_content=assistant_content,
                 channel=channel,
                 chat_id=chat_id,
+                quarantined=bool(user_flag or assistant_flag),
             )
         # Index into long-term vector memory (fire-and-forget).
         if self._longterm is not None and (user_content or assistant_content):
             channel, chat_id = self._parse_session_parts(session_id)
             meta = {"channel": channel, "chat_id": chat_id} if channel else {}
             if user_content:
-                self._longterm.index_async(user_content, "turn/user", meta)
+                src = f"{QUARANTINE_PREFIX}turn/user" if user_flag else "turn/user"
+                if user_flag:
+                    meta = {**meta, "security_flag": user_flag}
+                self._longterm.index_async(user_content, src, meta)
             if assistant_content:
-                self._longterm.index_async(assistant_content, "turn/assistant", meta)
+                src = (
+                    f"{QUARANTINE_PREFIX}turn/assistant"
+                    if assistant_flag else "turn/assistant"
+                )
+                if assistant_flag:
+                    meta = {**meta, "security_flag": assistant_flag}
+                self._longterm.index_async(assistant_content, src, meta)
 
     def shutdown(self) -> None:
         """Clean up resources."""
@@ -1151,6 +1228,13 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             dedup_key=lambda r: (r.get("source", ""), r.get("content", "")),
         )
 
+        # Explicit search may still surface scanner-rejected content (the
+        # user asked for it), but it is labelled so neither the tool result
+        # nor the model treats it as trusted. Prefetch never reaches here.
+        for r in unique_results:
+            if is_quarantined_source(str(r.get("source", ""))):
+                r["quarantined"] = True
+
         return unique_results
 
     # -- Extra methods for tool compatibility --------------------------------
@@ -1164,6 +1248,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         channel: str | None = None,
         session_id: str | None = None,
         is_group: bool | None = None,
+        supersedes: str | None = None,
     ) -> bool:
         """Add a memory entry (for MemorySaveTool).
 
@@ -1174,6 +1259,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             channel: Optional channel for privacy gating.
             session_id: Optional session key used when channel is omitted.
             is_group: Whether the caller is a group/multi-party session.
+            supersedes: Text of an earlier entry this one replaces. Recorded
+                as a supersede edge so the retired fact stops being injected
+                and the agent can see that the value was corrected.
 
         Returns:
             True if successful.
@@ -1184,7 +1272,7 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             return False
         if target not in ("memory", "user"):
             target = "memory"
-        result = self._memory_store.add(target, content)
+        result = self._memory_store.add(target, content, supersedes=supersedes)
         return result.get("success", False)
 
     async def delete_memory(
@@ -1682,7 +1770,9 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if not parts:
             return ""
 
-        return fence_context("\n\n".join(parts), system_note=True)
+        return fence_context(
+            "\n\n".join(parts), system_note=True, trust=MEMORY_TRUST_DERIVED
+        )
 
     async def restart_embedding_model(self) -> None:
         """Restart the embedding model (no-op for file-based backend)."""

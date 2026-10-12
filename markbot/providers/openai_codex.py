@@ -35,6 +35,14 @@ class OpenAICodexProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
+        # Opt-in only. When False (the default) a certificate-verification
+        # failure aborts the request instead of retrying unverified, which
+        # would expose the whole conversation and the OAuth credential to a
+        # man-in-the-middle. Operators behind a TLS-inspecting proxy can turn
+        # this on knowingly.
+        self.insecure_skip_verify = bool(
+            getattr(spec, "insecure_skip_verify", False)
+        )
 
     async def _call_codex(
         self,
@@ -78,7 +86,33 @@ class OpenAICodexProvider(LLMProvider):
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
-                logger.warning("SSL verification failed for Codex API; retrying with verify=False")
+                # Never silently downgrade to an unverified connection. Doing
+                # so accepted any MITM certificate without telling anyone,
+                # and this request carries the full conversation plus the
+                # OAuth credential. An operator with a genuine problem (a
+                # corporate TLS-inspecting proxy) can opt in explicitly.
+                if not self.insecure_skip_verify:
+                    logger.error(
+                        "TLS verification failed for the Codex API. Refusing to "
+                        "retry without verification. If you are behind a TLS-"
+                        "inspecting proxy, set providers.codex."
+                        "insecureSkipVerify=true (this removes MITM protection)."
+                    )
+                    return LLMResponse(
+                        content=(
+                            f"Error: TLS certificate verification failed for the "
+                            f"Codex API ({e}). Refusing to retry without "
+                            "verification because that would expose the "
+                            "conversation and credentials to interception."
+                        ),
+                        finish_reason="error",
+                        error_type=classify_to_error_type(None, repr(e)),
+                    )
+                logger.warning(
+                    "TLS verification failed for the Codex API; retrying with "
+                    "verify=False because insecureSkipVerify is enabled. "
+                    "This connection is not protected against MITM."
+                )
                 content, tool_calls, finish_reason, usage = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=False,
                     on_content_delta=on_content_delta,
@@ -240,7 +274,25 @@ def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
-    raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
+    """A cache key that is stable across turns of the same conversation.
+
+    The key identifies a cache *route*, not a payload. Hashing the whole
+    message array meant the key changed on every turn as the conversation
+    grew, so the prefix cache could never hit — the opposite of the point of
+    sending one.
+
+    What is stable is the conversation's opening: the system prompt plus the
+    first user turn. That is the span the provider actually caches, and it
+    does not change as later turns are appended. Hashing that prefix gives a
+    key that persists for the life of the session while still separating
+    distinct conversations.
+    """
+    prefix: list[dict[str, Any]] = []
+    for msg in messages:
+        prefix.append(msg)
+        if msg.get("role") == "user":
+            break  # system + first user turn
+    raw = json.dumps(prefix, ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

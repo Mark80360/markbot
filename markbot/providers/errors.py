@@ -33,81 +33,29 @@ class ErrorType(str, Enum):
     """The error did not match any known pattern. Treated as non-retryable."""
 
 
-_STATUS_TO_ERROR_TYPE: dict[int, ErrorType] = {
-    401: ErrorType.UNAVAILABLE,
-    402: ErrorType.UNAVAILABLE,
-    403: ErrorType.UNAVAILABLE,
-    404: ErrorType.UNAVAILABLE,
-    408: ErrorType.TRANSIENT,
-    429: ErrorType.TRANSIENT,
-    500: ErrorType.TRANSIENT,
-    502: ErrorType.TRANSIENT,
-    503: ErrorType.TRANSIENT,
-    504: ErrorType.TRANSIENT,
-    529: ErrorType.TRANSIENT,
-}
-
-# Body-level markers that indicate a PERMANENT failure. These take
-# precedence over status code because aggregators (new_api / one-api
-# style distributors) often return 5xx with a body that reveals the
-# true failure is permanent — e.g. ``model_not_found`` or
-# ``no available channel`` on a 503. Treating such responses as
-# TRANSIENT (based on the 5xx status alone) causes the fallback chain
-# to retry each dead model 3 times, wasting ~10s per model.
-_UNAVAILABLE_BODY_MARKERS: tuple[str, ...] = (
-    "unauthorized", "invalid api key", "authentication",
-    "insufficient balance", "insufficient_quota", "quota exceeded",
-    "forbidden", "access denied",
-    "model not found", "model_not_found",
-    "no available channel",
-    "invalid function arguments", "invalid params",
-)
-
-_CONTENT_BODY_MARKERS: tuple[str, ...] = (
-    "content_filter", "content filter",
-)
-
-_TRANSIENT_BODY_MARKERS: tuple[str, ...] = (
-    "rate limit", "rate_limit", "too many requests", "throttle",
-    "timeout", "timed out", "connection",
-    "server error", "internal server error",
-    "service unavailable", "overloaded", "capacity", "busy",
-    "temporarily unavailable", "try again",
-)
-
-
 def classify_error(status_code: int | None, message: str) -> ErrorType:
     """Classify an LLM error into a structured ``ErrorType``.
 
-    Resolution order (most-specific first):
+    Thin adapter over :func:`markbot.providers.error_classifier.classify_api_error`
+    so error semantics have a single source of truth (the shared pattern
+    tables live in ``error_classifier``). The one intentional difference is
+    the fallback policy for unmatched errors: here an unrecognised error maps
+    to ``UNKNOWN`` (non-retryable), while the richer classifier defaults it to
+    TRANSIENT (retryable) as the safer choice for the retry loop.
 
-    1. **Permanent body markers** (``model_not_found``, ``unauthorized``,
-       ``quota exceeded`` …). Body semantics win over status code because
-       aggregators often proxy permanent failures through 5xx responses.
-    2. **Content-filter body markers**.
-    3. **HTTP status code** — authoritative for transient network/server
-       failures when the body has no permanent marker.
-    4. **Transient body markers** (``timeout``, ``rate limit`` …) — only
-       consulted when there is no status code (e.g. connection-level
-       exceptions raised before an HTTP response).
-    5. ``ErrorType.UNKNOWN``.
+    ``status_code`` is authoritative when present; otherwise the message body
+    is matched against the shared patterns.
     """
-    msg_lower = (message or "").lower()
+    # Imported lazily: error_classifier imports ErrorType from this module, so
+    # a module-level import would create an import cycle.
+    from markbot.providers.error_classifier import classify_api_error
 
-    for marker in _UNAVAILABLE_BODY_MARKERS:
-        if marker in msg_lower:
-            return ErrorType.UNAVAILABLE
-    for marker in _CONTENT_BODY_MARKERS:
-        if marker in msg_lower:
-            return ErrorType.CONTENT
-
-    if status_code is not None and status_code in _STATUS_TO_ERROR_TYPE:
-        return _STATUS_TO_ERROR_TYPE[status_code]
-
-    for marker in _TRANSIENT_BODY_MARKERS:
-        if marker in msg_lower:
-            return ErrorType.TRANSIENT
-    return ErrorType.UNKNOWN
+    classified = classify_api_error(status_code, message)
+    if classified.reason == "unknown":
+        return ErrorType.UNKNOWN
+    if classified.reason == "content_policy":
+        return ErrorType.CONTENT
+    return ErrorType.TRANSIENT if classified.retryable else ErrorType.UNAVAILABLE
 
 
 __all__ = ["ErrorType", "classify_error"]

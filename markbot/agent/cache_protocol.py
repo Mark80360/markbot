@@ -180,6 +180,25 @@ class UsageNormaliser:
     cache_creation_key: Optional[str] = None
     cache_miss_key: Optional[str] = None
 
+    #: Set on normalisers whose provider reports the cache buckets nested
+    #: under ``usage.prompt_tokens_details`` (OpenAI and Azure do; they send
+    #: no top-level ``*_cache_*`` key at all, so without this the cache read
+    #: was never discovered and every cached call billed at the full input
+    #: price).
+    read_nested_cache: bool = False
+
+    #: Whether the provider's ``input_tokens`` / ``prompt_tokens`` figure is
+    #: the *total* prompt size (i.e. it already contains the cache buckets),
+    #: as opposed to counting only the uncached portion.
+    #:
+    #: - OpenAI / DeepSeek / Codex: True. ``prompt_tokens`` is the total, so
+    #:   the miss bucket is ``input - read - creation``.
+    #: - Anthropic: False. ``input_tokens`` already counts only the
+    #:   uncached input; the cache buckets are reported *alongside* it. The
+    #:   miss bucket is therefore ``input_tokens`` itself. Subtracting the
+    #:   cache buckets here would under-bill every cached Anthropic call.
+    input_includes_cache: bool = False
+
     def normalise(self, usage: dict[str, Any] | None) -> CanonicalUsage:
         if not usage:
             return CanonicalUsage()
@@ -187,18 +206,29 @@ class UsageNormaliser:
         cache_creation = self._pick(usage, self.cache_creation_key) if self.cache_creation_key else None
         cache_miss = self._pick(usage, self.cache_miss_key) if self.cache_miss_key else None
         input_tokens = self._pick(usage, "input_tokens", "prompt_tokens")
-        # Synthesise the miss bucket when the provider only reports
-        # cache_read + cache_creation (e.g. Anthropic) or just
-        # ``cached_input_tokens`` (e.g. Codex Responses).  We treat
-        # the residual ``input - read - creation`` as the miss.
+        if cache_read is None and self.read_nested_cache:
+            cache_read = self._nested_pick(usage, "prompt_tokens_details", "cached_tokens")
+        if cache_creation is None and self.read_nested_cache:
+            cache_creation = self._nested_pick(
+                usage, "prompt_tokens_details", "cache_creation_tokens"
+            )
+        # Synthesise the miss bucket for providers that don't report one
+        # directly. The arithmetic depends on whether the provider's input
+        # figure is inclusive of the cache buckets (see
+        # ``input_includes_cache``):
+        #   inclusive  -> miss = input - read - creation  (OpenAI, Codex)
+        #   exclusive  -> miss = input                    (Anthropic)
         if cache_miss is None and input_tokens is not None:
-            residual = input_tokens
-            if cache_read is not None:
-                residual -= cache_read
-            if cache_creation is not None:
-                residual -= cache_creation
-            if residual > 0:
-                cache_miss = residual
+            if self.input_includes_cache:
+                residual = input_tokens
+                if cache_read is not None:
+                    residual -= cache_read
+                if cache_creation is not None:
+                    residual -= cache_creation
+                if residual > 0:
+                    cache_miss = residual
+            else:
+                cache_miss = input_tokens
         return CanonicalUsage(
             input_tokens=input_tokens,
             output_tokens=self._pick(usage, "output_tokens", "completion_tokens"),
@@ -223,6 +253,23 @@ class UsageNormaliser:
                 except (TypeError, ValueError):
                     continue
         return None
+
+    @staticmethod
+    def _nested_pick(d: dict[str, Any], *path: str) -> Optional[int]:
+        """Read an int from a nested mapping, e.g.
+        ``("prompt_tokens_details", "cached_tokens")``. Returns ``None`` at
+        the first missing level."""
+        cur: Any = d
+        for part in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+            if cur is None:
+                return None
+        try:
+            return int(cur)
+        except (TypeError, ValueError):
+            return None
 
 
 # ---------------------------------------------------------------------------

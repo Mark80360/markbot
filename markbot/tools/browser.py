@@ -16,6 +16,7 @@ import time
 from typing import Any, Optional
 
 from markbot.tools.base import Tool
+from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -576,9 +577,21 @@ class BrowserVisionTool(Tool):
 
 
 class BrowserConsoleTool(Tool):
-    """Get browser console output or evaluate JavaScript."""
+    """Get browser console output or evaluate JavaScript.
 
-    _is_read_only = True
+    Reading the console buffer is genuinely read-only. Supplying an
+    ``expression`` is not: ``page.evaluate()`` runs arbitrary JavaScript in
+    the page, which can read ``document.cookie`` / ``localStorage``, exfiltrate
+    the DOM to an attacker's host, or drive the page. The tool therefore
+    declares itself *not* read-only and gates the mutating half on an explicit
+    permission check, so a prompt-injected page cannot make the agent run JS
+    with no confirmation — including in PLAN mode, where
+    ``check_permission`` is consulted before the read-only shortcut.
+    """
+
+    # Deliberately False. See the class docstring: `expression` executes
+    # arbitrary JavaScript, which is not a read-only operation.
+    _is_read_only = False
 
     @property
     def name(self) -> str:
@@ -617,12 +630,34 @@ class BrowserConsoleTool(Tool):
             },
         }
 
+    async def check_permission(self, params: dict, context) -> PermissionDecision:
+        """Confirm only the JavaScript-evaluation half.
+
+        Reading the console buffer is a genuine read and stays
+        auto-approved; ``expression`` executes caller-supplied JS in the
+        page, which is not. Splitting here keeps the common debugging case
+        frictionless while closing the injection path.
+        """
+        if not (params or {}).get("expression"):
+            return PermissionDecision(
+                behavior="allow", reason="reading the console buffer is read-only"
+            )
+        return await super().check_permission(params, context)
+
     async def _legacy_execute(self, clear: bool = False, expression: str = "", **kwargs: Any) -> Any:
         context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
             if expression:
+                # Defence in depth: `check_permission` is the gate, but a
+                # future caller that bypasses the pipeline should not get
+                # arbitrary JS execution for free either.
+                verdict = await self.check_permission(
+                    {"expression": expression}, context
+                )
+                if verdict.behavior == "deny":
+                    return f"Error: {verdict.reason or 'expression evaluation denied'}"
                 result = await page.evaluate(expression)
                 if isinstance(result, (dict, list)):
                     import json

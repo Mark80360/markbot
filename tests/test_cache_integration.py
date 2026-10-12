@@ -85,7 +85,8 @@ class TestIterationNormaliserDispatch(unittest.TestCase):
         })
         self.assertEqual(u.cache_read_tokens, 60)
         self.assertEqual(u.cache_creation_tokens, 20)
-        self.assertEqual(u.cache_miss_tokens, 20)
+        # Anthropic's input_tokens is already the uncached figure.
+        self.assertEqual(u.cache_miss_tokens, 100)
 
     def test_openai_compat_dispatch(self) -> None:
         u = normalise_usage("deepseek", {

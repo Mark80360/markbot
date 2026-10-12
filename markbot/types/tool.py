@@ -130,6 +130,12 @@ class ToolContext:
     channel: str = ""
     chat_id: str = ""
     message_id: str | None = None
+    #: Whether this call came from a multi-party chat. Part of the per-call
+    #: context because it gates curated-memory access: a tool that read
+    #: group-ness from shared instance state could let a group chat read a
+    #: private user's MEMORY.md, or block a private session because a group
+    #: turn had run most recently.
+    is_group: bool | None = None
 
     report_progress: Optional[Callable[[str, Optional[float]], None]] = None
     add_notification: Optional[Callable[[str, str], None]] = None

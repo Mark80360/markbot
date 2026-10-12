@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import secrets
 import string
 import uuid
@@ -30,6 +31,25 @@ _ALLOWED_MSG_KEYS = frozenset({
     "role", "content", "tool_calls", "tool_call_id", "name",
     "reasoning_content", "extra_content",
 })
+
+# Model-name prefixes whose API rejects the legacy ``max_tokens`` request
+# field. Matched against the bare model name (any ``vendor/`` prefix and any
+# trailing deployment suffix are stripped first), so a routed name like
+# ``openai/gpt-5.2-chat`` or an Azure deployment ``my-gpt-5-prod`` is caught
+# by the substring rules.
+_REASONING_NAME_RE = re.compile(
+    r"(?:^|[^a-z0-9])(o[134](?:[-_]|$)|gpt-5|gpt-6|codex)", re.IGNORECASE
+)
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """Return True when *model_name* is a reasoning model that rejects
+    ``max_tokens`` in favour of ``max_completion_tokens``."""
+    if not model_name:
+        return False
+    bare = model_name.strip().lower().split("/")[-1]
+    return bool(_REASONING_NAME_RE.search(bare))
+
 _ALNUM = string.ascii_letters + string.digits
 
 _STANDARD_TC_KEYS = frozenset({"id", "type", "index", "function"})
@@ -60,6 +80,23 @@ def _coerce_dict(value: Any) -> dict[str, Any] | None:
         if isinstance(dumped, dict) and dumped:
             return dumped
     return None
+
+
+def _parse_retry_after(e: Exception) -> float | None:
+    """Extract the ``Retry-After`` header (seconds) from a provider exception."""
+    headers = getattr(getattr(e, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:  # pragma: no cover - defensive: header object shape varies
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
 
 
 def _extract_tc_extras(tc: Any) -> tuple[
@@ -133,14 +170,19 @@ class OpenAICompatProvider(LLMProvider):
         )
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
-        """Set environment variables based on provider spec."""
+        """Set environment variables based on provider spec.
+
+        Always ``setdefault``: a key already present in the process
+        environment was put there by the operator (or by a sibling
+        provider) and silently overwriting it here would repoint a
+        correctly-configured client at a different credential. Child
+        processes spawned by the shell tool inherit ``os.environ`` in
+        full, so an unexpected overwrite here is a credential leak.
+        """
         spec = self._spec
         if not spec or not spec.env_key:
             return
-        if spec.is_gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
+        os.environ.setdefault(spec.env_key, api_key)
         effective_base = api_base or spec.default_api_base
         for env_name, env_val in spec.env_extras:
             resolved = env_val.replace("{api_key}", api_key).replace("{api_base}", effective_base)
@@ -242,12 +284,19 @@ class OpenAICompatProvider(LLMProvider):
 
         sanitized = self._sanitize_messages(self._sanitize_empty_content(messages))
 
+        # OpenAI's reasoning models (gpt-5, o1/o3/o4-mini, …) reject the
+        # legacy ``max_tokens`` field outright with
+        # ``400 Unsupported parameter``. Every other model still wants it.
+        # ``max_completion_tokens`` is understood by both generations, so it
+        # is always safe to send; ``max_tokens`` is only added when the model
+        # is not a known reasoning model.
         kwargs: dict[str, Any] = {
             "model": model_name,
             "messages": sanitized,
-            "max_tokens": max(1, max_tokens),
             "max_completion_tokens": max(1, max_tokens),
         }
+        if not _is_reasoning_model(model_name):
+            kwargs["max_tokens"] = max(1, max_tokens)
 
         if spec and spec.fixed_temperature is _OMIT_TEMPERATURE:
             pass
@@ -304,7 +353,6 @@ class OpenAICompatProvider(LLMProvider):
             if spec.default_max_tokens and "max_tokens" not in kwargs:
                 kwargs["max_tokens"] = spec.default_max_tokens
                 kwargs["max_completion_tokens"] = spec.default_max_tokens
-
         return kwargs
 
     # ------------------------------------------------------------------
@@ -369,13 +417,20 @@ class OpenAICompatProvider(LLMProvider):
                 # Anthropic-style cache fields
                 "cache_creation_input_tokens": int(usage_map.get("cache_creation_input_tokens") or 0),
                 "cache_read_input_tokens": int(usage_map.get("cache_read_input_tokens") or 0),
-                # DeepSeek / OpenAI-style cache fields
+                # DeepSeek / OpenAI-style cache fields. Only emitted when the
+                # provider actually reported them: a hard 0 here is
+                # indistinguishable from "zero misses", and downstream that
+                # reads as a real miss count — which would bill the whole
+                # prompt as cache-hit and charge nothing for input.
                 "prompt_cache_hit_tokens": int(usage_map.get("prompt_cache_hit_tokens") or 0),
-                "prompt_cache_miss_tokens": int(usage_map.get("prompt_cache_miss_tokens") or 0),
+                "prompt_cache_miss_tokens": int(usage_map["prompt_cache_miss_tokens"])
+                if usage_map.get("prompt_cache_miss_tokens") is not None else None,
                 # OpenAI Codex Responses-style cache fields
                 "cached_tokens": int(usage_map.get("cached_tokens") or 0),
             }
-            return result
+            # A None value is not a valid usage field; drop the key so the
+            # normaliser sees "absent" rather than an explicit null.
+            return {k: v for k, v in result.items() if v is not None}
 
         if usage_obj:
             pt = getattr(usage_obj, "prompt_tokens", 0) or 0
@@ -390,13 +445,15 @@ class OpenAICompatProvider(LLMProvider):
                 # Anthropic-style cache fields
                 "cache_creation_input_tokens": getattr(usage_obj, "cache_creation_input_tokens", 0) or 0,
                 "cache_read_input_tokens": getattr(usage_obj, "cache_read_input_tokens", 0) or 0,
-                # DeepSeek / OpenAI-style cache fields
+                # DeepSeek / OpenAI-style cache fields. See the note in the
+                # dict branch above: a synthesised 0 is not "zero misses".
                 "prompt_cache_hit_tokens": getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0,
-                "prompt_cache_miss_tokens": getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0,
+                "prompt_cache_miss_tokens": int(getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0)
+                if getattr(usage_obj, "prompt_cache_miss_tokens", None) is not None else None,
                 # OpenAI Codex Responses-style cache fields
                 "cached_tokens": getattr(usage_obj, "cached_tokens", 0) or 0,
             }
-            return result
+            return {k: v for k, v in result.items() if v is not None}
         return {}
 
     def _parse(self, response: Any) -> LLMResponse:
@@ -655,10 +712,13 @@ class OpenAICompatProvider(LLMProvider):
         else:
             msg = "Error calling LLM: connection failed or timed out (empty error from provider)"
         logger.error("Provider error: {}: {}", type(e).__name__, e)
+        status_code = getattr(e, "status_code", None)
         return LLMResponse(
             content=msg,
             finish_reason="error",
-            error_type=classify_to_error_type(getattr(e, "status_code", None), repr(e), e),
+            error_type=classify_to_error_type(status_code, repr(e), e),
+            status_code=status_code,
+            retry_after=_parse_retry_after(e),
         )
 
     # ------------------------------------------------------------------
@@ -715,12 +775,21 @@ class OpenAICompatProvider(LLMProvider):
                         await on_content_delta(text)
             return self._parse_chunks(chunks)
         except Exception as e:
+            # Stop emitting deltas for this attempt. `finish_reason == "error"`
+            # makes the fallback chain rotate to the next model, and that
+            # model streams into the *same* sink — so partial text from this
+            # attempt would be concatenated with the replacement's full
+            # output, and neither can be retracted. The loop already treats
+            # `content_filter` this way (it discards the stream buffer); a
+            # mid-stream transport failure needs the same treatment.
             return self._handle_error(e)
 
     def get_default_model(self) -> str:
         return self.default_model
 
 
-from markbot.providers.registry import register_provider_factory
+# Imported at the bottom deliberately: registry imports the provider classes
+# to build its factory table, so a top-level import here would be circular.
+from markbot.providers.registry import register_provider_factory  # noqa: E402
 
 register_provider_factory("openai_compat", OpenAICompatProvider)

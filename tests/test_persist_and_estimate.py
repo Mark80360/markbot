@@ -28,29 +28,38 @@ SYSTEM = "You are a helpful assistant."
 
 
 class TestTokenEstimateCache(unittest.TestCase):
+    """The cache is content-addressed and session-scoped.
+
+    It used to be keyed on ``messages_revision``, a counter the loop bumped
+    unconditionally at the top of every iteration and then immediately
+    queried — so the hot path missed ~100% of the time. Worse, the key held
+    no session identity while one instance was shared by all concurrent
+    sessions, so two users with identical system prompts could be served
+    each other's estimate. That number gates the compaction threshold.
+    """
+
     def test_first_call_misses_then_hits(self) -> None:
         cache = TokenEstimateCache()
+        msgs = [{"role": "user", "content": "hello"}]
         n1 = cache.lookup_or_compute(
-            messages_revision=1,
-            system_prompt=SYSTEM,
-            messages=[{"role": "user", "content": "hello"}],
+            system_prompt=SYSTEM, messages=msgs, session_key="s1",
         )
         n2 = cache.lookup_or_compute(
-            messages_revision=1,
-            system_prompt=SYSTEM,
-            messages=[{"role": "user", "content": "hello"}],
+            system_prompt=SYSTEM, messages=msgs, session_key="s1",
         )
         self.assertEqual(n1, n2)
         self.assertEqual(cache.misses, 1)
         self.assertGreaterEqual(cache.hits, 1)
 
-    def test_revision_change_recomputes(self) -> None:
+    def test_message_growth_recomputes(self) -> None:
         cache = TokenEstimateCache()
+        msgs: list = []
         cache.lookup_or_compute(
-            messages_revision=1, system_prompt=SYSTEM, messages=[]
+            system_prompt=SYSTEM, messages=msgs, session_key="s1"
         )
+        msgs.append({"role": "user", "content": "hello"})
         cache.lookup_or_compute(
-            messages_revision=2, system_prompt=SYSTEM, messages=[]
+            system_prompt=SYSTEM, messages=msgs, session_key="s1"
         )
         self.assertEqual(cache.misses, 2)
         self.assertEqual(cache.hits, 0)
@@ -58,12 +67,38 @@ class TestTokenEstimateCache(unittest.TestCase):
     def test_system_fingerprint_change(self) -> None:
         cache = TokenEstimateCache()
         cache.lookup_or_compute(
-            messages_revision=1, system_prompt="A", messages=[]
+            system_prompt="A", messages=[], session_key="s1"
         )
         cache.lookup_or_compute(
-            messages_revision=1, system_prompt="B", messages=[]
+            system_prompt="B", messages=[], session_key="s1"
         )
         self.assertEqual(cache.misses, 2)
+
+    def test_same_content_different_sessions_isolated(self) -> None:
+        cache = TokenEstimateCache()
+        msgs = [{"role": "user", "content": "shared"}]
+        cache.lookup_or_compute(
+            system_prompt=SYSTEM, messages=msgs, session_key="alice"
+        )
+        cache.lookup_or_compute(
+            system_prompt=SYSTEM, messages=msgs, session_key="bob"
+        )
+        self.assertEqual(cache.misses, 2)
+        self.assertEqual(cache.hits, 0)
+
+    def test_legacy_bump_invalidates(self) -> None:
+        cache = TokenEstimateCache()
+        msgs = [{"role": "user", "content": "hello"}]
+        cache.lookup_or_compute(
+            system_prompt=SYSTEM, messages=msgs, session_key="s1"
+        )
+        cache.bump_messages_revision(2)
+        cache.lookup_or_compute(
+            system_prompt=SYSTEM, messages=msgs, session_key="s1"
+        )
+        # The content did not change, so the LRU entry still serves it.
+        self.assertEqual(cache.misses, 1)
+        self.assertEqual(cache.hits, 1)
 
 
 class TestPromptPersist(unittest.TestCase):

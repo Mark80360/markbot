@@ -169,6 +169,81 @@ def validate_resolved_url(url: str, allow_private: bool = False) -> tuple[bool, 
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 
+class SSRFRedirectError(Exception):
+    """Raised when a request or one of its redirect hops is blocked."""
+
+
+def ssrf_guard_transport(allow_private: bool = False, proxy: str | None = None):
+    """Build an ``httpx`` transport that validates every hop *before* sending.
+
+    Post-response validation is not enough: by the time
+    ``validate_resolved_url`` runs on ``response.url``, the request has
+    already been delivered to whatever the redirect pointed at. Against
+    ``169.254.169.254`` that means the cloud metadata service has already
+    answered, and the TCP connection to an internal host has already been
+    made.
+
+    Hooking ``handle_request`` means each hop — the original URL and every
+    redirect target — is checked before a socket is opened, so a hostile
+    redirect chain cannot reach the internal network at all.
+
+    *proxy* is accepted here rather than mounted beside the guard, because
+    httpx keys ``mounts`` by URL pattern: two entries registered for
+    ``all://`` collide and the second silently replaces the first, which
+    would disable the guard on any proxy-configured deployment.
+    """
+    import httpx
+
+    class _GuardedTransport(httpx.AsyncHTTPTransport):
+        """Validates every hop, then delegates to a (possibly proxied)
+        transport.
+
+        The proxy is held here rather than mounted alongside, because httpx
+        keys ``mounts`` by URL pattern: registering the guard and the proxy
+        under ``all://`` would collide and the second entry would silently
+        replace the first, disabling the guard entirely on any deployment
+        that configures a proxy.
+        """
+
+        def __init__(self, *args, proxy: str | None = None, **kw) -> None:
+            self._allow_private = allow_private
+            if proxy:
+                kw["proxy"] = proxy
+            super().__init__(*args, **kw)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            ok, err = validate_resolved_url(
+                str(request.url), allow_private=self._allow_private
+            )
+            if not ok:
+                raise SSRFRedirectError(err)
+            return await super().handle_async_request(request)
+
+    return _GuardedTransport(proxy=proxy)
+
+
+def guarded_client(**kwargs) -> "httpx.AsyncClient":
+    """An ``AsyncClient`` that refuses to connect to a blocked host.
+
+    Combines the guard transport with ``follow_redirects=True`` so every
+    hop is intercepted. A configured proxy is passed *into* the guard
+    transport rather than mounted beside it, so the check runs whether or
+    not a proxy is set.
+
+    Returns the client; the caller owns its lifecycle.
+    """
+    import httpx
+
+    allow_private = bool(kwargs.pop("allow_private", False))
+    proxy = kwargs.pop("proxy", None)
+    transport = ssrf_guard_transport(allow_private=allow_private, proxy=proxy)
+    return httpx.AsyncClient(
+        transport=transport,
+        follow_redirects=True,
+        **kwargs,
+    )
+
+
 def contains_internal_url(
     command: str,
     allowed_ips: list[str] | None = None,

@@ -982,7 +982,13 @@ class MultiLevelCompactor:
             task_section = f"\n\n{task_context}\n\n"
 
         compact_msg = {
-            "role": "system",
+            # A ``user`` message, not ``system``. Compaction replaces the
+            # whole list so the prefix cache is gone either way, but a
+            # mid-conversation ``role: system`` message still contradicts the
+            # invariant the agent loop documents: Anthropic hoists these into
+            # a separate system list, and the OpenAI-compat sanitisers drop
+            # them, so the notice would silently vanish on some backends.
+            "role": "user",
             "content": (
                 "This session is being continued from a previous conversation "
                 "that ran out of context. The summary below covers the earlier portion.\n\n"
@@ -1040,7 +1046,7 @@ class MultiLevelCompactor:
         if task_context:
             task_section = f"\n\n{task_context}"
         snip_notice = {
-            "role": "system",
+            "role": "user",
             "content": (
                 f"[{len(messages) - keep} earlier messages were removed by context snip "
                 f"to fit within the context window.]{task_section}"

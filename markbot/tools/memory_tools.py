@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from markbot.tools.base import Tool
+from markbot.tools.context_explorer import _per_call_session
 
 if TYPE_CHECKING:
     from markbot.memory.base import BaseMemoryManager
@@ -70,13 +71,24 @@ class MemorySaveTool(Tool):
                         "'user' for user profile. Default: 'memory'."
                     ),
                 },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional tags for categorisation (e.g. ['user-preference', 'project-decision'])",
-                },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for categorisation (e.g. ['user-preference', 'project-decision'])",
             },
-            "required": ["content"],
+            "supersedes": {
+                "type": "string",
+                "description": (
+                    "Exact text of an existing memory entry that this one "
+                    "REPLACES. Use when the user corrects a fact (e.g. they "
+                    "used to live in Berlin and now live in Paris). The old "
+                    "entry is retired and the correction is recorded, so the "
+                    "agent stops acting on the stale value. Do not use this "
+                    "for merely related or complementary facts."
+                ),
+            },
+        },
+        "required": ["content"],
         }
 
     async def _legacy_execute(
@@ -84,6 +96,7 @@ class MemorySaveTool(Tool):
         content: str = "",
         target: str = "memory",
         tags: list[str] | None = None,
+        supersedes: str | None = None,
         **kwargs: Any,
     ) -> str:
         if not content:
@@ -92,11 +105,15 @@ class MemorySaveTool(Tool):
             return "Error: Memory manager is not available."
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
+        # Per-call routing. The instance fields are a fallback for callers
+        # that do not build a ToolContext; reading them unconditionally let a
+        # concurrent session's context decide *this* call's privacy gate.
+        eff_channel, eff_chat_id, eff_group = _per_call_session(self, kwargs)
         try:
-            session_id = f"{self._channel}:{self._chat_id}" if self._channel and self._chat_id else None
+            session_id = f"{eff_channel}:{eff_chat_id}" if eff_channel and eff_chat_id else None
             if hasattr(self._memory_manager, "allow_curated_memory"):
                 if not self._memory_manager.allow_curated_memory(
-                    self._channel, session_id=session_id, is_group=self._is_group
+                    eff_channel, session_id=session_id, is_group=eff_group
                 ):
                     return (
                         "Curated MEMORY.md / PROFILE.md edits are only available in "
@@ -107,9 +124,10 @@ class MemorySaveTool(Tool):
                 content=content,
                 tags=tags or [],
                 target=target,
-                channel=self._channel,
+                channel=eff_channel,
                 session_id=session_id,
-                is_group=self._is_group,
+                is_group=eff_group,
+                supersedes=supersedes,
             )
             if not result:
                 return (
@@ -186,9 +204,12 @@ class MemoryForgetTool(Tool):
             return "Error: Memory manager is not available."
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
+        # Per-call routing; see MemorySaveTool for why the instance fields
+        # are only a fallback.
+        eff_channel, _eff_chat_id, eff_group = _per_call_session(self, kwargs)
         try:
             from markbot.utils.constants import is_main_memory_session
-            if not is_main_memory_session(self._channel, is_group=self._is_group):
+            if not is_main_memory_session(eff_channel, is_group=eff_group):
                 return (
                     "Curated MEMORY.md / PROFILE.md edits are only available in "
                     "main/private sessions (cli/web/api/local)."
@@ -196,8 +217,8 @@ class MemoryForgetTool(Tool):
             result = await self._memory_manager.delete_memory(
                 memory_id=memory_id,
                 target=target,
-                channel=self._channel,
-                is_group=self._is_group,
+                channel=eff_channel,
+                is_group=eff_group,
             )
             if not result:
                 return f"No entry containing '{memory_id[:40]}' found in {target}."
@@ -265,9 +286,12 @@ class MemoryListTool(Tool):
             return "Error: Memory manager is not available."
         if target not in ("memory", "user"):
             return "Error: target must be 'memory' or 'user'."
+        # Per-call routing; see MemorySaveTool for why the instance fields
+        # are only a fallback.
+        eff_channel, _eff_chat_id, eff_group = _per_call_session(self, kwargs)
         try:
             from markbot.utils.constants import is_main_memory_session
-            if not is_main_memory_session(self._channel, is_group=self._is_group):
+            if not is_main_memory_session(eff_channel, is_group=eff_group):
                 return (
                     "Curated MEMORY.md / PROFILE.md listing is only available in "
                     "main/private sessions. Use memory_search for this conversation's "
@@ -276,8 +300,8 @@ class MemoryListTool(Tool):
             memories = await self._memory_manager.list_memories(
                 limit=limit,
                 target=target,
-                channel=self._channel,
-                is_group=self._is_group,
+                channel=eff_channel,
+                is_group=eff_group,
             )
             if not memories:
                 return f"No {target} entries found."

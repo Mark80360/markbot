@@ -151,6 +151,13 @@ class ProviderSpec:
     # default headers sent with every request
     default_headers: tuple[tuple[str, str], ...] = ()
 
+    #: Allow this provider to fall back to an unverified TLS connection when
+    #: certificate verification fails. Off by default and only consulted by
+    #: providers that document the downgrade (OpenAI Codex). Enabling it
+    #: removes MITM protection for a channel that carries the full
+    #: conversation and credentials.
+    insecure_skip_verify: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()

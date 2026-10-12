@@ -369,7 +369,10 @@ class WebFetchTool(Tool):
 
         # Detect and fetch images directly to avoid Jina's textual image captioning
         try:
-            async with httpx.AsyncClient(proxy=self.proxy, follow_redirects=True, max_redirects=MAX_REDIRECTS, timeout=15.0) as client:
+            from markbot.utils.ssrf import guarded_client
+            async with guarded_client(
+                proxy=self.proxy, max_redirects=MAX_REDIRECTS, timeout=15.0
+            ) as client:
                 async with client.stream("GET", url, headers={"User-Agent": USER_AGENT}) as r:
                     from markbot.utils.ssrf import validate_resolved_url
 
@@ -399,7 +402,10 @@ class WebFetchTool(Tool):
                 headers["Authorization"] = f"Bearer {jina_key}"
 
             async def _do_fetch():
-                async with httpx.AsyncClient(proxy=self.proxy, timeout=_JINA_TIMEOUT) as client:
+                from markbot.utils.ssrf import guarded_client
+                async with guarded_client(
+                    proxy=self.proxy, timeout=_JINA_TIMEOUT
+                ) as client:
                     r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
                     if r.status_code == 429:
                         logger.debug("Jina Reader rate limited")
@@ -439,8 +445,8 @@ class WebFetchTool(Tool):
         from readability import Document
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
+            from markbot.utils.ssrf import guarded_client
+            async with guarded_client(
                 max_redirects=MAX_REDIRECTS,
                 timeout=30.0,
                 proxy=self.proxy,
@@ -843,7 +849,11 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
             if jina_key:
                 headers["Authorization"] = f"Bearer {jina_key}"
 
-            async with httpx.AsyncClient(proxy=self.proxy, timeout=_JINA_TIMEOUT) as client:
+            # The target host is fixed, but a hijacked or compromised
+            # endpoint could redirect into the private network, so the hop is
+            # guarded too.
+            from markbot.utils.ssrf import guarded_client
+            async with guarded_client(proxy=self.proxy, timeout=_JINA_TIMEOUT) as client:
                 r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
                 if r.status_code in (429, 500, 502, 503):
                     return None
@@ -879,15 +889,29 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
         """Local fallback using readability-lxml."""
         from readability import Document
 
+        from markbot.utils.ssrf import SSRFRedirectError, guarded_client
+
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
+            # Guarded transport: every hop (original + each redirect) is
+            # checked before a socket is opened. Validating only
+            # ``response.url`` afterwards was too late — the request had
+            # already reached whatever the redirect pointed at, including
+            # 169.254.169.254.
+            async with guarded_client(
                 max_redirects=MAX_REDIRECTS,
                 timeout=_FETCH_TIMEOUT,
                 proxy=self.proxy,
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
+
+            # Belt and braces: re-check the final URL in case a custom
+            # transport was swapped in.
+            from markbot.utils.ssrf import validate_resolved_url
+            redir_ok, redir_err = validate_resolved_url(str(r.url))
+            if not redir_ok:
+                return {"url": url, "title": "", "content": "",
+                        "error": f"Redirect blocked: {redir_err}"}
 
             ctype = r.headers.get("content-type", "")
             if ctype.startswith("image/"):

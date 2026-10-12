@@ -72,6 +72,33 @@ _CARD_RE = re.compile(
     r"(?<!\d)(?P<card>(?:\d[ -]?){12,18}\d)(?!\d)"
 )
 
+# Bare provider API keys. These are the highest-value secret in this
+# codebase and were not matched by any earlier pattern: an
+# ``Authorization:`` header or a ``key=value`` pair is redacted, but the same
+# key appearing bare in a message, a tool argument, or a provider error body
+# was logged verbatim. Provider keys are written into ``os.environ`` at
+# startup, so any path that echoes them is a live leak.
+#
+# The vendor prefixes are explicit rather than a generic ``sk-`` rule: a bare
+# ``sk-`` followed by 20+ alphanumerics also matches ordinary base64 blobs
+# and long identifiers, and over-redacting makes logs unreadable.
+_PROVIDER_KEY_RE = re.compile(
+    r"(?P<key>"
+    r"\b(?:"
+    r"sk-ant-[A-Za-z0-9\-_]{20,}"       # Anthropic
+    r"|sk-or-v1-[A-Za-z0-9]{20,}"       # OpenRouter
+    r"|sk-proj-[A-Za-z0-9\-_]{20,}"     # OpenAI project keys
+    r"|sk-[A-Za-z0-9]{32,}"             # OpenAI legacy / DeepSeek / Groq
+    r"|gsk_[A-Za-z0-9]{20,}"            # Groq
+    r"|xai-[A-Za-z0-9]{20,}"            # xAI
+    r"|AIza[A-Za-z0-9\-_]{30,}"         # Google
+    r"|gh[pousr]_[A-Za-z0-9]{30,}"      # GitHub
+    r"|glpat-[A-Za-z0-9\-_]{20,}"       # GitLab
+    r"|hf_[A-Za-z0-9]{30,}"             # HuggingFace
+    r"|AKIA[0-9A-Z]{16}"                # AWS access key id
+    r"))\b"
+)
+
 
 def _luhn_ok(s: str) -> bool:
     digits = [int(c) for c in s if c.isdigit()]
@@ -145,6 +172,7 @@ def redact_sensitive(text: str) -> str:
     out = _AUTHORIZATION_RE.sub(_auth_sub, text)
     out = _BEARER_RE.sub(_bearer_sub, out)
     out = _JWT_RE.sub(_jwt_sub, out)
+    out = _PROVIDER_KEY_RE.sub("***", out)
     out = _KV_SECRET_RE.sub(_kv_sub, out)
     out = _PASSWORD_RE.sub(_kv_sub, out)
     out = _CARD_RE.sub(_card_sub, out)

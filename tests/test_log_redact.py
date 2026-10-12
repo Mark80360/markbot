@@ -183,3 +183,61 @@ class TestDefaultFilterRedaction:
         rec = _record("PING", name="websockets.protocol")
         # Even if a token leaked into the ping, the filter must drop it.
         assert default_filter(rec) is False
+
+
+class TestBareProviderKeys:
+    """Provider keys written into ``os.environ`` at startup are the highest
+    value secret here. An ``Authorization:`` header or a ``key=value`` pair
+    was redacted, but the same key appearing *bare* — in a message, a tool
+    argument, or a provider error body — was logged verbatim."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "sk-ant-api03-AAAABBBBCCCCDDDDEEEE1234",
+            "sk-or-v1-1234567890abcdef1234567890abcd",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz1234",
+            "sk-1234567890abcdefghijklmnopqrstuvwxyz",
+            "gsk_1234567890abcdefghijklmnop",
+            "xai-1234567890abcdefghijklmnop",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+            "ghs_1234567890abcdefghijklmnopqrstuvwxyz",
+            "glpat-1234567890abcdefghij",
+            "hf_1234567890abcdefghijklmnopqrstuv",
+            "AKIAIOSFODNN7EXAMPLE",
+        ],
+    )
+    def test_provider_key_redacted(self, key):
+        from markbot.log.redact import redact_sensitive
+
+        assert key not in redact_sensitive(f"calling api with {key} now")
+
+    @pytest.mark.parametrize(
+        "benign",
+        [
+            "the build finished in 12.5 seconds",
+            "order 10000000000 shipped",
+            "commit a1b2c3d4e5f6a7b8",
+            "user greeted the assistant",
+            "sk-short",
+            "path=/usr/local/bin/python3",
+        ],
+    )
+    def test_no_false_positives(self, benign):
+        from markbot.log.redact import redact_sensitive
+
+        assert redact_sensitive(benign) == benign
+
+    def test_bare_key_in_provider_error_body(self):
+        """A real leak path: providers echo the offending key in the error
+        body, and that body is put into the assistant message."""
+        from markbot.log.redact import redact_sensitive
+
+        body = (
+            "Error: Invalid API key: sk-1234567890abcdefghijklmnopqrstuvwxyz "
+            "provided"
+        )
+        out = redact_sensitive(body)
+        assert "sk-1234567890abcdefghijklmnopqrstuvwxyz" not in out
+        assert "Invalid API key" in out

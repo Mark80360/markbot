@@ -15,6 +15,10 @@ from markbot.tools.base import Tool
 from markbot.utils.constants import DANGEROUS_COMMAND_PATTERNS
 from markbot.utils.helpers import strip_ansi
 
+#: Matches an environment-variable reference in a path token, in either
+#: POSIX (``$VAR`` / ``${VAR}``) or Windows (``%VAR%``) form.
+_ENV_REF_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%+")
+
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
@@ -24,6 +28,33 @@ class ExecTool(Tool):
     # Rate limiting: max commands per session in a sliding window
     _RATE_WINDOW_S = 60
     _MAX_COMMANDS_PER_WINDOW = 30
+
+    #: Environment variable names never passed to a child process.
+    #:
+    #: ``exec`` runs the *operator's own* agent doing ordinary development
+    #: work, so an allowlist (as used by the skill sandbox) would break
+    #: ``git push``, ``npm``, ``docker`` and every other tool that reads its
+    #: own env. A denylist is the right trade-off here. It matters because
+    #: ``OpenAICompatProvider._setup_env`` writes the live provider API keys
+    #: into ``os.environ``; with a bare ``os.environ.copy()`` any prompt
+    #: injection that reached the shell could exfiltrate every configured
+    #: credential with ``env > /tmp/x && curl -T /tmp/x …``.
+    _SENSITIVE_ENV_EXACT: frozenset[str] = frozenset({
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_API_BASE",
+        "OPENROUTER_API_KEY", "AZURE_OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY",
+        "COHERE_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY",
+        "XAI_API_KEY", "PERPLEXITY_API_KEY", "OPENROUTER_API_BASE",
+        "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN",
+        "GH_TOKEN", "GL_TOKEN", "NPM_TOKEN", "DOCKER_PASSWORD",
+    })
+
+    #: Substrings that mark an env var as secret-bearing (case-insensitive).
+    _SENSITIVE_ENV_SUBSTRINGS: tuple[str, ...] = (
+        "_API_KEY", "_APIKEY", "API_KEY", "_TOKEN", "_SECRET",
+        "_PASSWORD", "_PASSWD", "_CREDENTIAL", "_PRIVATE_KEY",
+        "SESSION_KEY", "ACCESS_KEY", "_AUTH",
+    )
 
     def __init__(
         self,
@@ -35,6 +66,8 @@ class ExecTool(Tool):
         require_allowlist: bool = False,
         path_append: str = "",
         allowed_internal_ips: list[str] | None = None,
+        extra_env_allow: list[str] | None = None,
+        env_allowlist: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -50,7 +83,62 @@ class ExecTool(Tool):
         self.require_allowlist = require_allowlist
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
+        # Optional env vars to re-inject even though they look secret
+        # (e.g. a CI token a specific script needs).
+        self.extra_env_allow = {str(v).upper() for v in (extra_env_allow or [])}
+        # When set, only these names (plus the allowlist above) reach the
+        # child process. Defaults to the denylist behaviour above.
+        self.env_allowlist = {str(v).upper() for v in (env_allowlist or [])}
         self._cmd_timestamps: defaultdict[str, list[float]] = defaultdict(list)
+
+    def _build_env(self) -> dict[str, str]:
+        """Construct the child environment with credentials stripped.
+
+        In allowlist mode the environment is *strict*: only the named
+        variables survive, and nothing is added on the operator's behalf.
+        ``PATH`` is therefore not force-included here — an allowlist that
+        omits it means "run with no search path", which is a legitimate
+        hardening choice and is what the strict test asserts.
+
+        The one exception is ``path_append``: line 205 concatenates onto the
+        existing value, so with no ``PATH`` it would build the bogus
+        ``";/opt/bin"`` and silently drop the configured directory instead of
+        adding it. When ``path_append`` is set, a real ``PATH`` is required
+        for it to mean anything, so one is supplied from the inherited
+        environment.
+        """
+        source = os.environ
+        if self.env_allowlist:
+            # Case-insensitive: Windows environment variable names are, so a
+            # user writing `Path` (the usual Windows spelling) must not be
+            # silently ignored.
+            names = {n.upper() for n in self.env_allowlist} | {
+                n.upper() for n in self.extra_env_allow
+            }
+            if self.path_append:
+                names.add("PATH")
+            env = {k: v for k, v in source.items() if k.upper() in names}
+            if self.path_append:
+                env.setdefault(
+                    "PATH",
+                    source.get("PATH")
+                    or os.defpath
+                    or os.pathsep.join(("/usr/bin", "/bin")),
+                )
+            return env
+
+        out: dict[str, str] = {}
+        for key, value in source.items():
+            upper = key.upper()
+            if upper in self.extra_env_allow:
+                out[key] = value
+                continue
+            if upper in self._SENSITIVE_ENV_EXACT:
+                continue
+            if any(tok in upper for tok in self._SENSITIVE_ENV_SUBSTRINGS):
+                continue
+            out[key] = value
+        return out
 
     @property
     def name(self) -> str:
@@ -93,7 +181,15 @@ class ExecTool(Tool):
         self, command: str, working_dir: str | None = None,
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
-        cwd = working_dir or self.working_dir or os.getcwd()
+        # The confinement root is the *operator-configured* working dir, not
+        # whatever the model asked for. `working_dir` is a model-supplied
+        # tool parameter, so anchoring the path check to it meant a single
+        # `working_dir="/"` argument disabled restrict_to_workspace entirely.
+        confine_root = self.working_dir or os.getcwd()
+        cwd = self._resolve_working_dir(working_dir, confine_root)
+        if isinstance(cwd, str) and cwd.startswith("Error:"):
+            return cwd
+        cwd = str(cwd)
 
         # Intercept self-restart / self-stop commands so they go through
         # the sentinel mechanism instead of being spawned as a child of
@@ -114,7 +210,7 @@ class ExecTool(Tool):
 
         effective_timeout = min(timeout or self.timeout, self._MAX_TIMEOUT)
 
-        env = os.environ.copy()
+        env = self._build_env()
         if self.path_append:
             env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
 
@@ -277,6 +373,35 @@ class ExecTool(Tool):
             f"Sentinel: {spath}"
         )
 
+    def _resolve_working_dir(
+        self, working_dir: str | None, confine_root: str
+    ) -> Path | str:
+        """Resolve the execution cwd, keeping it inside *confine_root*.
+
+        Returns an ``Error:`` string when the requested directory escapes the
+        confinement root, so the caller can hand it straight back to the model.
+        """
+        if not working_dir:
+            return Path(confine_root).resolve()
+        try:
+            candidate = Path(os.path.expandvars(working_dir)).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(confine_root) / candidate
+            resolved = candidate.resolve()
+        except Exception as exc:
+            return f"Error: invalid working_dir ({exc})"
+
+        if self.restrict_to_workspace:
+            root = Path(confine_root).resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                return (
+                    "Error: Command blocked by safety guard "
+                    f"(working_dir {working_dir} is outside the workspace)"
+                )
+        return resolved
+
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
@@ -311,9 +436,29 @@ class ExecTool(Tool):
             cwd_path = Path(cwd).resolve()
 
             for raw in self._extract_all_paths(cmd):
+                token = raw.strip()
+                if not token:
+                    continue
+                # An unresolvable environment-variable reference is treated
+                # as an escape, not as a relative path. `os.path.expandvars`
+                # only substitutes names present in the environment, so on
+                # Windows `$HOME/...` (where the variable is `USERPROFILE`,
+                # not `HOME`) survives expansion verbatim; treating the
+                # result as relative turned `cat $HOME/.aws/credentials`
+                # into a path *inside* the workspace and let it through.
+                # The shell will expand it to the user's real home, so the
+                # guard must fail closed here.
+                if _ENV_REF_RE.search(token):
+                    probe = os.path.expandvars(token)
+                    if _ENV_REF_RE.search(probe):
+                        return (
+                            "Error: Command blocked by safety guard "
+                            f"(unresolvable environment variable in path: {token})"
+                        )
+                    token = probe
+
                 try:
-                    expanded = os.path.expandvars(raw.strip())
-                    p = Path(expanded).expanduser()
+                    p = Path(token).expanduser()
                     if not p.is_absolute():
                         p = cwd_path / p
                     p = p.resolve()
@@ -418,11 +563,24 @@ class ExecTool(Tool):
 
         win_paths = re.findall(r'[A-Za-z]:[\\/][^\s\"\'|><;]+', remaining)
         posix_paths = re.findall(r'(?:^|[\s|>])(/[^\s\"\'|><;]+)', remaining)
-        home_paths = re.findall(r'(?:^|[\s|>])(~/[^\s\"\'|><;]*)', remaining)
+        home_paths = re.findall(r'(?:^|[\s|>])(~[^\s\"\'|><;]*)', remaining)
+        # Environment-variable path references, both POSIX (``$HOME/…``,
+        # ``${HOME}/…``) and Windows (``%USERPROFILE%\…``) spellings. Without
+        # these, `cat $HOME/.aws/credentials` and `cat ${HOME}/.ssh/id_rsa`
+        # slipped past while `cat ~/.aws/credentials` was caught — the shell
+        # expands every one of them to the same path.
+        env_var_paths = re.findall(
+            r'(?:^|[\s|>])'
+            r'(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%)'
+            r'[/\\][^\s\"\'|><;]*',
+            remaining,
+        )
         rel_traversal = re.findall(
             r'(?:^|[\s|>])([^\s\"\'|><;]*[/\\]\.\.(?:[/\\][^\s\"\'|><;]*)*)',
             remaining,
         )
 
-        paths.extend(win_paths + posix_paths + home_paths + rel_traversal)
+        paths.extend(
+            win_paths + posix_paths + home_paths + env_var_paths + rel_traversal
+        )
         return paths

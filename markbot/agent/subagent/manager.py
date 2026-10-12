@@ -591,6 +591,8 @@ class SubagentManager:
                 restrict_to_workspace=getattr(self.exec_config, "restrict_to_workspace", False),
                 path_append=getattr(self.exec_config, "path_append", ""),
                 allowed_internal_ips=getattr(self.exec_config, "allowed_internal_ips", None),
+                env_allowlist=getattr(self.exec_config, "env_allowlist", None),
+                extra_env_allow=getattr(self.exec_config, "extra_env_allow", None),
             ),
         }
 

@@ -6,16 +6,20 @@ Refactored to use new core types and skill system inspired by MarkBot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from markbot.agent.turn_trace import TurnTrace
 
 from loguru import logger
 
 from markbot.agent.compact import CompactionConfig
-from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 from markbot.agent.container import AgentContext
 from markbot.agent.pipeline.engine import ProcessContext
 from markbot.agent.stream_scrubber import ScrubberPool
@@ -29,6 +33,7 @@ from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
 from markbot.tools.message import MessageTool
 from markbot.types.permission import PermissionMode
+from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
 
 
 class AgentLoop:
@@ -156,8 +161,10 @@ class AgentLoop:
             from markbot.agent.footprint import apply_footprint_to_registry
 
             apply_footprint_to_registry(self.tools, self.tool_footprint)
-        # Increment on every add/remove/clear of the message list so
-        # the token-estimate cache invalidates correctly.
+        # Retained for external diagnostics only. The token-estimate cache
+        # is content-addressed and no longer reads a revision counter —
+        # the old scheme was bumped unconditionally each iteration and then
+        # immediately queried, so it never hit.
         self._messages_revision: int = 0
 
         self._running = False
@@ -170,6 +177,20 @@ class AgentLoop:
         # callers would look "idle" while still mutating memory / tools.
         self._direct_inflight: int = 0
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Completed turn traces, newest last, bounded. This is what makes
+        # "why did the agent do that?" answerable after the log stream has
+        # scrolled away.
+        self._turn_traces: "OrderedDict[str, TurnTrace]" = OrderedDict()
+        self._max_turn_traces = 50
+        # Which task currently owns each session lock, so ``_turn_admission``
+        # can be re-entrant without weakening the cross-task exclusion.
+        self._session_lock_owners: dict[str, asyncio.Task] = {}
+        # Per-session tool-permission mode override. ``/mode`` used to write
+        # a single process-global mode read by every turn, so one user could
+        # change the tool policy for everybody else's conversation. Entries
+        # here win over the global default; the global value remains the
+        # baseline so a fresh session still inherits the configured mode.
+        self._session_permission_modes: dict[str, PermissionMode] = {}
         # Strong references to fire-and-forget tasks so they are not
         # garbage-collected mid-flight and their exceptions are logged.
         self._background_tasks: set[asyncio.Task] = set()
@@ -651,7 +672,139 @@ class AgentLoop:
 
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Get or create the per-session serial lock."""
-        return self._session_locks.setdefault(session_key, asyncio.Lock())
+        locks = getattr(self, "_session_locks", None)
+        if locks is None:
+            locks = self._session_locks = {}
+        return locks.setdefault(session_key, asyncio.Lock())
+
+    # ------------------------------------------------------------------
+    # Turn traces (post-hoc "why did it do that?")
+    # ------------------------------------------------------------------
+
+    def record_turn_trace(self, trace) -> None:
+        """Retain a completed turn's trace, evicting the oldest."""
+        try:
+            traces = getattr(self, "_turn_traces", None)
+            if traces is None:
+                traces = self._turn_traces = OrderedDict()
+            key = f"{trace.session_key}:{time.time():.6f}"
+            traces[key] = trace
+            traces.move_to_end(key)
+            while len(traces) > self._max_turn_traces:
+                traces.popitem(last=False)
+        except Exception as exc:  # pragma: no cover - telemetry only
+            logger.debug("Failed to retain turn trace: {}", exc)
+
+    def recent_turn_traces(self, limit: int = 5, *, session_key: str | None = None):
+        """Return recent traces, newest first, optionally filtered."""
+        traces = list(getattr(self, "_turn_traces", {}).values())
+        if session_key:
+            traces = [t for t in traces if t.session_key == session_key]
+        return list(reversed(traces))[:limit]
+
+    def last_turn_trace(self, *, session_key: str | None = None):
+        """The most recent trace, or None."""
+        found = self.recent_turn_traces(1, session_key=session_key)
+        return found[0] if found else None
+
+    def _holds_session_lock(self, session_key: str) -> bool:
+        """True when the *current* task already owns this session's lock.
+
+        ``process_direct`` can legitimately be re-entered from inside a turn
+        that is already holding the session lock (a tool, a plugin, or a
+        nested caller). Blocking there would deadlock the whole daemon, so
+        the lock is skipped when this task is the owner. The owner is
+        tracked per task, not per session, so a *different* task on the same
+        session still queues as intended.
+        """
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover - no running loop
+            return False
+        if current is None:
+            return False
+        owners = getattr(self, "_session_lock_owners", None)
+        if owners is None:
+            return False
+        return owners.get(session_key) is current
+
+    @contextlib.asynccontextmanager
+    async def _turn_admission(self, session_key: str):
+        """Acquire the per-session lock and the global concurrency gate.
+
+        Re-entrant: when the current task already holds either, the wait is
+        skipped. Shared by ``_dispatch`` and ``process_direct`` so the two
+        entry points cannot mutate the same session concurrently.
+
+        ``Session.messages`` is a plain list appended without a lock, and
+        ``SessionManager`` updates its persisted-message cursor outside the
+        file lock, so two concurrent turns on one session can interleave
+        appends, double-write or drop lines, and leave the on-disk history
+        inconsistent with in-memory state. ``process_direct`` is the entry
+        point for the web UI, cron, heartbeat and autopilot, so without this
+        the race was reachable in the default configuration (two browser
+        tabs, or a WebSocket reconnect onto the same session id).
+        """
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover - no running loop
+            current = None
+
+        if self._holds_session_lock(session_key):
+            yield
+            return
+
+        async with contextlib.AsyncExitStack() as stack:
+            # Session lock first, matching _dispatch's ordering, so the
+            # global gate is never held while waiting on a busy session.
+            await stack.enter_async_context(self._get_session_lock(session_key))
+            owners = getattr(self, "_session_lock_owners", None)
+            if owners is None:
+                owners = self._session_lock_owners = {}
+            if current is not None:
+                owners[session_key] = current
+            gate = getattr(self, "_concurrency_gate", None)
+            if gate is not None:
+                await stack.enter_async_context(gate)
+            try:
+                yield
+            finally:
+                if current is not None:
+                    owners.pop(session_key, None)
+
+    # ------------------------------------------------------------------
+    # Per-session permission mode
+    # ------------------------------------------------------------------
+
+    def get_session_permission_mode(self, session_key: str) -> PermissionMode | None:
+        """Return the per-session mode override, or None if unset."""
+        return self._session_permission_modes.get(session_key)
+
+    def set_session_permission_mode(
+        self, session_key: str, mode: PermissionMode | None
+    ) -> None:
+        """Set (or clear, with ``None``) this session's permission mode.
+
+        Scoping the mode to the session rather than the process is what stops
+        one user's ``/mode auto`` from silently granting unrestricted tool
+        access to every other conversation in the daemon.
+        """
+        if mode is None:
+            self._session_permission_modes.pop(session_key, None)
+        else:
+            self._session_permission_modes[session_key] = mode
+        # Mirror onto the global app_state so the change survives a restart
+        # and so the TUI / ``/mode`` (no args) readout reflects it.
+        provider = getattr(self.ctx, "app_state", None)
+        if provider is not None and mode is not None:
+            try:
+                provider.set_permission_mode(mode)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror session permission mode: {}", exc)
+
+    def clear_session_permission_mode(self, session_key: str) -> None:
+        """Forget a session's override so it falls back to the global mode."""
+        self._session_permission_modes.pop(session_key, None)
 
     # ------------------------------------------------------------------
     # Tool audit bridge (pipeline events → session event log)
@@ -957,7 +1110,13 @@ class AgentLoop:
         return False
 
     async def _dispatch_unlocked(self, msg: InboundMessage) -> None:
-        """Process a message without the per-session lock (question replies)."""
+        """Process a message without the per-session lock (question replies).
+
+        Deliberately skips the session lock: this runs *inside* a turn that
+        already holds it, so taking it again would deadlock. Approval replies
+        are the only traffic routed here. The global gate is still respected
+        so this path cannot exceed the process-wide turn budget.
+        """
         gate = self._concurrency_gate or nullcontext()
         async with gate:
             try:
@@ -973,9 +1132,7 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._get_session_lock(msg.session_key)
-        gate = self._concurrency_gate or nullcontext()
-        async with lock, gate:
+        async with self._turn_admission(msg.session_key):
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
@@ -1442,25 +1599,32 @@ class AgentLoop:
                 content=content,
                 media=media or [],
             )
-            try:
-                return await self._process_message(
-                    msg,
-                    session_key=session_key,
-                    on_progress=on_progress,
-                    on_stream=on_stream,
-                    on_stream_end=on_stream_end,
-                    on_tool_start=on_tool_start,
-                    on_tool_complete=on_tool_complete,
-                    on_outbound_message=on_outbound_message,
-                    permission_mode_override=permission_mode,
-                )
-            finally:
-                # process_direct bypasses _dispatch, so its finally block
-                # (which clears allow_all) never runs.  Clear it here to
-                # prevent the flag from leaking into the next call with
-                # the same session_key.
-                approver = getattr(getattr(self, "ctx", None), "permission_approver", None)
-                if approver is not None and hasattr(approver, "clear_allow_all"):
-                    approver.clear_allow_all(session_key)
+            # Same admission control as the bus path. process_direct is the
+            # entry point for the web UI, cron, heartbeat and autopilot, so
+            # without this two of those could mutate one Session at once —
+            # the lock was previously only taken by _dispatch.
+            async with self._turn_admission(session_key):
+                try:
+                    return await self._process_message(
+                        msg,
+                        session_key=session_key,
+                        on_progress=on_progress,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
+                        on_tool_start=on_tool_start,
+                        on_tool_complete=on_tool_complete,
+                        on_outbound_message=on_outbound_message,
+                        permission_mode_override=permission_mode,
+                    )
+                finally:
+                    # process_direct bypasses _dispatch, so its finally block
+                    # (which clears allow_all) never runs.  Clear it here to
+                    # prevent the flag from leaking into the next call with
+                    # the same session_key.
+                    approver = getattr(
+                        getattr(self, "ctx", None), "permission_approver", None
+                    )
+                    if approver is not None and hasattr(approver, "clear_allow_all"):
+                        approver.clear_allow_all(session_key)
         finally:
             self._direct_inflight = max(0, self._direct_inflight - 1)

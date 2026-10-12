@@ -136,6 +136,7 @@ class DailyLogManager:
         channel: str = "",
         chat_id: str = "",
         metadata: dict[str, Any] | None = None,
+        quarantined: bool = False,
     ) -> None:
         """Append one user-assistant turn to today's daily log.
 
@@ -145,6 +146,9 @@ class DailyLogManager:
             channel: Source channel (e.g. "cli", "dingtalk").
             chat_id: Chat/session identifier.
             metadata: Optional extra metadata dict.
+            quarantined: The security scanner rejected this turn. The entry
+                is still written (the transcript belongs to the user) but is
+                tagged so ``search`` can exclude it from automatic recall.
         """
         now = datetime.now()
         filename = f"{now.strftime('%Y-%m-%d')}.md"
@@ -158,6 +162,7 @@ class DailyLogManager:
         timestamp = now.strftime("%H:%M:%S")
         session_tag = f" `{chat_id}`" if chat_id else ""
         channel_tag = f" via {channel}" if channel else ""
+        quarantine_tag = " [quarantined]" if quarantined else ""
 
         user_text = self._truncate(user_content or "")
         assistant_text = self._truncate(assistant_content or "")
@@ -166,7 +171,7 @@ class DailyLogManager:
         if header:
             parts.append(header)
 
-        parts.append(f"## [{timestamp}]{session_tag}{channel_tag}\n")
+        parts.append(f"## [{timestamp}]{session_tag}{channel_tag}{quarantine_tag}\n")
         parts.append(f"**User**:\n\n{user_text}\n")
         parts.append("---\n")
         parts.append(f"**Assistant**:\n\n{assistant_text}\n")
@@ -190,6 +195,7 @@ class DailyLogManager:
         *,
         channel: str | None = None,
         chat_id: str | None = None,
+        include_quarantined: bool = False,
     ) -> list[dict]:
         """Keyword search over daily log files with optional session filtering.
 
@@ -202,6 +208,9 @@ class DailyLogManager:
             max_results: Maximum number of results to return.
             channel: Optional channel filter (e.g. "feishu").
             chat_id: Optional chat ID filter.
+            include_quarantined: Include sections the security scanner
+                rejected. Off by default so an injection payload cannot ride
+                back in through keyword recall.
 
         Returns:
             List of dicts with ``content``, ``source``, ``score`` keys.
@@ -229,6 +238,12 @@ class DailyLogManager:
 
                 header_line = section.split("\n", 1)[0]
                 match = _SECTION_HEADER_RE.match("## [" + header_line)
+
+                # Scanner-rejected turns stay on disk for the user's own
+                # audit but are invisible to automatic recall, matching the
+                # vector-store quarantine.
+                if not include_quarantined and "[quarantined]" in header_line:
+                    continue
 
                 sec_channel = ""
                 sec_chat_id = ""

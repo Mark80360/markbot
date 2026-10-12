@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from markbot.tools.base import Tool
+from markbot.tools.base import Tool, _resolve_path
 from markbot.utils.constants import BOOTSTRAP_FILES, MEMORY_FILENAME, USER_FILENAME, is_main_memory_session
 from markbot.utils.helpers import format_time
 
@@ -25,8 +25,55 @@ if TYPE_CHECKING:
 
 
 def _session_allows_curated(channel: str | None, is_group: bool | None = None) -> bool:
-    """Whether curated MEMORY/PROFILE may be listed/loaded for this channel."""
+    """Whether curated MEMORY.md / PROFILE.md may be read in this session.
+
+    Always fails closed on unknown group-ness, so a per-call ``is_group`` of
+    ``None`` blocks rather than leaks.
+    """
     return is_main_memory_session(channel, is_group=is_group)
+
+
+def _per_call_session(
+    tool: Any, kwargs: dict
+) -> tuple[str | None, str | None, bool | None]:
+    """Resolve ``(channel, chat_id, is_group)`` for the *current* call.
+
+    The context-explorer and memory tools are singletons shared by every
+    concurrent session. Their ``set_session_context`` fields are therefore a
+    fallback only: reading them unconditionally meant one session's privacy
+    gate could be decided by whichever session most recently called
+    ``set_session_context`` — including one from a different chat, which is a
+    cross-session privacy leak (a group chat reading a private user's
+    MEMORY.md, or vice versa).
+
+    ``ToolContext`` is constructed per call, so preferring it removes the race.
+    A ``ToolContext`` with an empty ``channel`` falls through to the instance
+    value so existing non-context callers still work.
+    """
+    ctx = kwargs.get("_tool_context")
+    if ctx is not None:
+        channel = getattr(ctx, "channel", "") or getattr(tool, "_channel", None)
+        chat_id = getattr(ctx, "chat_id", "") or getattr(tool, "_chat_id", None)
+        is_group = getattr(ctx, "is_group", None)
+        if is_group is None:
+            is_group = getattr(tool, "_is_group", None)
+        return channel, chat_id, is_group
+    return (
+        getattr(tool, "_channel", None),
+        getattr(tool, "_chat_id", None),
+        getattr(tool, "_is_group", None),
+    )
+
+
+def _encode_workspace_id(rel: Path) -> str:
+    """Encode a workspace-relative path into its stable context id.
+
+    ``as_posix()`` is required: on Windows ``str(rel)`` renders separators as
+    ``\\``, so replacing only ``/`` produced ids like ``docs\\guide_md`` that
+    no model would ever type. Generation and lookup must agree, so both sides
+    go through this helper.
+    """
+    return rel.as_posix().replace('/', '_').replace('.', '_')
 
 
 class ExploreContextCatalogTool(Tool):
@@ -96,21 +143,28 @@ class ExploreContextCatalogTool(Tool):
         source_type: str = "all",
         **kwargs: Any,
     ) -> str:
+        channel, _chat_id, is_group = _per_call_session(self, kwargs)
         try:
             sections = []
 
             if source_type in ("all", "bootstrap"):
-                bootstrap_section = self._build_bootstrap_catalog()
+                bootstrap_section = self._build_bootstrap_catalog(
+                    channel=channel, is_group=is_group
+                )
                 if bootstrap_section:
                     sections.append(bootstrap_section)
 
             if source_type in ("all", "memory"):
-                memory_section = await self._build_memory_catalog()
+                memory_section = await self._build_memory_catalog(
+                    channel=channel, is_group=is_group
+                )
                 if memory_section:
                     sections.append(memory_section)
 
             if source_type in ("all", "workspace"):
-                workspace_section = self._build_workspace_catalog()
+                workspace_section = self._build_workspace_catalog(
+                    channel=channel, is_group=is_group
+                )
                 if workspace_section:
                     sections.append(workspace_section)
 
@@ -130,7 +184,9 @@ class ExploreContextCatalogTool(Tool):
             logger.error("Context catalog exploration failed: {}", e)
             return f"Error exploring context catalog: {e}"
 
-    def _build_bootstrap_catalog(self) -> str:
+    def _build_bootstrap_catalog(
+        self, *, channel: str | None = None, is_group: bool | None = None
+    ) -> str:
         """Build lightweight catalog for bootstrap files."""
         if not self.workspace or not self.workspace.exists():
             return ""
@@ -140,7 +196,7 @@ class ExploreContextCatalogTool(Tool):
 
         has_files = False
         allow_curated = _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         )
         for filename in self.BOOTSTRAP_FILES:
             if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
@@ -166,13 +222,15 @@ class ExploreContextCatalogTool(Tool):
 
         return "\n".join(lines)
 
-    async def _build_memory_catalog(self) -> str:
+    async def _build_memory_catalog(
+        self, *, channel: str | None = None, is_group: bool | None = None
+    ) -> str:
         """Build catalog for memory entries."""
         lines = ["## Memory Entries (Persistent Knowledge)\n"]
         lines.append("Contains user preferences, project history, decisions, and learned facts.\n")
 
         if not _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         ):
             lines.append(
                 "*Curated MEMORY.md / PROFILE.md catalog is unavailable on shared channels. "
@@ -188,7 +246,7 @@ class ExploreContextCatalogTool(Tool):
             if hasattr(self._memory_manager, 'list_memories'):
                 entries = await self._memory_manager.list_memories(
                     limit=10,
-                    channel=getattr(self, '_channel', None),
+                    channel=channel,
                 )
 
                 if entries:
@@ -223,7 +281,9 @@ class ExploreContextCatalogTool(Tool):
 
         return "\n".join(lines)
 
-    def _build_workspace_catalog(self) -> str:
+    def _build_workspace_catalog(
+        self, *, channel: str | None = None, is_group: bool | None = None
+    ) -> str:
         """Build catalog for workspace context."""
         if not self.workspace or not self.workspace.exists():
             return ""
@@ -353,19 +413,26 @@ class SearchContextTool(Tool):
         max_results: int = 5,
         **kwargs: Any,
     ) -> str:
+        channel, _chat_id, is_group = _per_call_session(self, kwargs)
         try:
             all_results = []
 
             if source in ("all", "memory"):
-                memory_results = await self._search_memory(query, max_results)
+                memory_results = await self._search_memory(
+                    query, max_results, channel=channel, is_group=is_group
+                )
                 all_results.extend(memory_results)
 
             if source in ("all", "bootstrap"):
-                bootstrap_results = self._search_bootstrap(query, max_results)
+                bootstrap_results = self._search_bootstrap(
+                    query, max_results, channel=channel, is_group=is_group
+                )
                 all_results.extend(bootstrap_results)
 
             if source in ("all", "workspace"):
-                workspace_results = self._search_workspace(query, max_results)
+                workspace_results = self._search_workspace(
+                    query, max_results, channel=channel, is_group=is_group
+                )
                 all_results.extend(workspace_results)
 
             if len(all_results) > max_results:
@@ -395,7 +462,10 @@ class SearchContextTool(Tool):
             logger.error("Context search failed: {}", e)
             return f"Error searching context: {e}"
 
-    async def _search_memory(self, query: str, max_results: int) -> list[dict]:
+    async def _search_memory(
+        self, query: str, max_results: int, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> list[dict]:
         """Search memory using semantic search."""
         results = []
 
@@ -408,7 +478,7 @@ class SearchContextTool(Tool):
                     query=query,
                     max_results=max_results,
                     min_score=0.1,
-                    channel=getattr(self, '_channel', None),
+                    channel=channel,
                     chat_id=getattr(self, '_chat_id', None),
                 )
 
@@ -422,7 +492,7 @@ class SearchContextTool(Tool):
                         'full_content': r.get('content', ''),
                     })
             elif _session_allows_curated(
-                getattr(self, '_channel', None), getattr(self, '_is_group', None)
+                channel, is_group
             ):
                 memory_file = self.workspace / MEMORY_FILENAME
                 if memory_file.exists():
@@ -447,7 +517,10 @@ class SearchContextTool(Tool):
 
         return results
 
-    def _search_bootstrap(self, query: str, max_results: int) -> list[dict]:
+    def _search_bootstrap(
+        self, query: str, max_results: int, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> list[dict]:
         """Search bootstrap files for keyword matches."""
         results = []
 
@@ -455,7 +528,7 @@ class SearchContextTool(Tool):
             return results
 
         allow_curated = _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         )
         for filename in self.BOOTSTRAP_FILES:
             if filename in (MEMORY_FILENAME, USER_FILENAME) and not allow_curated:
@@ -490,7 +563,10 @@ class SearchContextTool(Tool):
 
         return results
 
-    def _search_workspace(self, query: str, max_results: int) -> list[dict]:
+    def _search_workspace(
+        self, query: str, max_results: int, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> list[dict]:
         """Search workspace files (excluding bootstrap files) for keyword matches."""
         results = []
 
@@ -531,7 +607,7 @@ class SearchContextTool(Tool):
 
                     rel = file_path.relative_to(self.workspace)
                     results.append({
-                        'id': str(rel).replace('/', '_').replace('.', '_'),
+                        'id': _encode_workspace_id(rel),
                         'source': 'workspace',
                         'title': str(rel),
                         'preview': preview,
@@ -618,16 +694,23 @@ class LoadContextTool(Tool):
         max_tokens: int = 4000,
         **kwargs: Any,
     ) -> str:
+        channel, _chat_id, is_group = _per_call_session(self, kwargs)
         try:
             content = None
             source_type = "unknown"
 
             if context_id.startswith('mem_'):
-                content, source_type = await self._load_memory(context_id)
+                content, source_type = await self._load_memory(
+                    context_id, channel=channel, is_group=is_group
+                )
             else:
-                content, source_type = self._load_bootstrap(context_id)
+                content, source_type = self._load_bootstrap(
+                    context_id, channel=channel, is_group=is_group
+                )
                 if content is None:
-                    content, source_type = self._load_workspace(context_id)
+                    content, source_type = self._load_workspace(
+                        context_id, channel=channel, is_group=is_group
+                    )
 
             if content is None:
                 return f"Error: Context entry '{context_id}' not found or unavailable."
@@ -652,10 +735,13 @@ class LoadContextTool(Tool):
             logger.error("Context loading failed: {}", e)
             return f"Error loading context '{context_id}': {e}"
 
-    async def _load_memory(self, context_id: str) -> tuple[str | None, str]:
+    async def _load_memory(
+        self, context_id: str, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> tuple[str | None, str]:
         """Load memory entry."""
         if not _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         ):
             return (
                 "Curated MEMORY.md entries are unavailable on shared channels. "
@@ -669,7 +755,7 @@ class LoadContextTool(Tool):
             if hasattr(self._memory_manager, 'list_memories'):
                 entries = await self._memory_manager.list_memories(
                     limit=100,
-                    channel=getattr(self, '_channel', None),
+                    channel=channel,
                 )
                 try:
                     idx = int(context_id.split('_')[1])
@@ -683,7 +769,7 @@ class LoadContextTool(Tool):
             logger.warning("Failed to load memory {}: {}", context_id, e)
 
         if _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         ):
             memory_file = self.workspace / MEMORY_FILENAME
             if memory_file.exists():
@@ -691,7 +777,10 @@ class LoadContextTool(Tool):
 
         return None, "memory"
 
-    def _load_bootstrap(self, context_id: str) -> tuple[str | None, str]:
+    def _load_bootstrap(
+        self, context_id: str, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> tuple[str | None, str]:
         """Load bootstrap file with duplicate detection.
 
         Detects if MEMORY.md is being reloaded and returns a hint instead
@@ -712,7 +801,7 @@ class LoadContextTool(Tool):
         filename = filename_map.get(context_id, context_id.replace('_', '.'))
 
         if filename in (MEMORY_FILENAME, USER_FILENAME) and not _session_allows_curated(
-            getattr(self, '_channel', None), getattr(self, '_is_group', None)
+            channel, is_group
         ):
             return (
                 f"*{filename} is unavailable on shared channels.*",
@@ -727,9 +816,31 @@ class LoadContextTool(Tool):
             )
             return hint, 'bootstrap'
 
-        file_path = self.workspace / filename
+        # Confine the read to the workspace. ``context_id`` is model-supplied
+        # and ``_`` -> ``.`` is not an escaping transformation, so ids like
+        # ``../pyproject.toml`` or ``../../.markbot/config.json`` reach this
+        # point unchanged and ``workspace / filename`` would happily resolve
+        # outside the workspace — reading the file that holds every provider
+        # API key. The tool is read-only, so it is auto-approved in every
+        # permission mode including PLAN; without this check it was an
+        # unauthenticated arbitrary-file-read.
+        try:
+            file_path = _resolve_path(
+                filename,
+                workspace=self.workspace,
+                allowed_dir=self.workspace,
+            )
+        except PermissionError:
+            logger.warning(
+                "load_context refused path outside workspace: {}", context_id
+            )
+            return (
+                f"*'{context_id}' resolves outside the workspace and was "
+                "refused. Use read_file with a workspace-relative path.*",
+                'bootstrap',
+            )
 
-        if file_path.exists():
+        if file_path.exists() and file_path.is_file():
             try:
                 return file_path.read_text(encoding='utf-8'), 'bootstrap'
             except Exception as e:
@@ -737,11 +848,14 @@ class LoadContextTool(Tool):
 
         return None, 'bootstrap'
 
-    def _load_workspace(self, context_id: str) -> tuple[str | None, str]:
+    def _load_workspace(
+        self, context_id: str, *,
+        channel: str | None = None, is_group: bool | None = None,
+    ) -> tuple[str | None, str]:
         """Load a workspace file by its encoded ID.
 
-        Workspace IDs are generated as ``str(rel).replace('/', '_').replace('.', '_')``,
-        so ``docs/guide.md`` becomes ``docs_guide_md``. Since this encoding is
+        Workspace IDs are generated as ``_encode_workspace_id(rel)`` (e.g.
+        ``docs/guide.md`` becomes ``docs_guide_md``). Since that encoding is
         not reversible (``_`` may come from ``/``, ``.``, or the filename),
         we re-walk the same candidate files as ``_search_workspace`` and match
         by regenerated ID.
@@ -750,7 +864,10 @@ class LoadContextTool(Tool):
             return None, "workspace"
 
         bootstrap_set = set(getattr(self, 'BOOTSTRAP_FILES', ()))
-        candidate_globs = ["README*", "docs/**/*.md", "*.md"]
+        # ``docs/**/*.md`` does not match ``docs/guide.md`` under pathlib's
+        # glob semantics (``**`` requires at least one intermediate directory
+        # for this pattern), so the one-level case needs its own entry.
+        candidate_globs = ["README*", "docs/**/*.md", "docs/*.md", "*.md"]
         seen: set[Path] = set()
 
         for pattern in candidate_globs:
@@ -763,7 +880,7 @@ class LoadContextTool(Tool):
                 if not file_path.is_file():
                     continue
                 rel = file_path.relative_to(self.workspace)
-                file_id = str(rel).replace('/', '_').replace('.', '_')
+                file_id = _encode_workspace_id(rel)
                 if file_id == context_id:
                     try:
                         return file_path.read_text(encoding='utf-8'), 'workspace'

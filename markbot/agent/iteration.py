@@ -22,13 +22,13 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from markbot.agent.cache_policy import CacheMutationPolicy
-from markbot.agent.compact import CompactAction, is_prompt_too_long_error, offload_tool_output
-from markbot.agent.cost import BudgetExceededError
 from markbot.agent.cache_protocol import (
-    CanonicalUsage,
     CacheEvent,
+    CanonicalUsage,
     UsageNormaliser,
 )
+from markbot.agent.compact import CompactAction, is_prompt_too_long_error, offload_tool_output
+from markbot.agent.cost import BudgetExceededError
 from markbot.agent.prefix_cache import (
     PrefixStabilityManager,
     system_prompt_text,
@@ -44,6 +44,7 @@ from markbot.agent.tool_guardrails import (
     is_failure_result,
     is_preblocked_result,
 )
+from markbot.agent.turn_trace import TurnTrace
 from markbot.bus.events import EventType, make_session_key
 from markbot.session.handoff import build_handoff_from_session
 from markbot.types.permission import PermissionMode, ToolPermissionContext
@@ -102,6 +103,16 @@ class TurnExitReason(str, Enum):
 
     TOOL_CONTINUE = "tool_continue"
     """Tools executed; loop continues to next iteration (not a real exit)."""
+
+
+#: Exit reasons that mean "the loop is still working", not "the turn ended
+#: here". Used to detect iteration exhaustion: the final iteration of a
+#: maxed-out turn still reports TOOL_CONTINUE, so a `None` sentinel can never
+#: distinguish exhaustion from normal progress.
+_CONTINUE_REASONS: frozenset["TurnExitReason"] = frozenset({
+    TurnExitReason.TOOL_CONTINUE,
+    TurnExitReason.STEER_CONTINUE,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -202,16 +213,25 @@ _ACTION_COMPLETION_CLAIM_PATTERNS: tuple[str, ...] = (
 # 长任务若不 compact，todo 长期不在上下文里；每 N 轮主动注入一次活跃 todo。
 _TODO_REINJECT_INTERVAL = 8
 
+#: Floor for the per-tool inline output budget. Above ~8 tool calls in one turn
+#: the proportional share of ``tool_output_inline_chars`` would fall below this
+#: and the "shrink with fan-out" behaviour would silently stop shrinking — so
+#: the floor is the real effective limit from that point on.
+_INLINE_BUDGET_FLOOR_CHARS = 2000
+
 
 # ---------------------------------------------------------------------------
 # Provider-specific usage normalisers
 # ---------------------------------------------------------------------------
 
 class _OpenAICompatNormaliser(UsageNormaliser):
-    """DeepSeek / OpenAI / CodeWhale: ``prompt_cache_hit/miss_tokens``."""
+    """DeepSeek / OpenAI / Azure: ``prompt_cache_hit/miss_tokens`` or the
+    nested ``prompt_tokens_details.cached_tokens`` (OpenAI proper)."""
 
     cache_read_key = "prompt_cache_hit_tokens"
     cache_miss_key = "prompt_cache_miss_tokens"
+    read_nested_cache = True
+    input_includes_cache = True
 
 
 class _CodexResponsesNormaliser(UsageNormaliser):
@@ -219,15 +239,21 @@ class _CodexResponsesNormaliser(UsageNormaliser):
 
     cache_read_key = "cached_tokens"
     cache_miss_key = None  # implicit (input_tokens - cached)
+    input_includes_cache = True
 
 
 class _AnthropicNormaliser(UsageNormaliser):
     """Anthropic Messages: ``cache_read_input_tokens`` /
-    ``cache_creation_input_tokens``."""
+    ``cache_creation_input_tokens``.
+
+    ``input_tokens`` here counts only the *uncached* input, so the miss
+    bucket is the input figure itself — not a residual.
+    """
 
     cache_read_key = "cache_read_input_tokens"
     cache_creation_key = "cache_creation_input_tokens"
     cache_miss_key = None
+    input_includes_cache = False
 
 
 #: Lookup table; ``provider`` here is the provider class name (or
@@ -269,6 +295,12 @@ class LoopState:
     current_tokens: int = 0
     last_response: Any = None
     last_attempts: list = field(default_factory=list)
+    # 本次 LLM 调用的已记账成本（美元），由 _phase_call_llm 的
+    # _record_canonical_usage 写入。_phase_check_budget 只读它做预算判定，
+    # 绝不能再次调用 cost_tracker 记账 —— 同一个 response 被记两次会让
+    # max_budget_usd 在真实花费的一半处就熔断。
+    # None 表示本轮尚未记账（canonical 路径没跑），此时才允许回退。
+    last_call_cost: float | None = None
     last_compact_action: CompactAction = CompactAction.NONE
     steer_continues: int = 0
     # Cache telemetry (populated by _phase_call_llm).
@@ -359,6 +391,18 @@ class IterationRunner:
         # Populated during the pre-execution check_all pass, enforced in
         # ``_execute_one_tool_call`` so error/critical violations never run.
         self._guardrail_blocked: dict[str, str] = {}
+        # Tool calls in the batch currently being processed. Drives the
+        # per-tool inline output budget so a high fan-out cannot blow up the
+        # context. Set at the start of each execution path.
+        self._batch_tool_count: int = 1
+        # Decision trace for this turn: what the loop saw and which branches
+        # it took. Created per turn and handed to the loop on completion.
+        self.trace: TurnTrace | None = TurnTrace(
+            session_key=session_key or "",
+            channel=channel,
+            chat_id=chat_id,
+        )
+        self.last_trace: TurnTrace | None = None
         policy = getattr(loop, "cache_mutation_policy", None)
         if policy is None:
             raise RuntimeError("AgentLoop.cache_mutation_policy is required")
@@ -496,14 +540,21 @@ class IterationRunner:
         1. ``permission_mode_override`` — set by unattended callers (cron /
            autopilot / heartbeat) via ``process_direct`` so they don't depend
            on the global app_state mode being set by a user.
-        2. Global ``app_state.permission_mode`` — the single place slash
-           commands / UI code change the active mode for interactive turns.
-        3. ``PermissionMode.DEFAULT`` fallback.
+        2. **Per-session mode** — set by ``/mode`` for this conversation only.
+           Scoping the mode per session is what keeps one user's
+           ``/mode auto`` from granting unrestricted tools to everybody else
+           sharing the daemon.
+        3. Global ``app_state.permission_mode`` — the process-wide baseline
+           (config ``defaultPermissionMode`` or a mirrored ``/mode``).
+        4. ``PermissionMode.DEFAULT`` fallback.
         """
         if self.permission_mode_override is not None:
             return self.permission_mode_override, ToolPermissionContext(
                 mode=self.permission_mode_override
             )
+        session_mode = self._session_permission_mode()
+        if session_mode is not None:
+            return session_mode, ToolPermissionContext(mode=session_mode)
         provider = getattr(getattr(self.loop, "ctx", None), "app_state", None)
         try:
             state = provider.get() if provider is not None else None
@@ -514,6 +565,19 @@ class IterationRunner:
         except Exception as exc:
             logger.debug("Failed to read app permission state: {}", exc)
         return PermissionMode.DEFAULT, ToolPermissionContext(mode=PermissionMode.DEFAULT)
+
+    def _session_permission_mode(self) -> PermissionMode | None:
+        """Read the owning session's permission override, if it has one."""
+        session = getattr(self, "session", None)
+        session_key = getattr(session, "key", None) or getattr(session, "id", None)
+        if not session_key:
+            return None
+        try:
+            mode = self.loop.get_session_permission_mode(session_key)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to read session permission mode: {}", exc)
+            return None
+        return mode if isinstance(mode, PermissionMode) else None
 
     def _is_non_interactive(self) -> bool:
         """Unattended callers pass permission_mode_override and should not block on ask."""
@@ -810,23 +874,108 @@ class IterationRunner:
         finally:
             self._stop_watchdog()
 
-        # If we exited the loop without an explicit break (i.e. hit the
-        # max_iterations boundary), set the reason here.
-        if state.exit_reason is None:
+        # Detect iteration exhaustion directly. Relying on
+        # ``exit_reason is None`` did not work: the last iteration of a
+        # maxed-out turn returns ``TOOL_CONTINUE`` (a non-None telemetry
+        # value), so the sentinel was never None and this branch never ran —
+        # the handoff recorded "tool_continue" for a turn that had actually
+        # hit the cap, and the "continue" resume prompt told the model to
+        # look for an interruption the structured reason never reported.
+        if state.iteration >= self.loop.max_iterations and (
+            state.exit_reason is None
+            or state.exit_reason in _CONTINUE_REASONS
+        ):
             state.exit_reason = TurnExitReason.MAX_ITERATIONS
+            logger.warning(
+                "Turn hit the iteration cap ({} iterations); "
+                "reporting exit reason MAX_ITERATIONS",
+                self.loop.max_iterations,
+            )
 
         await self._finalize_loop(state)
+        self._close_trace(state)
 
         save_start = len(state.messages) + 1 if self._durable_turn_enabled() else state.new_msg_start
         return state.final_content, state.tools_used, state.messages, save_start
 
+    def _close_trace(self, state: LoopState) -> None:
+        """Seal the turn trace and hand it to the loop for later inspection.
+
+        Retaining the trace on the loop is what makes "why did it do that?"
+        answerable *after* the fact — the log stream is gone by then.
+        """
+        trace = getattr(self, "trace", None)
+        if trace is None:
+            return
+        try:
+            trace.finish(
+                exit_reason=state.exit_reason.value if state.exit_reason else "",
+                error="" if state.final_content else "no final content",
+            )
+            self.last_trace = trace
+            recorder = getattr(self.loop, "record_turn_trace", None)
+            if callable(recorder):
+                recorder(trace)
+        except Exception as exc:  # pragma: no cover - telemetry only
+            logger.debug("trace close failed: {}", exc)
+        finally:
+            # One trace per turn; do not carry it into the next.
+            self.trace = None
+
+    def _polluted_stream(self, attempts: list | None) -> str:
+        """Reason the already-streamed output must be discarded, or "".
+
+        Emitted deltas cannot be retracted. If an attempt failed part-way
+        through a stream, the fallback chain rotates to another model which
+        streams into the *same* sink, so the user would receive the failed
+        attempt's partial text followed by the replacement's full output.
+        Both a content-filter hit and a mid-stream transport failure leave
+        unusable bytes on the wire, so both force a discard.
+        """
+        for a in (attempts or []):
+            err = str(getattr(a, "error", "") or "")
+            if not err:
+                continue
+            if err == "content_filter":
+                return "content_filter in fallback chain"
+            # A streamed attempt that failed rather than completing.
+            if getattr(a, "streamed", False):
+                return f"stream failed mid-flight ({err})"
+        return ""
+
+    @staticmethod
+    def _append_synthetic_notice(
+        messages: list[dict],
+        content: str,
+        marker: str,
+    ) -> None:
+        """Append a harness notice to the end of the live message list.
+
+        Two properties this deliberately preserves:
+
+        * **It is a ``user`` message, not ``system``.** Mid-conversation
+          ``role: system`` messages contradict the invariant the rest of the
+          loop documents (Anthropic accumulates them into a separate system
+          list; OpenAI-compat sanitisers drop them), and correctness then
+          depends on a provider-adapter detail.
+        * **It is appended, not inserted near the front.** Inserting at
+          index 1 rewrites position 1 onward, which invalidates the prefix
+          cache for the *entire* remaining history — exactly the
+          multi-turn cache reuse the rest of the agent works to preserve.
+          Appending leaves every existing message byte-identical and in
+          place, and puts the notice where the model actually needs it:
+          immediately before the call that must act on it.
+        """
+        messages.append({
+            "role": "user",
+            "content": content,
+            # Marker so downstream consumers can identify it as a synthetic
+            # harness injection rather than a real user turn.
+            marker: True,
+        })
+
     async def _run_one_iteration(self, state: LoopState) -> IterationResult:
         self._runtime_budget.touch_activity()
-        # Bump the messages revision so the token estimate cache
-        # knows to recompute on the next call.
-        rev = getattr(self.loop, "_messages_revision", None)
-        if rev is not None:
-            self.loop._messages_revision = rev + 1
         state.current_tokens = self._estimate_tokens(state)
         logger.debug("Estimated context tokens: {}", state.current_tokens)
 
@@ -935,27 +1084,22 @@ class IterationRunner:
             failed_methods = self._tool_guardrail.state.failed_methods
             if failed_methods:
                 recent = failed_methods[-15:]
-                blacklist_msg = {
-                    "role": "system",
-                    "content": (
+                self._append_synthetic_notice(
+                    state.messages,
+                    (
                         "[Failure Blacklist — 已尝试且失败的方法]\n"
                         "以下方法在本次任务中已尝试且失败，**绝对不要重复这些方法或其变体**。"
                         "如果下一步要用方法和下面任意一条相似，请立刻改用完全不同的方法，"
                         "或直接告知用户当前环境无法完成任务并说明缺失的条件。\n\n"
                         + "\n".join(f"- {m}" for m in recent)
                     ),
-                }
-                insert_idx = 0
-                for i, m in enumerate(state.messages):
-                    if m.get("role") == "system":
-                        insert_idx = i + 1
-                    else:
-                        break
-                state.messages.insert(insert_idx, blacklist_msg)
-                self._account_insert(state, insert_idx)
+                    "_failure_blacklist",
+                )
+                # Appended at the tail, so the existing cursor stays valid.
+                self._account_insert(state, len(state.messages) - 1)
                 logger.info(
-                    "Injected failure blacklist ({} entries) after compact ({}) at idx {}",
-                    len(recent), action_val, insert_idx,
+                    "Injected failure blacklist ({} entries) after compact ({}) at tail",
+                    len(recent), action_val,
                 )
             state.last_todo_reinject_iter = state.iteration
 
@@ -965,8 +1109,13 @@ class IterationRunner:
         markbot 原先只在 compact 后 reinject todo（compact.py 内部），
         但长任务若一直没触发 compact，todo 长期不在上下文里，模型可能
         忘记剩余 plan 或重复已完成步骤。每 ``_TODO_REINJECT_INTERVAL``
-        轮主动注入一次，作为 system message 插到开头连续 system 消息之后
-        （与 failure blacklist 注入位置一致，保证不破坏 system prompt 首位）。
+        轮主动注入一次。
+
+        注入位置在消息列表**末尾**且角色为 ``user``：原实现是在开头连续
+        system 消息之后插入一条 ``role: system``，这既违反本循环自己声明的
+        不变量（见 ``_append_synthetic_notice``），又会让 index 1 之后的所有
+        消息前缀缓存全部失效——而缓存正是本 agent 反复维护的东西。追加到末尾
+        既保住整段前缀，又让提示出现在模型真正需要它的位置（本轮 LLM 调用前）。
 
         compact 触发的那一轮由 ``_phase_compact`` 同步更新计数，本方法
         在间隔不足时直接返回，不会重复注入。
@@ -985,24 +1134,16 @@ class IterationRunner:
             # 没有活跃 todo —— 也更新计数，避免每轮都重试 format_for_injection。
             state.last_todo_reinject_iter = state.iteration
             return
-        insert_idx = 0
-        for i, m in enumerate(state.messages):
-            if m.get("role") == "system":
-                insert_idx = i + 1
-            else:
-                break
-        state.messages.insert(insert_idx, {
-            "role": "system",
-            "content": snapshot,
-            # Marker so downstream consumers can identify it as a synthetic
-            # re-injection (not part of the original system prompt).
-            "_todo_reinjection": True,
-        })
-        self._account_insert(state, insert_idx)
+        self._append_synthetic_notice(
+            state.messages, snapshot, "_todo_reinjection"
+        )
+        # Appended at the end, so the existing cursor is still valid; account
+        # for the new message so persistence picks it up this turn.
+        self._account_insert(state, len(state.messages) - 1)
         state.last_todo_reinject_iter = state.iteration
         logger.info(
-            "Re-injected active todo snapshot at iteration {} (idx={})",
-            state.iteration, insert_idx,
+            "Re-injected active todo snapshot at iteration {} (tail)",
+            state.iteration,
         )
 
     async def _phase_inject_memory_context(self, state: LoopState) -> None:
@@ -1898,17 +2039,20 @@ class IterationRunner:
         self, state: LoopState, tool_defs: list[dict]
     ) -> IterationResult | None:
         self._runtime_budget.touch_activity()
-        # If a previous model returned content_filter, the stream buffer may be
-        # polluted. Discard it before starting a new LLM call.
+        # Clear the per-call cost sentinel before the request, not after it.
+        # ``_phase_budget`` treats ``None`` as "canonical accounting did not
+        # run for this response" and falls back to the legacy reader. A stale
+        # value left over from the previous iteration is not ``None``, so it
+        # would both suppress that fallback — letting the budget check degrade
+        # to a no-op after a billing glitch — and report a misleading spend.
+        state.last_call_cost = None
+        # If a previous attempt left unusable bytes on the wire (a
+        # content-filter hit, or a stream that failed mid-flight), discard
+        # the buffer before starting a new LLM call.
         if self.on_stream and self.on_stream_end and state.last_attempts:
-            had_content_filter = any(
-                getattr(a, "error", "") == "content_filter"
-                for a in state.last_attempts
-            )
-            if had_content_filter:
-                logger.info(
-                    "Discarding polluted stream buffer before new LLM call"
-                )
+            polluted = self._polluted_stream(state.last_attempts)
+            if polluted:
+                logger.info("Discarding polluted stream buffer: {}", polluted)
                 await self.on_stream_end(discard=True)
                 self._stream_filter.reset()
         # ------------------------------------------------------------------
@@ -1948,8 +2092,7 @@ class IterationRunner:
             # Normalise the response usage and feed it to the cost tracker.
             # The provider name comes from the most recent successful
             # attempt when available, else we fall back to "unknown".
-            self._record_canonical_usage(response, attempts)
-            # Refresh the cache event's token fields with the *current*
+            self._record_canonical_usage(response, attempts, state)            # Refresh the cache event's token fields with the *current*
             # response's usage.  ``_check_prefix_stability`` ran before
             # the call and could only see the previous turn's usage, so
             # without this refresh the TUI chip would always lag one
@@ -1960,6 +2103,19 @@ class IterationRunner:
             self._maybe_write_response_cache(state, tool_defs, response, attempts)
             self._emit_model_succeeded(response, attempts)
             return None
+        except BudgetExceededError as exc:
+            # Raised by the cost tracker during accounting. This is not an
+            # LLM failure — retrying or compacting would not help, and the
+            # generic handler below would treat it as one.
+            logger.error("Budget exceeded: {}. Stopping turn.", exc)
+            state.budget_exceeded = True
+            state.final_content = (
+                f"[Budget] Cost cap reached (${exc.current_cost:.4f} of "
+                f"${exc.budget:.2f}). Stopping this turn."
+            )
+            return IterationResult(
+                should_break=True, exit_reason=TurnExitReason.BUDGET_EXCEEDED
+            )
         except Exception as llm_exc:
             self._emit_model_failed(llm_exc)
             return await self._handle_llm_error(state, tool_defs, llm_exc)
@@ -2071,6 +2227,10 @@ class IterationRunner:
         except Exception as e:
             logger.debug("_emit_model_succeeded failed: {}", e)
 
+        # Decision trace: what this call cost and which branch it sent the
+        # loop down. Without this a finished turn leaves no record of *why*.
+        self._trace_llm(response, attempts)
+
     def _emit_model_failed(self, error: BaseException) -> None:
         """Emit MODEL_FAILED so monitors can alert on provider outages."""
         try:
@@ -2087,18 +2247,37 @@ class IterationRunner:
         self,
         response: Any,
         attempts: list[Any] | None,
-    ) -> None:
+        state: LoopState | None = None,
+    ) -> float:
         """Normalise the response usage and feed it to the cost tracker.
 
-        Falls back to ``update_from_response`` (legacy path) when no
-        attempts are recorded, so the cost tracker keeps working for
-        provider adapters that haven't been migrated yet.
+        This is the **single** accounting entry point for the main agent
+        loop. ``_phase_check_budget`` reads the cost recorded here instead
+        of re-recording the same response — two ``add_usage`` calls for one
+        response double every counter and trip ``max_budget_usd`` at half
+        the intended spend.
+
+        Returns the recorded cost in USD (0.0 when nothing was billable).
+
+        Raises:
+            BudgetExceededError: propagated, not swallowed. Budget
+                enforcement depends on this signal reaching
+                ``_phase_check_budget``; catching it here would leave the
+                cost cap unenforced while still logging the spend.
         """
         if response is None:
-            return
+            if state is not None:
+                state.last_call_cost = None
+            return 0.0
         usage = getattr(response, "usage", None)
         if not isinstance(usage, dict):
-            return
+            # Not billable. Clear the sentinel so ``_phase_check_budget``
+            # still sees "nothing recorded for this call" and can fall back
+            # to the legacy reader, instead of reading a previous
+            # iteration's figure.
+            if state is not None:
+                state.last_call_cost = None
+            return 0.0
         provider_name = ""
         if attempts:
             for a in reversed(attempts):
@@ -2107,21 +2286,57 @@ class IterationRunner:
                     provider_name = str(provider_cfg.type)
                     break
         canonical = normalise_usage(provider_name, usage)
-        # Best-effort: also surface to cost tracker.
         cost_tracker = getattr(self.loop, "cost_tracker", None)
-        model = ""
+        # Resolve the billed model. ``PricingTable`` has no entry for the
+        # literal "unknown" and falls back to a near-zero default price
+        # (0.003/1k), so a call recorded under it is billed roughly a
+        # thousandth of its real cost and the budget cap stops biting.
+        # Seed from the loop's configured model — the same default
+        # ``_phase_check_budget`` uses — and let the attempt record override
+        # it when one is available.
+        model = str(getattr(self.loop, "model", "") or "")
         if attempts:
             for a in reversed(attempts):
-                m = getattr(a, "model_ref", None)
+                m = getattr(a, "model_ref", None) or getattr(
+                    getattr(a, "model", None), "name", None
+                )
                 if m:
                     model = str(m)
                     break
+        if not model:
+            model = "unknown"
+            logger.debug(
+                "No model reference available for this response; billing under "
+                "'unknown' (near-zero default price)."
+            )
         if cost_tracker is not None and hasattr(cost_tracker, "add_canonical_usage"):
             try:
-                cost_tracker.add_canonical_usage(canonical, model=model or "unknown")
+                cost = cost_tracker.add_canonical_usage(
+                    canonical, model=model or "unknown"
+                )
+            except BudgetExceededError:
+                # The spend is already recorded; only the *signal* that the
+                # cap was hit needs to reach the caller.
+                if state is not None:
+                    state.last_call_cost = 0.0
+                raise
             except Exception as exc:
-                # Don't break the loop on a billing glitch.
+                # Don't break the loop on a billing glitch, but do not leave
+                # the sentinel pointing at a previous iteration: a stale
+                # value suppresses the legacy fallback in
+                # ``_phase_check_budget`` and silently disables the cap.
                 logger.debug("cost_tracker.add_canonical_usage failed: {}", exc)
+                if state is not None:
+                    state.last_call_cost = None
+                return 0.0
+        else:
+            if state is not None:
+                state.last_call_cost = None
+            return 0.0
+
+        if state is not None:
+            state.last_call_cost = cost
+        return cost
 
     def _refresh_cache_event_tokens(
         self,
@@ -2257,9 +2472,9 @@ class IterationRunner:
         if cache is None:
             return None
         from markbot.agent.llm_response_cache import (
-            request_is_cacheable,
-            make_response_cache_key,
             canonicalise_body,
+            make_response_cache_key,
+            request_is_cacheable,
         )
         # Streaming requests are never cacheable.
         if self.on_stream:
@@ -2303,9 +2518,9 @@ class IterationRunner:
         if cache is None:
             return
         from markbot.agent.llm_response_cache import (
-            request_is_cacheable,
-            make_response_cache_key,
             canonicalise_body,
+            make_response_cache_key,
+            request_is_cacheable,
         )
         if self.on_stream:
             return
@@ -2333,22 +2548,30 @@ class IterationRunner:
 
     def _estimate_tokens(self, state: LoopState) -> int:
         """Estimate the current token count, using the estimate cache
-        when available."""
+        when available.
+
+        The cache is content-addressed and keyed by session, so no external
+        revision bookkeeping is required. That matters: the previous
+        counter-based scheme was bumped unconditionally at the top of every
+        iteration and then immediately queried with the new value, so the hot
+        path missed ~100% of the time — and because the key carried no
+        session identity, one session could be served another's estimate
+        even on a hit. That number gates compaction.
+        """
         tec = getattr(self.loop, "token_estimate_cache", None)
-        rev = getattr(self.loop, "_messages_revision", 0)
         if tec is not None:
             try:
-                # Extract the system prompt text so the cache's
-                # ``system_fingerprint`` key actually invalidates when
-                # the system prompt bytes change.  Without this, the
-                # fingerprint would always be 0 and the cache would
-                # rely solely on ``messages_revision`` being bumped —
-                # fragile if any future code path forgets to bump it.
                 sys_text = system_prompt_text(state.messages)
+                session = getattr(self, "session", None)
+                session_key = (
+                    getattr(session, "key", None)
+                    or getattr(session, "id", None)
+                    or ""
+                )
                 return tec.lookup_or_compute(
-                    messages_revision=rev,
                     system_prompt=sys_text,
                     messages=state.messages,
+                    session_key=str(session_key or ""),
                 )
             except Exception:
                 pass
@@ -2431,16 +2654,30 @@ class IterationRunner:
                 should_break=True, exit_reason=TurnExitReason.BUDGET_EXCEEDED
             )
 
+        # Cost axis. The spend for this response was already recorded by
+        # _record_canonical_usage in _phase_call_llm, so this phase only
+        # *reads* the recorded figure. Re-recording here is what made every
+        # call bill twice and trip the budget at half its real spend.
         try:
-            call_cost = self.loop.cost_tracker.update_from_response(
-                response, model=_actual_model
-            )
+            call_cost = state.last_call_cost
+            if call_cost is None:
+                # Canonical accounting did not run for this response (e.g. a
+                # provider adapter that reports no usage dict). Fall back to
+                # the legacy reader so the budget is still evaluated.
+                call_cost = self.loop.cost_tracker.update_from_response(
+                    response, model=_actual_model
+                )
+                state.last_call_cost = call_cost
             if call_cost > 0:
                 logger.debug("API cost this call: ${:.6f}", call_cost)
             return None
         except BudgetExceededError as exc:
             logger.error("Budget exceeded: {}. Stopping loop early.", exc)
             state.budget_exceeded = True
+            state.final_content = (
+                f"[Budget] Cost cap reached (${exc.current_cost:.4f} of "
+                f"${exc.budget:.2f}). Stopping this turn."
+            )
             return IterationResult(
                 should_break=True, exit_reason=TurnExitReason.BUDGET_EXCEEDED
             )
@@ -2459,15 +2696,9 @@ class IterationRunner:
         mutations_before = len(state.file_mutations)
 
         if self.on_stream and self.on_stream_end:
-            had_content_filter = any(
-                getattr(a, "error", "") == "content_filter"
-                for a in (state.last_attempts or [])
-            )
-            if had_content_filter:
-                logger.info(
-                    "Discarding polluted stream buffer "
-                    "(content_filter in fallback chain)"
-                )
+            polluted = self._polluted_stream(state.last_attempts)
+            if polluted:
+                logger.info("Discarding polluted stream buffer: {}", polluted)
                 await self.on_stream_end(resuming=True, discard=True)
                 self._stream_filter.reset()
             else:
@@ -2503,120 +2734,26 @@ class IterationRunner:
             safe_args = args_str[:200].replace("{", "{{").replace("}", "}}")
             logger.info("Tool call: {}({})", tc.name, safe_args)
 
-        self.loop._set_tool_context(
-            self.channel, self.chat_id, self.message_id, is_group=self.is_group
-        )
+        # No mid-turn tool re-binding here. The tools that need routing read
+        # it from the per-call ToolContext, so re-running _set_tool_context
+        # mid-turn only overwrote the singleton fallbacks with *this* turn's
+        # values — which, with concurrent sessions, made whichever turn
+        # happened to run last decide where everyone else's messages, cron
+        # jobs and memory writes went.
 
         invalid_tool_calls = self._detect_and_repair_hallucinated_tools(response)
         if invalid_tool_calls:
-            self._invalid_tool_retries = getattr(self, "_invalid_tool_retries", 0) + 1
-            available = ", ".join(sorted(self.loop.tools.tool_names))
-            invalid_name = invalid_tool_calls[0]
-            invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
-            logger.warning(
-                "Unknown tool '{}' — sending error to model for self-correction ({}/3)",
-                invalid_preview, self._invalid_tool_retries,
+            return await self._run_hallucinated_tool_recovery(
+                state, response, invalid_tool_calls
             )
-
-            if self._invalid_tool_retries >= 3:
-                logger.error("Max retries (3) for invalid tool calls exceeded. Stopping.")
-                self._invalid_tool_retries = 0
-                state.final_content = (
-                    f"I tried to call a tool that doesn't exist ('{invalid_preview}') "
-                    f"too many times. Available tools: {available}"
-                )
-                return IterationResult(
-                    should_break=True,
-                    exit_reason=TurnExitReason.INVALID_TOOL_MAX_RETRIES,
-                )
-
-            error_msg = (
-                f"Tool '{invalid_name}' does not exist. "
-                f"Available tools: {available}. "
-                f"Please use only the tools listed above."
-            )
-            permission_mode, permission_context = self._current_permission_context()
-            recovery_ctx = ToolContext(
-                session_id=self.session_key,
-                workspace=str(self.loop.workspace),
-                permission_mode=permission_mode,
-                tool_permission_context=permission_context,
-                is_non_interactive=self._is_non_interactive(),
-                channel=self.channel,
-                chat_id=self.chat_id,
-                message_id=self.message_id,
-            )
-            for tc in response.tool_calls:
-                if not self.loop.tools.has(tc.name):
-                    state.messages = await self.loop.context.add_tool_result_async(
-                        state.messages, tc.id, tc.name, error_msg
-                    )
-                else:
-                    # Run skill guardrail checks (same as normal tool phase)
-                    # so error/critical violations block execution here too.
-                    self._check_skill_guardrail(tc)
-                    # Same pre-block path as the normal tool phase.
-                    result = await self._execute_one_tool_call(tc, recovery_ctx)
-                    state.messages = await self.loop.context.add_tool_result_async(
-                        state.messages, tc.id, tc.name, result
-                    )
-                    # Track file mutations in the recovery path too — if the
-                    # LLM mixed a valid write_file with hallucinated tools,
-                    # the mutation must still be recorded so the verifier
-                    # doesn't false-positive on the final response.
-                    self._record_file_mutation(state, tc, result)
-                    self._record_verification_call(state, tc, result)
-                    # Feed recovery-path results into the guardrail engine.
-                    self._record_tool_result(state, result, tc.name, tc)
-            self._flush_messages(state)
-            # Batch-end failure-window check (same as normal tool phase).
-            failure_result = self._phase_check_failure_loop(state)
-            if failure_result is not None:
-                return failure_result
-            return IterationResult(
-                should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
-            )
-        else:
-            self._invalid_tool_retries = 0
+        self._invalid_tool_retries = 0
 
         for tc in response.tool_calls:
             self._check_skill_guardrail(tc)
 
         logger.info("Executing {} tool calls...", len(response.tool_calls))
 
-        # Build a per-turn progress callback so long-running tools
-        # (run_code streaming a pip install, exec running a build) can push
-        # incremental stdout lines onto the event bus. The bus-side payload
-        # carries the session key so subscribers (CLI, web UI) can render
-        # live progress. report_progress is sync per the ToolContext
-        # contract; we hop into the loop to emit the async event.
-        _progress_session_key = self.session_key
-        _progress_loop = asyncio.get_running_loop()
-        _active_tool_names = [tc.name for tc in response.tool_calls]
-
-        def _report_progress(text: str, percent: float | None = None) -> None:
-            self._runtime_budget.touch_activity()
-            try:
-                from markbot.bus.emitter import get_event_emitter
-                from markbot.bus.events import EventType
-
-                emitter = get_event_emitter()
-                payload = {
-                    "text": text,
-                    "percent": percent,
-                    "tools": _active_tool_names,
-                    "channel": self.channel,
-                    "chat_id": self.chat_id,
-                }
-                _progress_loop.create_task(
-                    emitter.emit(
-                        EventType.TOOL_PROGRESS,
-                        payload,
-                        session_key=_progress_session_key,
-                    )
-                )
-            except Exception as e:
-                logger.debug("report_progress emit failed: {}", e)
+        _report_progress = self._make_progress_reporter(response.tool_calls)
 
         permission_mode, permission_context = self._current_permission_context()
         _tool_ctx = ToolContext(
@@ -2628,6 +2765,7 @@ class IterationRunner:
             channel=self.channel,
             chat_id=self.chat_id,
             message_id=self.message_id,
+            is_group=self.is_group,
             report_progress=_report_progress,
         )
 
@@ -2657,112 +2795,13 @@ class IterationRunner:
         results = await self._execute_tool_calls_safely(response.tool_calls, _tool_ctx)
         logger.info("Tool execution completed, {} results", len(results))
 
-        for idx, (tool_call, result) in enumerate(zip(response.tool_calls, results)):
-            if isinstance(result, BaseException):
-                logger.error(
-                    "Tool {} failed with exception: {}", tool_call.name, result
-                )
-                self._emit(
-                    EventType.TOOL_FAILED,
-                    {"tool": tool_call.name, "call_id": tool_call.id,
-                     "error": type(result).__name__},
-                )
-                result = f"Error: {type(result).__name__}: {result}"
-            elif isinstance(result, dict) and result.get("_multimodal"):
-                # Multimodal results (e.g. computer_use screenshots) carry a
-                # base64 image that dwarfs the inline-char threshold. They must
-                # NOT be stringified or offloaded — add_tool_result unwraps the
-                # dict into a content array (text + image_url) for the provider.
-                # Logging the text_summary keeps base64 out of the log.
-                preview = (result.get("text_summary") or "")[:100]
-                safe_preview = preview.replace("{", "{{").replace("}", "}}")
-                logger.info("Tool {} result (multimodal): {}", tool_call.name, safe_preview)
-            else:
-                result_str = str(result)
-                # Dynamic per-tool budget: when the model calls N tools in one
-                # turn, each tool's inline allowance shrinks proportionally so
-                # the total injected text stays bounded regardless of fan-out.
-                # This prevents a single turn with many verbose tools from
-                # forcing a compaction that would lose information.
-                _tool_count = max(1, len(response.tool_calls))
-                _inline_budget = max(
-                    2000, self.loop.compactor.config.tool_output_inline_chars // _tool_count
-                )
-                if len(result_str) > _inline_budget:
-                    inline, artifact_path = offload_tool_output(
-                        result_str,
-                        tool_call.name,
-                        tool_call.id,
-                        inline_limit=_inline_budget,
-                        preview_chars=self.loop.compactor.config.tool_output_preview_chars,
-                    )
-                    if artifact_path:
-                        logger.info(
-                            "Tool {} output offloaded to {} ({} chars)",
-                            tool_call.name, artifact_path, len(result_str),
-                        )
-                        result = inline
-                    else:
-                        result_preview = (
-                            result_str[:100] + "..." if len(result_str) > 100 else result_str
-                        )
-                        safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                        logger.info(
-                            "Tool {} result: {}", tool_call.name, safe_preview
-                        )
-                else:
-                    result_preview = (
-                        result_str[:100] + "..." if len(result_str) > 100 else result_str
-                    )
-                    safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
-                    logger.info(
-                        "Tool {} result: {}", tool_call.name, safe_preview
-                    )
-            state.messages = await self.loop.context.add_tool_result_async(
-                state.messages, tool_call.id, tool_call.name, result
-            )
+        # Number of calls in this batch, used to divide the per-tool inline
+        # output budget so a high fan-out cannot blow up the context.
+        self._batch_tool_count = len(response.tool_calls)
 
-            # 记录 tool 结果用于连续失败检测
-            self._record_tool_result(state, result, tool_call.name, tool_call)
+        for tool_call, result in zip(response.tool_calls, results):
+            await self._apply_tool_result(state, tool_call, result)
 
-            # File-mutation tracking: record successful mutating-tool calls so
-            # the verifier in _phase_final_response can detect "LLM claims
-            # done but nothing landed on disk". We only track tools in
-            # MUTATING_TOOL_NAMES (write_file / edit_file / delete_file) and
-            # only when the result is not an error. Shell/exec tools are
-            # excluded because their file effects are not deterministically
-            # parseable from arguments.
-            self._record_file_mutation(state, tool_call, result)
-            # Track verification tool calls (exec/shell/run_code) for
-            # the verify-on-stop nudge — see _should_inject_verify_nudge.
-            self._record_verification_call(state, tool_call, result)
-
-            # Emit TOOL_COMPLETED so monitors can track tool latency/usage.
-            # Mirror _is_tool_result_failure so the event's `ok` field
-            # agrees with the guardrail's failure classifier — a tool
-            # returning ``{"error": "..."}`` (JSON string) would otherwise
-            # be flagged as failure for steering but reported as success here.
-            is_error = self._is_tool_result_failure(result, tool_call.name)
-            self._emit(
-                EventType.TOOL_COMPLETED,
-                {"tool": tool_call.name, "call_id": tool_call.id,
-                 "ok": not is_error},
-            )
-
-            if self.on_tool_complete:
-                error_msg = None
-                summary = None
-                if is_error:
-                    error_msg = result if isinstance(result, str) else str(result)
-                elif isinstance(result, str):
-                    summary = result[:200] if len(result) > 200 else result
-                try:
-                    await self.on_tool_complete(tool_call.id, tool_call.name, summary, error_msg)
-                except Exception as e:
-                    logger.debug("on_tool_complete callback failed: {}", e)
-            # Keep the inactivity clock fresh after each tool result.
-            self._runtime_budget.touch_activity()
-            self._flush_messages(state)
         logger.info(
             "Added {} tool results to messages, continue to next iteration",
             len(results),
@@ -2774,10 +2813,8 @@ class IterationRunner:
         # guardrail's success-loop detector before the failure check below
         # (which now also evaluates stagnation). Compared against the file
         # mutation count captured before execution.
-        self._tool_guardrail.note_iteration(
-            [(tc.name, tc.arguments) for tc in response.tool_calls],
-            assistant_text=response.content or "",
-            had_file_mutation=len(state.file_mutations) > mutations_before,
+        self._note_tool_batch_execution(
+            state, response.tool_calls, response, mutations_before
         )
 
         # 连续失败检测：在所有 tool 执行完毕后检查是否陷入失败循环
@@ -2785,6 +2822,409 @@ class IterationRunner:
         if failure_result is not None:
             return failure_result
 
+        return IterationResult(
+            should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
+        )
+
+    async def _apply_tool_result(
+        self,
+        state: LoopState,
+        tool_call: Any,
+        result: Any,
+        *,
+        emit_events: bool = True,
+    ) -> Any:
+        """Normalise, bound, record, emit and append a single tool result.
+
+        This is the one place a tool result becomes part of the conversation.
+        It used to be inlined in the main tool phase with a second, reduced
+        copy on the hallucinated-tool recovery path — that copy silently
+        skipped output truncation/offload, the progress callbacks, the
+        TOOL_CALLED/TOOL_COMPLETED events, the inactivity-clock touch and the
+        stagnation feed. So one model typo degraded a turn into an
+        unmonitored, unbounded-output execution mode.
+
+        Keeping a single implementation is what makes those guarantees hold
+        on both paths.
+
+        Returns the (possibly rewritten) result that was appended.
+        """
+        # --- 1. Coerce an exception into a model-readable string -----------
+        if isinstance(result, BaseException):
+            logger.error(
+                "Tool {} failed with exception: {}", tool_call.name, result
+            )
+            if emit_events:
+                self._emit(
+                    EventType.TOOL_FAILED,
+                    {"tool": tool_call.name, "call_id": tool_call.id,
+                     "error": type(result).__name__},
+                )
+            result = f"Error: {type(result).__name__}: {result}"
+
+        # --- 2. Bound what goes back into the context ----------------------
+        if isinstance(result, dict) and result.get("_multimodal"):
+            # Multimodal results (e.g. computer_use screenshots) must NOT be
+            # stringified or offloaded — add_tool_result unwraps the dict into
+            # a content array (text + image_url) for the provider. But that
+            # made the *text* half unbounded: the base64 blob dwarfs the
+            # character threshold, so a tool returning several screenshots, or
+            # a long text_summary beside them, went into the context whole.
+            # Bound the text half and drop oversized images to their summary.
+            result = self._bound_multimodal(result, tool_call)
+            preview = (result.get("text_summary") or "")[:100]
+            safe_preview = preview.replace("{", "{{").replace("}", "}}")
+            logger.info("Tool {} result (multimodal): {}", tool_call.name, safe_preview)
+        else:
+            result_str = str(result)
+            # Dynamic per-tool budget: when the model calls N tools in one
+            # turn, each tool's inline allowance shrinks proportionally so
+            # the total injected text stays bounded regardless of fan-out.
+            # This prevents a single turn with many verbose tools from
+            # forcing a compaction that would lose information.
+            budget = self._inline_budget_for(result_str, state)
+            if len(result_str) > budget:
+                inline, artifact_path = offload_tool_output(
+                    result_str,
+                    tool_call.name,
+                    tool_call.id,
+                    inline_limit=budget,
+                    preview_chars=self.loop.compactor.config.tool_output_preview_chars,
+                )
+                if artifact_path:
+                    logger.info(
+                        "Tool {} output offloaded to {} ({} chars)",
+                        tool_call.name, artifact_path, len(result_str),
+                    )
+                    result = inline
+                else:
+                    result = result
+            if isinstance(result, str):
+                result_preview = (
+                    result[:100] + "..." if len(result) > 100 else result
+                )
+                safe_preview = result_preview.replace("{", "{{").replace("}", "}}")
+                logger.info("Tool {} result: {}", tool_call.name, safe_preview)
+
+        # --- 3. Append to the conversation ---------------------------------
+        state.messages = await self.loop.context.add_tool_result_async(
+            state.messages, tool_call.id, tool_call.name, result
+        )
+
+        # --- 4. Guardrail / verifier bookkeeping ---------------------------
+        self._record_tool_result(state, result, tool_call.name, tool_call)
+        self._record_file_mutation(state, tool_call, result)
+        self._record_verification_call(state, tool_call, result)
+
+        # --- 5. Observability ---------------------------------------------
+        is_error = self._is_tool_result_failure(result, tool_call.name)
+        if emit_events:
+            self._emit(
+                EventType.TOOL_COMPLETED,
+                {"tool": tool_call.name, "call_id": tool_call.id,
+                 "ok": not is_error},
+            )
+
+        if self.on_tool_complete:
+            error_msg = None
+            summary = None
+            if is_error:
+                error_msg = result if isinstance(result, str) else str(result)
+            elif isinstance(result, str):
+                summary = result[:200] if len(result) > 200 else result
+            try:
+                await self.on_tool_complete(
+                    tool_call.id, tool_call.name, summary, error_msg
+                )
+            except Exception as e:
+                logger.debug("on_tool_complete callback failed: {}", e)
+
+        # Keep the inactivity clock fresh after each tool result.
+        self._runtime_budget.touch_activity()
+        self._flush_messages(state)
+        self._trace_tool(tool_call, result)
+        return result
+
+    #: Upper bound on the base64 payload of a single inline image. ~1.5 MB of
+    #: encoded data is already far more than a model can usefully attend to in
+    #: one tool result, and an unbounded blob can push the whole turn past the
+    #: context window before compaction ever runs.
+    _MAX_INLINE_IMAGE_BYTES = 1_500_000
+
+    #: How many images a single tool result may carry inline.
+    _MAX_INLINE_IMAGES = 4
+
+    def _bound_multimodal(self, result: dict, tool_call: Any) -> dict:
+        """Cap a multimodal tool result's text and image payloads.
+
+        The previous code passed the dict straight through, so a tool that
+        returned many screenshots — or a long ``text_summary`` beside them —
+        injected an unbounded amount of data. Images past the count or size
+        limit are replaced by their summary, which keeps the turn's shape
+        (the model still learns the tool ran and what it saw) while making
+        the context cost predictable.
+        """
+        try:
+            cfg = self.loop.compactor.config
+            text_budget = max(
+                _INLINE_BUDGET_FLOOR_CHARS,
+                cfg.tool_output_inline_chars // max(1, self._batch_tool_count),
+            )
+            summary = result.get("text_summary")
+            if isinstance(summary, str) and len(summary) > text_budget:
+                kept = summary[:text_budget]
+                artifact, path = offload_tool_output(
+                    summary,
+                    tool_call.name,
+                    tool_call.id,
+                    inline_limit=text_budget,
+                    preview_chars=cfg.tool_output_preview_chars,
+                )
+                if path:
+                    result = dict(result)
+                    result["text_summary"] = (
+                        f"{kept}\n[full text offloaded to {path}]"
+                    )
+                else:
+                    result = dict(result)
+                    result["text_summary"] = (
+                        f"{kept}\n[... ({len(summary) - text_budget} chars truncated)]"
+                    )
+
+            content = result.get("content")
+            if isinstance(content, list):
+                kept_blocks: list[Any] = []
+                images = 0
+                changed = False
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        images += 1
+                        if images > self._MAX_INLINE_IMAGES:
+                            changed = True
+                            continue
+                        url = (block.get("image_url") or {}).get("url", "")
+                        # Rough base64 length check; no need to decode.
+                        if len(url) > self._MAX_INLINE_IMAGE_BYTES:
+                            changed = True
+                            kept_blocks.append({
+                                "type": "text",
+                                "text": (
+                                    "[image omitted: "
+                                    f"{len(url) // 1024} KB exceeds the "
+                                    "inline image limit]"
+                                ),
+                            })
+                            continue
+                    kept_blocks.append(block)
+                # A dropped image shortens the list, but an oversized one is
+                # replaced 1:1 — so compare identity, not length, or the
+                # replacement is silently discarded.
+                if changed:
+                    result = dict(result)
+                    result["content"] = kept_blocks
+            return result
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Multimodal bounding failed: {}", exc)
+            return result
+
+    def _inline_budget_for(self, result_str: str, state: LoopState) -> int:
+        """Per-tool inline character allowance for the current batch."""
+        count = max(1, self._batch_tool_count)
+        floor = _INLINE_BUDGET_FLOOR_CHARS
+        return max(floor, self.loop.compactor.config.tool_output_inline_chars // count)
+
+    def _note_tool_batch_execution(
+        self, state: LoopState, tool_calls: list, response: Any, mutations_before: int
+    ) -> None:
+        """Feed a completed batch into the stagnation detector."""
+        self._tool_guardrail.note_iteration(
+            [(tc.name, tc.arguments) for tc in tool_calls],
+            assistant_text=getattr(response, "content", "") or "",
+            had_file_mutation=len(state.file_mutations) > mutations_before,
+        )
+
+
+
+    def _trace_llm(self, response: Any, attempts: list | None) -> None:
+        """Record one model call on the turn trace. Never raises."""
+        trace = getattr(self, "trace", None)
+        if trace is None:
+            return
+        try:
+            usage = getattr(response, "usage", None) or {}
+            if not isinstance(usage, dict):
+                usage = {}
+            model = ""
+            for a in reversed(attempts or []):
+                m = getattr(a, "model_ref", None)
+                if m:
+                    model = str(m)
+                    break
+            canonical = normalise_usage("", usage)
+            trace.record_llm(
+                model=model or str(self.loop.model or "unknown"),
+                input_tokens=int(canonical.input_tokens or 0),
+                output_tokens=int(canonical.output_tokens or 0),
+                cache_read=int(canonical.cache_read_tokens or 0),
+                cache_creation=int(canonical.cache_creation_tokens or 0),
+                finish_reason=str(getattr(response, "finish_reason", "") or ""),
+                tool_calls=len(getattr(response, "tool_calls", []) or []),
+            )
+        except Exception as exc:  # pragma: no cover - telemetry only
+            logger.debug("trace llm record failed: {}", exc)
+
+    def _trace_tool(self, tool_call: Any, result: Any) -> None:
+        """Record one tool outcome on the turn trace. Never raises."""
+        trace = getattr(self, "trace", None)
+        if trace is None:
+            return
+        try:
+            ok = not self._is_tool_result_failure(result, tool_call.name)
+            name = str(tool_call.name)
+            trace.record_tool(
+                name,
+                ok=ok,
+                result_chars=(
+                    len(result) if isinstance(result, str) else None
+                ),
+            )
+        except Exception as exc:  # pragma: no cover - telemetry only
+            logger.debug("trace tool record failed: {}", exc)
+
+    def _trace_event(self, kind: str, **data: Any) -> None:
+        trace = getattr(self, "trace", None)
+        if trace is not None:
+            trace.record(kind, **data)
+
+    def _make_progress_reporter(self, tool_calls: list) -> Callable[[str, float | None], None]:
+        """Build the per-batch progress callback passed to ToolContext.
+
+        Long-running tools (``run_code`` streaming a pip install, ``exec``
+        running a build) push incremental output through this. It is a factory
+        rather than an inline closure so the recovery path gets the same
+        reporting as the main path — the recovery branch previously had none,
+        so a hallucinated tool name also meant a silently running tool.
+        """
+        session_key = self.session_key
+        active_tool_names = [tc.name for tc in tool_calls]
+
+        def _report_progress(text: str, percent: float | None = None) -> None:
+            self._runtime_budget.touch_activity()
+            try:
+                from markbot.bus.emitter import get_event_emitter
+                from markbot.bus.events import EventType
+
+                loop = asyncio.get_running_loop()
+                emitter = get_event_emitter()
+                payload = {
+                    "text": text,
+                    "percent": percent,
+                    "tools": active_tool_names,
+                    "channel": self.channel,
+                    "chat_id": self.chat_id,
+                }
+                loop.create_task(
+                    emitter.emit(
+                        EventType.TOOL_PROGRESS, payload, session_key=session_key
+                    )
+                )
+            except Exception as e:
+                logger.debug("report_progress emit failed: {}", e)
+
+        return _report_progress
+
+    async def _run_hallucinated_tool_recovery(
+        self, state: LoopState, response: Any, invalid_tool_calls: list[str]
+    ) -> IterationResult:
+        """Execute the valid calls from a batch that also named unknown tools.
+
+        The model is told which names do not exist so it can self-correct, and
+        the valid calls in the same batch still run. Historically this branch had
+        its own inlined copy of the tool-result pipeline that skipped output
+        truncation, the progress callbacks, the TOOL_* events, the inactivity
+        touch and the stagnation feed; it now shares _apply_tool_result so a
+        single typo cannot degrade a turn into an unmonitored execution mode.
+        """
+        self._invalid_tool_retries = getattr(self, "_invalid_tool_retries", 0) + 1
+        available = ", ".join(sorted(self.loop.tools.tool_names))
+        invalid_name = invalid_tool_calls[0]
+        invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
+        logger.warning(
+            "Unknown tool '{}' — sending error to model for self-correction ({}/3)",
+            invalid_preview, self._invalid_tool_retries,
+        )
+        # Baseline for this batch's stagnation check, mirroring the main path.
+        mutations_before = len(state.file_mutations)
+
+        if self._invalid_tool_retries >= 3:
+            logger.error("Max retries (3) for invalid tool calls exceeded. Stopping.")
+            self._invalid_tool_retries = 0
+            state.final_content = (
+                f"I tried to call a tool that doesn't exist ('{invalid_preview}') "
+                f"too many times. Available tools: {available}"
+            )
+            return IterationResult(
+                should_break=True,
+                exit_reason=TurnExitReason.INVALID_TOOL_MAX_RETRIES,
+            )
+
+        error_msg = (
+            f"Tool '{invalid_name}' does not exist. "
+            f"Available tools: {available}. "
+            f"Please use only the tools listed above."
+        )
+        permission_mode, permission_context = self._current_permission_context()
+        recovery_ctx = ToolContext(
+            session_id=self.session_key,
+            workspace=str(self.loop.workspace),
+            permission_mode=permission_mode,
+            tool_permission_context=permission_context,
+            is_non_interactive=self._is_non_interactive(),
+            channel=self.channel,
+            chat_id=self.chat_id,
+            message_id=self.message_id,
+            is_group=self.is_group,
+            report_progress=self._make_progress_reporter(response.tool_calls),
+        )
+        self._batch_tool_count = len(response.tool_calls)
+        for tc in response.tool_calls:
+            if not self.loop.tools.has(tc.name):
+                state.messages = await self.loop.context.add_tool_result_async(
+                    state.messages, tc.id, tc.name, error_msg
+                )
+                continue
+            # Same pre-block path as the normal tool phase.
+            self._check_skill_guardrail(tc)
+            if self.on_tool_start:
+                ctx_str = None
+                if isinstance(tc.arguments, dict):
+                    preview = json.dumps(tc.arguments, ensure_ascii=False)[:200]
+                    ctx_str = f"{tc.name}({preview})"
+                try:
+                    await self.on_tool_start(tc.id, tc.name, ctx_str)
+                except Exception as e:
+                    logger.debug("on_tool_start callback failed: {}", e)
+            self._emit(
+                EventType.TOOL_CALLED,
+                {"tool": tc.name, "call_id": tc.id},
+            )
+            result = await self._execute_one_tool_call(tc, recovery_ctx)
+            # One implementation for both paths. The previous inline copy
+            # on this branch skipped output truncation/offload, the
+            # progress callbacks, the TOOL_CALLED/TOOL_COMPLETED events,
+            # the inactivity touch and the guardrail bookkeeping, so a
+            # single hallucinated tool name silently turned the turn into
+            # an unmonitored, unbounded-output execution mode.
+            await self._apply_tool_result(state, tc, result)
+        self._flush_messages(state)
+        self._inject_pending_steer(state)
+        self._note_tool_batch_execution(
+            state, response.tool_calls, response, mutations_before
+        )
+        # Batch-end failure-window check (same as normal tool phase).
+        failure_result = self._phase_check_failure_loop(state)
+        if failure_result is not None:
+            return failure_result
         return IterationResult(
             should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
         )
@@ -2808,15 +3248,9 @@ class IterationRunner:
                     )
 
         if self.on_stream and self.on_stream_end:
-            had_content_filter = any(
-                getattr(a, "error", "") == "content_filter"
-                for a in (state.last_attempts or [])
-            )
-            if had_content_filter:
-                logger.info(
-                    "Discarding polluted stream buffer "
-                    "(content_filter in fallback chain)"
-                )
+            polluted = self._polluted_stream(state.last_attempts)
+            if polluted:
+                logger.info("Discarding polluted stream buffer: {}", polluted)
                 await self.on_stream_end(discard=True)
                 self._stream_filter.reset()
                 clean = strip_think(response.content) or None

@@ -75,7 +75,13 @@ _LOOP_CAP_CONFIG_FIELDS: dict[str, str] = {
     "web_search": "max_web_searches_per_turn",
     "web_fetch": "max_web_fetches_per_turn",
     "browser_navigate": "max_browser_navigations_per_turn",
-    "delegate_task": "max_delegations_per_turn",
+    # The delegation tool is named ``spawn`` (see
+    # markbot.agent.subagent.spawn.SpawnTool). It was listed here as
+    # ``delegate_task``, which no tool has ever been called, so
+    # ``max_delegations_per_turn`` never applied and a runaway-delegation
+    # loop was unbounded. The only test covered the fictional name, so it
+    # passed while proving nothing.
+    "spawn": "max_delegations_per_turn",
 }
 
 # Read-only / idempotent tools: identical args + identical result ⇒ no progress.
@@ -809,6 +815,13 @@ class ToolCallGuardrail:
 
         These are HARD ceilings that fire regardless of failure detection —
         even if all calls succeed, hitting the cap blocks further calls.
+        They are therefore **not** gated on ``config.enabled``: that flag
+        disables the failure-pattern *detectors* (exact-failure, no-progress,
+        stagnation), which are heuristics that can be wrong. A runaway loop
+        that spends real money and tool calls is not a heuristic. An operator
+        who wants the ceilings off sets the individual caps to 0, which is
+        explicit and per-tool.
+
         Counters reset every turn via :meth:`reset_turn_local` /
         :meth:`reset_for_turn`.
         """

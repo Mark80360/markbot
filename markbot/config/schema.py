@@ -1,11 +1,14 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
+
+if TYPE_CHECKING:
+    from markbot.agent.authorization import AuthzDecision
 
 
 class Base(BaseModel):
@@ -170,6 +173,17 @@ class ProviderConfig(Base):
         default_factory=list,
         description="List of models available under this provider"
     )
+    insecure_skip_verify: bool = Field(
+        False,
+        description=(
+            "Only honoured by providers that document a TLS downgrade "
+            "(currently OpenAI Codex). When false, a certificate-verification "
+            "failure aborts the request. When true, the request is retried "
+            "with verification disabled, which exposes the conversation and "
+            "credentials to man-in-the-middle. Only enable this behind a "
+            "TLS-inspecting corporate proxy you control."
+        ),
+    )
 
     @property
     def credential_keys(self) -> list[str]:
@@ -312,7 +326,12 @@ class ExecToolConfig(Base):
     timeout: int = 60
     restrict_to_workspace: bool = Field(
         default=True,
-        description="If true, block shell commands that reference paths outside the working directory",
+        description=(
+            "Block shell commands that reference paths outside the configured "
+            "working directory. This is a best-effort lexical check, not a "
+            "sandbox: it cannot see shell expansion, globs, or computed "
+            "paths. Use OS-level isolation (containers) for hard guarantees."
+        ),
     )
     require_allowlist: bool = Field(
         default=False,
@@ -333,6 +352,24 @@ class ExecToolConfig(Base):
     allowed_internal_ips: list[str] = Field(
         default_factory=list,
         description="List of internal IPs to skip SSRF check in shell commands",
+    )
+    env_allowlist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When non-empty, ONLY these environment variable names are passed "
+            "to shell commands. Empty (default) means denylist behaviour: "
+            "everything is inherited except credential-shaped names "
+            "(anything matching *_API_KEY, *_TOKEN, *_SECRET, *_PASSWORD, "
+            "AWS_*, GITHUB_TOKEN, …), which are stripped because provider "
+            "keys are written into the process environment at startup."
+        ),
+    )
+    extra_env_allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Environment variable names to pass through even though they look "
+            "like credentials (e.g. a CI token one specific script needs)."
+        ),
     )
 
 
@@ -1101,6 +1138,37 @@ class SsrfConfig(Base):
     )
 
 
+class SecurityConfig(Base):
+    """Authorization for privileged, process-global operations.
+
+    ``/mode`` changes the tool-permission mode for *every* conversation in
+    the daemon and persists it to config.json, so it is guarded by an
+    identity check rather than by the channel-level ``allowFrom`` list
+    (which only decides who may talk to the bot at all).
+    """
+
+    admin_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Sender IDs permitted to run privileged commands (/mode, /stop, "
+            "/restart, cron and message routing). Accepts channel-qualified "
+            "forms like 'feishu:ou_123' and bare IDs. '*' allows everyone — "
+            "only safe for single-operator deployments. When empty, a "
+            "channel whose allowFrom lists exactly one sender still treats "
+            "that sender as the operator, and local surfaces (cli/web) are "
+            "always permitted."
+        ),
+    )
+    allow_private_chat_fallback: bool = Field(
+        True,
+        description=(
+            "Allow the single-allowlisted-sender inference on private chats "
+            "when adminIds is empty. Set false to require an explicit "
+            "adminIds entry on every messaging channel."
+        ),
+    )
+
+
 class Config(BaseSettings):
     """Root configuration for markbot."""
 
@@ -1114,6 +1182,28 @@ class Config(BaseSettings):
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     display: DisplayConfig = Field(default_factory=DisplayConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+
+    def is_privileged_sender(
+        self,
+        *,
+        channel: str | None,
+        sender_id: str | None,
+        is_group: bool | None = None,
+        channel_config: Any = None,
+    ) -> "AuthzDecision":
+        """Delegate to :mod:`markbot.agent.authorization`, threading the
+        configured admin list through. Imported lazily to keep the config
+        layer free of a dependency on the agent package."""
+        from markbot.agent.authorization import is_privileged_sender as _check
+
+        return _check(
+            channel=channel,
+            sender_id=sender_id,
+            is_group=is_group,
+            channel_config=channel_config,
+            global_admin_ids=self.security.admin_ids,
+        )
 
     @property
     def workspace_path(self) -> Path:

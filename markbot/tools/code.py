@@ -309,8 +309,20 @@ class CodeExecutionTool(Tool):
             return None
 
         except Exception as e:
-            logger.warning("Security scan failed (allowing execution): {}", e)
-            return None
+            # Fail CLOSED. This is a security control: an import error, a
+            # regex catastrophe or an attribute change would otherwise turn
+            # every run_code call into unscanned arbitrary code execution.
+            # The rest of the codebase already fails closed on the same
+            # principle (ToolPipeline.stage_guards, BaseTool.is_available);
+            # this branch was the one exception.
+            logger.error("Security scan failed; blocking execution: {}", e)
+            return (
+                "Error: Code blocked — the security scanner could not run "
+                f"({type(e).__name__}: {e}).\n"
+                "Refusing to execute unscanned code. This is a fail-closed "
+                "guard; retry, or run the command through the exec tool with "
+                "an explicit approval prompt."
+            )
 
     @staticmethod
     def _build_dep_shim(dependencies: list[str]) -> str:

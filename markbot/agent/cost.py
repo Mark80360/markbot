@@ -224,15 +224,36 @@ class CostTracker:
     ) -> float:
         """Record a :class:`CanonicalUsage` snapshot.
 
-        Falls back to the per-field ``add_usage`` path for any
-        provider that still hands us the legacy dict shape.  This is
-        the preferred entry point once a :class:`CanonicalUsage` is
-        available — it transparently handles the OpenAI / DeepSeek /
-        Anthropic bucket-name differences.
+        This is the preferred entry point; it transparently handles the
+        OpenAI / DeepSeek / Anthropic bucket-name differences.
+
+        Cache-bucket arithmetic matters here. For OpenAI and DeepSeek,
+        ``input_tokens`` (``prompt_tokens``) is the *total* prompt size and
+        already includes the cached portion, so charging it at the full
+        input rate *and* charging ``cache_read_tokens`` at the cache rate
+        bills every cached token twice. ``CanonicalUsage.cache_miss_tokens``
+        is the normalised residual (``input - read - creation``) and is the
+        correct full-price quantity when present. Anthropic reports
+        ``input_tokens`` as already-uncached, and the normaliser sets the
+        miss bucket to that same figure, so the two agree.
+
+    A miss count of 0 is only meaningful when it came with a real cache
+    read. If a provider synthesises a zero where it reported nothing, that
+    would bill the entire prompt as a cache hit and charge nothing for
+    input, so the input figure is used instead. Guarding here as well as in
+    the normalisers means a future adapter cannot silently reintroduce it.
         """
+        billable_input = usage.cache_miss_tokens
+        if (
+            billable_input is None
+            or billable_input < 0
+            or (billable_input == 0 and not usage.cache_read_tokens)
+        ):
+            billable_input = usage.input_tokens
+
         return self.add_usage(
             model=model,
-            input_tokens=usage.input_tokens or 0,
+            input_tokens=max(0, billable_input or 0),
             output_tokens=usage.output_tokens or 0,
             cache_creation_input_tokens=usage.cache_creation_tokens or 0,
             cache_read_input_tokens=usage.cache_read_tokens or 0,
@@ -243,6 +264,11 @@ class CostTracker:
 
         Supports Anthropic SDK responses and dicts with a ``usage`` attr/key.
         Returns the cost of this call.
+
+        The subagent loop uses this as its only accounting path, so it also
+        understands the non-Anthropic cache bucket names. Reading only the
+        four Anthropic-shaped keys silently billed every cached DeepSeek /
+        OpenAI / Codex turn at the full uncached input price.
         """
         usage_data = getattr(response, "usage", None)
         if not usage_data:
@@ -259,12 +285,61 @@ class CostTracker:
                 return int(usage_data.get(key, default) or default)
             return int(getattr(usage_data, key, default) or default)
 
+        def _nested(mapping: Any, *path: str) -> int:
+            cur = mapping
+            for part in path:
+                if isinstance(cur, dict):
+                    cur = cur.get(part)
+                else:
+                    cur = getattr(cur, part, None)
+                if cur is None:
+                    return 0
+            try:
+                return int(cur or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        input_tokens = _extract("input_tokens")
+        cache_read = _extract("cache_read_input_tokens")
+        cache_creation = _extract("cache_creation_input_tokens")
+        # True while the reported input figure still contains the cache
+        # buckets, so it must not also be charged at the cache-read rate.
+        input_includes_cache = False
+
+        if not input_tokens:
+            # OpenAI-compat flat alias. ``prompt_tokens`` is the *total*
+            # prompt size, i.e. it already contains the cache read.
+            input_tokens = _extract("prompt_tokens")
+            input_includes_cache = bool(input_tokens)
+        if not cache_read:
+            cache_read = (
+                # DeepSeek — total prompt, cache read reported separately
+                _extract("prompt_cache_hit_tokens")
+                or _nested(usage_data, "prompt_tokens_details", "cached_tokens")
+                # Codex
+                or _extract("cached_input_tokens")
+            )
+            if cache_read:
+                input_includes_cache = bool(input_tokens)
+        if not cache_creation:
+            cache_creation = _nested(
+                usage_data, "prompt_tokens_details", "cache_creation_tokens"
+            )
+
+        if input_includes_cache and cache_read:
+            # Charge only the uncached residual at the full input rate; the
+            # cached portion is billed once, at the cache-read rate.
+            input_tokens = max(0, input_tokens - cache_read - cache_creation)
+
         return self.add_usage(
             model=model,
-            input_tokens=_extract("input_tokens"),
-            output_tokens=_extract("output_tokens"),
-            cache_creation_input_tokens=_extract("cache_creation_input_tokens"),
-            cache_read_input_tokens=_extract("cache_read_input_tokens"),
+            input_tokens=input_tokens,
+            output_tokens=(
+                _extract("output_tokens")
+                or _extract("completion_tokens")
+            ),
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )
 
     def get_model_usage(self, model: str) -> ModelUsage | None:

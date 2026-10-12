@@ -921,11 +921,14 @@ For `todo`: mark `in_progress` on start, `completed` immediately on finish.
             f"{body}"
         )
         # Curated memory is injected into the system prompt; fence it so the
-        # model treats it as reference data rather than instructions. Without
-        # this, poisoned MEMORY.md/PROFILE.md entries act as prompt injection.
-        from markbot.memory.fencing import fence_context
+        # model treats it as reference data rather than instructions. These
+        # entries are written by the user (via memory_save / the encoder), so
+        # they get the user-stated trust label — the strongest class, but
+        # still explicitly non-authoritative and explicitly overridable by the
+        # current request.
+        from markbot.memory.fencing import MEMORY_TRUST_USER, fence_context
 
-        return fence_context(body_text, system_note=True)
+        return fence_context(body_text, system_note=True, trust=MEMORY_TRUST_USER)
 
     def _load_essential_bootstrap(
         self, *, channel: str | None = None, is_group: bool | None = None

@@ -9,11 +9,60 @@ import sys
 from loguru import logger
 
 from markbot import __version__
-from markbot.bus.events import OutboundMessage, make_session_key
+from markbot.agent.authorization import denial_message, is_privileged_sender
+from markbot.bus.events import OutboundMessage, derive_is_group, make_session_key
 from markbot.cli.slash_commands.router import CommandContext, CommandRouter
 from markbot.locales import t
 from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import build_status_content
+
+
+def check_privileged(ctx: CommandContext, command: str) -> str | None:
+    """Return a refusal message when the sender may not run *command*.
+
+    Privileged commands change state for the *whole process* (``/mode`` also
+    rewrites ``config.json``), so they must not be reachable by anyone who
+    merely appears in a channel's ``allowFrom`` list. Returns ``None`` when
+    the sender is authorised, otherwise operator-facing text.
+    """
+    msg = ctx.msg
+    loop = ctx.loop
+    config = getattr(loop, "config", None)
+    channel_config = None
+    # Per-channel sections are stashed as *attributes* of the ChannelsConfig
+    # model (the model allows extra fields and the channel manager reads them
+    # the same way, via ``getattr(config.channels, name)``), so an attribute
+    # lookup is what resolves them. ``ChannelsConfig`` is a Pydantic model and
+    # has no ``.get()``; calling one would raise and silently leave every
+    # ``adminFrom`` / single-sender ``allowFrom`` rule unenforced.
+    channels_config = getattr(loop, "channels_config", None) or getattr(
+        config, "channels", None
+    )
+    if channels_config is not None and msg.channel:
+        try:
+            channel_config = getattr(channels_config, msg.channel, None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("channel config lookup failed: {}", exc)
+
+    is_group = derive_is_group(msg.metadata, msg.chat_id)
+
+    decision = is_privileged_sender(
+        channel=msg.channel,
+        sender_id=msg.sender_id,
+        is_group=is_group,
+        channel_config=channel_config,
+        global_admin_ids=getattr(
+            getattr(config, "security", None), "admin_ids", None
+        ),
+    )
+    if decision.allowed:
+        return None
+    reason = denial_message(decision, command=command)
+    logger.warning(
+        "Refused {} from {}:{} ({}): {}",
+        command, msg.channel, msg.sender_id, msg.chat_id, decision.reason,
+    )
+    return reason
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
@@ -29,9 +78,10 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     # single-threaded model this synchronous read is atomic.
     tasks = list(loop._active_tasks.get(session_key, []))
     cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-    for t in tasks:
+    # Not named `t`: that would shadow the module-level i18n helper `t`.
+    for task in tasks:
         try:
-            await t
+            await task
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -51,6 +101,14 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
+
+    # os.execv replaces the running daemon. From a shared group chat that
+    # is an unauthenticated availability attack, so gate it like /mode.
+    if refusal := check_privileged(ctx, "/restart"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
 
     async def _do_restart():
         await asyncio.sleep(1)
@@ -97,6 +155,55 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         chat_id=ctx.msg.chat_id,
         content=base,
         metadata={"render_as": "text"},
+    )
+
+
+async def cmd_trace(ctx: CommandContext) -> OutboundMessage:
+    """Show the decision trace of the most recent turn for this session.
+
+    Answers "what did the agent actually do, and what did it cost?" after the
+    fact. The log stream has scrolled away by then; the trace has not.
+    """
+    loop = ctx.loop
+    getter = getattr(loop, "last_turn_trace", None)
+    trace = None
+    if callable(getter):
+        trace = getter(session_key=ctx.msg.session_key)
+
+    if trace is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="No turn trace recorded for this session yet.",
+            metadata={"render_as": "text"},
+        )
+
+    arg = (ctx.args or "").strip().lower()
+    if arg in ("--full", "full", "--timeline", "timeline"):
+        body = trace.render()
+    else:
+        s = trace.summary()
+        body = "\n".join([
+            f"**Turn trace** — {s['events']} events in {s['duration_s']}s",
+            f"- LLM calls: {s['llm']['calls']}"
+            f"  ({', '.join(s['llm']['models']) or 'n/a'})",
+            f"- Tokens: {s['llm']['input_tokens']} in / "
+            f"{s['llm']['output_tokens']} out"
+            f"  (cache read {s['llm']['cache_read']})",
+            f"- Cost: ${s['llm']['cost_usd']:.6f}",
+            f"- Tools: {s['tools']['count']}"
+            + (f" ({s['tools']['failed']} failed)" if s['tools']['failed'] else ""),
+            f"- Tools used: {', '.join(t for t in s['tools']['names'] if t) or 'none'}",
+        ])
+        if s["truncated"]:
+            body += (
+                f"\n\n⚠ {s['dropped_events']} earlier events were dropped; "
+                "this trace is incomplete."
+            )
+        body += "\n\nUse `/trace full` for the step-by-step timeline."
+
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=body, metadata={"render_as": "text"},
     )
 
 
@@ -362,6 +469,7 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
       /mode bypass     — bypass all permission checks (dangerous)
     """
     loop = ctx.loop
+    msg = ctx.msg
     app_state = getattr(getattr(loop, "ctx", None), "app_state", None)
     if app_state is None:
         return OutboundMessage(
@@ -371,7 +479,13 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
 
     arg = (ctx.args or "").strip().lower()
     if not arg:
-        current = app_state.get_permission_mode()
+        # Prefer this session's override so the readout reflects what the
+        # user actually gets, not another session's global change.
+        current = (
+            loop.get_session_permission_mode(ctx.msg.session_key)
+            if callable(getattr(loop, "get_session_permission_mode", None))
+            else None
+        ) or app_state.get_permission_mode()
         lines = [
             t("cmd.mode.modes_header"),
             t("cmd.mode.mode_default"),
@@ -396,7 +510,25 @@ async def cmd_mode(ctx: CommandContext) -> OutboundMessage:
             content=t("cmd.mode.unknown", arg=arg, valid=", ".join(sorted(_MODE_ALIASES))),
         )
 
+    # Only an authorised sender may change the process-global permission
+    # mode. Checked *after* validating the argument so a typo still gets a
+    # helpful message, and *before* any state change or config write.
+    if refusal := check_privileged(ctx, "/mode"):
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
+
     app_state.set_permission_mode(mode)
+    # Scope the change to the calling session. Writing only the global mode
+    # would silently change the tool policy for every other conversation
+    # sharing this daemon. The global is still updated (via the loop helper)
+    # so it persists across restarts and shows up in ``/mode`` with no args.
+    if setter := getattr(loop, "set_session_permission_mode", None):
+        try:
+            setter(msg.session_key, mode)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to scope permission mode to session: {}", exc)
     # Persist to config.json so the choice survives restarts. Best-effort:
     # the in-memory switch above already took effect, so a failed write
     # only means the user will need to /mode again after next restart.
@@ -471,6 +603,18 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
             content=t("cmd.profile.unknown", arg=arg, valid=", ".join(list_profiles())),
         )
 
+    # Writing a profile is at least as privileged as /mode: it persists a
+    # process-global default and switches the live permission mode, and some
+    # profiles raise it (``unattended`` grants auto-approval). Gating only
+    # /mode would leave an equivalent door open, so the same authorisation
+    # check runs here. Checked after argument validation so a typo still gets
+    # a helpful message, and before any state change or config write.
+    if refusal := check_privileged(ctx, "/profile"):
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
+
     from markbot.config.loader import update_config_value
     persisted = update_config_value(["agents", "defaults", "profile"], arg)
     profile = get_profile(arg)
@@ -489,7 +633,7 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-def build_builtin_catalog() -> "CommandCatalog":
+def build_builtin_catalog() -> "CommandCatalog":  # noqa: F821
     """Single-source CommandDef catalog for built-in slash commands."""
     from markbot.cli.slash_commands.command_def import (
         CommandCatalog,
@@ -529,6 +673,15 @@ def build_builtin_catalog() -> "CommandCatalog":
             handler=cmd_status,
             description="Show session status, token usage, and statistics",
             tier=CommandTier.PRIORITY,
+            category="session",
+            control_plane=True,
+        ),
+        CommandDef(
+            name="/trace",
+            handler=cmd_trace,
+            description="Show the last turn's decision trace (add `full` for the timeline)",
+            tier=CommandTier.PRIORITY,
+            args_hint="[full]",
             category="session",
             control_plane=True,
         ),

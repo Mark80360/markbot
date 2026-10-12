@@ -683,12 +683,29 @@ class TestGuardrailLoopCap:
             d = g.check_loop_cap("web_search")
             assert d.action is GuardrailAction.ALLOW
 
-    def test_delegate_task_cap(self, guardrail):
+    def test_spawn_cap(self, guardrail):
+        """``spawn`` is the delegation tool's real name (SpawnTool). The cap
+        table listed a fictional ``delegate_task``, so
+        ``max_delegations_per_turn`` never applied — and this test, which
+        exercised the fictional name, passed while proving nothing."""
         from markbot.agent.tool_guardrails import GuardrailAction
-        d1 = guardrail.check_loop_cap("delegate_task")
+        d1 = guardrail.check_loop_cap("spawn")
         assert d1.action is GuardrailAction.ALLOW
-        d2 = guardrail.check_loop_cap("delegate_task")
+        d2 = guardrail.check_loop_cap("spawn")
         assert d2.action is GuardrailAction.BLOCK
+
+    def test_loop_cap_table_matches_real_tool_names(self):
+        """Every name in the cap table must be a tool that actually exists."""
+        import inspect
+
+        from markbot.agent.subagent.spawn import SpawnTool
+        from markbot.agent.tool_guardrails import _LOOP_CAP_CONFIG_FIELDS
+
+        # SpawnTool needs a SubagentManager, so read the declared name from
+        # the source rather than instantiating it.
+        assert 'name="spawn"' in inspect.getsource(SpawnTool)
+        assert "spawn" in _LOOP_CAP_CONFIG_FIELDS
+        assert "delegate_task" not in _LOOP_CAP_CONFIG_FIELDS
 
     def test_caps_reset_with_turn_local(self, guardrail):
         from markbot.agent.tool_guardrails import GuardrailAction

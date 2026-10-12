@@ -178,6 +178,8 @@ class ToolBinder:
                     deny_patterns=deny_patterns,
                     path_append=self._exec_config.path_append,
                     allowed_internal_ips=self._exec_config.allowed_internal_ips,
+                    env_allowlist=getattr(self._exec_config, "env_allowlist", None),
+                    extra_env_allow=getattr(self._exec_config, "extra_env_allow", None),
                 )
             )
 

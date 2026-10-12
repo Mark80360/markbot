@@ -16,6 +16,33 @@ from markbot.providers.errors import classify_error  # noqa: F401 (re-export)
 
 _ALNUM = string.ascii_letters + string.digits
 
+# Values that explicitly mean "do not think". Anything else non-empty is
+# treated as an effort level, so a bare ``bool(effort)`` would happily turn
+# on extended thinking (and force temperature=1.0) for "none" / "off" /
+# "disabled" — values that arrive from hand-edited config files.
+_THINKING_OFF = frozenset({"none", "off", "no", "false", "disabled", "0"})
+
+# Recognised effort levels -> thinking budget in tokens. "max" is accepted
+# because other providers (DeepSeek, Moonshot) expose it and a user may
+# reasonably copy that value into a Claude model override.
+_THINKING_BUDGETS = {"low": 1024, "medium": 4096, "max": 16384}
+
+
+def _is_thinking_effort(effort: str | None) -> bool:
+    """Return True when *effort* asks for extended thinking."""
+    if not effort:
+        return False
+    return effort.strip().lower() not in _THINKING_OFF
+
+
+def _thinking_budget(effort: str | None, max_tokens: int) -> int:
+    """Map *effort* to a thinking-token budget."""
+    level = (effort or "medium").strip().lower()
+    if level == "high":
+        return max(8192, max_tokens)
+    return _THINKING_BUDGETS.get(level, 4096)
+
+
 
 def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
@@ -34,10 +61,12 @@ class AnthropicProvider(LLMProvider):
         api_base: str | None = None,
         default_model: str = "claude-sonnet-4-20250514",
         extra_headers: dict[str, str] | None = None,
+        spec: Any = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._spec = spec
 
         from anthropic import AsyncAnthropic
 
@@ -316,16 +345,31 @@ class AnthropicProvider(LLMProvider):
         supports_caching: bool = True,
     ) -> dict[str, Any]:
         model_name = self._strip_prefix(model or self.default_model)
+        spec = self._spec
+
+        if spec is not None:
+            if spec.prepare_messages is not None:
+                messages = spec.prepare_messages(messages)
+            if spec.strip_model_prefix:
+                model_name = model_name.split("/")[-1]
+
         system, anthropic_msgs = self._convert_messages(self._sanitize_empty_content(messages))
         anthropic_tools = self._convert_tools(tools)
 
-        if supports_caching:
+        # The spec can opt out of prompt caching. Anthropic's native
+        # support is unconditional, so honour the flag here instead of
+        # leaving ``supports_prompt_caching`` dead on the spec.
+        if supports_caching and (spec is None or spec.supports_prompt_caching):
             system, anthropic_msgs, anthropic_tools = self._apply_cache_control(
                 system, anthropic_msgs, anthropic_tools,
             )
 
+        if spec is not None and spec.default_max_tokens:
+            max_tokens = spec.default_max_tokens
+
         max_tokens = max(1, max_tokens)
-        thinking_enabled = bool(reasoning_effort)
+        thinking_enabled = _is_thinking_effort(reasoning_effort)
+        budget = _thinking_budget(reasoning_effort, max_tokens) if thinking_enabled else 0
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -337,13 +381,25 @@ class AnthropicProvider(LLMProvider):
             kwargs["system"] = system
 
         if thinking_enabled:
-            budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
-            budget = budget_map.get(reasoning_effort.lower(), 4096)  # type: ignore[union-attr]
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
             kwargs["temperature"] = 1.0
         else:
-            kwargs["temperature"] = temperature
+            from markbot.providers.registry import _OMIT_TEMPERATURE
+
+            if spec is not None and spec.fixed_temperature is _OMIT_TEMPERATURE:
+                pass
+            elif spec is not None and spec.fixed_temperature is not None:
+                kwargs["temperature"] = spec.fixed_temperature
+            else:
+                kwargs["temperature"] = temperature
+
+        if spec is not None:
+            model_lower = model_name.lower()
+            for pattern, overrides in spec.model_overrides:
+                if pattern in model_lower:
+                    kwargs.update(overrides)
+                    break
 
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
@@ -468,6 +524,8 @@ class AnthropicProvider(LLMProvider):
         return self.default_model
 
 
-from markbot.providers.registry import register_provider_factory
+# Imported at the bottom deliberately: registry imports the provider classes
+# to build its factory table, so a top-level import here would be circular.
+from markbot.providers.registry import register_provider_factory  # noqa: E402
 
 register_provider_factory("anthropic", AnthropicProvider)

@@ -204,13 +204,20 @@ class AzureOpenAIProvider(LLMProvider):
                     "total_tokens": usage_data.get("total_tokens", 0),
                     "input_tokens": pt,
                     "output_tokens": ct,
-                    # DeepSeek / OpenAI-style cache fields
+                    # DeepSeek / OpenAI-style cache fields. Only emitted when
+                    # the provider reported them: a synthesised 0 reads as
+                    # "zero cache misses" downstream, which would bill the
+                    # whole prompt as a cache hit and charge nothing for input.
                     "prompt_cache_hit_tokens": int(usage_data.get("prompt_cache_hit_tokens") or 0),
-                    "prompt_cache_miss_tokens": int(usage_data.get("prompt_cache_miss_tokens") or 0),
+                    "prompt_cache_miss_tokens": int(usage_data["prompt_cache_miss_tokens"])
+                    if usage_data.get("prompt_cache_miss_tokens") is not None else None,
                     # Anthropic-style cache fields
                     "cache_creation_input_tokens": int(usage_data.get("cache_creation_input_tokens") or 0),
                     "cache_read_input_tokens": int(usage_data.get("cache_read_input_tokens") or 0),
                 }
+                # A None is not a valid usage field; drop it so the
+                # normaliser reads "absent" rather than an explicit null.
+                usage = {k: v for k, v in usage.items() if v is not None}
 
             reasoning_content = message.get("reasoning_content") or None
 
@@ -249,6 +256,10 @@ class AzureOpenAIProvider(LLMProvider):
             reasoning_effort, tool_choice=tool_choice,
         )
         payload["stream"] = True
+        # Without this the API omits the trailing usage chunk entirely, so
+        # ``_consume_stream`` saw no usage at all and every streamed Azure
+        # turn was billed and budgeted as zero tokens.
+        payload["stream_options"] = {"include_usage": True}
 
         try:
             async with httpx.AsyncClient(timeout=60.0, verify=True) as client:

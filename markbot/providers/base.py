@@ -59,6 +59,13 @@ class LLMResponse:
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
     error_type: ErrorType | None = None
+    #: HTTP status code that produced this error response.  Carried so the
+    #: retry / fallback layers can re-classify with the authoritative status
+    #: instead of re-guessing from the error prose (which silently downgrades
+    #: 429 → "unknown" and loses the rate-limit backoff hint).
+    status_code: int | None = None
+    #: Server-advertised ``Retry-After`` in seconds (429 / 503 responses).
+    retry_after: float | None = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -110,6 +117,9 @@ class LLMProvider(ABC):
     """
 
     _CHAT_RETRY_DELAYS = (2, 4)
+    #: Upper bound (seconds) for a server-advertised Retry-After wait, so a
+    #: misreported header cannot stall a turn indefinitely.
+    _MAX_RETRY_AFTER = 120.0
 
     _SENTINEL = object()
 
@@ -317,7 +327,7 @@ class LLMProvider(ABC):
 
             if response.error_type != ErrorType.TRANSIENT:
                 # Use enhanced classifier for recovery action hints
-                cls = classify_api_error(None, response.content or "")
+                cls = classify_api_error(response.status_code, response.content or "")
                 if cls.should_strip_images:
                     stripped = self._strip_image_content(messages)
                     if stripped is not None:
@@ -329,10 +339,13 @@ class LLMProvider(ABC):
                 return response
 
             # Use classifier's backoff hint when available
-            cls = classify_api_error(None, response.content or "")
+            cls = classify_api_error(response.status_code, response.content or "")
             smart_delay = _compute_backoff(
                 cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
             )
+            if response.retry_after is not None:
+                # The server's Retry-After is authoritative; still clamp it.
+                smart_delay = min(max(smart_delay, response.retry_after), self._MAX_RETRY_AFTER)
             logger.warning(
                 "LLM transient error ({}), attempt {}/{}, retrying in {:.1f}s: {}",
                 cls.reason, attempt, len(self._CHAT_RETRY_DELAYS), smart_delay,
@@ -379,7 +392,7 @@ class LLMProvider(ABC):
 
             if response.error_type != ErrorType.TRANSIENT:
                 # Use enhanced classifier for recovery action hints
-                cls = classify_api_error(None, response.content or "")
+                cls = classify_api_error(response.status_code, response.content or "")
                 if cls.should_strip_images:
                     stripped = self._strip_image_content(messages)
                     if stripped is not None:
@@ -391,10 +404,13 @@ class LLMProvider(ABC):
                 return response
 
             # Use classifier's backoff hint when available
-            cls = classify_api_error(None, response.content or "")
+            cls = classify_api_error(response.status_code, response.content or "")
             smart_delay = _compute_backoff(
                 cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
             )
+            if response.retry_after is not None:
+                # The server's Retry-After is authoritative; still clamp it.
+                smart_delay = min(max(smart_delay, response.retry_after), self._MAX_RETRY_AFTER)
             logger.warning(
                 "LLM transient error ({}), attempt {}/{}, retrying in {:.1f}s: {}",
                 cls.reason, attempt, len(self._CHAT_RETRY_DELAYS), smart_delay,

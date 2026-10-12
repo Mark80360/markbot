@@ -42,7 +42,7 @@ long-running session cannot blow out memory.
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -106,69 +106,134 @@ class TokenEstimateCache:
     Lifetime: process-local only.  Cross-session persistence is out
     of scope (the cross-session prompt-base disk cache lives in
     :mod:`markbot.agent.prompt_persist`).
+
+    ## Why the key is content-addressed
+
+    An earlier version keyed on ``(messages_revision, system_fingerprint)``
+    and relied on the engine bumping ``messages_revision`` when the message
+    list changed. That never worked: the loop bumped the counter
+    unconditionally at the top of *every* iteration and then immediately
+    called the estimator with the new value, so the hit rate on the hot path
+    was ~0 — the cache paid its bookkeeping cost and never returned a hit.
+
+    It was worse than useless. One instance is shared by every concurrent
+    session, and the key contained no session identity, so two users on the
+    same channel — whose system prompts are byte-identical — could be served
+    each other's estimate. That number drives the compaction threshold.
+
+    So the key is derived from the content itself: a cheap hash of
+    ``(session_key, message count, system fingerprint, last message
+    digest)``. Identical content hits; any mutation (append, insert, replace
+    after compaction) changes the count or the tail digest and misses
+    correctly, with no external bookkeeping to forget. Entries are bounded
+    and evicted least-recently-used.
     """
 
-    messages_revision: int = 0
     system_fingerprint: int = 0
     cached_tokens: Optional[int] = None
+    cached_key: tuple = ()
     audit_ring: deque = field(default_factory=lambda: deque(maxlen=DEFAULT_AUDIT_RING_CAPACITY))
     hits: int = 0
     misses: int = 0
+    #: Bounded LRU of (key -> tokens). Small because the useful working set
+    #: is "the current estimate per active session", not a history.
+    max_entries: int = 32
+    _entries: "OrderedDict[tuple, int]" = field(default_factory=OrderedDict)
 
     # ------------------------------------------------------------------
     # Mutators
     # ------------------------------------------------------------------
     def bump_messages_revision(self, revision: int) -> None:
-        """Record a messages-revision bump.
+        """Retained for API compatibility.
 
-        Calling this with a value smaller than the current value is
-        a no-op (the cache is monotonic).
+        The cache is content-addressed and no longer needs an external
+        revision counter, so this only drops the single-entry fast path and
+        forces one recompute. Callers that used to bump it to signal a
+        change are now handled automatically.
         """
-        if revision > self.messages_revision:
-            self.messages_revision = revision
-            # Force the next lookup to recompute.
-            self.cached_tokens = None
+        self.cached_tokens = None
+        self.cached_key = ()
 
     def invalidate(self) -> None:
         """Forget all cached state.  Used by ``/clear`` and reset paths."""
         self.cached_tokens = None
         self.system_fingerprint = 0
+        self.cached_key = ()
         self.audit_ring.clear()
+        self._entries.clear()
         self.hits = 0
         self.misses = 0
+
+    def invalidate_session(self, session_key: str) -> None:
+        """Drop entries belonging to one session (``/clear``, close)."""
+        for key in [k for k in self._entries if k and k[0] == session_key]:
+            del self._entries[key]
+        if self.cached_key and self.cached_key[0] == session_key:
+            self.cached_tokens = None
+            self.cached_key = ()
 
     # ------------------------------------------------------------------
     # Lookup
     # ------------------------------------------------------------------
+    @staticmethod
+    def _content_key(
+        session_key: str,
+        system_prompt: Any,
+        messages: list[dict[str, Any]],
+        sys_fp: int,
+    ) -> tuple:
+        """Derive the cache key from content rather than a counter.
+
+        The tail digest catches in-place mutations of the last message (the
+        common case: a tool result appended to the previous turn's final
+        message) and the length catches every insertion or removal, which
+        includes the wholesale list replacement performed by compaction.
+        """
+        tail = ""
+        if messages:
+            try:
+                last = messages[-1]
+                tail = f"{last.get('role', '')}:{len(str(last.get('content', '')))}"
+            except Exception:  # pragma: no cover - defensive
+                tail = "?"
+        return (session_key, len(messages), sys_fp, hash(tail))
+
     def lookup_or_compute(
         self,
-        messages_revision: int,
         system_prompt: Any,
         messages: Iterable[dict[str, Any]],
+        *,
+        session_key: str = "",
     ) -> int:
         """Return the cached token estimate, recomputing on miss.
 
         ``messages`` is borrowed for the duration of the call so a
         miss can re-tokenize without copying.
         """
-        sys_fp = _system_fingerprint(system_prompt)
-        if (
-            self.messages_revision == messages_revision
-            and self.system_fingerprint == sys_fp
-            and self.cached_tokens is not None
-        ):
-            self.hits += 1
-            return self.cached_tokens
-
-        # Miss: re-tokenize.  Convert the iterable to a list so the
-        # downstream function can index it.
         msgs = list(messages)
+        sys_fp = _system_fingerprint(system_prompt)
+        key = self._content_key(session_key, system_prompt, msgs, sys_fp)
+
+        cached = self._entries.get(key)
+        if cached is not None:
+            self._entries.move_to_end(key)
+            self.hits += 1
+            self.cached_key = key
+            self.cached_tokens = cached
+            self.system_fingerprint = sys_fp
+            return cached
+
+        # Miss: re-tokenize.
         tokens = estimate_messages_tokens(msgs)
-        self.messages_revision = messages_revision
-        self.system_fingerprint = sys_fp
+        self._entries[key] = tokens
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+        self.cached_key = key
         self.cached_tokens = tokens
+        self.system_fingerprint = sys_fp
         self.misses += 1
-        self.audit_ring.append((messages_revision, tokens))
+        self.audit_ring.append((len(self._entries), tokens))
         return tokens
 
     # ------------------------------------------------------------------
@@ -180,7 +245,7 @@ class TokenEstimateCache:
         return {
             "hits": self.hits,
             "misses": self.misses,
-            "size": len(self.audit_ring),
+            "size": len(self._entries),
             "hit_rate": (self.hits / total) if total else 0.0,
         }
 

@@ -82,10 +82,12 @@ class TestProviderNormalisers(unittest.TestCase):
         )
         self.assertEqual(u.cache_read_tokens, 600)
         self.assertEqual(u.cache_creation_tokens, 200)
-        # Anthropic doesn't report a separate miss bucket — the
-        # protocol should treat the remaining input as the miss.
-        # 1000 - 600 - 200 = 200.
-        self.assertEqual(u.cache_miss_tokens, 200)
+        # Anthropic's ``input_tokens`` counts only the *uncached* input —
+        # the cache buckets are reported alongside it, not inside it. The
+        # miss bucket is therefore the input figure itself. Computing a
+        # residual here (1000 - 600 - 200 = 200) would under-bill every
+        # cached Anthropic call.
+        self.assertEqual(u.cache_miss_tokens, 1000)
 
     def test_codex(self) -> None:
         n = _CodexResponsesNormaliser()

@@ -43,6 +43,11 @@ class FallbackAttempt:
     response: LLMResponse | None = None
     circuit_skipped: bool = False
     error_code: ErrorCode | None = None
+    #: True once this attempt has pushed content deltas to the user. Emitted
+    #: bytes cannot be retracted, so a later attempt that streams into the
+    #: same sink must know the buffer is already polluted and force a
+    #: discard instead of concatenating two answers.
+    streamed: bool = False
 
 
 class AllModelsFailedError(MarkbotError):
@@ -125,17 +130,27 @@ class FallbackManager:
         circuit.state = "closed"
         self._half_open_probes.discard(circuit_key)
 
-    def _record_failure(self, circuit_key: str) -> None:
+    def _record_failure(self, circuit_key: str, *, permanent: bool = False) -> None:
+        """Record a failure and open the circuit when warranted.
+
+        ``permanent=True`` marks a deterministic failure (model not found, no
+        available channel, auth/billing) that retrying cannot fix, so the
+        circuit opens immediately rather than waiting for the consecutive-
+        failure threshold — a genuinely dead model is ejected after a single
+        response instead of being probed ``threshold`` times per cooldown.
+        """
         circuit = self._get_circuit(circuit_key)
         circuit.failure_count += 1
         circuit.last_failure_time = time.monotonic()
         self._half_open_probes.discard(circuit_key)
-        if circuit.failure_count >= self._circuit_threshold:
-            circuit.state = "open"
-            logger.warning(
-                "{} circuit OPEN ({} consecutive failures)",
-                circuit_key, circuit.failure_count,
-            )
+        if permanent or circuit.failure_count >= self._circuit_threshold:
+            if circuit.state != "open":
+                circuit.state = "open"
+                logger.warning(
+                    "{} circuit OPEN ({} consecutive failures{})",
+                    circuit_key, circuit.failure_count,
+                    ", permanent error" if permanent else "",
+                )
 
     def _get_or_create_provider(
         self,
@@ -170,7 +185,13 @@ class FallbackManager:
                 spec=spec,
             )
 
-        return self._providers_cache[cache_key]
+        provider = self._providers_cache[cache_key]
+        # Apply the per-provider TLS downgrade opt-in, which lives in
+        # config rather than on the (static) provider spec.
+        insecure = bool(getattr(provider_config, "insecure_skip_verify", False))
+        if hasattr(provider, "insecure_skip_verify"):
+            provider.insecure_skip_verify = insecure
+        return provider
 
     @staticmethod
     def _adapt_messages_for_model(
@@ -258,12 +279,21 @@ class FallbackManager:
                 provider_config, model_config = self.config.resolve_model(model_ref)
                 credential_keys = provider_config.credential_keys or [""]
 
-                _max_tokens = max_tokens or model_config.max_tokens or defaults.max_tokens
-                _temperature = (
-                    temperature
-                    if temperature is not None
-                    else (model_config.temperature or defaults.temperature)
-                )
+                _max_tokens = max_tokens
+                if _max_tokens is None:
+                    _max_tokens = model_config.max_tokens or defaults.max_tokens
+
+                # NOTE: ``is None`` (not ``or``) — an explicit temperature of
+                # 0.0 or 0 max_tokens is a valid setting and must not be
+                # silently replaced by the default.
+                _temperature = temperature
+                if _temperature is None:
+                    _temperature = (
+                        model_config.temperature
+                        if model_config.temperature is not None
+                        else defaults.temperature
+                    )
+
                 _reasoning = model_config.reasoning_effort or defaults.reasoning_effort
 
                 # Per-model capability adaptation: strip image content for
@@ -283,6 +313,10 @@ class FallbackManager:
                 # circuit breaker.
                 last_error: Exception | None = None
                 content_filter_hit = False
+                # HTTP status of the most recent failure, carried from the
+                # provider so the chain re-classifies with the authoritative
+                # status instead of guessing from the error prose alone.
+                error_status: int | None = None
                 for key_index, credential in enumerate(credential_keys):
                     provider = self._get_or_create_provider(
                         provider_config, provider_name,
@@ -298,6 +332,7 @@ class FallbackManager:
                         )
                     except Exception as e:
                         last_error = e
+                        error_status = getattr(e, "status_code", None)
                         if key_index < len(credential_keys) - 1:
                             logger.warning(
                                 "Model {} threw with credential {}/{}: {}. "
@@ -309,7 +344,8 @@ class FallbackManager:
 
                     if response.finish_reason == "error":
                         error_msg = response.content or "Unknown error"
-                        classified = classify_api_error(None, error_msg)
+                        error_status = response.status_code
+                        classified = classify_api_error(error_status, error_msg)
                         last_error = Exception(error_msg)
                         if key_index < len(credential_keys) - 1 and (
                             classified.retryable or classified.should_fallback
@@ -380,7 +416,7 @@ class FallbackManager:
                     )
                     attempts.append(attempt)
 
-                    err_type = classify_to_error_type(None, error_msg, last_error)
+                    err_type = classify_to_error_type(error_status, error_msg, last_error)
                     if err_type == ErrorType.TRANSIENT:
                         logger.warning(
                             "Model {} failed (retryable): {}. Trying next...",
@@ -399,8 +435,12 @@ class FallbackManager:
                     # TRANSIENT errors (429/5xx/timeout) are temporary and
                     # should not trip the circuit breaker — only persistent
                     # failures (UNAVAILABLE/UNKNOWN) indicate a real problem.
+                    # UNAVAILABLE is deterministic (model not found, no
+                    # channel, auth/billing) so it opens the circuit at once.
                     if err_type != ErrorType.TRANSIENT:
-                        self._record_failure(model_ref)
+                        self._record_failure(
+                            model_ref, permanent=(err_type == ErrorType.UNAVAILABLE),
+                        )
                     else:
                         # Still release the half-open probe so the next
                         # request can retry this provider.
@@ -420,7 +460,7 @@ class FallbackManager:
                 )
                 attempts.append(attempt)
 
-                err_type = classify_to_error_type(None, str(e), e)
+                err_type = classify_to_error_type(getattr(e, "status_code", None), str(e), e)
                 if err_type == ErrorType.TRANSIENT:
                     logger.warning(
                         "Model {} failed (retryable): {}. Trying next...",
@@ -433,8 +473,16 @@ class FallbackManager:
                 else:
                     logger.error("Model {} failed (non-retryable): {}. Trying next...", model_ref, e)
                 last_error = e
-                self._record_failure(model_ref)
+                self._record_failure(
+                    model_ref, permanent=(err_type == ErrorType.UNAVAILABLE),
+                )
                 continue
+            finally:
+                # Always release the half-open probe. ``except Exception`` above
+                # does NOT catch ``asyncio.CancelledError`` (a BaseException),
+                # so without this a single cancelled request would leave the
+                # probe "in flight" and lock the model out permanently.
+                self._half_open_probes.discard(model_ref)
 
         raise AllModelsFailedError(
             f"All {len(attempts)} models in chain failed",
@@ -483,6 +531,21 @@ class FallbackManager:
     ) -> tuple[LLMResponse, list[FallbackAttempt]]:
         """Try each model in chain with streaming until success."""
 
+        # Track whether this attempt has pushed bytes to the user. Emitted
+        # deltas cannot be retracted, so if the attempt then fails and the
+        # chain rotates, the next model must be told the buffer is polluted
+        # rather than concatenating two answers for the user.
+        emitted = {"any": False}
+
+        if on_content_delta is not None:
+            _inner = on_content_delta
+
+            async def _tracking(text: str) -> None:
+                emitted["any"] = True
+                await _inner(text)
+
+            on_content_delta = _tracking
+
         async def _call_stream(
             provider: LLMProvider,
             model_config: ModelConfig,
@@ -502,4 +565,13 @@ class FallbackManager:
                 on_content_delta=on_content_delta,
             )
 
-        return await self._try_chain(messages, tools, tool_choice, max_tokens, temperature, _call_stream)
+        response, attempts = await self._try_chain(
+            messages, tools, tool_choice, max_tokens, temperature, _call_stream,
+        )
+        # Attribute the emission flag to every attempt that shares this sink
+        # and failed, so the loop can discard the buffer.
+        if emitted["any"]:
+            for a in attempts:
+                if not a.success:
+                    a.streamed = True
+        return response, attempts
