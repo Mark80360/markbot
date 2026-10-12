@@ -330,7 +330,19 @@ class ExecToolConfig(Base):
             "Block shell commands that reference paths outside the configured "
             "working directory. This is a best-effort lexical check, not a "
             "sandbox: it cannot see shell expansion, globs, or computed "
-            "paths. Use OS-level isolation (containers) for hard guarantees."
+            "paths. Use OS-level isolation (containers) for hard guarantees. "
+            "Profiles default this to True; setting it explicitly (true or "
+            "false) in config.json overrides the profile default."
+        ),
+    )
+    allow_shell_chaining: bool = Field(
+        default=False,
+        description=(
+            "If true, skip the shell-chaining / interpreter-injection heuristic "
+            "that blocks `$(...)`, backticks, `bash -c`, `python -c`, pipes into "
+            "interpreters and similar constructs. Off by default; enable only "
+            "when agents legitimately need such pipelines and OS-level isolation "
+            "is not available."
         ),
     )
     require_allowlist: bool = Field(

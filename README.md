@@ -6,7 +6,7 @@
 
 - **协议**：AGPL-3.0
 - **运行时**：Python ≥ 3.11（Web 控制台为 React + Vite，微信桥接需要 Node.js ≥ 18）
-- **当前版本**：`20260824`
+- **当前版本**：`20261012`
 
 ---
 
@@ -404,7 +404,7 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 | `restrictToWorkspace` | 总开关（默认 `true`）：所有工具限制在工作区内访问 |
 | `web.proxy` | HTTP/SOCKS5 代理，如 `http://127.0.0.1:7890` |
 | `web.search` | `provider`: `brave/tavily/duckduckgo/searxng/jina`；`apiKey`；SearXNG 另填 `base_url`；`maxResults`(5) |
-| `exec` | Shell：`enable`、`timeout`(60s)、`restrictToWorkspace`、`requireAllowlist` + `allowPatterns`/`denyPatterns` 正则白黑名单、`allowedInternalIps`（放行 SSRF 检查的内网 IP） |
+| `exec` | Shell：`enable`、`timeout`(60s)、`restrictToWorkspace`、`allowShellChaining`、`requireAllowlist` + `allowPatterns`/`denyPatterns` 正则白黑名单、`allowedInternalIps`（放行 SSRF 检查的内网 IP）。详见 [tools.exec —— Shell 安全防护粒度](#tools-exec--shell-安全防护粒度) |
 | `filesystem` | `backupDir` 备份目录、`maxBackups`(50)、`safeDelete`(true=移入回收站而非直接删除) |
 | `codeExecution` | 沙箱 Python：`enable`、`timeout`(5–300s)、`maxMemoryMb`(64–4096)、`allowedDependencies`(pip 包白名单) |
 | `memory` | 见下方[记忆配置](#记忆配置) |
@@ -416,6 +416,74 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 | `delegation` | 子代理控制：`maxSpawnDepth`(1)、`maxConcurrentChildren`(3)、`blockedTools` 黑名单、`allowNestedSpawn`(false) |
 | `outcomeGate` | 完成前验证门：`enabled`、`maxNudges`(2)、对变更/副作用强制验证 |
 | `runtimeBudget` | 单回合硬顶：`maxInactivitySeconds`(引擎默认 1800s，0 关闭)、`maxTotalTokens`(引擎默认 3M) |
+
+#### tools.exec —— Shell 安全防护粒度
+
+`exec` 的防护按顺序分四层，任一层命中即拦截：
+
+1. **内置危险命令黑名单**（`rm -rf`、`mkfs`、`shutdown`、`curl … | bash` 等）——始终生效，只能用 `denyPatterns` 追加，无法移除；
+2. **注入启发式**（`$(...)`、反引号、`bash -c`、`python -c`、管道进解释器等）——由 `allowShellChaining` 控制；
+3. **白名单**——`requireAllowlist` + `allowPatterns`，只能收窄；
+4. **路径限制**——`restrictToWorkspace`，拦截工作区外的路径。
+
+配置键（config.json 用驼峰，snake_case 亦可解析）：
+
+| 键 | 含义 | 默认 |
+|----|------|------|
+| `enable` | 是否注册 `exec` 工具 | `true` |
+| `timeout` | 单条命令超时（秒） | `60` |
+| `restrictToWorkspace` | 拦截路径在工作区外的命令；**显式写 `false` 可关闭**，不写则跟随 profile 默认（`true`） | `true` |
+| `allowShellChaining` | 放行 `$(...)`、反引号、`bash -c`、`python -c` 等链式 / 解释器调用 | `false` |
+| `requireAllowlist` | 仅允许 `allowPatterns` 命中的命令 | `false` |
+| `allowPatterns` | 允许名单（正则） | `[]` |
+| `denyPatterns` | 在内置黑名单之上追加（只能加，不能减） | `[]` |
+| `pathAppend` | 追加到子进程 `PATH` 的目录 | `""` |
+| `allowedInternalIps` | 放行 SSRF 检查的内网 IP / CIDR（**仅 IPv4**） | `[]` |
+| `envAllowlist` | 非空时仅这些环境变量传入子进程（严格白名单模式） | `[]` |
+| `extraEnvAllow` | 即使形似密钥也放行传递的环境变量名 | `[]` |
+
+**最宽松**——面向受信 / 已隔离环境，几乎不做拦截：
+
+```json
+{
+  "tools": {
+    "restrictToWorkspace": false,
+    "exec": {
+      "enable": true,
+      "timeout": 600,
+      "restrictToWorkspace": false,
+      "allowShellChaining": true,
+      "requireAllowlist": false,
+      "allowedInternalIps": ["0.0.0.0/0"]
+    }
+  }
+}
+```
+
+> `allowedInternalIps: ["0.0.0.0/0"]` 等价于关闭所有 IPv4 的 SSRF 拦截，且不覆盖 IPv6 内网地址；如需放行请优先写具体地址，如 `["127.0.0.1", "10.10.1.90"]`。
+
+**最收紧**——仅允许少数只读命令，黑名单 + 白名单 + 环境白名单三重加固：
+
+```json
+{
+  "tools": {
+    "restrictToWorkspace": true,
+    "exec": {
+      "enable": true,
+      "timeout": 30,
+      "restrictToWorkspace": true,
+      "allowShellChaining": false,
+      "requireAllowlist": true,
+      "allowPatterns": ["^ls\\b", "^cat\\b", "^pwd\\b", "^git status\\b"],
+      "denyPatterns": ["\\bcurl\\b", "\\bwget\\b", "\\bssh\\b"],
+      "allowedInternalIps": [],
+      "envAllowlist": ["PATH", "HOME", "LANG"]
+    }
+  }
+}
+```
+
+> 内置危险命令黑名单与速率限制（30 条 / 60 秒）写死在代码中，`denyPatterns` 只能追加、无法移除；`allowPatterns` 只能在黑名单与注入检测之后再收窄，不能反向放行。
 
 #### 记忆配置
 

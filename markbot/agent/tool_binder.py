@@ -153,14 +153,27 @@ class ToolBinder:
 
         if self._exec_config and self._exec_config.enable:
             profile = self._profile
-            restrict = getattr(self._exec_config, "restrict_to_workspace", True)
-            if profile is not None and getattr(profile, "exec_restrict_to_workspace", False):
+            # Precedence: an *explicitly* configured value wins over the profile
+            # default. Profiles harden assistant/unattended by defaulting exec
+            # confinement on, but an operator who sets
+            # `tools.exec.restrict_to_workspace` in config.json is making a
+            # deliberate choice and must be able to loosen it.
+            if "restrict_to_workspace" in getattr(
+                self._exec_config, "model_fields_set", set()
+            ):
+                restrict = bool(self._exec_config.restrict_to_workspace)
+            elif profile is not None:
+                restrict = bool(getattr(profile, "exec_restrict_to_workspace", True))
+            else:
                 restrict = True
             require_allowlist = bool(getattr(self._exec_config, "require_allowlist", False))
             if profile is not None and getattr(profile, "exec_require_allowlist", False):
                 require_allowlist = True
             allow_patterns = list(getattr(self._exec_config, "allow_patterns", None) or [])
             deny_patterns = list(getattr(self._exec_config, "deny_patterns", None) or [])
+            allow_shell_chaining = bool(
+                getattr(self._exec_config, "allow_shell_chaining", False)
+            )
             # Safe default allowlist for assistant/unattended when none configured.
             if require_allowlist and not allow_patterns:
                 allow_patterns = [
@@ -174,6 +187,7 @@ class ToolBinder:
                     timeout=self._exec_config.timeout,
                     restrict_to_workspace=restrict,
                     require_allowlist=require_allowlist,
+                    allow_shell_chaining=allow_shell_chaining,
                     allow_patterns=allow_patterns,
                     deny_patterns=deny_patterns,
                     path_append=self._exec_config.path_append,

@@ -173,6 +173,48 @@ class TestCredentialEnvStripping:
         assert "leaked-value" not in out
 
 
+class TestGuardRelaxations:
+    """Operators can tune the guard via ``tools.exec.*`` in config.json."""
+
+    def test_dev_null_read_redirect_allowed(self, workspace):
+        tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+        assert tool._guard_command("cat inside.txt 2>/dev/null", str(workspace)) is None
+
+    def test_dev_null_write_redirect_allowed(self, workspace):
+        tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+        assert tool._guard_command("ls > /dev/null 2>&1", str(workspace)) is None
+
+    def test_external_redirect_still_blocked(self, workspace):
+        tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+        outside = str(workspace.parent / "outside_secret.md")
+        err = tool._guard_command(f"echo x > {outside}", str(workspace))
+        assert err is not None
+        assert "blocked" in err
+
+    def test_shell_chaining_blocked_by_default(self, workspace):
+        tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+        assert tool._guard_command("echo $(date)", str(workspace)) is not None
+
+    def test_shell_chaining_allowed_when_opted_in(self, workspace):
+        tool = ExecTool(
+            working_dir=str(workspace),
+            restrict_to_workspace=True,
+            allow_shell_chaining=True,
+        )
+        assert tool._guard_command("echo $(date)", str(workspace)) is None
+
+    def test_denylist_still_applies_when_chaining_allowed(self, workspace):
+        """Opting out of the heuristic must not disable the denylist."""
+        tool = ExecTool(
+            working_dir=str(workspace),
+            restrict_to_workspace=True,
+            allow_shell_chaining=True,
+        )
+        err = tool._guard_command("rm -rf /tmp/x", str(workspace))
+        assert err is not None
+        assert "blocked" in err
+
+
 class TestConfigWiring:
     def test_schema_exposes_env_controls(self):
         from markbot.config.schema import ExecToolConfig
@@ -180,6 +222,13 @@ class TestConfigWiring:
         cfg = ExecToolConfig()
         assert cfg.env_allowlist == []
         assert cfg.extra_env_allow == []
+
+    def test_schema_exposes_guard_controls(self):
+        from markbot.config.schema import ExecToolConfig
+
+        cfg = ExecToolConfig()
+        assert cfg.restrict_to_workspace is True
+        assert cfg.allow_shell_chaining is False
 
     def test_schema_env_allowlist_camel_alias(self):
         from markbot.config.schema import ExecToolConfig

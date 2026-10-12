@@ -19,6 +19,13 @@ from markbot.utils.helpers import strip_ansi
 #: POSIX (``$VAR`` / ``${VAR}``) or Windows (``%VAR%``) form.
 _ENV_REF_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%+")
 
+#: Device / standard-stream paths that are outside the workspace but safe to
+#: reference (e.g. the ubiquitous ``2>/dev/null``). Exempted from the lexical
+#: confinement check so ordinary shell commands are not blocked.
+_SAFE_DEVICE_PATHS: frozenset[str] = frozenset({
+    "/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr",
+})
+
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
@@ -64,6 +71,7 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = True,
         require_allowlist: bool = False,
+        allow_shell_chaining: bool = False,
         path_append: str = "",
         allowed_internal_ips: list[str] | None = None,
         extra_env_allow: list[str] | None = None,
@@ -81,6 +89,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.require_allowlist = require_allowlist
+        self.allow_shell_chaining = allow_shell_chaining
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
         # Optional env vars to re-inject even though they look secret
@@ -413,7 +422,9 @@ class ExecTool(Tool):
 
         # Shell metacharacter / interpreter chaining that commonly bypasses
         # simple command denylists. This is still best-effort, not a sandbox.
-        if self._looks_like_shell_injection(cmd):
+        # Operators who need such pipelines may opt out via
+        # ``tools.exec.allow_shell_chaining``.
+        if not self.allow_shell_chaining and self._looks_like_shell_injection(cmd):
             return (
                 "Error: Command blocked by safety guard "
                 "(shell chaining / interpreter injection detected)"
@@ -438,6 +449,13 @@ class ExecTool(Tool):
             for raw in self._extract_all_paths(cmd):
                 token = raw.strip()
                 if not token:
+                    continue
+                # Device / std-stream targets such as ``2>/dev/null`` live
+                # outside the workspace by design yet are safe to reference,
+                # so exempt them from the confinement check. Compare on the
+                # raw token (POSIX-normalised) because ``resolve()`` would
+                # rewrite ``/dev/null`` into a drive-relative path on Windows.
+                if token.replace("\\", "/").rstrip("/") in _SAFE_DEVICE_PATHS:
                     continue
                 # An unresolvable environment-variable reference is treated
                 # as an escape, not as a relative path. `os.path.expandvars`

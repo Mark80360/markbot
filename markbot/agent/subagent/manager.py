@@ -589,6 +589,7 @@ class SubagentManager:
                 working_dir=str(self.workspace) if self.workspace else None,
                 timeout=getattr(self.exec_config, "timeout", 60),
                 restrict_to_workspace=getattr(self.exec_config, "restrict_to_workspace", False),
+                allow_shell_chaining=getattr(self.exec_config, "allow_shell_chaining", False),
                 path_append=getattr(self.exec_config, "path_append", ""),
                 allowed_internal_ips=getattr(self.exec_config, "allowed_internal_ips", None),
                 env_allowlist=getattr(self.exec_config, "env_allowlist", None),
