@@ -32,6 +32,9 @@
 - **本地模型**：vLLM、Ollama、OVMS，以及任意 OpenAI 兼容端点（`custom`）。
 - **模型链自动降级**：`model_chain` 按优先级排列多个模型，超时 / 限流 / 过载时自动切换下一个；内置熔断器（连续 6 次失败熔断，60 秒冷却）。
 - **Prompt Caching**：Anthropic 与 OpenRouter 支持前缀缓存，缓存策略跨 Provider 统一管理。
+- **Mixture-of-Agents（MoA）**：`/moa` 命令让多个低成本模型并行独立作答，再由聚合模型综合成最终答案；顾问模型可显式指定，也可从各 Provider 的 `default_aux_model` 自动挑选。
+- **辅助模型路由**：`agents.defaults.auxiliary` 可按任务名（如 `web_extract`）固定辅助模型，未配置的任务走自动解析。
+- **Provider 插件**：向数据目录的 `providers/` 放入任意 `.py` 并调用 `register_provider_spec()`，即可新增或覆盖内置 Provider，无需改动源码。
 
 ### 多渠道消息接入
 
@@ -74,6 +77,7 @@
 ### 安全与权限
 
 - 5 种权限模式（default / plan / accept_edits / auto / bypass_permissions），3 种运行档案（coding / assistant / unattended）。
+- **特权命令鉴权**：`/mode`、`/stop`、`/restart` 等进程级操作按 `security.adminIds` 校验发送者；群聊默认不具备特权，单管理员部署可回退到 `allowFrom` 唯一匹配。
 - 文件系统与 Shell 默认限制在工作区内；SSRF 防护（云元数据地址硬黑名单 + 私网段拦截）；工具循环 guardrails 防止死循环烧钱。
 - 会话预算控制（USD 上限 + 告警阈值 + 自定义单价）与 token 用量实时统计。
 
@@ -90,7 +94,7 @@
 | Skills | 技能浏览与管理 |
 | Cron | 定时任务管理 |
 | Config | 配置文件在线编辑（JSON 编辑器） |
-| Env | 环境变量查看 |
+| Keys | 环境变量与密钥查看（敏感值单独分组） |
 | Logs | 运行日志查看 |
 | System | 系统 / 运行状态 |
 
@@ -281,6 +285,11 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
         "forceTextOnly": false,
         "provider": "openai",
         "model": "gpt-4o-mini"
+      },
+      "moa": {
+        "advisors": ["deepseek/deepseek-chat"],
+        "numAdvisors": 3,
+        "aggregator": ""
       }
     }
   },
@@ -310,7 +319,11 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
   "gateway": {
     "host": "127.0.0.1",
     "port": 18790,
-    "heartbeat": { "enabled": true, "interval_s": 1800 }
+    "heartbeat": { "enabled": true, "interval_s": 1800, "keep_recent_messages": 8 }
+  },
+  "security": {
+    "adminIds": ["feishu:ou_xxxxxxxx"],
+    "allowPrivateChatFallback": true
   },
   "tools": {
     "restrictToWorkspace": true,
@@ -368,6 +381,10 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 | `defaultPermissionMode` | 继承 profile | 启动时的权限模式，见[权限模式与安全](#权限模式与安全) |
 | `auxiliaryVision.forceTextOnly` | `false` | 强制所有多模态结果降级为纯文本 |
 | `auxiliaryVision.provider/model` | 空 | 辅助识图模型：主模型不支持图片时由它描述截图 |
+| `auxiliary` | `{}` | 按任务名覆盖辅助模型，如 `{"web_extract": {"provider": "deepseek", "model": "deepseek-chat"}}`；未配置的任务走自动解析 |
+| `moa.advisors` | `[]` | MoA 顾问模型列表（`"provider/model"`）；留空则从各 Provider 的 `default_aux_model` 自动挑选 |
+| `moa.numAdvisors` | `3` | 自动挑选顾问时的数量上限（1–6） |
+| `moa.aggregator` | 空 | 聚合模型；留空则用主模型 `model_chain[0]` |
 
 #### providers.<name> —— 模型提供商
 
@@ -384,6 +401,23 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 | `capabilities` | 能力声明，可选 `text` `image` `image_edit` `image_generate` `video` `audio` `music` `embedding` `tool_use`；驱动能力感知路由（主模型无 `image` 能力时截图自动转辅助识图描述） |
 
 内置 provider 标识（可直接作为键名）：`anthropic`、`openai`、`openai_codex`(OAuth)、`github_copilot`(OAuth)、`azure_openai`、`openrouter`、`deepseek`、`groq`、`zhipu`、`dashscope`、`gemini`、`moonshot`、`minimax`、`mistral`、`stepfun`、`xai`、`nvidia`、`huggingface`、`aihubmix`、`siliconflow`、`volcengine`、`volcengine_coding_plan`、`byteplus`、`byteplus_coding_plan`、`vllm`、`ollama`、`ovms`、`custom`（任意 OpenAI 兼容端点）。部分 provider 支持别名查找（如 `anthropic`=`claude`、`gemini`=`google`、`dashscope`=`alibaba`/`qwen-dashscope`）。
+
+**Provider 插件**：在数据目录的 `providers/` 下（默认 `~/.markbot/providers/`）放置任意 `.py`，模块导入时调用 `register_provider_spec()` 即可注册自定义 Provider：
+
+```python
+# ~/.markbot/providers/mycloud.py
+from markbot.providers.registry import ProviderSpec, register_provider_spec
+
+register_provider_spec(ProviderSpec(
+    name="mycloud",
+    keywords=("mycloud",),
+    env_key="MYCLOUD_API_KEY",
+    display_name="MyCloud",
+    default_api_base="https://api.mycloud.example/v1",
+))
+```
+
+同名插件会覆盖内置 Provider（后写入者生效），新名字则追加在内置列表之后；发现是惰性的，插件加载失败不会影响启动。
 
 #### channels —— 渠道
 
@@ -413,8 +447,9 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 | `skills` | `minScore` 质量门槛（0 关闭）、`hideStale`(true 隐藏过期技能) |
 | `mcpServers` | 见下方 [MCP 配置](#mcp-配置) |
 | `guardrails` | 工具循环护栏阈值（重复失败告警/熔断、无进展检测、停滞上限等） |
-| `delegation` | 子代理控制：`maxSpawnDepth`(1)、`maxConcurrentChildren`(3)、`blockedTools` 黑名单、`allowNestedSpawn`(false) |
-| `outcomeGate` | 完成前验证门：`enabled`、`maxNudges`(2)、对变更/副作用强制验证 |
+| `delegation` | 子代理控制：`maxSpawnDepth`(1)、`maxConcurrentChildren`(3)、`maxChildrenPerSession`(8)、`blockedTools` 黑名单、`allowNestedSpawn`(false)、`forceAutoPermission`(true) |
+| `outcomeGate` | 完成前验证门：`enabled`、`maxNudges`(2)、`surfaces`(默认 `cli`/`web`)、`requireVerificationForMutations`、`requireVerificationForSideEffects` |
+| `cachePolicy` | 前缀缓存策略：`deferMutations`(true，把工具面/系统提示变更推迟到下一回合，保持字节稳定的缓存前缀) |
 | `runtimeBudget` | 单回合硬顶：`maxInactivitySeconds`(引擎默认 1800s，0 关闭)、`maxTotalTokens`(引擎默认 3M) |
 
 #### tools.exec —— Shell 安全防护粒度
@@ -496,16 +531,28 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
       "longTermEnabled": true,
       "vectorBackend": "sqlite",
       "vectorMaxRecords": 50000,
+      "vectorMaxScanRecords": 20000,
       "vectorMinScore": 0.15,
+      "vectorMinContentChars": 12,
+      "vectorTopKMultiplier": 2,
       "embeddingBackend": "openai",
       "embeddingApiKey": "",
       "embeddingBaseUrl": "",
       "embeddingModelName": "",
       "memorySummaryEnabled": true,
       "contextCompactEnabled": true,
+      "memoryCompactThreshold": 0,
+      "memoryCompactReserve": 10000,
+      "memoryCompactRatio": 0.75,
+      "memoryReserveRatio": 0.1,
+      "forceMemorySearch": false,
+      "forceMaxResults": 1,
+      "forceMinScore": 0.3,
       "dreamCron": "0 23 * * *",
       "consolidationEnabled": true,
       "consolidationDedupThreshold": 0.95,
+      "consolidationAgeDecayDays": 90,
+      "consolidationPromoteAccess": 8,
       "dailyLogRetentionDays": 30,
       "autoSummaryToCurated": false
     }
@@ -514,6 +561,14 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 ```
 
 Embedding 后端按优先级自动选择：① OpenAI 兼容 API（设置 `embeddingApiKey` 后启用，质量最佳）；② 本地 sentence-transformers（安装 `.[local-embeddings]`，离线可用）；③ 零依赖哈希兜底。
+
+几个不常用但影响较大的旋钮：
+
+- `vectorMaxScanRecords`（20000）：单次 SQLite 向量查询载入内存的向量上限，语料更大请换 ChromaDB。
+- `vectorTopKMultiplier`（2）：向量召回的过采样倍数，先多取再与关键词结果做 RRF 融合。
+- `forceMemorySearch`（false）：每次 LLM 调用前自动注入记忆检索结果（`forceMaxResults` / `forceMinScore` 控制条数与阈值）。
+- `memoryCompactThreshold`（0）：记忆压缩的 token 阈值，0 表示按上下文窗口的 75%（`memoryCompactRatio`）自动计算；`memoryCompactReserve` 为压缩后为新消息预留的 token。
+- `consolidationAgeDecayDays`（90）：重要性的年龄衰减半衰期；`consolidationPromoteAccess`（8）为访问次数超过多少后可将高价值记忆晋升到 `MEMORY.md`。
 
 外部记忆 Provider 插件：设置 `tools.memory.provider`（如 `"chroma"`）+ `providerConfig`；支持 entry points（`markbot.memory_providers`）、命名约定（`markbot_memory_*` 包）与手动注册三种发现方式。
 
@@ -544,10 +599,22 @@ Embedding 后端按优先级自动选择：① OpenAI 兼容 API（设置 `embed
 
 `type` 支持 `stdio` / `sse` / `streamableHttp`（缺省自动探测）；`enabledTools` 控制注册哪些工具（`["*"]` 全部）。
 
+#### security —— 特权命令鉴权
+
+`/mode`、`/stop`、`/restart` 等命令是**进程级**的：一次 `/mode auto` 会切换整个守护进程的工具权限并写回 `config.json`。因此这些命令不按渠道 `allowFrom` 放行，而是走独立的管理员校验。
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `adminIds` | `[]` | 允许执行特权命令的发送者 ID；支持 `feishu:ou_xxx` 这类渠道限定形式，也接受裸 ID。`"*"` 表示所有人（仅限单操作者部署） |
+| `allowPrivateChatFallback` | `true` | `adminIds` 为空时，允许在私聊中把「`allowFrom` 恰好只有一个发送者」推断为管理员；设为 `false` 则要求每个渠道都显式配置 `adminIds` |
+
+判定顺序：本地界面（CLI / Web / API）始终有权 → 群聊永不隐式提权 → 显式 `adminIds`（或渠道级 `adminFrom`）优先 → 单用户部署回退 → 其余一律拒绝，并在回复中提示应配置哪个键。
+
 #### 其他模块
 
 | 模块 | 要点 |
 |------|------|
+| `gateway.heartbeat` | 心跳巡检：`enabled`(true)、`intervalS`(1800)、`keepRecentMessages`(8，巡检时回看的历史消息条数) |
 | `compaction` | 四级压缩参数：`thresholdRatio`(0.85 触发阈值)、`collapseToolResultChars`(4000)、`collapseHead/TailChars`(900/500)、`microCompactKeepTurns`(6)、`autoCompactKeepRecent`(5)、`snipKeepMessages`(10)、`toolOutputInlineChars`(16000，超出落盘)、`systemPromptTokenBudget`(16000) 等 |
 | `budget` | 成本控制：`enabled`、`maxBudgetUsd`(会话 USD 上限，null 不限)、`warnThresholdUsd`(0.5 告警)、`customPricing`(按模型覆盖单价) |
 | `reliability` | 后台任务可靠性：`cronMaxRetries`(2)、`cronRetryDelayS`(5)、`deadLetterKeep`(50)、`notifyOnFailure`(true) |
@@ -568,6 +635,8 @@ Embedding 后端按优先级自动选择：① OpenAI 兼容 API（设置 `embed
 | `MARKBOT_PRODUCTION` | `1` 收紧 Shell 工具安全限制 |
 | `MARKBOT_ARTIFACT_DIR` | 覆写工具输出落盘目录 |
 | `MARKBOT_IMAGE_TOKEN_ESTIMATE` | 覆写单张图片的 token 预估成本 |
+| `MARKBOT_LANGUAGE` | 覆写界面语言（`en` / `zh`），优先级高于 `display.language` |
+| `MARKBOT_PROMPT_CACHE_DIR` | 覆写系统提示缓存目录（主要供测试重定向） |
 
 此外，配置项也可通过 `MARKBOT_` 前缀 + 双下划线嵌套的环境变量覆盖（Pydantic Settings，如 `MARKBOT_AGENTS__DEFAULTS__TEMPERATURE=0.5`）。
 
@@ -616,7 +685,9 @@ markbot provider login github-copilot  # Copilot OAuth 登录
 # 配置与诊断
 markbot status                    # 进程 / 工作区 / 运行时状态
 markbot config get|set|list|show  # 查看与修改配置
-markbot plugins list              # 已发现的技能插件
+markbot config provider           # 交互式配置 LLM Provider 与模型
+markbot config channel            # 交互式配置聊天渠道
+markbot plugins list              # 已发现的渠道插件（内置 + 插件）
 markbot doctor                    # 环境体检
 markbot doctor fix                # 自动修复常见问题
 markbot --version
@@ -635,9 +706,11 @@ markbot --version
 | `/stop` | 取消所有活动任务与子代理 |
 | `/steer` | 向运行中的 Agent 注入中途指令 |
 | `/status` | 会话状态、token 用量与统计 |
+| `/trace [full]` | 查看上一回合的决策轨迹（加 `full` 输出完整时间线） |
 | `/mode [mode]` | 查看/切换权限模式 |
 | `/profile [name]` | 查看/切换运行档案 |
 | `/restart` | 重启 Agent 进程 |
+| `/moa [question]` | Mixture-of-Agents：多个顾问并行作答，再由聚合模型综合 |
 | `/help` | 显示可用命令 |
 
 ---
@@ -657,6 +730,7 @@ markbot --version
 要点：
 
 - Cron / Autopilot / Heartbeat 等无人值守路径**始终以 auto 模式**运行。
+- `/mode`、`/stop`、`/restart` 等进程级命令需要管理员身份，配置见 [security](#security--特权命令鉴权)。
 - 三种典型配置范式：
   - **安全聊天**（只读）：关闭 `exec` / `codeExecution` / `computerUse` / `browser`，配合 `/mode plan`；
   - **本地开发助手**：开启 exec + 代码执行但 `restrictToWorkspace: true`，配合 `/mode accept_edits`；
@@ -672,11 +746,11 @@ markbot --version
 ```
 markbot/
 ├── agent/            # Agent 循环：iteration、压缩、上下文构建、成本跟踪、
-│   │                 #   前缀缓存、pipeline 中间件、subagent、MCP 管理器
+│   │                 #   前缀缓存、pipeline 中间件、subagent、MCP 管理器、MoA
 ├── channels/         # 渠道：dingtalk / feishu / qq / weixin / email + 管理器
 ├── tools/            # 内置工具实现（文件系统/Shell/Web/记忆/browser/computer_use…）
 ├── skills/           # 技能框架（loader/scanner/guardrail/sandbox）+ 内置技能
-├── providers/        # 28 家 LLM Provider + FallbackManager(熔断) + OAuth
+├── providers/        # 28 家 LLM Provider + FallbackManager(熔断) + OAuth + 插件注册表
 ├── config/           # Pydantic 配置 schema / loader / 路径 / 运行档案
 ├── runtime/          # 声明式装配工厂（CLI/Gateway/Web 共用）
 ├── memory/           # 记忆系统：长期向量库、整合、每日日志、脱敏、插件发现
@@ -686,6 +760,9 @@ markbot/
 ├── autopilot/        # 自动任务流水线（Intake→Verify→Repair）
 ├── cli/              # Typer CLI：onboard/agent/gateway/web/skills/autopilot/doctor
 ├── web/              # FastAPI 服务端（WebSocket 聊天 + REST 路由）
+├── types/            # 共享类型定义（权限、工具、协议）
+├── utils/            # 通用工具函数
+├── locales/          # i18n 文案（en / zh）
 ├── templates/        # 工作区模板（SOUL.md / MEMORY.md 等）
 └── log/              # loguru 日志核心与敏感信息脱敏
 web/                  # Web 控制台前端（React 19 + Vite + Tailwind 4）
