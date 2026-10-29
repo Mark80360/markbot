@@ -13,9 +13,9 @@ from typing import Any
 
 from starlette.routing import WebSocketRoute
 
-from fastapi import File, UploadFile
+from fastapi import File, Request, UploadFile
 
-from markbot.web.auth import get_token
+from markbot.web.auth import get_token, is_valid_token
 
 _log = logging.getLogger(__name__)
 
@@ -479,14 +479,18 @@ def _build_app(workspace: str | Path | None = None):
         mt = media_types.get(ext, "application/octet-stream")
         return FileResponse(str(file_path), media_type=mt)
 
-    def _spa_response():
+    def _spa_response(include_token: bool = False):
         content = (WEB_DIST / "index.html").read_bytes()
         html = content.decode("utf-8")
-        html = html.replace(
-            "</head>",
-            f'<script>window.__MARKBOT_SESSION_TOKEN__="{get_token()}";</script></head>',
-            1,
-        )
+        if include_token:
+            # Only hand the token to a caller that already proved it has one.
+            # Injecting it into every anonymous page load made ``curl /`` a
+            # free credential for the whole API (config, env, logs).
+            html = html.replace(
+                "</head>",
+                f'<script>window.__MARKBOT_SESSION_TOKEN__="{get_token()}";</script></head>',
+                1,
+            )
         return FastResponse(
             html.encode("utf-8"),
             media_type="text/html",
@@ -497,12 +501,18 @@ def _build_app(workspace: str | Path | None = None):
             },
         )
 
+    def _request_has_token(request: Request) -> bool:
+        token = request.query_params.get("token", "") or request.headers.get(
+            "x-markbot-session-token", ""
+        )
+        return is_valid_token(token)
+
     if WEB_DIST.exists():
         app.mount("/assets", StaticFiles(directory=str(WEB_DIST / "assets")), name="static-assets")
 
         @app.get("/")
-        async def serve_index():
-            return _spa_response()
+        async def serve_index(request: Request):
+            return _spa_response(_request_has_token(request))
 
         # Register favicon BEFORE the catch-all SPA route so it isn't shadowed
         @app.get("/favicon.ico")
@@ -513,10 +523,10 @@ def _build_app(workspace: str | Path | None = None):
             return FastResponse(status_code=204)
 
         @app.get("/{full_path:path}")
-        async def serve_spa(full_path: str):
+        async def serve_spa(full_path: str, request: Request):
             if full_path.startswith("api/"):
                 return FastResponse(status_code=404)
-            return _spa_response()
+            return _spa_response(_request_has_token(request))
     else:
         @app.get("/")
         async def no_frontend():
@@ -533,6 +543,9 @@ def start_server(host: str = "127.0.0.1", port: int = 9120, workspace: str | Pat
     app = _build_app(workspace=workspace)
     print("\n  Markbot Web UI")
     print(f"  Listening on http://{host}:{port}")
+    # The token is only injected into pages whose request already carries it,
+    # so the printed URL is the intended entry point.
+    print(f"  Open: http://{host}:{port}/?token={get_token()}")
     print(f"  Token: {get_token()}")
     print("  Press Ctrl+C to stop\n")
     uvicorn.run(app, host=host, port=port, log_level="info")

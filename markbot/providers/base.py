@@ -320,9 +320,31 @@ class LLMProvider(ABC):
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
+            # Track emission per attempt. Retrying after deltas have already
+            # reached the sink would replay a second answer on top of the
+            # partial one, because emitted bytes cannot be retracted.
+            sent = {"any": False}
+            if on_content_delta is not None:
+                _inner = on_content_delta
+
+                async def _track(text: str, _sent=sent, _inner=_inner) -> None:
+                    _sent["any"] = True
+                    await _inner(text)
+
+                kw["on_content_delta"] = _track
+            else:
+                kw["on_content_delta"] = None
+
             response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
+                return response
+
+            if sent["any"]:
+                logger.warning(
+                    "LLM stream failed after emitting content; not retrying "
+                    "to avoid duplicating output"
+                )
                 return response
 
             if response.error_type != ErrorType.TRANSIENT:

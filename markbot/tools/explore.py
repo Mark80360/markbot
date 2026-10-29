@@ -60,11 +60,10 @@ class ExploreTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Deep code exploration and analysis tool. Use this for understanding codebases, "
-            "tracing symbols across files, analyzing architecture, and discovering patterns. "
-            "MUCH more powerful than individual read_file/grep/glob calls for research tasks. "
-            "Modes: overview (project map), trace (symbol tracking), analyze (deep dive), "
-            "dependencies (module graph). ALWAYS use this first when researching a codebase."
+            "Cross-file structural analysis: project map, symbol tracing, module graph. "
+            "Use it once locating (grep/glob) has told you what to look at, or when you "
+            "need relationships rather than text. For plain text search prefer grep/glob — "
+            "they are cheaper. Modes: overview | trace | analyze | dependencies."
         )
 
     @property
@@ -76,43 +75,39 @@ class ExploreTool(Tool):
                     "type": "string",
                     "enum": ["overview", "trace", "analyze", "dependencies"],
                     "description": (
-                        "Exploration mode:\n"
-                        "- **overview**: Map project structure, detect tech stack, identify architecture patterns, find key files\n"
-                        "- **trace**: Track a symbol (function/class/variable) across files — follow imports, calls, references\n"
-                        "- **analyze**: Deep analysis of a specific file or module with full context from related files\n"
-                        "- **dependencies**: Map import/dependency relationships between modules"
+                        "overview: project structure, tech stack, key files. "
+                        "trace: a symbol's definition, usages and call chain. "
+                        "analyze: one file or module plus its related context. "
+                        "dependencies: import graph between modules."
                     ),
                 },
                 "target": {
                     "type": "string",
                     "description": (
-                        "Target for exploration:\n"
-                        "- overview: directory path (default: workspace root)\n"
-                        "- trace: symbol name to track (e.g., 'QueryEngine', 'handle_request', 'useState')\n"
-                        "- analyze: file path or module name to deep-dive into\n"
-                        "- dependencies: file path or module name (default: workspace root)"
+                        "overview/dependencies: directory or module (default: workspace root). "
+                        "trace: symbol name. analyze: file path."
                     ),
                 },
                 "depth": {
                     "type": "integer",
-                    "description": "How deep to explore (1-5, default 3). Higher = more thorough but slower.",
+                    "description": "Exploration depth (1-5, default 3); higher is slower.",
                     "minimum": 1,
                     "maximum": 5,
                     "default": 3,
                 },
                 "focus": {
                     "type": "string",
-                    "description": "Optional focus area to narrow results (e.g., 'auth', 'database', 'api', 'ui')",
+                    "description": "Narrow results to one area (e.g. 'auth', 'api', 'ui').",
                 },
                 "include_patterns": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Glob patterns to include (e.g., ['**/*.py', '**/*.ts']). Default: all source files.",
+                    "description": "Glob patterns to include (default: all source files).",
                 },
                 "exclude_patterns": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Glob patterns to exclude (e.g., ['**/test_*']). Default: test files excluded in non-test focus.",
+                    "description": "Glob patterns to exclude (default: test files outside test focus).",
                 },
             },
             "required": ["mode"],

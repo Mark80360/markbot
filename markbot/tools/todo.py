@@ -218,34 +218,18 @@ class TodoTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Structured task tracking tool for managing todo items. "
-            "WHEN to use:\n"
-            "- A task requires 3+ steps with dependencies between them\n"
-            "- You need to persist progress across multiple tool-call turns\n"
-            "- User explicitly asks to record, track, or list tasks/todos\n"
-            "- Tracking steps within the current work session\n"
-            "WHEN NOT to use:\n"
-            "- Single-step operations or simple Q&A\n"
-            "- One-off commands with no follow-up\n"
-            "- Scheduled/future reminders (use `cron` instead)\n"
-            "- Autonomous task execution with verification "
-            "(use `autopilot_intake` instead)\n"
-            "OPERATIONAL DISCIPLINE (important):\n"
-            "- Keep only ONE item in_progress at a time. Mark it completed "
-            "before starting the next.\n"
-            "- Mark items completed *immediately* after the corresponding "
-            "step is done, not at the end.\n"
-            "- If a step fails twice, mark it failed/cancelled and add a "
-            "revised item describing the alternative approach — do not keep "
-            "retrying under the same entry.\n"
-            "- Write the plan *before* starting execution; update it as "
-            "you go. The list survives context compression, so it is your "
-            "source of truth for what remains.\n"
-            "Actions:\n"
-            "- write: create new items or update existing ones (provide id to update)\n"
-            "- list: query items with optional filters (status, priority)\n"
-            "- delete: remove items by id\n"
-            "Do NOT create markdown files as task trackers — use this tool instead."
+            "Task list for work spanning multiple tool-call turns. Use it when a task "
+            "needs 3+ steps, when progress must persist across turns, or when the user "
+            "asks to track tasks. Not for single-step work or one-off commands "
+            "(scheduled reminders belong to `cron`).\n"
+            "Discipline:\n"
+            "- Keep exactly ONE item in_progress; mark it completed before starting the next.\n"
+            "- Mark items completed the moment the step is done, not at the end.\n"
+            "- If a step fails twice, mark it failed and add a new item describing the "
+            "different approach — do not keep retrying under the same entry.\n"
+            "- Write the plan before executing and keep it current; the list survives "
+            "context compression, so it is your source of truth for what remains.\n"
+            "Do NOT create markdown files as task trackers."
         )
 
     @property
@@ -318,6 +302,11 @@ class TodoTool(Tool):
     async def _legacy_execute(self, **kwargs: Any) -> str:
         action = kwargs.get("action", "")
         store = self._get_store()
+        # Prefer the per-call context over the instance field: a single tool
+        # instance serves every session, so the last ``set_session`` caller
+        # otherwise decides where concurrent sessions read and write.
+        context = kwargs.get("_tool_context")
+        session_id = getattr(context, "session_id", None) or self._session_id
 
         if action == "write":
             items = kwargs.get("items", [])
@@ -326,7 +315,7 @@ class TodoTool(Tool):
             for idx, item in enumerate(items):
                 if not item.get("id") and not item.get("content", "").strip():
                     return f"Error: item at index {idx} is missing required field 'content'"
-            results = store.write(items, session_id=self._session_id)
+            results = store.write(items, session_id=session_id)
             return self._format_write_results(results)
 
         if action == "list":
@@ -334,7 +323,7 @@ class TodoTool(Tool):
             items = store.list_items(
                 status=filt.get("status"),
                 priority=filt.get("priority"),
-                session_id=filt.get("session_id") if "session_id" in filt else None,
+                session_id=filt.get("session_id") or session_id,
             )
             return self._format_list_results(items)
 

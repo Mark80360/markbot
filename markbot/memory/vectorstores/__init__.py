@@ -148,6 +148,11 @@ class ChromaVectorStore(VectorStore):
     def upsert(self, record: VectorRecord) -> None:
         rid = record.id
         meta = self._encode_meta(record.metadata)
+        # ``source`` is a first-class field on VectorRecord, not part of
+        # ``metadata``. Persist it explicitly: query filters, delete_by_source
+        # and quarantine checks all read it back from metadata, and without
+        # this every record looked source-less.
+        meta["source"] = record.source
         created = record.created_at or time.time()
         meta["created_at"] = created
         meta["access_count"] = int(record.access_count)

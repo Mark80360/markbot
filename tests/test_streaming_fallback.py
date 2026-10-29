@@ -195,3 +195,52 @@ def _async(value):
         return value
 
     return _inner()
+
+
+class TestProviderRetryAfterEmission:
+    @pytest.mark.asyncio
+    async def test_no_retry_after_partial_emission(self):
+        """A provider-level retry must not replay deltas already sent."""
+        from markbot.providers.base import LLMProvider
+        from markbot.providers.errors import ErrorType
+
+        class FakeProvider(LLMProvider):
+            _CHAT_RETRY_DELAYS = (0,)
+
+            def __init__(self):
+                super().__init__("k")
+                self.calls = 0
+
+            def get_default_model(self):
+                return "fake"
+
+            async def chat(self, **kwargs):
+                return LLMResponse(content="x")
+
+            async def chat_stream(self, **kwargs):
+                self.calls += 1
+                callback = kwargs.get("on_content_delta")
+                if callback:
+                    await callback(f"chunk{self.calls}")
+                if self.calls == 1:
+                    return LLMResponse(
+                        content="partial",
+                        finish_reason="error",
+                        error_type=ErrorType.TRANSIENT,
+                    )
+                return LLMResponse(content="done")
+
+        provider = FakeProvider()
+        deltas: list[str] = []
+
+        async def sink(text: str) -> None:
+            deltas.append(text)
+
+        response = await provider.chat_stream_with_retry(
+            messages=[], on_content_delta=sink
+        )
+
+        assert provider.calls == 1
+        assert deltas == ["chunk1"]
+        assert response.finish_reason == "error"
+

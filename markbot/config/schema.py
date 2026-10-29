@@ -1015,6 +1015,16 @@ class CompactionConfig(Base):
         le=20,
         description="Number of recent tool-result turns to preserve during micro-compact",
     )
+    micro_compact_digest_chars: int = Field(
+        default=240,
+        ge=80,
+        le=2_000,
+        description=(
+            "Characters of an elided tool result kept as a digest by micro-compact, "
+            "so an elided result stays partially useful instead of becoming a bare "
+            "placeholder the model has to re-fetch"
+        ),
+    )
     auto_compact_keep_recent: int = Field(
         default=5,
         ge=2,

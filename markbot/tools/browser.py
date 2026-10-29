@@ -44,47 +44,63 @@ def _build_multimodal_result(
     }
 
 
+_session_lock: Optional[asyncio.Lock] = None
+
+
+def _session_guard() -> asyncio.Lock:
+    """Lazily create the session-creation lock (avoids loop binding at import)."""
+    global _session_lock
+    if _session_lock is None:
+        _session_lock = asyncio.Lock()
+    return _session_lock
+
+
 async def _get_session(task_id: str, config: Optional[Any] = None) -> dict[str, Any]:
-    """Get or create a browser session for the given task_id."""
+    """Get or create a browser session for the given task_id.
+
+    Creation is serialised: two concurrent misses used to launch two browsers,
+    overwrite the dict entry, and leak the first Chromium process.
+    """
     global _cleanup_task
 
-    if task_id in _sessions:
-        _sessions[task_id]["last_used"] = time.time()
-        return _sessions[task_id]
+    async with _session_guard():
+        if task_id in _sessions:
+            _sessions[task_id]["last_used"] = time.time()
+            return _sessions[task_id]
 
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        raise RuntimeError(
-            "Playwright is not installed. Install with:\n"
-            "  pip install playwright && playwright install chromium"
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            raise RuntimeError(
+                "Playwright is not installed. Install with:\n"
+                "  pip install playwright && playwright install chromium"
+            )
+
+        headless = True
+        if config and hasattr(config, "headless"):
+            headless = config.headless
+
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            ignore_https_errors=True,
         )
+        page = await context.new_page()
 
-    headless = True
-    if config and hasattr(config, "headless"):
-        headless = config.headless
+        session = {
+            "playwright": pw,
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "last_used": time.time(),
+        }
+        _sessions[task_id] = session
 
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=headless)
-    context = await browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        ignore_https_errors=True,
-    )
-    page = await context.new_page()
+        if _cleanup_task is None or _cleanup_task.done():
+            _cleanup_task = asyncio.create_task(_cleanup_sessions())
 
-    session = {
-        "playwright": pw,
-        "browser": browser,
-        "context": context,
-        "page": page,
-        "last_used": time.time(),
-    }
-    _sessions[task_id] = session
-
-    if _cleanup_task is None or _cleanup_task.done():
-        _cleanup_task = asyncio.create_task(_cleanup_sessions())
-
-    return session
+        return session
 
 
 async def _cleanup_sessions() -> None:
@@ -128,10 +144,77 @@ def _get_task_id(context: ToolContext) -> str:
     return context.session_id or "default"
 
 
+_REF_ATTR = "data-markbot-ref"
+
+# Marks interactive elements with a reference the model can address. Playwright's
+# accessibility snapshot exposes role/name but neither a ref nor geometry, so the
+# click-by-ref and click-by-bounds paths could never match anything. Refs are
+# regenerated per snapshot, so they always describe the current DOM.
+_ANNOTATE_JS = """
+() => {
+  const SEL = 'a[href], button, input, textarea, select, summary, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [role="combobox"], [role="tab"], [onclick], [contenteditable="true"]';
+  document.querySelectorAll('[data-markbot-ref]').forEach(el => el.removeAttribute('data-markbot-ref'));
+  const out = [];
+  let n = 0;
+  for (const el of document.querySelectorAll(SEL)) {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    if (rect.width === 0 || rect.height === 0 || el.disabled) continue;
+    n += 1;
+    const ref = 'e' + n;
+    el.setAttribute('data-markbot-ref', ref);
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const label = (
+      el.innerText || el.value || el.getAttribute('aria-label') ||
+      el.getAttribute('placeholder') || el.getAttribute('name') ||
+      el.getAttribute('title') || ''
+    ).replace(/\\s+/g, ' ').trim().slice(0, 120);
+    out.push({ref, tag, type, label});
+    if (n >= 200) break;
+  }
+  return out;
+}
+"""
+
+
+def _normalize_ref(element: str) -> str:
+    """Accept ``e5``, ``@e5`` or ``5`` and return the canonical ``e5`` form."""
+    ref = (element or "").strip().lstrip("@")
+    if ref and not ref.startswith("e"):
+        ref = f"e{ref}"
+    return ref
+
+
+async def _annotate_page(page: Any) -> list[dict[str, Any]]:
+    """Tag interactive elements on the page and return their refs."""
+    try:
+        result = await page.evaluate(_ANNOTATE_JS)
+        return result if isinstance(result, list) else []
+    except Exception as e:
+        logger.debug("Annotate page failed: %s", e)
+        return []
+
+
+def _format_interactive_elements(elements: list[dict[str, Any]]) -> str:
+    """Render annotated elements as ``@e1 button "Submit"`` lines."""
+    lines: list[str] = []
+    for el in elements:
+        tag = el.get("tag") or "element"
+        typ = el.get("type") or ""
+        if typ and tag in ("input", "button"):
+            tag = f"{tag}[{typ}]"
+        label = el.get("label") or ""
+        lines.append(f"@{el.get('ref')} {tag}" + (f' "{label}"' if label else ""))
+    return "\n".join(lines)
+
+
 class BrowserNavigateTool(Tool):
     """Navigate to a URL in the browser."""
 
-    _is_read_only = True
+    # Not read-only: navigation changes the shared page state, so it must not
+    # join a concurrent batch with other browser calls.
 
     @property
     def name(self) -> str:
@@ -185,12 +268,16 @@ class BrowserNavigateTool(Tool):
                 ok, err = validate_resolved_url(response.url)
                 if not ok:
                     return f"Error: redirect blocked - {err}"
+                # Re-check the allow/deny policy on the final URL: a redirect
+                # can land on a domain the operator explicitly blocked.
+                policy_error = check_website_policy(response.url)
+                if policy_error:
+                    return f"Error: redirect blocked - {policy_error}"
             status = response.status if response else "unknown"
             title = await page.title()
             # Return navigation status + compact snapshot so the model can
             # immediately interact without a separate browser_snapshot call.
-            snapshot = await page.accessibility.snapshot()
-            snapshot_text = _format_snapshot_tree(snapshot) if snapshot else ""
+            snapshot_text = _format_interactive_elements(await _annotate_page(page))
             header = f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
             if snapshot_text:
                 max_chars = 8000
@@ -203,9 +290,10 @@ class BrowserNavigateTool(Tool):
 
 
 class BrowserSnapshotTool(Tool):
-    """Get accessibility snapshot of the current page."""
+    """Get a snapshot of the page's interactive elements."""
 
-    _is_read_only = True
+    # Re-annotating rewrites the ref attributes, so two snapshots must not run
+    # concurrently against the same page.
 
     @property
     def name(self) -> str:
@@ -214,13 +302,11 @@ class BrowserSnapshotTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Get a text-based snapshot of the current page's accessibility tree. "
-            "Returns interactive elements with ref IDs (like @e1, @e2) for browser_click "
-            "and browser_type. Full=false (default): compact view with interactive elements. "
-            "Full=true: complete page content. Snapshots over 8000 chars are truncated. "
-            "Requires browser_navigate first. Note: browser_navigate already returns a compact "
-            "snapshot — use this to refresh after interactions that change the page, or with "
-            "full=true for complete content."
+            "Get a snapshot of the page's interactive elements. "
+            "Returns elements with ref IDs (like @e1, @e2) for browser_click "
+            "and browser_type. Snapshots over 8000 chars are truncated. "
+            "Requires browser_navigate first. browser_navigate already returns "
+            "a snapshot — use this to refresh after interactions that change the page."
         )
 
     @property
@@ -232,11 +318,11 @@ class BrowserSnapshotTool(Tool):
         page = await _get_page(_get_task_id(context))
 
         try:
-            snapshot = await page.accessibility.snapshot()
-            if not snapshot:
-                return "No accessibility tree available"
+            elements = await _annotate_page(page)
+            if not elements:
+                return "No interactive elements found on the page"
 
-            result = _format_snapshot_tree(snapshot)
+            result = _format_interactive_elements(elements)
 
             max_chars = 8000
             if len(result) > max_chars:
@@ -245,33 +331,6 @@ class BrowserSnapshotTool(Tool):
             return result
         except Exception as e:
             return f"Snapshot error: {e}"
-
-
-def _format_snapshot(node: dict, lines: list[str], depth: int) -> None:
-    """Format an accessibility snapshot node into readable lines."""
-    indent = "  " * depth
-    role = node.get("role", "")
-    name = node.get("name", "")
-    ref = node.get("ref", "")
-
-    parts = [f"{indent}{role}"]
-    if name:
-        parts.append(f'"{name}"')
-    if ref:
-        idx = ref.replace("e", "") if ref.startswith("e") else ref
-        parts.append(f"@e{idx}")
-
-    lines.append(" ".join(parts))
-
-    for child in node.get("children", []):
-        _format_snapshot(child, lines, depth + 1)
-
-
-def _format_snapshot_tree(snapshot: dict) -> str:
-    """Format an accessibility snapshot tree into a readable string."""
-    lines: list[str] = []
-    _format_snapshot(snapshot, lines, depth=0)
-    return "\n".join(lines)
 
 
 class BrowserClickTool(Tool):
@@ -303,49 +362,27 @@ class BrowserClickTool(Tool):
         if not element:
             return "Error: 'element' parameter is required"
 
-        element_ref = element.lstrip("@")
+        element_ref = _normalize_ref(element)
         context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
-            locator = page.locator(f'[data-ref="{element_ref}"]')
-            count = await locator.count()
-            if count > 0:
+            locator = page.locator(f'[{_REF_ATTR}="{element_ref}"]')
+            if await locator.count() == 0:
+                # The DOM may have changed since the last snapshot; re-annotate
+                # once and retry with the same ref before giving up.
+                await _annotate_page(page)
+                locator = page.locator(f'[{_REF_ATTR}="{element_ref}"]')
+            if await locator.count() > 0:
                 await locator.first.click()
                 return f"Clicked element @{element_ref}"
         except Exception as e:
-            logger.debug("Click by data-ref failed: %s", e)
+            logger.debug("Click by ref failed: %s", e)
 
-        try:
-            snapshot = await page.accessibility.snapshot()
-            if snapshot:
-                coords = _find_element_coords(snapshot, element_ref)
-                if coords:
-                    await page.mouse.click(coords["x"], coords["y"])
-                    return f"Clicked element @{element_ref} at ({coords['x']}, {coords['y']})"
-        except Exception as e:
-            logger.debug("Click by accessibility snapshot failed: %s", e)
-
-        return f"Could not find element @{element_ref} on the page"
-
-
-def _find_element_coords(snapshot: dict, target_ref: str) -> dict[str, float] | None:
-    """Search the accessibility tree for an element's coordinates."""
-    ref = snapshot.get("ref", "")
-    if ref == target_ref or ref == f"e{target_ref}":
-        bounds = snapshot.get("bounds")
-        if bounds:
-            return {
-                "x": bounds.get("x", 0) + bounds.get("width", 0) / 2,
-                "y": bounds.get("y", 0) + bounds.get("height", 0) / 2,
-            }
-
-    for child in snapshot.get("children", []):
-        result = _find_element_coords(child, target_ref)
-        if result:
-            return result
-
-    return None
+        return (
+            f"Could not find element @{element_ref} on the page. "
+            "Call browser_snapshot to refresh the element refs."
+        )
 
 
 class BrowserTypeTool(Tool):
@@ -380,24 +417,28 @@ class BrowserTypeTool(Tool):
         if not text:
             return "Error: 'text' parameter is required"
 
-        element_ref = element.lstrip("@")
+        element_ref = _normalize_ref(element)
         context = kwargs.get("_tool_context")
         page = await _get_page(_get_task_id(context))
 
         try:
-            snapshot = await page.accessibility.snapshot()
-            if snapshot:
-                coords = _find_element_coords(snapshot, element_ref)
-                if coords:
-                    await page.mouse.click(coords["x"], coords["y"])
-                    await asyncio.sleep(0.1)
-                    await page.keyboard.press("Meta+a")
-                    await page.keyboard.type(text, delay=20)
-                    return f"Typed '{text[:50]}' into element @{element_ref}"
+            locator = page.locator(f'[{_REF_ATTR}="{element_ref}"]')
+            if await locator.count() == 0:
+                await _annotate_page(page)
+                locator = page.locator(f'[{_REF_ATTR}="{element_ref}"]')
+            if await locator.count() > 0:
+                # ``fill`` clears the field and sets the value atomically, which
+                # also works for contenteditable targets (the previous
+                # Meta+a shortcut only cleared fields on macOS).
+                await locator.first.fill(text)
+                return f"Typed '{text[:50]}' into element @{element_ref}"
         except Exception as e:
             return f"Type error: {e}"
 
-        return f"Could not find element @{element_ref} on the page"
+        return (
+            f"Could not find element @{element_ref} on the page. "
+            "Call browser_snapshot to refresh the element refs."
+        )
 
 
 class BrowserScrollTool(Tool):

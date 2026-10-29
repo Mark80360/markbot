@@ -416,6 +416,9 @@ class FallbackManager:
                     )
                     attempts.append(attempt)
 
+                    classification = classify_api_error(
+                        error_status, error_msg, last_error
+                    )
                     err_type = classify_to_error_type(error_status, error_msg, last_error)
                     if err_type == ErrorType.TRANSIENT:
                         logger.warning(
@@ -438,8 +441,16 @@ class FallbackManager:
                     # UNAVAILABLE is deterministic (model not found, no
                     # channel, auth/billing) so it opens the circuit at once.
                     if err_type != ErrorType.TRANSIENT:
+                        # A context overflow is deterministic for *this*
+                        # request, not for the model: compacting and retrying
+                        # is the intended recovery, so do not open the
+                        # circuit and lock the model out for every session.
                         self._record_failure(
-                            model_ref, permanent=(err_type == ErrorType.UNAVAILABLE),
+                            model_ref,
+                            permanent=(
+                                err_type == ErrorType.UNAVAILABLE
+                                and not classification.should_compress
+                            ),
                         )
                     else:
                         # Still release the half-open probe so the next
@@ -460,6 +471,9 @@ class FallbackManager:
                 )
                 attempts.append(attempt)
 
+                classification = classify_api_error(
+                    getattr(e, "status_code", None), str(e), e
+                )
                 err_type = classify_to_error_type(getattr(e, "status_code", None), str(e), e)
                 if err_type == ErrorType.TRANSIENT:
                     logger.warning(
@@ -474,7 +488,11 @@ class FallbackManager:
                     logger.error("Model {} failed (non-retryable): {}. Trying next...", model_ref, e)
                 last_error = e
                 self._record_failure(
-                    model_ref, permanent=(err_type == ErrorType.UNAVAILABLE),
+                    model_ref,
+                    permanent=(
+                        err_type == ErrorType.UNAVAILABLE
+                        and not classification.should_compress
+                    ),
                 )
                 continue
             finally:

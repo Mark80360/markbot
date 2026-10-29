@@ -52,6 +52,17 @@ DEFAULT_CUMULATIVE_FAILURE_RATIO = 0.5
 DEFAULT_STAGNATION_WARN = 6
 DEFAULT_STAGNATION_BLOCK = 10
 
+# Repeat-call defense: consecutive identical (tool, args) calls, whether they
+# succeeded or failed. Unlike DEFAULT_NO_PROGRESS_* this needs no identical
+# *result*, so it catches the pattern the interaction logs show most often —
+# the same successful call issued again because the previous result was never
+# used. Reminders fire once at each tier and never block: identical calls are
+# occasionally legitimate (polling a service, re-reading a file another
+# process is writing), and a hard block on argument equality would break those.
+DEFAULT_REPEAT_CALL_WARN = 3
+DEFAULT_REPEAT_CALL_STRONG_WARN = 5
+DEFAULT_REPEAT_CALL_INSISTENT = 8
+
 # Tools whose purpose is polling/waiting on external async state. An
 # iteration consisting solely of these is progress-neutral: it neither
 # resets nor advances the stagnation counter, so an agent legitimately
@@ -189,6 +200,10 @@ class GuardrailConfig:
     # Stagnation defense (success-loop detector)
     stagnation_warn: int = DEFAULT_STAGNATION_WARN
     stagnation_block: int = DEFAULT_STAGNATION_BLOCK
+    # Repeat-call reminder tiers (consecutive identical tool+args calls)
+    repeat_call_warn: int = DEFAULT_REPEAT_CALL_WARN
+    repeat_call_strong_warn: int = DEFAULT_REPEAT_CALL_STRONG_WARN
+    repeat_call_insistent: int = DEFAULT_REPEAT_CALL_INSISTENT
     # Per-turn loop caps (0 = unlimited)
     max_web_searches_per_turn: int = DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_web_fetches_per_turn: int = DEFAULT_MAX_WEB_FETCHES_PER_TURN
@@ -237,6 +252,13 @@ class GuardrailConfig:
             ),
             stagnation_warn=int(get("stagnation_warn", DEFAULT_STAGNATION_WARN)),
             stagnation_block=int(get("stagnation_block", DEFAULT_STAGNATION_BLOCK)),
+            repeat_call_warn=int(get("repeat_call_warn", DEFAULT_REPEAT_CALL_WARN)),
+            repeat_call_strong_warn=int(
+                get("repeat_call_strong_warn", DEFAULT_REPEAT_CALL_STRONG_WARN)
+            ),
+            repeat_call_insistent=int(
+                get("repeat_call_insistent", DEFAULT_REPEAT_CALL_INSISTENT)
+            ),
             max_web_searches_per_turn=int(
                 get("max_web_searches_per_turn", DEFAULT_MAX_WEB_SEARCHES_PER_TURN)
             ),
@@ -305,6 +327,12 @@ class GuardrailState:
     # reflections so a turn that burned its failure-reflection budget
     # still gets one stagnation-specific warning before HALT.
     stagnation_reflections: int = 0
+    # Repeat-call detection (consecutive identical tool+args calls, success or
+    # failure). ``repeat_calls_warned`` holds the tiers already emitted so a
+    # long identical run does not re-warn on every subsequent call.
+    last_call_signature: str = ""
+    repeat_call_count: int = 0
+    repeat_calls_warned: set[int] = field(default_factory=set)
 
 
 def args_signature(arguments: Any, max_len: int = 200) -> str:
@@ -552,6 +580,9 @@ class ToolCallGuardrail:
         self.state.stagnant_iterations = 0
         self.state.last_assistant_hash = ""
         self.state.stagnation_reflections = 0
+        self.state.last_call_signature = ""
+        self.state.repeat_call_count = 0
+        self.state.repeat_calls_warned.clear()
 
     def reset_for_turn(self) -> None:
         """Full reset for a new user turn — clears ALL state including
@@ -604,6 +635,7 @@ class ToolCallGuardrail:
         decisions = [
             self._observe_exact_failure(tool_name, arguments, failed),
             self._observe_tool_streak(tool_name, failed),
+            self._observe_repeat_call(tool_name, arguments),
         ]
         if not failed:
             decisions.append(self._observe_no_progress(tool_name, arguments, result))
@@ -983,6 +1015,63 @@ class ToolCallGuardrail:
                 ),
             )
         return GuardrailDecision(action=GuardrailAction.ALLOW)
+
+    def _observe_repeat_call(
+        self, tool_name: str, arguments: Any
+    ) -> GuardrailDecision:
+        """Remind on consecutive identical (tool, args) calls.
+
+        Fires once at each configured tier (default 3 / 5 / 8) and never blocks.
+        Two deliberate differences from :meth:`_observe_no_progress`:
+
+        * it does **not** require a byte-identical *result*, so it also catches
+          the pattern that dominates this project's interaction logs — the same
+          *successful* call issued again because the previous result was never
+          used, which the failure-driven detectors and no-progress cannot see;
+        * it never blocks. Identical calls are occasionally legitimate (polling
+          a service, re-reading a file another process is writing), and a hard
+          block on argument equality would break those. Escalating wording is
+          enough to break an unintended loop.
+        """
+        if not tool_name:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        sig = args_signature(arguments)
+        if not sig:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+
+        st = self.state
+        key = f"{tool_name}:{sig}"
+        if key != st.last_call_signature:
+            st.last_call_signature = key
+            st.repeat_call_count = 1
+            st.repeat_calls_warned.clear()
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+
+        st.repeat_call_count += 1
+        count = st.repeat_call_count
+        cfg = self.config
+        tiers = (
+            cfg.repeat_call_warn,
+            cfg.repeat_call_strong_warn,
+            cfg.repeat_call_insistent,
+        )
+        if count not in tiers or count in st.repeat_calls_warned:
+            return GuardrailDecision(action=GuardrailAction.ALLOW)
+        st.repeat_calls_warned.add(count)
+
+        return GuardrailDecision(
+            action=GuardrailAction.WARN,
+            reason="repeat_call",
+            tool_name=tool_name,
+            signature=sig,
+            count=count,
+            message=(
+                f"`{tool_name}` has now been called {count} times in a row with "
+                f"identical arguments [{sig}]. Analyse the previous result before "
+                "calling again: if the task is not complete, try a different "
+                "approach or different arguments instead of repeating the call."
+            ),
+        )
 
     def _observe_no_progress(
         self, tool_name: str, arguments: Any, result: Any

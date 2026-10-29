@@ -99,6 +99,11 @@ class CompactionConfig:
     collapse_head_chars: int = CONTEXT_COLLAPSE_HEAD_CHARS
     collapse_tail_chars: int = CONTEXT_COLLAPSE_TAIL_CHARS
     micro_compact_keep_turns: int = 6
+    #: Characters of an elided tool result kept as a digest by micro-compact.
+    #: A bare placeholder preserved nothing, so the only way to recover the
+    #: information was to re-run the call and pay for it a second time — the
+    #: exact waste micro-compact exists to prevent.
+    micro_compact_digest_chars: int = 240
     auto_compact_keep_recent: int = 5
     snip_keep_messages: int = 10
 
@@ -134,17 +139,52 @@ class CompactAttachment:
         return {"role": "user", "content": [{"type": "text", "text": text}]}
 
 
-def is_prompt_too_long_error(exc: Exception) -> bool:
+def _iter_exception_chain(exc: BaseException):
+    """Yield *exc* and its wrapped causes (``__cause__`` or ``last_error``).
+
+    ``AllModelsFailedError`` only renders "All N models in chain failed", so
+    the original context-overflow error is invisible unless the chain is
+    walked. Without this, reactive compaction never fires and a single
+    overflow ends the turn.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        nxt = getattr(current, "__cause__", None)
+        if nxt is None:
+            nxt = getattr(current, "last_error", None)
+        current = nxt if isinstance(nxt, BaseException) else None
+
+
+def is_prompt_too_long_error(exc: Exception | None) -> bool:
     """Check if an exception indicates the prompt exceeded the context window.
 
     Typed :class:`~markbot.errors.MarkbotError` instances dispatch on their
     machine code; legacy string exceptions fall back to pattern matching.
+    Wrapper errors are unwrapped so a context overflow survives the fallback
+    chain's ``AllModelsFailedError``.
     """
+    if exc is None:
+        return False
+    if not isinstance(exc, BaseException):
+        text = str(exc).lower()
+        return any(needle in text for needle in _PTL_ERROR_PATTERNS)
+
     try:
         from markbot.errors import ErrorCode, MarkbotError, is_prompt_too_long
 
-        if isinstance(exc, MarkbotError):
-            return exc.code == ErrorCode.CONTEXT_WINDOW_EXCEEDED or is_prompt_too_long(exc)
+        for candidate in _iter_exception_chain(exc):
+            if isinstance(candidate, MarkbotError) and (
+                candidate.code == ErrorCode.CONTEXT_WINDOW_EXCEEDED
+                or is_prompt_too_long(candidate)
+            ):
+                return True
+            text = str(candidate).lower()
+            if any(needle in text for needle in _PTL_ERROR_PATTERNS):
+                return True
+        return False
     except ImportError:  # pragma: no cover — defensive only
         pass
     text = str(exc).lower()
@@ -730,13 +770,15 @@ class MultiLevelCompactor:
                 attachments=attachments,
             )
 
-        # The LLM summary ran but was insufficient; history snip still gets us
-        # under the threshold, so this is a successful (degraded) compaction —
-        # do NOT arm the failure cooldown, which would otherwise disable future
-        # auto-compaction even though snip worked.
-        self._mark_compaction_success()
+        # The LLM summary ran but was insufficient. History snip is the last
+        # resort; only treat the attempt as successful if it actually brought
+        # the request under the threshold. Otherwise keep the failure counter
+        # armed so a persistently useless summariser backs off instead of
+        # calling the LLM again on every turn.
         messages = self._apply_history_snip(messages, task_context=task_context)
         tokens_after_snip = _estimate_messages_tokens(messages)
+        if tokens_after_snip < threshold:
+            self._mark_compaction_success()
         self._record_savings(tokens_before, tokens_after_snip)
         messages = self._inject_attachments(messages, attachments)
         logger.warning(
@@ -809,6 +851,23 @@ class MultiLevelCompactor:
         self._total_tokens_saved += max(0, before - after)
 
     @staticmethod
+    def _split_system_messages(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split ``system`` messages out of the compaction input.
+
+        The system prompt carries identity, safety constraints and tool
+        discipline. Truncating it (collapse) or folding it into a summary
+        (auto-compact / snip) strips every instruction the turn depends on,
+        and the loss is permanent because the result replaces
+        ``state.messages`` for the rest of the session.
+        """
+        system = [m for m in messages if m.get("role") == "system"]
+        if not system:
+            return [], messages
+        return system, [m for m in messages if m.get("role") != "system"]
+
+    @staticmethod
     def _inject_attachments(
         messages: list[dict[str, Any]],
         attachments: list[CompactAttachment],
@@ -836,6 +895,11 @@ class MultiLevelCompactor:
         tail = cfg.collapse_tail_chars
         collapsed = 0
         for m in messages:
+            # Never collapse the system prompt: it is not oversized tool
+            # output, and head/tail truncation would drop the instructions
+            # that make the rest of the turn coherent.
+            if m.get("role") == "system":
+                continue
             content = m.get("content")
 
             if isinstance(content, str) and len(content) > limit:
@@ -866,6 +930,38 @@ class MultiLevelCompactor:
     # Level 2: Micro-Compact — strip old tool results, keep recent N turns
     # ------------------------------------------------------------------
 
+    def _elide_tool_result(self, content: Any, tool_name: str = "") -> str:
+        """Replace an elided tool result with a bounded digest, not a void.
+
+        The previous placeholder — the literal string ``[tool result removed by
+        micro-compact]`` — preserved nothing. The model could not tell what the
+        call had returned, so the only way to recover the detail was to run the
+        call again, paying the full input cost a second time. Measured against
+        this project's own interaction log, 379 of 768 tool results (49%) had
+        been replaced this way before the turn ended.
+
+        The digest keeps three things and nothing more:
+
+        * which tool produced the result and how large the original was;
+        * the head of the content, **whitespace-collapsed** so a single long
+          line cannot smuggle the whole payload back into the context;
+        * an explicit instruction to re-run the call only when the detail is
+          actually needed.
+        """
+        label = tool_name or "tool"
+        if not isinstance(content, str) or not content:
+            return f"[{label} result elided by micro-compact]"
+        collapsible = " ".join(content.split())
+        limit = int(getattr(self.config, "micro_compact_digest_chars", 240) or 240)
+        limit = max(80, limit)
+        head = collapsible[:limit]
+        ellipsis = "…" if len(collapsible) > len(head) else ""
+        return (
+            f"[{label} result elided by micro-compact; original {len(content)} chars]\n"
+            f"{head}{ellipsis}\n"
+            f"[Re-run {label} only if you need the full result.]"
+        )
+
     def _apply_micro_compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         keep = self.config.micro_compact_keep_turns
         protected_ids = self._get_protected_tool_call_ids(messages)
@@ -888,7 +984,9 @@ class MultiLevelCompactor:
                 if msg.get("name") in _PROTECTED_TOOL_NAMES or str(msg.get("tool_call_id", "")) in protected_ids:
                     protected_count += 1
                     continue
-                msg["content"] = "[tool result removed by micro-compact]"
+                msg["content"] = self._elide_tool_result(
+                    msg.get("content"), str(msg.get("name") or "")
+                )
                 cleared += 1
             elif role == "user" and isinstance(msg.get("content"), list):
                 new_content = []
@@ -898,10 +996,17 @@ class MultiLevelCompactor:
                             new_content.append(block)
                             protected_count += 1
                             continue
+                        raw = block.get("content")
+                        if isinstance(raw, list):
+                            raw = " ".join(
+                                str(item.get("text") or "")
+                                for item in raw
+                                if isinstance(item, dict) and item.get("type") == "text"
+                            )
                         new_content.append({
                             "type": "tool_result",
                             "tool_call_id": block.get("tool_call_id", ""),
-                            "content": "[tool result removed by micro-compact]",
+                            "content": self._elide_tool_result(raw, ""),
                         })
                     else:
                         new_content.append(block)
@@ -920,9 +1025,10 @@ class MultiLevelCompactor:
     async def _apply_auto_compaction(
         self, messages: list[dict[str, Any]], *, task_context: str = ""
     ) -> tuple[list[dict[str, Any]], str]:
+        system_messages, messages = self._split_system_messages(messages)
         keep_recent = self.config.auto_compact_keep_recent
         if len(messages) <= keep_recent * 2:
-            return messages, ""
+            return system_messages + messages, ""
 
         split = max(0, len(messages) - keep_recent * 2)
         recent_messages = messages[split:]
@@ -974,7 +1080,7 @@ class MultiLevelCompactor:
             self._record_compaction_failure()
             summary = self._simple_truncation_summary(messages_to_compact)
             if not summary:
-                return messages, ""
+                return system_messages + messages, ""
         formatted = self._format_summary(summary)
 
         task_section = ""
@@ -1004,7 +1110,7 @@ class MultiLevelCompactor:
             "Auto-compacted: {} old messages summarized, {} recent kept",
             len(messages_to_compact), len(recent_messages),
         )
-        new_messages = [compact_msg] + recent_messages
+        new_messages = system_messages + [compact_msg] + recent_messages
 
         # Re-inject the active todo list as a standalone user message so the
         # model sees the remaining plan verbatim after compaction, instead of
@@ -1016,7 +1122,7 @@ class MultiLevelCompactor:
             try:
                 snapshot = todo_tool.format_for_injection()
                 if snapshot:
-                    new_messages.insert(1, {
+                    new_messages.insert(len(system_messages) + 1, {
                         "role": "user",
                         "content": snapshot,
                         # Marker so downstream consumers can identify it
@@ -1038,9 +1144,10 @@ class MultiLevelCompactor:
     # ------------------------------------------------------------------
 
     def _apply_history_snip(self, messages: list[dict[str, Any]], *, task_context: str = "") -> list[dict[str, Any]]:
+        system_messages, messages = self._split_system_messages(messages)
         keep = self.config.snip_keep_messages
         if len(messages) <= keep:
-            return messages
+            return system_messages + messages
         snipped = messages[-keep:]
         task_section = ""
         if task_context:
@@ -1052,7 +1159,7 @@ class MultiLevelCompactor:
                 f"to fit within the context window.]{task_section}"
             ),
         }
-        result = [snip_notice] + snipped
+        result = system_messages + [snip_notice] + snipped
 
         declared: set[str] = set()
         cleaned: list[dict[str, Any]] = []

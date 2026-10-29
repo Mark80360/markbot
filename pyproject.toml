@@ -1,6 +1,6 @@
 [project]
 name = "markbot"
-version = "20261012"
+version = "20261029"
 description = "A self-hosted, full-featured personal AI assistant framework (single-process, zero external infrastructure)"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"

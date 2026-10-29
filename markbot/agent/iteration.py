@@ -35,7 +35,7 @@ from markbot.agent.prefix_cache import (
 )
 from markbot.agent.shell_classify import classify_shell_command as _classify_shell_command
 from markbot.agent.stream import StreamFilter
-from markbot.agent.tokens import token_count_with_estimation
+from markbot.agent.tokens import estimate_tokens, token_count_with_estimation
 from markbot.agent.tool_guardrails import (
     GuardrailAction,
     GuardrailConfig,
@@ -425,6 +425,11 @@ class IterationRunner:
         # Watchdog thread for inactivity detection (Hermes-style).
         self._watchdog_stop: threading.Event | None = None
         self._watchdog_thread: threading.Thread | None = None
+        # Memoised cost of the model-facing tool schemas (see
+        # ``_tool_schema_tokens``). Keyed by (id, len) of the definitions
+        # list so a mid-turn surface change is picked up rather than
+        # silently reusing a stale figure.
+        self._tool_schema_token_cache: tuple[int, int, int] | None = None
 
     def _start_watchdog(self) -> threading.Thread:
         """Launch a daemon thread that monitors inactivity and requests
@@ -871,6 +876,21 @@ class IterationRunner:
                 if result.should_break:
                     break
 
+        except asyncio.CancelledError:
+            # /stop unwinds the task before the normal finalize path runs.
+            # Persist what the turn already produced and release the cache
+            # policy here, otherwise deferred mutations stay pending and the
+            # client never receives stream_end.
+            try:
+                self._flush_messages(state)
+            except Exception as exc:
+                logger.debug("flush on cancel failed: {}", exc)
+            try:
+                self._cache_policy.end_turn()
+            except Exception as exc:
+                logger.debug("cache_policy end_turn on cancel failed: {}", exc)
+            self._close_trace(state)
+            raise
         finally:
             self._stop_watchdog()
 
@@ -1015,23 +1035,68 @@ class IterationRunner:
         else:
             return await self._phase_final_response(state, response)
 
+    def _tool_schema_tokens(self) -> int:
+        """Tokens the provider bills for the tool schemas on **every** request.
+
+        Tool definitions travel beside the message list, so the message-only
+        estimator that gates compaction cannot see them. Budgeting compaction
+        straight against ``context_window_tokens`` therefore overshoots the
+        real request by the whole tool surface: the default registry is 38
+        schemas ≈ 30.5k chars ≈ 7.6k tokens, i.e. ~12% of a 64k window. That
+        is how a turn ends up issuing requests larger than the window it was
+        budgeted for, with compaction firing on nearly every iteration.
+
+        Memoised per definitions-list identity so the encode cost is paid
+        once per tool-surface change, not once per iteration.
+        """
+        try:
+            defs = self.loop.tools.get_definitions()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Tool schema token estimate unavailable: {}", exc)
+            return 0
+        cache = getattr(self, "_tool_schema_token_cache", None)
+        key = (id(defs), len(defs))
+        if cache is not None and cache[0] == key[0] and cache[1] == key[1]:
+            return cache[2]
+        try:
+            tokens = estimate_tokens(json.dumps(defs, ensure_ascii=False))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Tool schema token estimate failed: {}", exc)
+            tokens = 0
+        self._tool_schema_token_cache = (key[0], key[1], tokens)
+        return tokens
+
     async def _phase_compact(self, state: LoopState) -> None:
         self._runtime_budget.touch_activity()
         task_context = self.loop._gather_task_context()
         engine = getattr(self.loop, "context_engine", None)
+        # The message list is not the whole request: tool schemas (and the
+        # provider's own framing) are billed alongside it but are invisible
+        # to ``state.current_tokens``. Charge them against the window here so
+        # compaction fires on the real request size rather than on a figure
+        # that is short by the entire tool surface.
+        overhead_tokens = self._tool_schema_tokens()
+        message_budget = max(1, self.loop.context_window_tokens - max(0, overhead_tokens))
+        if overhead_tokens:
+            logger.debug(
+                "Compaction budget {} = window {} - tool schema {}",
+                message_budget,
+                self.loop.context_window_tokens,
+                overhead_tokens,
+            )
 
         if engine is not None and hasattr(engine, "should_compress"):
             # Narrow waist: all compression goes through ContextEngine.
             if not engine.should_compress(
                 state.messages,
                 state.current_tokens,
-                self.loop.context_window_tokens,
+                message_budget,
             ):
                 return
             engine_result = await engine.compress(
                 state.messages,
                 state.current_tokens,
-                self.loop.context_window_tokens,
+                message_budget,
                 task_context=task_context,
             )
             state.messages = engine_result.messages
@@ -1052,7 +1117,7 @@ class IterationRunner:
             compact_changed = engine_result.changed
         else:
             state.messages, compact_result = await self.loop.compactor.maybe_compact(
-                state.messages, state.current_tokens, self.loop.context_window_tokens,
+                state.messages, state.current_tokens, message_budget,
                 task_context=task_context,
             )
             state.last_compact_action = compact_result.action
@@ -1242,11 +1307,12 @@ class IterationRunner:
         if not context_parts:
             return
 
-        # Inject as a standalone user message after system to preserve
-        # system prompt immutability for Anthropic prompt caching.
+        # Inject at the tail of the live message list, not after the system
+        # message: see _inject_internal_context for why index-1 insertion
+        # invalidates the prefix cache for the entire remaining history.
         context_block = "\n\n".join(context_parts)
         self._inject_internal_context(state, sys_idx, context_block)
-        logger.info("Memory context injected as standalone message")
+        logger.info("Memory context injected at message tail")
 
     async def _phase_memory_compaction_hook(self, state: LoopState) -> None:
         self._runtime_budget.touch_activity()
@@ -1369,10 +1435,11 @@ class IterationRunner:
                         None,
                     )
                     if sys_idx is not None:
-                        # Append to existing internal context message (from memory
-                        # injection) or create a new one. This keeps all per-turn
-                        # runtime context in a single user message after system,
-                        # preserving system prompt immutability for prompt caching.
+                        # Extends the block already at the tail (from memory
+                        # injection) or appends a new one. Landing all per-turn
+                        # runtime context at the tail keeps every earlier
+                        # message byte-identical, which is what the prefix
+                        # cache actually keys on.
                         self._inject_internal_context(state, sys_idx, context_block)
                         logger.info(
                             "Session bootstrap context injected "
@@ -1411,41 +1478,61 @@ class IterationRunner:
     def _inject_internal_context(
         self, state: LoopState, sys_idx: int, context_block: str,
     ) -> None:
-        """Append *context_block* into the internal-context user message after system.
+        """Attach *context_block* to the **tail** of the message list.
 
-        If an internal-context message already exists (from a prior injection this
-        turn), the block is appended to it.  Otherwise a new user message is
-        inserted at ``sys_idx + 1`` and ``new_msg_start`` is incremented.
+        ``sys_idx`` is kept for call-site compatibility and intentionally
+        unused — see the rationale below.
 
-        Keeping all per-turn runtime context in a **single** user message:
-        * avoids consecutive same-role messages that some providers reject,
-        * minimises message-list growth, and
-        * preserves the system prompt verbatim for Anthropic prompt caching.
+        Why the tail, and not ``sys_idx + 1``
+        -------------------------------------
+        Inserting at index 1 does keep the *system prompt* byte-stable, which
+        is what this method used to protect. But the system prompt is only the
+        first ~10k of a ~60k request, and the server-side KV prefix cache
+        matches the **leading bytes of the whole request**: rewriting position
+        1 invalidates the cache for every message after it, so the entire
+        conversation history is re-billed at the miss rate on every call.
+        :meth:`_append_synthetic_notice` documents exactly this hazard, and
+        this was the last path still doing it — which is also why the
+        prefix-stability monitor reports "stable" while the real prefix is
+        broken (it fingerprints only the system prompt and tool schemas).
+
+        Appending still delivers the two properties the old design wanted:
+
+        * **one** block per turn — a second injection in the same turn extends
+          the block already at the tail instead of stacking a new message;
+        * nothing leaks into durable history — the block starts with
+          ``_INTERNAL_CONTEXT_TAG``, and ``agent/services/executor.py`` drops
+          history entries that start with it.
+
+        Role alternation is not at risk: appending a ``user`` turn is the same
+        move :meth:`_append_synthetic_notice` makes for todo re-injection and
+        guardrail notices, consecutive user turns are legal on the
+        OpenAI-compatible providers, and the Anthropic adapter folds them via
+        ``providers/anthropic.py::_merge_consecutive``.
         """
-        # Check if an internal-context message already exists right after system.
-        if sys_idx + 1 < len(state.messages):
-            next_msg = state.messages[sys_idx + 1]
-            content = next_msg.get("content")
+        if state.messages:
+            tail = state.messages[-1]
+            content = tail.get("content")
             if (
-                isinstance(content, str)
+                tail.get("role") == "user"
+                and isinstance(content, str)
                 and content.startswith(_INTERNAL_CONTEXT_TAG)
             ):
-                state.messages[sys_idx + 1]["content"] = (
-                    content + "\n\n" + context_block
-                )
+                # Second injection this turn — extend the existing block.
+                tail["content"] = f"{content}\n\n{context_block}"
                 return
 
-        # No existing internal-context message — create one.
-        runtime_msg = {
+        state.messages.append({
             "role": "user",
             "content": (
                 _INTERNAL_CONTEXT_TAG
                 + " — informational only, do not acknowledge]\n"
                 + context_block
             ),
-        }
-        state.messages.insert(sys_idx + 1, runtime_msg)
-        self._account_insert(state, sys_idx + 1)
+        })
+        # Appended at the tail, so the save cursors stay valid; account for the
+        # new message so persistence does not write it into session history.
+        self._account_insert(state, len(state.messages) - 1)
 
     def _inject_pending_steer(self, state: LoopState) -> None:
         steer_text = self.loop.drain_steer(self.session_key)
@@ -2401,8 +2488,14 @@ class IterationRunner:
 
         logger.warning("Prompt-too-long error, attempting reactive compaction")
         task_context = self.loop._gather_task_context()
+        # Budget the retry against the message share of the window, not the
+        # whole window: the tool schemas that helped push this request over
+        # the limit are still attached to the retry.
+        retry_budget = max(
+            1, self.loop.context_window_tokens - max(0, self._tool_schema_tokens())
+        )
         reactive_result = await self.loop.compactor.reactive_compact(
-            state.messages, self.loop.context_window_tokens, llm_exc,
+            state.messages, retry_budget, llm_exc,
             task_context=task_context,
         )
         if reactive_result is None:

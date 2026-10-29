@@ -851,6 +851,25 @@ class TestLogsRouter:
         assert resp.status_code == 200
         assert resp.json()["logs"] == []
 
+    def test_rejects_path_traversal(self, tmp_path, monkeypatch):
+        """``?file=../../config.json`` must not escape the log directory."""
+        from markbot.web.routers import logs
+
+        (tmp_path / "ok.log").write_text("x")
+        monkeypatch.setattr(logs, "_resolve_log_dir", lambda: tmp_path)
+
+        app = FastAPI()
+        app.add_middleware(auth.TokenAuthMiddleware)
+        app.include_router(logs.router)
+        monkeypatch.setattr(auth, "_session_token", "t")
+        client = TestClient(app)
+        resp = client.get(
+            "/api/logs",
+            params={"file": "../../config.json"},
+            headers={"x-markbot-session-token": "t"},
+        )
+        assert resp.status_code == 400
+
 
 # ---------------------------------------------------------------------------
 # routers/skills.py

@@ -446,6 +446,17 @@ class ExecTool(Tool):
         if self.restrict_to_workspace:
             cwd_path = Path(cwd).resolve()
 
+            # `cd ..` (and `cd -`) escapes without looking like a path token;
+            # everything after it resolves against the new directory. Absolute
+            # `cd` targets are already covered by the path scan below.
+            for m in re.finditer(r'(?:^|[;&|]\s*)cd\s+([^\s;&|]+)', cmd):
+                target = m.group(1).strip("\"'")
+                if target in ("..", "-") or target.startswith(("../", "..\\")):
+                    return (
+                        "Error: Command blocked by safety guard "
+                        "(cd outside working dir)"
+                    )
+
             for raw in self._extract_all_paths(cmd):
                 token = raw.strip()
                 if not token:
@@ -580,7 +591,7 @@ class ExecTool(Tool):
         remaining = quoted_re.sub(' ', command)
 
         win_paths = re.findall(r'[A-Za-z]:[\\/][^\s\"\'|><;]+', remaining)
-        posix_paths = re.findall(r'(?:^|[\s|>])(/[^\s\"\'|><;]+)', remaining)
+        posix_paths = re.findall(r'(?:^|[\s|>])(/[^\s\"\'|><;]*)', remaining)
         home_paths = re.findall(r'(?:^|[\s|>])(~[^\s\"\'|><;]*)', remaining)
         # Environment-variable path references, both POSIX (``$HOME/…``,
         # ``${HOME}/…``) and Windows (``%USERPROFILE%\…``) spellings. Without

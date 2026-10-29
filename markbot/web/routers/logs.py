@@ -44,7 +44,14 @@ async def get_logs(file: str = "markbot.log", lines: int = 200, level: str = "",
     log_dir = _resolve_log_dir()
     if not log_dir.exists():
         return JSONResponse({"logs": [], "file": file, "path": str(log_dir)})
-    log_file = log_dir / file
+    # Resolve before reading: ``?file=../../config.json`` would otherwise
+    # escape the log directory and read arbitrary files.
+    log_dir = log_dir.resolve()
+    log_file = (log_dir / file).resolve()
+    if not log_file.is_relative_to(log_dir):
+        return JSONResponse(
+            {"logs": [], "error": "invalid file path"}, status_code=400
+        )
     if not log_file.exists():
         return JSONResponse({"logs": [], "file": file, "path": str(log_file)})
     try:

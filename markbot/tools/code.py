@@ -86,12 +86,10 @@ class CodeExecutionTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Execute Python code in a sandboxed environment and return the output. "
-            "Use this when existing tools cannot accomplish the task — for example: "
-            "complex data processing, chart generation, file format conversion, "
-            "algorithm implementation, or batch operations. "
-            "Code runs in a temporary file that is cleaned up after execution. "
-            "Optionally specify pip dependencies to install before running."
+            "Run Python in a sandbox and return its output. Use it when no other tool "
+            "fits: data processing, chart generation, format conversion, algorithms, "
+            "batch operations. The script runs from a temp file removed afterwards; "
+            "list pip packages to install first if needed."
         )
 
     @property
@@ -101,55 +99,46 @@ class CodeExecutionTool(Tool):
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python code to execute. Write complete, self-contained scripts. Print output to stdout.",
+                    "description": "Complete, self-contained Python script. Print results to stdout.",
                 },
                 "purpose": {
                     "type": "string",
-                    "description": "Short description of what the code does (used for temp file naming).",
+                    "description": "Short label for the temp file name.",
                 },
                 "dependencies": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional pip packages to install before execution. "
-                        "Prefer pinned versions, e.g. ['pandas==2.2.0', 'numpy==1.26.0']. "
-                        "Standard library modules need not be listed."
+                        "pip packages to install first; pin versions "
+                        "(e.g. ['pandas==2.2.0']). Standard library needs no listing."
                     ),
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": f"Execution timeout in seconds (default {self._default_timeout}, max {self._MAX_TIMEOUT}).",
+                    "description": f"Timeout in seconds (default {self._default_timeout}, max {self._MAX_TIMEOUT}).",
                     "minimum": 1,
                     "maximum": self._MAX_TIMEOUT,
                 },
                 "save_artifacts": {
                     "type": "boolean",
-                    "description": (
-                        "If true, the temp script file is NOT deleted after execution. "
-                        "Use this when the code generates files you want to inspect later."
-                    ),
+                    "description": "Keep the temp script file after execution for later inspection.",
                     "default": False,
                 },
                 "output_files": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Paths (relative to the working directory or absolute) of files "
-                        "the script is expected to produce, e.g. ['chart.png', 'out/result.json']. "
-                        "After execution each existing file is confirmed and its absolute path "
-                        "returned so you can send it to the user via the message tool. "
-                        "Files that were not created are reported as missing."
+                        "Files the script is expected to produce, e.g. ['chart.png']. Each "
+                        "existing one is confirmed and its absolute path returned (send it via "
+                        "the message tool); missing ones are reported."
                     ),
                 },
                 "persist_as": {
                     "type": "string",
                     "description": (
-                        "If set to a skill name (lowercase, underscores/hyphens only), a "
-                        "successfully executed script is saved as a reusable skill tool under "
-                        "workspace/skills/<persist_as>/ and immediately registered. The new tool "
-                        "is named '<persist_as>.run' and takes no parameters — use this to turn a "
-                        "validated one-off script into a permanent capability you can call again. "
-                        "Only persist scripts that ran without errors."
+                        "Save a successful script as a reusable skill tool "
+                        "`<persist_as>.run` under workspace/skills/<persist_as>/. "
+                        "Lowercase, underscores/hyphens. Only persist scripts that ran clean."
                     ),
                 },
             },

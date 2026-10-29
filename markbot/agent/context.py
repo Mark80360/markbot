@@ -308,6 +308,47 @@ You have browser tools for web page interaction. Use them when you need to inter
 - NEVER answer these from memory or mental computation — ALWAYS use a tool: arithmetic/math, hashes/encodings, current time/date, system state (OS/CPU/memory/disk), file contents, git history, current facts (weather/news/versions)
 - If required context is missing, do NOT guess or hallucinate an answer. Use the appropriate lookup tool, or ask a clarifying question if the information cannot be retrieved by tools"""
 
+    # Token economy. Every tool call re-sends the whole conversation, so the
+    # number of round trips — not the length of any single reply — dominates
+    # both cost and latency. Measured against this project's own interaction
+    # logs, 84% of assistant turns carried exactly one tool call while the
+    # average request was ~56k prompt tokens: the multiplier is round trips,
+    # and nothing in the prompt was asking the model to economise them.
+    _OPERATING_DISCIPLINE = """# Operating discipline
+
+Every tool call re-sends this entire conversation to the model, so the number
+of round trips dominates cost and latency far more than the size of any single
+reply. Treat each round trip as expensive.
+
+## Batch independent calls
+- Before calling a tool, ask what else you already know you need. When two or
+  more calls do not depend on each other's results, issue them **in the same
+  response** — not one per turn. Read the files you already know you need
+  together, run the greps together, list the directories together.
+- Sequence calls only when a later argument genuinely depends on an earlier
+  result (you cannot read a path you have not discovered yet).
+- Never re-issue a call whose result is already in this conversation.
+
+## Read the narrowest thing that answers the question
+- Prefer `grep`/`glob` over `read_file`, `read_file` with `offset`/`limit` over
+  a whole-file read, and `explore(mode="trace")` over opening a whole module.
+- Do not read a file "for context" that you are not going to act on, and do not
+  re-read a file you have already read unless it changed on disk since.
+- Prefer one decisive command over a series of exploratory ones.
+
+## Do not spend output on narration
+- Do not send a message to the user merely to announce what you are about to
+  do. Report once, when you have the result.
+- Do not restate what a tool result already showed — cite it.
+- Do not call a tool to organise your thoughts. Reason directly.
+
+## Stop conditions
+- Stop as soon as the request is satisfied and verified. Do not add unrequested
+  follow-up work, polish, or "while I was here" changes.
+- Do not stop mid-task to ask something a tool can answer.
+- When blocked, state the blocking condition and what you tried, then stop —
+  do not keep retrying variations of an approach that already failed."""
+
     def __init__(
         self,
         workspace: Path,
@@ -380,6 +421,13 @@ You have browser tools for web page interaction. Use them when you need to inter
         # Priority 1: Honesty & accuracy
         sections.append(PromptSection(
             content=self._HONESTY_GUIDANCE, name="honesty", priority=1,
+        ))
+        # Priority 1: Operating discipline (round-trip / token economy).
+        # Kept at priority 1 because it is the single largest lever on cost:
+        # the loop re-sends the whole conversation on every tool call, so
+        # batching independent calls is worth more than any other prompt rule.
+        sections.append(PromptSection(
+            content=self._OPERATING_DISCIPLINE, name="operating_discipline", priority=1,
         ))
         # Priority 1: Security core rules
         sections.append(PromptSection(

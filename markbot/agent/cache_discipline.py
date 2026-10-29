@@ -31,35 +31,28 @@ from __future__ import annotations
 
 #: Section body.  Keep this **short and stable** — every byte of
 #: drift here is a cache miss on the *next* turn.
-CACHE_DISCIPLINE_SECTION = """# Cache discipline (always enforced)
+CACHE_DISCIPLINE_SECTION = """# Cache discipline
 
-The system prompt above is layered most-static-first so the
-server-side KV prefix cache can hit turn-over-turn.  Cached input
-tokens are billed at roughly 1/10 of the miss rate.  The model is
-asked to follow these rules so the cache stays warm:
+This conversation is served from a server-side KV prefix cache: the leading
+bytes of each request are matched against the previous one and billed at
+roughly a tenth of the miss rate. You keep that cache warm by leaving the
+earlier part of the conversation untouched.
 
-1. **Append, don't reorder.**  When adding to the message history,
-   push the new turn onto the end.  Never insert, remove, or
-   re-order earlier turns.  Reordering busts the prefix for every
-   token that follows.
-2. **Don't paraphrase quoted content.**  If the user pastes an
-   error message, a stack trace, or any other verbatim snippet,
-   reproduce it byte-for-byte when re-quoting it.
-3. **Use `/compact` as a hard reset, not a tweak.**  Compaction
-   intentionally rewrites the prefix to a shorter summary.  Do
-   *not* trigger it for small wins — only when the cache is
-   already losing.
-4. **Read once, refer back.**  Cite content from earlier turns
-   verbatim instead of restating it in your own words.  A new
-   paraphrase is a new cache miss.
-5. **Heed the `Cache: NN%` chip.**  When the chip turns red, the
-   operator will see the system prompt churn — investigate before
-   the next compact.
+1. **Append, don't reorder.** When adding to the message history, push the new
+   turn onto the end. Never insert, remove, or re-order earlier turns — every
+   token after the change is rebilled at the full rate.
+2. **Don't paraphrase quoted content.** If the user pastes an error message, a
+   stack trace, or any other verbatim snippet, reproduce it byte-for-byte when
+   re-quoting it. A paraphrase is a new string and a miss.
+3. **Read once, refer back.** Cite content from earlier turns verbatim instead
+   of restating it in your own words.
+4. **Do not ask for `/compact` yourself.** Compaction rewrites the prefix down
+   to a summary. That is a forced invalidation of the whole cache, not a
+   routine tidy-up, and the operator decides when to pay for it. Work within
+   the context you already have.
 
-> The system prompt is the longest byte-stable prefix in this
-> conversation.  Everything below this line is volatile by design;
-> everything above this line is stable by design.  Treat them
-> accordingly.
+The `Cache: NN%` chip reports to the operator how much of the last request was
+served from cache. When it drops, something ahead of this point changed.
 """
 
 

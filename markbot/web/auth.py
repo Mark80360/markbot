@@ -19,6 +19,11 @@ def get_token() -> str:
     return _session_token
 
 
+def is_valid_token(token: str) -> bool:
+    """Constant-time check for a caller-supplied session token."""
+    return bool(token) and secrets.compare_digest(token, _session_token)
+
+
 def regenerate_token() -> str:
     global _session_token
     _session_token = secrets.token_urlsafe(32)
@@ -46,11 +51,11 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         # headers. Uses the same session token via secrets.compare_digest.
         if not token:
             token = request.query_params.get("token", "")
-        if not secrets.compare_digest(token, _session_token):
+        if not is_valid_token(token):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
 
 async def verify_ws_token(websocket: WebSocket) -> bool:
     token = websocket.query_params.get("token", "")
-    return secrets.compare_digest(token, _session_token)
+    return is_valid_token(token)

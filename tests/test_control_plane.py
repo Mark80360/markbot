@@ -104,8 +104,50 @@ class TestToolCallGuardrail:
         args = {"path": "a"}
         g.observe("read_file", args, "Error: x", is_failure=True)
         g.observe("read_file", args, "ok content", is_failure=False)
+        # The intervening success must clear the failure counter on its own.
+        assert g.state.exact_failure_counts == {}
         d = g.observe("read_file", args, "Error: x", is_failure=True)
-        assert d.action is GuardrailAction.ALLOW
+        # ...so this third identical call is a *first* failure again — one short
+        # of exact_failure_warn. Asserted on the counter and the decision reason
+        # rather than on ALLOW, because a separate detector (repeat_call) now
+        # counts consecutive identical calls regardless of outcome and may warn
+        # here; that detector is covered by its own tests below.
+        assert g.state.exact_failure_counts == {'read_file:{"path": "a"}': 1}
+        assert d.reason != "exact_failure"
+
+    def test_repeat_call_reminds_without_blocking(self):
+        g = ToolCallGuardrail(GuardrailConfig())
+        args = {"command": "tail -1 app.log"}
+        # A *changing* result is the case no other detector covers: no_progress
+        # needs a byte-identical result, exact_failure/tool_streak need failure.
+        assert g.observe("exec", args, "line-1").action is GuardrailAction.ALLOW
+        assert g.observe("exec", args, "line-2").action is GuardrailAction.ALLOW
+        d3 = g.observe("exec", args, "line-3")
+        assert d3.action is GuardrailAction.WARN
+        assert d3.reason == "repeat_call"
+        assert d3.count == 3
+        assert "different approach" in d3.message
+        # Tiers fire once each, at 5 and 8.
+        assert g.observe("exec", args, "line-4").action is GuardrailAction.ALLOW
+        assert g.observe("exec", args, "line-5").reason == "repeat_call"
+        for i in range(6, 8):
+            g.observe("exec", args, f"line-{i}")
+        assert g.observe("exec", args, "line-8").reason == "repeat_call"
+        # ...and it never blocks, because identical calls are sometimes legitimate.
+        for i in range(9, 14):
+            assert g.observe("exec", args, f"line-{i}").action is GuardrailAction.ALLOW
+
+    def test_repeat_call_counter_resets_on_different_call(self):
+        g = ToolCallGuardrail(GuardrailConfig())
+        for _ in range(3):
+            g.observe("exec", {"command": "a"}, "ok")
+        assert g.state.repeat_call_count == 3
+        g.observe("exec", {"command": "b"}, "ok")
+        assert g.state.repeat_call_count == 1
+        # Key order must not defeat the detector.
+        g.observe("read_file", {"limit": 5, "path": "z"}, "x")
+        g.observe("read_file", {"path": "z", "limit": 5}, "x")
+        assert g.state.repeat_call_count == 2
 
     def test_persisted_roundtrip(self):
         g = ToolCallGuardrail()

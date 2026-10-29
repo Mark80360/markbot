@@ -725,6 +725,12 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
                 bool(assistant_flag),
             )
 
+        # Redact credentials before persisting. The daily log and the vector
+        # index are durable, and the raw transcript used to be written
+        # verbatim even though the summary path already redacted.
+        user_content = redact_sensitive_text(user_content)
+        assistant_content = redact_sensitive_text(assistant_content)
+
         if self._daily_log:
             channel, chat_id = self._parse_session_parts(session_id)
             self._daily_log.append_turn(
@@ -779,12 +785,13 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
         if self._daily_log:
             self._daily_log.append_turn(
                 user_content=f"[Memory {action}:{target}]",
-                assistant_content=content[:500],
+                assistant_content=redact_sensitive_text(content)[:500],
                 channel="memory_tool",
                 chat_id=action,
             )
         # Keep the vector index in sync with curated memory writes.
         # add/replace → upsert; remove → delete by content hash.
+        content = redact_sensitive_text(content)
         if self._longterm is not None and content:
             try:
                 if action in ("add", "replace"):
@@ -932,6 +939,10 @@ class MemoryManager(BaseMemoryManager, MemoryProvider):
             # Every message needed compaction; leave the very last one
             # untouched so the model has at least one fresh turn to read.
             compact_count = max(len(messages) - 1, 0)
+
+        # The loop can also break at i == 0, which would compact the entire
+        # list and leave the model with no recent turn to continue from.
+        compact_count = min(compact_count, max(len(messages) - 1, 0))
 
         # Cap the compacted prefix so at least one recent turn (and, when
         # supplied, an explicit token reserve) remains in the live window.

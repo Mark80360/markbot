@@ -188,6 +188,10 @@ class TokenEstimateCache:
         common case: a tool result appended to the previous turn's final
         message) and the length catches every insertion or removal, which
         includes the wholesale list replacement performed by compaction.
+        ``content_chars`` catches in-place edits of *middle* messages —
+        collapse and micro-compact rewrite tool results without changing the
+        message count or the tail, which otherwise made the next turn reuse a
+        pre-compaction estimate and re-compact every iteration.
         """
         tail = ""
         if messages:
@@ -196,7 +200,13 @@ class TokenEstimateCache:
                 tail = f"{last.get('role', '')}:{len(str(last.get('content', '')))}"
             except Exception:  # pragma: no cover - defensive
                 tail = "?"
-        return (session_key, len(messages), sys_fp, hash(tail))
+        content_chars = 0
+        for m in messages:
+            try:
+                content_chars += len(str(m.get("content", "")))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return (session_key, len(messages), sys_fp, hash(tail), content_chars)
 
     def lookup_or_compute(
         self,

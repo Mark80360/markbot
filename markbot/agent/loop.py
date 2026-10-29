@@ -660,7 +660,6 @@ class AgentLoop:
         """Remove a completed task; clean up empty session entries."""
         tasks = self._active_tasks.get(session_key)
         if tasks is None:
-            self._session_locks.pop(session_key, None)
             return
         try:
             tasks.remove(task)
@@ -668,7 +667,9 @@ class AgentLoop:
             pass
         if not tasks:
             self._active_tasks.pop(session_key, None)
-            self._session_locks.pop(session_key, None)
+            # Keep the lock object: ``process_direct`` (web/cron) can hold it
+            # without being tracked here, and popping it would hand the next
+            # bus message a fresh lock while that turn is still running.
 
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Get or create the per-session serial lock."""

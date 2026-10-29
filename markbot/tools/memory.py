@@ -21,8 +21,6 @@ class MemorySearchTool(Tool):
     """Search agent memory (MEMORY.md, PROFILE.md, daily logs) semantically.
 
     Use this tool before answering questions about prior work, decisions,
-
-    _is_read_only = True
     dates, people, preferences, or todos. Returns top relevant snippets.
 
     When ``force_memory_search`` is enabled on the manager, this tool also
@@ -32,6 +30,8 @@ class MemorySearchTool(Tool):
     loop before each turn so that searches are scoped to the current
     conversation.
     """
+
+    _is_read_only = True
 
     def __init__(self, memory_manager: "BaseMemoryManager | None" = None, **kwargs):
         super().__init__(**kwargs)

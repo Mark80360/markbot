@@ -101,6 +101,12 @@ class MCPToolWrapper(Tool):
     async def _legacy_execute(self, **kwargs: Any) -> str:
         from mcp import types
 
+        # ``Tool.execute`` injects the runtime context into legacy tools as
+        # ``_tool_context``. MCP arguments must contain only the fields the
+        # server's schema declares: a ToolContext dataclass is not JSON
+        # serialisable, so forwarding it makes every call fail with TypeError.
+        kwargs.pop("_tool_context", None)
+
         try:
             result = await asyncio.wait_for(
                 self._session.call_tool(self._original_name, arguments=kwargs),
