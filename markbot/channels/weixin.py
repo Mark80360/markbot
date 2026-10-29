@@ -28,7 +28,12 @@ from pydantic import Field
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
+from markbot.channels.base import (
+    BaseChannel,
+    SendError,
+    SendErrorKind,
+    classify_send_error,
+)
 from markbot.config.paths import get_media_dir, get_runtime_subdir
 from markbot.config.schema import Base
 from markbot.utils.helpers import split_message
@@ -635,7 +640,10 @@ class WeixinChannel(BaseChannel):
             chat_id=from_user_id,
             content=content,
             media=media_paths or None,
-            metadata={"message_id": msg_id},
+            # Personal WeChat only delivers 1:1 messages here; declaring the
+            # surface lets derive_is_group() treat this as a private session
+            # (curated memory stays enabled) instead of failing closed.
+            metadata={"message_id": msg_id, "chat_type": "p2p"},
         )
 
     # ------------------------------------------------------------------
@@ -728,7 +736,11 @@ class WeixinChannel(BaseChannel):
         """
         if not self._token and not self._load_state():
             logger.warning("WeChat not authenticated; cannot send")
-            return
+            raise SendError(
+                "WeChat not authenticated (run 'markbot channels login weixin')",
+                kind=SendErrorKind.FORBIDDEN,
+                chat_level=False,
+            )
 
         direct_temp = False
         if not self._client:
@@ -749,7 +761,12 @@ class WeixinChannel(BaseChannel):
                     "WeChat: no context_token for chat_id={}, cannot send",
                     msg.chat_id,
                 )
-                return
+                raise SendError(
+                    f"WeChat has no context_token for {msg.chat_id} "
+                    "(the user must message the bot first)",
+                    kind=SendErrorKind.NOT_FOUND,
+                    chat_level=False,
+                )
 
             for media_path in (msg.media or []):
                 try:
@@ -811,10 +828,22 @@ class WeixinChannel(BaseChannel):
         data = await self._api_post("ilink/bot/sendmessage", body)
         errcode = data.get("errcode", 0)
         if errcode and errcode != 0:
-            logger.warning(
-                "WeChat send error (code {}): {}",
-                errcode,
-                data.get("errmsg", ""),
+            errmsg = data.get("errmsg", "")
+            logger.warning("WeChat send error (code {}): {}", errcode, errmsg)
+            if errcode == ERRCODE_SESSION_EXPIRED:
+                self._pause_session()
+                raise SendError(
+                    f"WeChat session expired while sending to {to_user_id}",
+                    kind=SendErrorKind.FORBIDDEN,
+                    chat_level=False,
+                )
+            info = classify_send_error(
+                RuntimeError(f"weixin sendmessage errcode={errcode}: {errmsg}")
+            )
+            raise SendError(
+                f"WeChat send failed (code {errcode}): {errmsg}",
+                kind=info.kind,
+                retry_after=info.retry_after,
             )
 
     async def _send_media_file(

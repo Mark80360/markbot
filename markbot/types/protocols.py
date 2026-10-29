@@ -155,11 +155,27 @@ class InboundMessageMetadata(TypedDict, total=False):
     _wants_stream: bool
     _progress: bool
     _tool_hint: bool
+    # Group-vs-private surface hint consumed by ``derive_is_group``.
+    # Accepted tokens: group/channel/guild/forum/topic/room, p2p/dm/direct/
+    # private/single/c2c/im.
+    chat_type: str
+    is_group: bool
+    message_id: str
+    reaction_id: str
+    thread_id: str
 
 
 class OutboundMessageMetadata(TypedDict, total=False):
     _progress: bool
     _tool_hint: bool
+    # Streaming frames — all three are routed through ``send_delta`` in order.
+    _stream_delta: bool
+    _stream_end: bool
+    _stream_discard: bool
+    _streamed: bool
+    _resuming: bool
+    message_id: str
+    reaction_id: str
     # Feishu/DingTalk group @mention: list of open_id strings or
     # {"user_id": "...", "name": "..."} dicts. Use "all" to @everyone.
     mentions: list  # list[str | dict[str, str]]

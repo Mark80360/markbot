@@ -11,6 +11,15 @@ from starlette.responses import JSONResponse
 
 router = APIRouter()
 
+# Fallback probe targets for channels that have no explicit host/port in their
+# config (they all speak outbound HTTPS to a fixed platform endpoint).
+_CHANNEL_PROBE_DEFAULTS: dict[str, tuple[str, int]] = {
+    "feishu": ("open.feishu.cn", 443),
+    "dingtalk": ("api.dingtalk.com", 443),
+    "qq": ("api.sgroup.qq.com", 443),
+    "weixin": ("ilinkai.weixin.qq.com", 443),
+}
+
 
 def _get_config():
     from markbot.config.loader import load_config
@@ -24,7 +33,7 @@ def _save_config(cfg):
 
 def _extract_host(section: Any) -> str | None:
     """Extract host from a channel config section."""
-    for attr in ("host", "ws_host", "server", "base_url", "url"):
+    for attr in ("host", "ws_host", "server", "base_url", "url", "smtp_host"):
         val = getattr(section, attr, None) if not isinstance(section, dict) else section.get(attr)
         if val and isinstance(val, str):
             parsed = urlparse(val if "://" in val else f"scheme://{val}")
@@ -34,7 +43,7 @@ def _extract_host(section: Any) -> str | None:
 
 def _extract_port(section: Any) -> int | None:
     """Extract port from a channel config section."""
-    for attr in ("port", "ws_port"):
+    for attr in ("port", "ws_port", "smtp_port"):
         val = getattr(section, attr, None) if not isinstance(section, dict) else section.get(attr)
         if val:
             try:
@@ -123,19 +132,18 @@ async def test_channel(channel_id: str):
             host = _extract_host(section)
             port = _extract_port(section)
 
+        # Channels with no explicit endpoint fall back to their platform host.
+        if not host or not port:
+            defaults = _CHANNEL_PROBE_DEFAULTS.get(channel_id)
+            if defaults:
+                host = host or defaults[0]
+                port = port or defaults[1]
+
         if not host:
             return JSONResponse({"ok": False, "error": "No host configured for this channel"})
 
         if not port:
-            # Try common defaults based on channel type
-            if channel_id == "slack":
-                port = 443
-            elif channel_id == "telegram":
-                port = 443
-            elif channel_id == "discord":
-                port = 443
-            else:
-                return JSONResponse({"ok": False, "error": "No port configured for this channel"})
+            return JSONResponse({"ok": False, "error": "No port configured for this channel"})
 
         # Attempt TCP connection with timeout
         try:

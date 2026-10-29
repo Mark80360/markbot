@@ -130,6 +130,27 @@ class TestBaseChannel:
         assert ch.is_running is False
 
     @pytest.mark.asyncio
+    async def test_restart_returns_for_long_running_start(self, bus):
+        """start() loops forever in real channels; restart() must not block."""
+
+        class _LoopingChannel(_ConcreteChannel):
+            async def start(self):  # noqa: D401
+                self._running = True
+                while self._running:
+                    await asyncio.sleep(0.01)
+
+        ch = _LoopingChannel(StubConfig(), bus)
+        task = asyncio.create_task(ch.start())
+        await asyncio.sleep(0.02)
+        try:
+            await asyncio.wait_for(ch.restart(), timeout=2.0)
+        finally:
+            task.cancel()
+            if ch._start_task is not None:
+                ch._start_task.cancel()
+        assert ch.is_running is True
+
+    @pytest.mark.asyncio
     async def test_transcribe_audio_no_key(self, bus):
         ch = _ConcreteChannel(StubConfig(), bus)
         # No transcription_api_key set → returns empty string without network.
@@ -452,6 +473,22 @@ class TestChannelManager:
         ch.send_delta.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_once_stream_discard_routes_to_send_delta(self, bus):
+        """A discard frame must reach send_delta so the channel clears its buffer."""
+        ch = AsyncMock()
+        msg = OutboundMessage(
+            channel="x",
+            chat_id="c",
+            content="",
+            metadata={"_stream_discard": True, "_resuming": False},
+        )
+        await ChannelManager._send_once(ch, msg)
+        ch.send_delta.assert_awaited_once()
+        ch.send.assert_not_called()
+        # The channel needs the metadata to know it is a discard.
+        assert ch.send_delta.await_args.args[2]["_stream_discard"] is True
+
+    @pytest.mark.asyncio
     async def test_send_once_streamed_skips_send(self, bus):
         ch = AsyncMock()
         msg = OutboundMessage(
@@ -485,6 +522,22 @@ class TestChannelManager:
         # Should NOT retry — only one call to send_delta.
         await mgr._send_with_retry(ch, msg)
         assert ch.send_delta.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_stream_discard_no_retry(self, bus):
+        cfg = self._make_config({})
+        cfg.channels.send_max_retries = 3
+        mgr = ChannelManager(cfg, bus)
+        ch = AsyncMock()
+        ch.send_delta.side_effect = RuntimeError("boom")
+
+        msg = OutboundMessage(
+            channel="x", chat_id="c", content="", metadata={"_stream_discard": True}
+        )
+        # Ordered stream frame: exactly one attempt, and no channel.send fallback.
+        await mgr._send_with_retry(ch, msg)
+        assert ch.send_delta.await_count == 1
+        ch.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_with_retry_retries_and_succeeds(self, bus, monkeypatch):
@@ -1655,6 +1708,215 @@ class TestEmailChannel:
         # end <= start → empty list, no IMAP calls
         result = ch.fetch_messages_between_dates(date(2026, 1, 5), date(2026, 1, 1))
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel contract: outbound robustness
+# ---------------------------------------------------------------------------
+
+
+class TestOutboundRobustness:
+    """Channels must surface delivery failures and respect platform limits."""
+
+    @pytest.mark.asyncio
+    async def test_qq_send_splits_long_text(self, bus):
+        from markbot.channels.qq import _MAX_QQ_TEXT_LEN, QQChannel, QQConfig
+
+        ch = QQChannel(QQConfig(allow_from=["*"]), bus)
+        ch._client = object()
+        ch._send_text_only = AsyncMock()
+        msg = OutboundMessage(
+            channel="qq",
+            chat_id="chat1",
+            content="x" * (_MAX_QQ_TEXT_LEN * 2 + 10),
+        )
+        await ch.send(msg)
+        assert ch._send_text_only.await_count == 3
+        for call in ch._send_text_only.await_args_list:
+            assert len(call.kwargs["content"]) <= _MAX_QQ_TEXT_LEN
+
+    @pytest.mark.asyncio
+    async def test_qq_send_raises_when_sdk_returns_none(self, bus):
+        """botpy returns None on aiohttp timeouts instead of raising."""
+        from markbot.channels.qq import QQChannel, QQConfig
+
+        ch = QQChannel(QQConfig(allow_from=["*"]), bus)
+        ch._client = SimpleNamespace(
+            api=SimpleNamespace(post_c2c_message=AsyncMock(return_value=None))
+        )
+        with pytest.raises(SendError) as exc:
+            await ch._send_text_only(
+                chat_id="user1", is_group=False, msg_id=None, content="hi"
+            )
+        assert exc.value.kind is SendErrorKind.TRANSIENT
+
+    @pytest.mark.asyncio
+    async def test_weixin_send_raises_on_api_errcode(self, bus):
+        from markbot.channels.weixin import WeixinChannel, WeixinConfig
+
+        ch = WeixinChannel.__new__(WeixinChannel)
+        ch.config = WeixinConfig(allow_from=["*"])
+        ch.bus = bus
+        ch._token = "tok"
+        ch._client = object()
+        ch._context_tokens = {"wx1": "ctx"}
+        ch._running = False
+        ch._session_pause_until = 0.0
+        ch._api_post = AsyncMock(
+            return_value={"errcode": 0, "errmsg": "ok"}
+        )
+
+        # errcode == 0 → no exception
+        await ch._send_text("wx1", "hi", "ctx")
+
+        ch._api_post = AsyncMock(return_value={"errcode": 40001, "errmsg": "invalid"})
+        with pytest.raises(SendError):
+            await ch._send_text("wx1", "hi", "ctx")
+
+    @pytest.mark.asyncio
+    async def test_email_skips_progress_frames(self, bus, monkeypatch):
+        from markbot.channels.email import EmailChannel, EmailConfig
+
+        ch = EmailChannel(
+            EmailConfig(
+                consent_granted=True,
+                smtp_host="smtp.example.com",
+                smtp_username="bot@example.com",
+                smtp_password="x",
+                from_address="bot@example.com",
+                allow_from=["*"],
+            ),
+            bus,
+        )
+        sent: list = []
+        monkeypatch.setattr(ch, "_smtp_send", lambda m: sent.append(m))
+
+        await ch.send(
+            OutboundMessage(
+                channel="email",
+                chat_id="user@example.com",
+                content="thinking...",
+                metadata={"_progress": True},
+            )
+        )
+        assert sent == []
+
+        await ch.send(
+            OutboundMessage(
+                channel="email", chat_id="user@example.com", content="final answer"
+            )
+        )
+        assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel contract: inbound surface metadata
+# ---------------------------------------------------------------------------
+
+
+class TestInboundSurfaceContract:
+    """Every channel must declare group-vs-private on inbound messages.
+
+    ``derive_is_group`` only reads ``chat_type``/``is_group``; when the hint is
+    missing ``is_main_memory_session`` fails closed and silently disables
+    curated memory even for 1:1 chats.
+    """
+
+    @staticmethod
+    def _capture(bus):
+        published: list[InboundMessage] = []
+
+        async def _sink(msg):
+            published.append(msg)
+
+        bus.publish_inbound = _sink  # type: ignore[assignment]
+        return published
+
+    @pytest.mark.asyncio
+    async def test_qq_marks_c2c_and_group(self, bus):
+        from markbot.bus.events import derive_is_group
+        from markbot.channels.qq import QQChannel, QQConfig
+
+        ch = QQChannel(QQConfig(allow_from=["*"]), bus)
+        published = self._capture(bus)
+
+        await ch._on_message(
+            SimpleNamespace(
+                id="m-group",
+                content="hi",
+                group_openid="group1",
+                author=SimpleNamespace(member_openid="member1"),
+                attachments=[],
+            ),
+            is_group=True,
+        )
+        await ch._on_message(
+            SimpleNamespace(
+                id="m-c2c",
+                content="hi",
+                author=SimpleNamespace(id="user1"),
+                attachments=[],
+            ),
+            is_group=False,
+        )
+
+        assert [m.metadata["chat_type"] for m in published] == ["group", "c2c"]
+        assert [derive_is_group(m.metadata, m.chat_id) for m in published] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_weixin_marks_p2p(self, bus):
+        from markbot.bus.events import derive_is_group
+        from markbot.channels.weixin import WeixinChannel, WeixinConfig
+
+        ch = WeixinChannel.__new__(WeixinChannel)
+        ch.config = WeixinConfig(allow_from=["*"])
+        ch.bus = bus
+        ch._processed_ids = OrderedDict()
+        ch._context_tokens = {}
+        published = self._capture(bus)
+
+        await ch._process_message(
+            {
+                "message_id": "m1",
+                "from_user_id": "wx1",
+                "item_list": [{"type": 1, "text_item": {"text": "hi"}}],
+            }
+        )
+
+        assert len(published) == 1
+        assert published[0].metadata["chat_type"] == "p2p"
+        assert derive_is_group(published[0].metadata, published[0].chat_id) is False
+
+    @pytest.mark.asyncio
+    async def test_dingtalk_marks_p2p_and_group(self, bus):
+        from markbot.bus.events import derive_is_group
+        from markbot.channels.dingtalk import DingTalkChannel, DingTalkConfig
+
+        ch = DingTalkChannel(
+            DingTalkConfig(client_id="id", client_secret="s", allow_from=["*"]), bus
+        )
+        published = self._capture(bus)
+
+        await ch._on_message(
+            content="hi",
+            sender_id="staff1",
+            sender_name="Alice",
+            conversation_type="1",
+            conversation_id=None,
+            message_id="msg-1",
+        )
+        await ch._on_message(
+            content="hi",
+            sender_id="staff1",
+            sender_name="Alice",
+            conversation_type="2",
+            conversation_id="conv1",
+            message_id="msg-2",
+        )
+
+        assert [m.metadata["chat_type"] for m in published] == ["p2p", "group"]
+        assert [derive_is_group(m.metadata, m.chat_id) for m in published] == [False, True]
+        assert [m.metadata["message_id"] for m in published] == ["msg-1", "msg-2"]
 
 
 # ---------------------------------------------------------------------------

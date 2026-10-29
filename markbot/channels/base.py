@@ -22,6 +22,12 @@ except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
 
 
+# How long restart() waits for a freshly started channel to fail before it
+# hands control back to the caller. Channel start() loops run forever, so this
+# is only a window to surface immediate (config/auth) failures.
+_RESTART_START_GRACE_S = 0.5
+
+
 class SendErrorKind(str, Enum):
     """Outbound send failure categories (mirrors hermes-agent gateway)."""
 
@@ -196,6 +202,7 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        self._start_task: asyncio.Task | None = None
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
         """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
@@ -284,18 +291,23 @@ class BaseChannel(ABC):
     async def restart(self) -> None:
         """Restart the channel by stopping and starting it.
 
-        Override in subclasses if special cleanup is needed before restart.
-        Default implementation calls stop() then start().
+        ``start()`` is a long-running listen loop in every built-in channel,
+        so it must run as a background task — awaiting it here would block the
+        caller (the manager's health-check loop) forever. Immediate start
+        failures (bad credentials/config) are still surfaced by waiting a
+        short grace window before returning.
         """
         try:
             await self.stop()
         except Exception as e:
             logger.warning("{}: error during stop before restart: {}", self.name, e)
-        try:
-            await self.start()
-        except Exception as e:
-            logger.error("{}: failed to restart: {}", self.name, e)
-            raise
+
+        task = asyncio.create_task(self.start(), name=f"{self.name}-restart-start")
+        self._start_task = task
+        done, _ = await asyncio.wait({task}, timeout=_RESTART_START_GRACE_S)
+        if done:
+            # Re-raise immediate failures (configuration/auth errors).
+            task.result()
 
     @property
     def supports_streaming(self) -> bool:

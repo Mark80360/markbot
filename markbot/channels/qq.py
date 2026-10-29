@@ -36,8 +36,9 @@ from pydantic import Field
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
+from markbot.channels.base import BaseChannel, SendError, SendErrorKind
 from markbot.config.schema import Base
+from markbot.utils.helpers import split_message
 from markbot.utils.ssrf import validate_url_target
 
 try:
@@ -71,6 +72,14 @@ _MAX_QQ_MEDIA_BYTES = 200 * 1024 * 1024
 _UPLOAD_PART_TIMEOUT_S = 60
 _UPLOAD_PART_MAX_RETRIES = 2
 _UPLOAD_FINISH_MAX_RETRIES = 3
+
+# QQ rejects a single text/markdown message above ~2000 chars; longer replies
+# must be split into sequential messages (msg_seq keeps them in order).
+_MAX_QQ_TEXT_LEN = 2000
+
+# Bound on the chat_id -> chat_type cache so a long-lived bot cannot grow it
+# without limit.
+_CHAT_TYPE_CACHE_SIZE = 1000
 
 
 def _compute_file_hashes(data: bytes) -> tuple[str, str, str]:
@@ -284,14 +293,15 @@ class QQChannel(BaseChannel):
                     content=f"[Attachment send failed: {filename}]",
                 )
 
-        # 2) Send text
+        # 2) Send text (split because QQ caps a single message at ~2000 chars)
         if msg.content and msg.content.strip():
-            await self._send_text_only(
-                chat_id=msg.chat_id,
-                is_group=is_group,
-                msg_id=msg_id,
-                content=msg.content.strip(),
-            )
+            for chunk in split_message(msg.content.strip(), _MAX_QQ_TEXT_LEN):
+                await self._send_text_only(
+                    chat_id=msg.chat_id,
+                    is_group=is_group,
+                    msg_id=msg_id,
+                    content=chunk,
+                )
 
     async def _send_text_only(
         self,
@@ -317,9 +327,17 @@ class QQChannel(BaseChannel):
             payload["content"] = content
 
         if is_group:
-            await self._client.api.post_group_message(group_openid=chat_id, **payload)
+            result = await self._client.api.post_group_message(group_openid=chat_id, **payload)
         else:
-            await self._client.api.post_c2c_message(openid=chat_id, **payload)
+            result = await self._client.api.post_c2c_message(openid=chat_id, **payload)
+
+        # botpy swallows aiohttp timeouts / connection resets and returns None
+        # instead of raising, so an unchecked send would look successful.
+        if result is None:
+            raise SendError(
+                f"QQ send returned no response (timeout/reset) for {chat_id}",
+                kind=SendErrorKind.TRANSIENT,
+            )
 
     async def _send_media(
         self,
@@ -646,13 +664,14 @@ class QQChannel(BaseChannel):
         if is_group:
             chat_id = data.group_openid
             user_id = data.author.member_openid
-            self._chat_type_cache[chat_id] = "group"
+            chat_type = "group"
         else:
             chat_id = str(
                 getattr(data.author, "id", None) or getattr(data.author, "user_openid", "unknown")
             )
             user_id = chat_id
-            self._chat_type_cache[chat_id] = "c2c"
+            chat_type = "c2c"
+        self._remember_chat_type(chat_id, chat_type)
 
         content = (data.content or "").strip()
 
@@ -677,9 +696,19 @@ class QQChannel(BaseChannel):
             media=media_paths if media_paths else None,
             metadata={
                 "message_id": data.id,
+                "chat_type": chat_type,
                 "attachments": att_meta,
             },
         )
+
+    def _remember_chat_type(self, chat_id: str, chat_type: str) -> None:
+        """Cache chat_id -> chat_type, evicting oldest entries when full."""
+        self._chat_type_cache[chat_id] = chat_type
+        while len(self._chat_type_cache) > _CHAT_TYPE_CACHE_SIZE:
+            oldest = next(iter(self._chat_type_cache), None)
+            if oldest is None:
+                break
+            self._chat_type_cache.pop(oldest, None)
 
     async def _handle_attachments(
         self,

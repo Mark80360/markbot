@@ -19,7 +19,7 @@ from pydantic import Field
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
+from markbot.channels.base import BaseChannel, SendError, SendErrorKind
 from markbot.config.paths import get_media_dir, get_runtime_subdir
 from markbot.config.schema import Base
 from markbot.utils.atomic import atomic_write_json
@@ -1686,7 +1686,7 @@ class FeishuChannel(BaseChannel):
                     msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
                 )
 
-            def _do_send(m_type: str, content: str) -> None:
+            def _do_send(m_type: str, content: str) -> bool:
                 logger.info(
                     "_do_send() type={}, content_preview='{}...'",
                     m_type,
@@ -1696,9 +1696,10 @@ class FeishuChannel(BaseChannel):
                     ok = self._reply_message_sync(reply_message_id, m_type, content)
                     if ok:
                         logger.info("_do_send() replied successfully")
-                        return
+                        return True
                 result = self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
                 logger.info("_do_send() result={}", result)
+                return bool(result)
 
             # Track whether text was already sent combined with a single media file.
             text_sent_via_post = False
@@ -1783,7 +1784,12 @@ class FeishuChannel(BaseChannel):
                     if mention_at_text:
                         text = f"{mention_at_text} {text}"
                     text_body = json.dumps({"text": text}, ensure_ascii=False)
-                    await loop.run_in_executor(None, _do_send, "text", text_body)
+                    ok = await loop.run_in_executor(None, _do_send, "text", text_body)
+                    if not ok:
+                        raise SendError(
+                            f"Feishu text send failed for chat {msg.chat_id}",
+                            kind=SendErrorKind.TRANSIENT,
+                        )
 
                 elif fmt == "post":
                     post_body = self._markdown_to_post(msg.content)
@@ -1799,7 +1805,12 @@ class FeishuChannel(BaseChannel):
                         if at_elements:
                             lang_block.setdefault("content", []).insert(0, at_elements)
                         post_body = json.dumps(post_obj, ensure_ascii=False)
-                    await loop.run_in_executor(None, _do_send, "post", post_body)
+                    ok = await loop.run_in_executor(None, _do_send, "post", post_body)
+                    if not ok:
+                        raise SendError(
+                            f"Feishu post send failed for chat {msg.chat_id}",
+                            kind=SendErrorKind.TRANSIENT,
+                        )
 
                 else:
                     elements = self._build_card_elements(msg.content)
@@ -1826,12 +1837,17 @@ class FeishuChannel(BaseChannel):
                         )
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
+                        ok = await loop.run_in_executor(
                             None,
                             _do_send,
                             "interactive",
                             json.dumps(card, ensure_ascii=False),
                         )
+                        if not ok:
+                            raise SendError(
+                                f"Feishu card send failed for chat {msg.chat_id}",
+                                kind=SendErrorKind.TRANSIENT,
+                            )
 
             logger.info("=== send() EXIT (success) ===")
 

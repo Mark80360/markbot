@@ -198,14 +198,35 @@ class ChannelManager:
                 break
 
     @staticmethod
+    def _is_stream_op(msg: OutboundMessage) -> bool:
+        """True for ordered streaming frames (delta / end / discard).
+
+        All three must be delivered through ``send_delta`` in order: a discard
+        that fell through to ``send()`` would never clear the channel's stream
+        buffer, and the next ``_stream_end`` would re-emit the discarded text.
+        """
+        meta = msg.metadata
+        return bool(
+            meta.get("_stream_delta")
+            or meta.get("_stream_end")
+            or meta.get("_stream_discard")
+        )
+
+    @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
         is_stream_end = msg.metadata.get("_stream_end")
+        is_stream_discard = msg.metadata.get("_stream_discard")
         is_stream_delta = msg.metadata.get("_stream_delta")
         is_streamed = msg.metadata.get("_streamed")
         if is_stream_end:
             logger.info(
                 "[MANAGER] stream end: chat_id={}",
+                msg.chat_id,
+            )
+        elif is_stream_discard:
+            logger.info(
+                "[MANAGER] stream discard: chat_id={}",
                 msg.chat_id,
             )
         elif is_stream_delta:
@@ -219,7 +240,7 @@ class ChannelManager:
                 msg.chat_id,
                 is_streamed,
             )
-        if is_stream_delta or is_stream_end:
+        if is_stream_delta or is_stream_end or is_stream_discard:
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not is_streamed:
             await channel.send(msg)
@@ -241,7 +262,7 @@ class ChannelManager:
         Note: CancelledError is re-raised to allow graceful shutdown.
         """
         # Stream deltas are ordered; retrying would cause out-of-order delivery.
-        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+        if self._is_stream_op(msg):
             try:
                 await self._send_once(channel, msg)
             except asyncio.CancelledError:

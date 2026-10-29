@@ -177,6 +177,12 @@ class EmailChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send email via SMTP."""
+        # Progress frames are a chat-surface affordance. Delivering each one
+        # would turn a single agent turn into a burst of emails.
+        if msg.metadata.get("_progress") or msg.metadata.get("_stream_delta"):
+            logger.debug("Skip email send: progress/stream frame")
+            return
+
         if not self.config.consent_granted:
             logger.warning("Skip email send: consent_granted is false")
             return
@@ -447,6 +453,7 @@ class EmailChannel(BaseChannel):
 
                 metadata = {
                     "message_id": message_id,
+                    "chat_type": "p2p",  # email is always a 1:1 surface
                     "subject": subject,
                     "date": date_value,
                     "sender_email": sender,

@@ -16,7 +16,7 @@ from pydantic import Field
 
 from markbot.bus.events import OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels.base import BaseChannel
+from markbot.channels.base import BaseChannel, SendError, SendErrorKind
 from markbot.config.schema import Base
 
 try:
@@ -198,6 +198,8 @@ class DingTalkChannel(BaseChannel):
         # Access Token management for sending messages
         self._access_token: str | None = None
         self._token_expiry: float = 0
+        # HTTP status of the most recent send attempt (for error classification).
+        self._last_send_status: int | None = None
 
         # Hold references to background tasks to prevent GC
         self._background_tasks: set[asyncio.Task] = set()
@@ -414,6 +416,7 @@ class DingTalkChannel(BaseChannel):
             body = resp.text
             if resp.status_code != 200:
                 logger.error("DingTalk send failed msgKey={} status={} body={}", msg_key, resp.status_code, body[:500])
+                self._last_send_status = resp.status_code
                 return False
             try:
                 result = resp.json()
@@ -422,11 +425,14 @@ class DingTalkChannel(BaseChannel):
             errcode = result.get("errcode")
             if errcode not in (None, 0):
                 logger.error("DingTalk send api error msgKey={} errcode={} body={}", msg_key, errcode, body[:500])
+                self._last_send_status = 400
                 return False
             logger.debug("DingTalk message sent to {} with msgKey={}", chat_id, msg_key)
+            self._last_send_status = 200
             return True
         except Exception as e:
             logger.error("Error sending DingTalk message msgKey={} err={}", msg_key, e)
+            self._last_send_status = None
             return False
 
     async def _send_markdown_text(self, token: str, chat_id: str, content: str) -> bool:
@@ -500,12 +506,16 @@ class DingTalkChannel(BaseChannel):
         """Send a message through DingTalk."""
         token = await self._get_access_token()
         if not token:
-            return
+            raise SendError(
+                "DingTalk access token unavailable; cannot send",
+                kind=SendErrorKind.FORBIDDEN,
+                chat_level=False,
+            )
 
         if msg.content and msg.content.strip():
             ok = await self._send_markdown_text(token, msg.chat_id, msg.content.strip())
             if not ok:
-                raise RuntimeError(f"DingTalk text send failed to {msg.chat_id}")
+                raise self._send_error(msg.chat_id, "text")
 
         for media_ref in msg.media or []:
             ok = await self._send_media_ref(token, msg.chat_id, media_ref)
@@ -519,6 +529,32 @@ class DingTalkChannel(BaseChannel):
                 msg.chat_id,
                 f"[Attachment send failed: {filename}]",
             )
+
+    def _send_error(self, chat_id: str, what: str) -> SendError:
+        """Classify the last failed DingTalk send into a structured error."""
+        status = self._last_send_status
+        if status == 429:
+            return SendError(
+                f"DingTalk {what} send rate-limited for {chat_id}",
+                kind=SendErrorKind.RATE_LIMITED,
+            )
+        if status in (401, 403):
+            # Usually a bad robotCode / revoked app permission: channel-level,
+            # so don't blacklist the individual chat.
+            return SendError(
+                f"DingTalk {what} send forbidden for {chat_id} (status {status})",
+                kind=SendErrorKind.FORBIDDEN,
+                chat_level=False,
+            )
+        if status == 400:
+            return SendError(
+                f"DingTalk {what} send rejected for {chat_id} (bad request)",
+                kind=SendErrorKind.BAD_FORMAT,
+            )
+        return SendError(
+            f"DingTalk {what} send failed for {chat_id} (status {status})",
+            kind=SendErrorKind.TRANSIENT,
+        )
 
     async def _on_message(
         self,
@@ -549,6 +585,8 @@ class DingTalkChannel(BaseChannel):
                 chat_id=chat_id,
                 content=str(content),
                 metadata={
+                    "message_id": message_id,
+                    "chat_type": "group" if is_group else "p2p",
                     "sender_name": sender_name,
                     "platform": "dingtalk",
                     "conversation_type": conversation_type,
