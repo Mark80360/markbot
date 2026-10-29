@@ -163,6 +163,16 @@ class OpenAICompatProvider(LLMProvider):
             api_key=api_key or "no-key",
             base_url=effective_base,
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+            # Retry policy lives in this codebase, not in the SDK.
+            # ``AsyncOpenAI`` defaults to ``max_retries=2`` and retries 429s
+            # blindly after ~0.5s — inside a TPM/RPM window that is guaranteed
+            # to fail, and each retry re-sends the whole (often 30k-token)
+            # prompt against the budget that is already exhausted. Stacked on
+            # top of ``chat_with_retry`` that turned one logical call into up
+            # to nine HTTP requests per model. ``chat_with_retry`` +
+            # ``FallbackManager`` own backoff, model rotation, and the
+            # rate-limit window, so the SDK must not add its own attempts.
+            max_retries=0,
             default_headers={
                 "x-session-affinity": uuid.uuid4().hex,
                 **(extra_headers or {}),

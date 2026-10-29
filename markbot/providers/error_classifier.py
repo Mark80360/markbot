@@ -173,6 +173,14 @@ _OVERLOADED_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Default window (seconds) a rate-limited credential needs to recover.
+#: TPM/RPM budgets are enforced over a rolling minute, so a retry a few
+#: seconds later is guaranteed to hit the same wall — and every doomed
+#: retry re-sends the full prompt against the very budget that is already
+#: exhausted. Callers must wait out this window (or rotate to another
+#: model) instead of retrying immediately.
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+
 # Rate limit patterns (transient — per-key throttling, backoff then retry).
 _RATE_LIMIT_RE = re.compile(
     r"rate[\s_]?limit|rate_limit|too[\s_]?many[\s_]?requests|throttl|"
@@ -237,7 +245,12 @@ _STATUS_MAP: dict[int, _StatusHint] = {
     404: _StatusHint(ErrorCategory.DETERMINISTIC, "model_not_found", False, should_fallback=True),
     408: _StatusHint(ErrorCategory.TRANSIENT, "timeout", True, backoff_seconds=1.0),
     413: _StatusHint(ErrorCategory.DETERMINISTIC, "payload_too_large", False, should_compress=True, should_strip_images=True),
-    429: _StatusHint(ErrorCategory.TRANSIENT, "rate_limit", True, backoff_seconds=5.0, backoff_strategy=BackoffStrategy.JITTERED),
+    429: _StatusHint(
+        ErrorCategory.TRANSIENT, "rate_limit", True,
+        should_fallback=True,
+        backoff_seconds=RATE_LIMIT_WINDOW_SECONDS,
+        backoff_strategy=BackoffStrategy.JITTERED,
+    ),
     432: _StatusHint(ErrorCategory.DETERMINISTIC, "billing", False, should_fallback=True),
     500: _StatusHint(ErrorCategory.TRANSIENT, "server_error", True, backoff_seconds=1.0),
     502: _StatusHint(ErrorCategory.TRANSIENT, "bad_gateway", True, backoff_seconds=1.0),
@@ -257,7 +270,8 @@ def classify_api_error(
     """Classify an API error with recovery action hints.
 
     Resolution order (most-specific first):
-      0.  HTTP 429 (authoritative rate limit — transient, before body markers)
+      0.  HTTP 429 — overloaded → transient; billing-only body → deterministic
+          billing; otherwise a transient rate-limit window (should_fallback)
       1.  SSL certificate verification (deterministic — fail fast)
       2.  Context overflow (deterministic — should_compress)
       3.  Content policy / safety filter (deterministic — should_fallback)
@@ -302,20 +316,37 @@ def classify_api_error(
             backoff_strategy=backoff_strategy,
         )
 
-    # 0. HTTP 429 is authoritative for rate limiting. A spent rpm/tpm or quota
-    # window is transient by nature and must NOT be re-labelled as a permanent
-    # billing failure just because the body carries ``quota_exceeded_error``.
+    # 0. HTTP 429 is authoritative for rate limiting. A spent rpm/tpm window is
+    # transient by nature and must NOT be re-labelled as a permanent billing
+    # failure just because the body carries ``quota_exceeded_error``.
     # (Body markers still win over 5xx for non-429 statuses, where aggregators
     # proxy permanent failures such as model_not_found / no available channel.)
     if status_code == 429:
         if _OVERLOADED_RE.search(msg):
             return _result(
                 "overloaded", ErrorCategory.TRANSIENT,
+                should_fallback=True,
                 backoff_seconds=3.0, backoff_strategy=BackoffStrategy.EXPONENTIAL,
+            )
+        # A 429 whose body carries only a billing marker (``insufficient_quota``,
+        # "exceeded your current quota", …) and no rate/tpm/rpm marker is not a
+        # window that reopens in a minute — the account itself is out of credit.
+        # Retrying it burns latency and hides the real cause, so classify it as
+        # the deterministic billing failure it is and let the chain rotate.
+        if _BILLING_RE.search(msg) and not _RATE_LIMIT_RE.search(msg):
+            return _result(
+                "billing", ErrorCategory.DETERMINISTIC,
+                should_fallback=True,
             )
         return _result(
             "rate_limit", ErrorCategory.TRANSIENT,
-            backoff_seconds=5.0, backoff_strategy=BackoffStrategy.JITTERED,
+            # Rate limits are per-credential windows: rotating to the next
+            # model is cheap and immediate, while re-sending the same prompt
+            # to the same throttled key inside the window is guaranteed to
+            # fail again and consumes more of the exhausted budget.
+            should_fallback=True,
+            backoff_seconds=RATE_LIMIT_WINDOW_SECONDS,
+            backoff_strategy=BackoffStrategy.JITTERED,
         )
 
     # 1. SSL certificate verification — deterministic, fail fast

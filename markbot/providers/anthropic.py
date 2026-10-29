@@ -77,6 +77,11 @@ class AnthropicProvider(LLMProvider):
             client_kw["base_url"] = api_base
         if extra_headers:
             client_kw["default_headers"] = extra_headers
+        # Retries belong to ``chat_with_retry`` / ``FallbackManager``: they
+        # know about the model chain and the rate-limit window. The SDK's own
+        # ``max_retries=2`` default retries 429s seconds later, which cannot
+        # clear a per-minute budget and re-sends the whole prompt each time.
+        client_kw["max_retries"] = 0
         self._client = AsyncAnthropic(**client_kw)
 
     @staticmethod

@@ -60,6 +60,20 @@ if TYPE_CHECKING:
 _INTERNAL_CONTEXT_TAG = "[Agent Internal Context"
 
 
+def _describe_llm_error(exc: BaseException, *, limit: int = 500) -> str:
+    """Render *exc* for the user without hiding the provider's own message.
+
+    ``FallbackManager`` raises ``AllModelsFailedError``, whose ``str()`` only
+    says "All N models in chain failed" — the upstream body (429 TPM limit,
+    401, 404, …) is reachable through ``.summary``. Surfacing it is the
+    difference between "something broke" and "your provider says the
+    per-minute token budget is exhausted". Truncating at 200 chars (the old
+    behaviour) cut the JSON body before the actual message in most 429s.
+    """
+    detail = getattr(exc, "summary", None) or str(exc) or type(exc).__name__
+    return str(detail).strip()[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Turn-exit-reason taxonomy
 # ---------------------------------------------------------------------------
@@ -2480,7 +2494,8 @@ class IterationRunner:
         if not is_prompt_too_long_error(llm_exc):
             logger.error("LLM call failed: {}", llm_exc)
             state.final_content = (
-                f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
+                "Sorry, I encountered an error calling the AI model: "
+                + _describe_llm_error(llm_exc)
             )
             return IterationResult(
                 should_break=True, exit_reason=TurnExitReason.LLM_ERROR
@@ -2501,7 +2516,8 @@ class IterationRunner:
         if reactive_result is None:
             logger.error("LLM call failed (not a PTL error): {}", llm_exc)
             state.final_content = (
-                f"Sorry, I encountered an error calling the AI model: {str(llm_exc)[:200]}"
+                "Sorry, I encountered an error calling the AI model: "
+                + _describe_llm_error(llm_exc)
             )
             return IterationResult(
                 should_break=True, exit_reason=TurnExitReason.LLM_ERROR

@@ -1004,11 +1004,16 @@ class TestErrorClassifierBackoff:
 
     def test_rate_limit_jittered_backoff(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            classify_api_error, BackoffStrategy, RATE_LIMIT_WINDOW_SECONDS,
         )
         result = classify_api_error(429, "rate limit exceeded")
-        assert result.backoff_seconds == 5.0
+        # A TPM/RPM budget is a rolling minute: a 5s backoff retried the same
+        # throttled key inside the same window and could never succeed.
+        assert result.backoff_seconds == RATE_LIMIT_WINDOW_SECONDS
+        assert result.backoff_seconds >= 60.0
         assert result.backoff_strategy is BackoffStrategy.JITTERED
+        # The chain is allowed to rotate to another model instead.
+        assert result.should_fallback
 
     def test_overloaded_exponential_backoff(self):
         from markbot.providers.error_classifier import (

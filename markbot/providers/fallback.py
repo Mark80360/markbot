@@ -1,5 +1,6 @@
 """Multi-model fallback chain management."""
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -9,7 +10,11 @@ from loguru import logger
 from markbot.config.schema import Config, ModelConfig, ProviderConfig
 from markbot.errors import ErrorCode, MarkbotError, classify_exception
 from markbot.providers.base import LLMProvider, LLMResponse
-from markbot.providers.error_classifier import classify_api_error, classify_to_error_type
+from markbot.providers.error_classifier import (
+    RATE_LIMIT_WINDOW_SECONDS,
+    classify_api_error,
+    classify_to_error_type,
+)
 from markbot.providers.errors import ErrorType
 
 
@@ -48,6 +53,10 @@ class FallbackAttempt:
     #: same sink must know the buffer is already polluted and force a
     #: discard instead of concatenating two answers.
     streamed: bool = False
+    #: Server-advertised ``Retry-After`` (seconds) for this failure, when the
+    #: provider sent one. Used by the chain-level rate-limit retry to wait
+    #: exactly as long as the upstream asked instead of guessing.
+    retry_after: float | None = None
 
 
 class AllModelsFailedError(MarkbotError):
@@ -65,6 +74,26 @@ class AllModelsFailedError(MarkbotError):
         self.attempts = attempts or []
         self.last_error = last_error
 
+    @property
+    def summary(self) -> str:
+        """Per-model failure digest, for surfacing the *real* cause to users.
+
+        ``str(exc)`` only says "All N models in chain failed", which hides
+        whether the cause was a 429, a dead key, or a missing model. This
+        renders one line per attempted model so the operator — and the user
+        reading the agent's reply — sees the upstream message verbatim.
+        """
+        parts: list[str] = []
+        for attempt in self.attempts:
+            if attempt.success:
+                continue
+            if attempt.circuit_skipped:
+                parts.append(f"{attempt.model_ref}: skipped (circuit open)")
+                continue
+            detail = (attempt.error or "unknown error").strip().replace("\n", " ")
+            parts.append(f"{attempt.model_ref}: {detail[:200]}")
+        return "; ".join(parts) or str(self)
+
 
 class FallbackManager:
     """Manages multi-model fallback chain with circuit breaker.
@@ -76,6 +105,10 @@ class FallbackManager:
 
     DEFAULT_CIRCUIT_THRESHOLD = 6
     DEFAULT_CIRCUIT_COOLDOWN = 60.0
+    #: Upper bound (seconds) on the chain-level wait for a rate-limit window
+    #: to roll over. A misreported ``Retry-After`` must not stall a turn for
+    #: minutes; beyond this the request fails with the upstream error visible.
+    DEFAULT_MAX_RATE_LIMIT_WAIT = 120.0
 
     def __init__(self, config: Config):
         self.config = config
@@ -83,6 +116,7 @@ class FallbackManager:
         self._circuits: dict[str, CircuitState] = {}
         self._circuit_threshold = self.DEFAULT_CIRCUIT_THRESHOLD
         self._circuit_cooldown = self.DEFAULT_CIRCUIT_COOLDOWN
+        self._max_rate_limit_wait = self.DEFAULT_MAX_RATE_LIMIT_WAIT
         self._half_open_probes: set[str] = set()
 
     # The circuit breaker is keyed by the full ``model_ref`` (e.g.
@@ -246,6 +280,7 @@ class FallbackManager:
         max_tokens: int | None,
         temperature: float | None,
         caller: "_ModelCaller",
+        allow_rate_limit_retry: bool = True,
     ) -> tuple[LLMResponse, list[FallbackAttempt]]:
         """Try each model in chain using *caller* for the actual LLM invocation.
 
@@ -253,9 +288,20 @@ class FallbackManager:
         and retry logic is handled here so that ``chat_with_fallback``
         and ``chat_stream_with_fallback`` only differ in the provider
         method they pass as the *caller*.
+
+        ``allow_rate_limit_retry`` controls the chain-level second pass:
+        when *every* model in the chain was throttled, the only way to serve
+        the request is to wait for the TPM/RPM window to roll over and try
+        once more. The recursive call disables it, so at most one extra pass
+        is ever made.
         """
         attempts: list[FallbackAttempt] = []
         last_error: Exception | None = None
+        # Hoisted out of the per-model loop: the chain-level rate-limit retry
+        # below needs the *last* failure's status code, and a chain in which
+        # every model was circuit-skipped never assigns it inside the loop.
+        error_status: int | None = None
+        last_retry_after: float | None = None
         defaults = self.config.agents.defaults
 
         for model_ref in defaults.model_chain:
@@ -313,10 +359,6 @@ class FallbackManager:
                 # circuit breaker.
                 last_error: Exception | None = None
                 content_filter_hit = False
-                # HTTP status of the most recent failure, carried from the
-                # provider so the chain re-classifies with the authoritative
-                # status instead of guessing from the error prose alone.
-                error_status: int | None = None
                 for key_index, credential in enumerate(credential_keys):
                     provider = self._get_or_create_provider(
                         provider_config, provider_name,
@@ -333,6 +375,7 @@ class FallbackManager:
                     except Exception as e:
                         last_error = e
                         error_status = getattr(e, "status_code", None)
+                        last_retry_after = getattr(e, "retry_after", None)
                         if key_index < len(credential_keys) - 1:
                             logger.warning(
                                 "Model {} threw with credential {}/{}: {}. "
@@ -345,6 +388,7 @@ class FallbackManager:
                     if response.finish_reason == "error":
                         error_msg = response.content or "Unknown error"
                         error_status = response.status_code
+                        last_retry_after = response.retry_after
                         classified = classify_api_error(error_status, error_msg)
                         last_error = Exception(error_msg)
                         if key_index < len(credential_keys) - 1 and (
@@ -413,6 +457,7 @@ class FallbackManager:
                         success=False,
                         error=error_msg,
                         error_code=classify_exception(last_error).code,
+                        retry_after=last_retry_after,
                     )
                     attempts.append(attempt)
 
@@ -502,8 +547,41 @@ class FallbackManager:
                 # probe "in flight" and lock the model out permanently.
                 self._half_open_probes.discard(model_ref)
 
+        # ------------------------------------------------------------------
+        # Chain-level rate-limit recovery.
+        #
+        # Rotating models is the first response to a 429 (the provider layer
+        # no longer retries a throttled model — see
+        # ``LLMProvider.chat_with_retry``), but when *every* model is
+        # throttled the request is not doomed: TPM/RPM budgets are windows
+        # over time. Wait the window out and run the chain once more. This is
+        # the only path that can turn "everything is rate-limited" into a
+        # served request, and it runs at most once per call.
+        # ------------------------------------------------------------------
+        if allow_rate_limit_retry and last_error is not None:
+            final = classify_api_error(error_status, str(last_error), last_error)
+            if final.reason == "rate_limit":
+                # The server's Retry-After is authoritative when present;
+                # otherwise a TPM/RPM budget needs its full rolling window.
+                if last_retry_after is not None:
+                    wait = last_retry_after
+                else:
+                    wait = max(RATE_LIMIT_WINDOW_SECONDS, final.backoff_seconds)
+                wait = min(max(wait, 0.0), self._max_rate_limit_wait)
+                logger.warning(
+                    "All {} model(s) rate-limited; waiting {:.0f}s for the "
+                    "TPM/RPM window to roll over, then retrying once",
+                    len(attempts), wait,
+                )
+                await asyncio.sleep(wait)
+                return await self._try_chain(
+                    messages, tools, tool_choice, max_tokens, temperature, caller,
+                    allow_rate_limit_retry=False,
+                )
+
         raise AllModelsFailedError(
-            f"All {len(attempts)} models in chain failed",
+            f"All {len(attempts)} models in chain failed"
+            + (f"; last error: {last_error}" if last_error is not None else ""),
             attempts=attempts,
             last_error=last_error,
         )

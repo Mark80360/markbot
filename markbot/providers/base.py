@@ -347,9 +347,10 @@ class LLMProvider(ABC):
                 )
                 return response
 
+            cls = classify_api_error(response.status_code, response.content or "")
+
             if response.error_type != ErrorType.TRANSIENT:
                 # Use enhanced classifier for recovery action hints
-                cls = classify_api_error(response.status_code, response.content or "")
                 if cls.should_strip_images:
                     stripped = self._strip_image_content(messages)
                     if stripped is not None:
@@ -360,8 +361,21 @@ class LLMProvider(ABC):
                         return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
-            # Use classifier's backoff hint when available
-            cls = classify_api_error(response.status_code, response.content or "")
+            # A rate limit is a per-credential, per-minute window. Retrying the
+            # same model seconds later cannot clear it — and every attempt
+            # re-sends the whole prompt against the budget that is already
+            # exhausted, which keeps the account pinned at the limit. Hand the
+            # failure back so the fallback chain rotates to the next model
+            # (the documented behaviour for 限流). The chain waits out the
+            # window itself only when *every* model is throttled.
+            if cls.reason == "rate_limit":
+                logger.warning(
+                    "LLM rate-limited ({}), rotating to the next model instead "
+                    "of retrying the same one: {}",
+                    response.status_code, (response.content or "")[:160],
+                )
+                return response
+
             smart_delay = _compute_backoff(
                 cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
             )
@@ -412,9 +426,10 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
 
+            cls = classify_api_error(response.status_code, response.content or "")
+
             if response.error_type != ErrorType.TRANSIENT:
                 # Use enhanced classifier for recovery action hints
-                cls = classify_api_error(response.status_code, response.content or "")
                 if cls.should_strip_images:
                     stripped = self._strip_image_content(messages)
                     if stripped is not None:
@@ -425,8 +440,17 @@ class LLMProvider(ABC):
                         return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
-            # Use classifier's backoff hint when available
-            cls = classify_api_error(response.status_code, response.content or "")
+            # See chat_stream_with_retry: a throttled credential cannot recover
+            # inside a few seconds, so rotate models instead of re-burning the
+            # same exhausted TPM/RPM window.
+            if cls.reason == "rate_limit":
+                logger.warning(
+                    "LLM rate-limited ({}), rotating to the next model instead "
+                    "of retrying the same one: {}",
+                    response.status_code, (response.content or "")[:160],
+                )
+                return response
+
             smart_delay = _compute_backoff(
                 cls.backoff_seconds, cls.backoff_strategy, attempt, delay,
             )
