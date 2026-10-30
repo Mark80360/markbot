@@ -4,6 +4,33 @@ from typing import Any
 
 from markbot.log.redact import redact_sensitive
 
+#: Depth limit for the ``extra`` walk. ``logger.bind(payload=huge_dict)`` is
+#: legal and the sink must not spend unbounded time on it.
+_MAX_EXTRA_DEPTH = 4
+
+
+def _redact_extra(value: Any, depth: int = 0) -> Any:
+    """Recursively redact the string leaves of ``record["extra"]``.
+
+    ``extra`` is not part of the message, so ``redact_sensitive`` never saw
+    it. The bundled formatters only render ``extra["component"]`` today, but
+    ``extra`` is the documented place to attach structured context
+    (``logger.bind(apiKey=..., headers=...)``) and any custom sink, or a
+    ``diagnose=True`` traceback dump, prints it verbatim. Redacting at the
+    sink is the only place that covers every formatter, present and future.
+    """
+    if depth > _MAX_EXTRA_DEPTH:
+        return "***" if isinstance(value, str) else value
+    if isinstance(value, str):
+        return redact_sensitive(value)
+    if isinstance(value, dict):
+        return {k: _redact_extra(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_redact_extra(v, depth + 1) for v in value)
+    if isinstance(value, set):
+        return {_redact_extra(v, depth + 1) for v in value}
+    return value
+
 
 def default_filter(record: dict[str, Any]) -> bool:
     """Global loguru filter shared by console and file sinks.
@@ -39,5 +66,10 @@ def default_filter(record: dict[str, Any]) -> bool:
     # mutate-in-place convention (used by the truncation branch) so
     # downstream sinks see the cleaned text.
     record["message"] = redact_sensitive(msg)
+
+    # ``extra`` carries structured context the message may not repeat.
+    extra = record.get("extra")
+    if isinstance(extra, dict) and extra:
+        record["extra"] = _redact_extra(extra)
 
     return True

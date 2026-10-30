@@ -1041,12 +1041,31 @@ def _user_plugins_dir() -> Path | None:
 
 
 def _discover_user_plugins() -> None:
-    """Import every ``*.py`` in the user plugins dir.
+    """Import user provider plugins — **only** when explicitly opted in.
 
     Each plugin registers itself by calling :func:`register_provider_spec`
     at import time. Runs at most once per process and is failure-tolerant:
     a broken plugin logs a warning and never blocks the other plugins or
     the bundled registry.
+
+    Opt-in is mandatory. Discovery used to ``exec_module`` every ``*.py`` in
+    the directory unconditionally, which turned a writable data directory
+    into a code-execution primitive that bypassed the whole permission and
+    sandbox stack: the agent's ``write`` tool (or any sync client, or an
+    archive extracted into the wrong place) could drop a file there and get
+    arbitrary code run in-process on the next provider lookup, with no
+    approval prompt and no scan. A provider *definition* is data; a provider
+    *plugin* is code, and code loading has to be a deliberate act.
+
+    Two ways to opt in, both off by default:
+
+    * ``security.allow_user_provider_plugins: true`` — load every plugin.
+    * ``security.user_provider_plugin_allowlist: ["acme.py"]`` — load only
+      the named files (this is the narrower, preferred form).
+
+    Skipped files are named in a single warning so an operator who expected
+    a plugin to load finds out why instead of silently getting the bundled
+    profile.
     """
     global _USER_PLUGINS_SCANNED
     if _USER_PLUGINS_SCANNED:
@@ -1057,11 +1076,53 @@ def _discover_user_plugins() -> None:
     if plugins_dir is None:
         return
 
+    candidates: list[Path] = []
     for child in sorted(plugins_dir.iterdir()):
         if not child.is_file() or not child.name.endswith(".py"):
             continue
         if child.name.startswith("_"):  # private / helper modules are opt-in
             continue
+        candidates.append(child)
+    if not candidates:
+        return
+
+    allow_all, allowlist = _plugin_opt_in()
+    allowed = [
+        child
+        for child in candidates
+        if allow_all or child.name in allowlist or child.stem in allowlist
+    ]
+    skipped = [child.name for child in candidates if child not in allowed]
+    if skipped:
+        logger.warning(
+            "User provider plugins are not loaded by default: {}. "
+            "Enable with security.allow_user_provider_plugins=true, or list "
+            "specific files in security.user_provider_plugin_allowlist. "
+            "Directory: {}",
+            ", ".join(skipped),
+            plugins_dir,
+        )
+
+    for child in allowed:
+        # Refuse a world-writable plugin: anyone who can create or replace the
+        # file gets code execution in this process, and a shared or
+        # group-synced directory makes that a real possibility rather than a
+        # theoretical one.
+        try:
+            mode = child.stat().st_mode
+        except OSError as exc:
+            logger.warning("Cannot stat user provider plugin {}: {}", child.name, exc)
+            continue
+        if mode & 0o002:
+            logger.error(
+                "Refusing world-writable user provider plugin {} (mode {:o}). "
+                "Run: chmod o-w {}",
+                child.name,
+                mode & 0o777,
+                child,
+            )
+            continue
+
         module_name = f"_markbot_user_provider_{child.stem}"
         if module_name in sys.modules:
             continue
@@ -1077,6 +1138,27 @@ def _discover_user_plugins() -> None:
                 "Failed to load user provider plugin {}: {}", child.name, exc
             )
             sys.modules.pop(module_name, None)
+
+
+def _plugin_opt_in() -> tuple[bool, set[str]]:
+    """Read the plugin opt-in switches from config.
+
+    Returns ``(allow_all, allowlist)``. Any failure to read config resolves
+    to ``(False, set())`` — the closed state — because the alternative is
+    executing code on the strength of a config that could not be parsed.
+    """
+    try:
+        from markbot.config.loader import load_config
+
+        security = getattr(load_config(), "security", None)
+        if security is None:
+            return False, set()
+        allow_all = bool(getattr(security, "allow_user_provider_plugins", False))
+        raw = getattr(security, "user_provider_plugin_allowlist", None) or []
+        return allow_all, {str(item).strip() for item in raw if str(item).strip()}
+    except Exception as exc:
+        logger.debug("Could not read provider-plugin opt-in config: {}", exc)
+        return False, set()
 
 
 def list_specs() -> list[ProviderSpec]:

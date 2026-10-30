@@ -88,7 +88,7 @@ _PROVIDER_KEY_RE = re.compile(
     r"sk-ant-[A-Za-z0-9\-_]{20,}"       # Anthropic
     r"|sk-or-v1-[A-Za-z0-9]{20,}"       # OpenRouter
     r"|sk-proj-[A-Za-z0-9\-_]{20,}"     # OpenAI project keys
-    r"|sk-[A-Za-z0-9]{32,}"             # OpenAI legacy / DeepSeek / Groq
+    r"|sk-[A-Za-z0-9]{32,}"             # OpenAI legacy / DeepSeek / Groq / Moonshot
     r"|gsk_[A-Za-z0-9]{20,}"            # Groq
     r"|xai-[A-Za-z0-9]{20,}"            # xAI
     r"|AIza[A-Za-z0-9\-_]{30,}"         # Google
@@ -96,8 +96,93 @@ _PROVIDER_KEY_RE = re.compile(
     r"|glpat-[A-Za-z0-9\-_]{20,}"       # GitLab
     r"|hf_[A-Za-z0-9]{30,}"             # HuggingFace
     r"|AKIA[0-9A-Z]{16}"                # AWS access key id
+    # --- added for H6: vendors whose keys matched nothing above -----------
+    r"|tvly-[A-Za-z0-9\-_]{20,}"        # Tavily
+    r"|pplx-[A-Za-z0-9]{20,}"           # Perplexity
+    r"|fw_[A-Za-z0-9]{20,}"             # Fireworks
+    r"|r8_[A-Za-z0-9]{20,}"             # Replicate
+    r"|jina_[A-Za-z0-9]{20,}"           # Jina
+    r"|BSA[A-Za-z0-9\-_]{20,}"          # Brave Search
+    r"|npm_[A-Za-z0-9]{30,}"            # npm automation token
+    r"|pypi-[A-Za-z0-9\-_]{30,}"        # PyPI upload token
+    r"|[sr]k_(?:live|test)_[A-Za-z0-9]{20,}"   # Stripe secret / restricted
+    r"|dop_v1_[A-Za-z0-9]{40,}"         # DigitalOcean
+    r"|shp(?:at|ss|ca|pa)_[A-Za-z0-9]{20,}"    # Shopify
     r"))\b"
 )
+
+# Zhipu / BigModel keys are ``<32 hex>.<16 alnum>`` — neither segment alone is
+# long or distinctive enough for the generic entropy rule, and the ``.``
+# separator means no vendor-prefix rule can catch it either.
+_ZHIPU_KEY_RE = re.compile(r"\b(?P<key>[0-9a-fA-F]{32}\.[A-Za-z0-9]{16})\b")
+
+
+# ---------------------------------------------------------------------------
+# Generic high-entropy tokens
+# ---------------------------------------------------------------------------
+#
+# Vendor-prefix matching is a losing game: every provider invents a new
+# prefix, and a user's self-hosted or proxy endpoint can mint keys with no
+# prefix at all. The rules above therefore only cover keys we happened to
+# enumerate; anything else — a Tavily key before the prefix was known, a
+# self-hosted gateway's bearer secret, an arbitrary ``apiKey`` field — was
+# written to the log verbatim.
+#
+# This pass catches the *shape* of a credential instead of its name.
+#
+# Deliberate exclusions, so logs stay usable:
+#   * pure-hex tokens (git SHAs, md5/sha digests, trace ids) — no vendor
+#     issues a hex-only API key, and redacting every digest makes logs
+#     undebuggable;
+#   * anything shorter than 32 characters — a 20-char random string is as
+#     likely to be a session id fragment as a key, and short tokens are
+#     covered by the explicit vendor rules above;
+#   * ``/`` and ``+`` are outside the character class, so filesystem paths
+#     and URL paths (which are long, contain digits, and have high character
+#     variety) do not match.
+
+_ENTROPY_CANDIDATE_RE = re.compile(r"(?<![\w\-])(?P<tok>[A-Za-z0-9_\-]{32,200})(?![\w\-])")
+_HEX_ONLY_RE = re.compile(r"\A[0-9a-fA-F]+\Z")
+
+#: Bits per character. Uniform random base62 is ~5.95; English prose is ~4.0
+#: but is broken up by spaces so it never forms one long token.
+_MIXED_CASE_ENTROPY = 3.6
+#: A lowercase-only run is usually a long identifier (a test name, a config
+#: key, a generated directory) rather than a credential, so it has to clear a
+#: much higher bar before we destroy it in the log.
+_LOWERCASE_ONLY_ENTROPY = 4.3
+_MIN_DISTINCT_CHARS = 12
+
+
+def _shannon_entropy(s: str) -> float:
+    from collections import Counter
+    from math import log2
+
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    total = len(s)
+    return -sum((n / total) * log2(n / total) for n in counts.values())
+
+
+def _looks_like_secret_token(tok: str) -> bool:
+    """Heuristic: is *tok* shaped like a credential rather than an identifier?"""
+    if len(tok) < 32:
+        return False
+    if _HEX_ONLY_RE.match(tok):
+        return False
+    has_lower = any(c.islower() for c in tok)
+    has_upper = any(c.isupper() for c in tok)
+    has_digit = any(c.isdigit() for c in tok)
+    if not has_digit or not (has_lower or has_upper):
+        return False
+    if len(set(tok)) < _MIN_DISTINCT_CHARS:
+        return False
+    entropy = _shannon_entropy(tok)
+    if has_upper and has_lower:
+        # Mixed case + digits is the shape every key generator produces.
+        return entropy >= _MIXED_CASE_ENTROPY
+    return entropy >= _LOWERCASE_ONLY_ENTROPY
 
 
 def _luhn_ok(s: str) -> bool:
@@ -169,12 +254,21 @@ def redact_sensitive(text: str) -> str:
     def _card_sub(m: re.Match[str]) -> str:
         return "***" if _luhn_ok(m.group("card").replace(" ", "").replace("-", "")) else m.group(0)
 
+    def _entropy_sub(m: re.Match[str]) -> str:
+        tok = m.group("tok")
+        return "***" if _looks_like_secret_token(tok) else tok
+
     out = _AUTHORIZATION_RE.sub(_auth_sub, text)
     out = _BEARER_RE.sub(_bearer_sub, out)
     out = _JWT_RE.sub(_jwt_sub, out)
     out = _PROVIDER_KEY_RE.sub("***", out)
+    out = _ZHIPU_KEY_RE.sub("***", out)
     out = _KV_SECRET_RE.sub(_kv_sub, out)
     out = _PASSWORD_RE.sub(_kv_sub, out)
+    # Runs after the named patterns so a recognised vendor key is replaced by
+    # the same ``***`` either way; before the PII passes so an email-local-part
+    # or phone-shaped digit run inside a token cannot mask it first.
+    out = _ENTROPY_CANDIDATE_RE.sub(_entropy_sub, out)
     out = _CARD_RE.sub(_card_sub, out)
     out = _EMAIL_RE.sub("***@***", out)
     out = _CN_MOBILE_RE.sub("***", out)

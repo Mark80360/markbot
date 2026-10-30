@@ -156,13 +156,19 @@ class TestContainsInternalUrl:
         assert contains_internal_url("curl http://127.0.0.1/admin") is True
 
     def test_multiple_urls_one_internal(self):
-        with patch("markbot.utils.network.validate_url_target") as mock:
+        # ``contains_internal_url`` is re-exported from markbot.utils.ssrf, so
+        # the patch has to target the module that actually performs the call.
+        # Patching ``markbot.utils.network.validate_url_target`` used to look
+        # like it worked only because the real check happened to return the
+        # same answer.
+        with patch("markbot.utils.ssrf.validate_url_target") as mock:
             mock.side_effect = [
                 (True, ""),
                 (False, "blocked"),
             ]
             result = contains_internal_url("curl https://example.com http://10.0.0.1")
             assert result is True
+            assert mock.call_count == 2
 
     def test_allowed_ip_whitelist(self):
         result = contains_internal_url(
@@ -184,3 +190,38 @@ class TestContainsInternalUrl:
             allowed_ips=["192.168.1.0/24"],
         )
         assert result is True
+
+
+class TestDelegatesToSsrf:
+    """``markbot.utils.network`` must not carry its own copy of the predicate.
+
+    It used to. The two copies disagreed on IPv4-embedded IPv6 addresses
+    (this one blocked ``::ffff:8.8.8.8``, ssrf allowed
+    ``::ffff:169.254.169.254``). These tests pin the delegation so a
+    future edit cannot quietly re-fork the logic.
+    """
+
+    def test_public_functions_are_the_same_objects(self):
+        import markbot.utils.network as network
+        import markbot.utils.ssrf as ssrf
+
+        assert network.validate_url_target is ssrf.validate_url_target
+        assert network.validate_resolved_url is ssrf.validate_resolved_url
+        assert network.contains_internal_url is ssrf.contains_internal_url
+
+    def test_blocked_networks_is_a_live_view(self):
+        import markbot.utils.network as network
+        import markbot.utils.ssrf as ssrf
+
+        assert network._BLOCKED_NETWORKS is ssrf._PRIVATE_NETWORKS
+
+    def test_is_private_agrees_with_the_live_predicate(self):
+        import ipaddress
+
+        import markbot.utils.ssrf as ssrf
+
+        for literal in ("127.0.0.1", "10.0.0.1", "169.254.169.254",
+                        "::1", "fc00::1", "fe80::1", "8.8.8.8"):
+            addr = ipaddress.ip_address(literal)
+            blocked, _ = ssrf._blocked_reason(addr, allow_private=False)
+            assert _is_private(addr) is blocked, literal

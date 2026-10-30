@@ -94,6 +94,11 @@ class TestCmdModePersist:
         from markbot.config import loader as loader_mod
         from markbot.cli.slash_commands.builtin import cmd_mode
 
+        # The assertion below looks for the English word "warning", so pin the
+        # language: get_language() otherwise reads display.language from the
+        # machine's real ~/.markbot/config.json and this test flips to Chinese.
+        monkeypatch.setenv("MARKBOT_LANGUAGE", "en")
+
         blocker = tmp_path / "blocker"
         blocker.write_text("not a dir", encoding="utf-8")
         cfg = blocker / "config.json"  # parent is a file, mkdir will fail

@@ -65,9 +65,14 @@ html {
   font-size: var(--theme-base-size);
   line-height: var(--theme-line-height);
   letter-spacing: var(--theme-letter-spacing);
+  /* 100dvh 跟随移动端地址栏收起/展开，避免底部输入框被遮挡；旧浏览器回退 100vh */
+  height: 100vh;
   height: 100dvh;
   max-height: 100dvh;
   overflow: hidden;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overscroll-behavior: none;
 }
 
 body {
@@ -92,17 +97,71 @@ code, kbd, pre, samp, .font-mono {
   height: 100%;
   max-height: 100%;
   overflow: hidden;
+  isolation: isolate;
 }
 
+/* 触屏设备去掉 300ms 点击延迟与灰色高亮块 */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+[role="button"],
+a,
+input,
+select,
+textarea {
+  touch-action: manipulation;
+}
+
+/* 统一的键盘焦点样式：鼠标点击不显示，Tab 导航可见 */
+a:focus-visible,
+button:focus-visible,
+[role="button"]:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent-teal);
+  outline-offset: 2px;
+}
+
+/* 组件本身已有焦点反馈时，用它关掉默认描边 */
+.no-focus-ring:focus-visible {
+  outline: none;
+}
+
+/* 刘海屏安全区工具类 */
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.safe-x {
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* 尊重系统的"减少动态效果"设置 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 窄屏下滚动条改为更细的样式，减少对内容的挤占 */
 @media (max-width: 768px) {
-  html,
-  body,
-  #root {
-    min-height: 100dvh;
-    height: auto;
-    max-height: none;
-    overflow-x: hidden;
-    overflow-y: auto;
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
   }
 }
 
@@ -127,7 +186,7 @@ code { font-size: 0.875rem; }
   --color-destructive-foreground: #ffffff;
   --color-success: #4ade80;
   --color-warning: #ffbd38;
-  --color-border: color-mix(in srgb, var(--midground-base) 15%, transparent);
+  --color-border: color-mix(in srgb, var(--midground-base) 18%, transparent);
   --color-input: color-mix(in srgb, var(--midground-base) 15%, transparent);
   --color-ring: var(--midground);
   --color-popover: color-mix(in srgb, var(--midground-base) 4%, var(--background-base));
@@ -143,9 +202,9 @@ code { font-size: 0.875rem; }
   --color-midground-faint: color-mix(in srgb, var(--midground-base) 30%, transparent);
 
   --color-text-primary: var(--midground);
-  --color-text-secondary: color-mix(in srgb, var(--midground-base) 70%, transparent);
-  --color-text-tertiary: color-mix(in srgb, var(--midground-base) 40%, transparent);
-  --color-text-muted: color-mix(in srgb, var(--midground-base) 25%, transparent);
+  --color-text-secondary: color-mix(in srgb, var(--midground-base) 78%, transparent);
+  --color-text-tertiary: color-mix(in srgb, var(--midground-base) 55%, transparent);
+  --color-text-muted: color-mix(in srgb, var(--midground-base) 42%, transparent);
 
   --color-accent-teal: var(--accent-teal);
   --color-accent-teal-hover: var(--accent-teal-hover);

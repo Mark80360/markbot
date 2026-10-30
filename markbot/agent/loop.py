@@ -31,6 +31,8 @@ from markbot.bus.events import (
 )
 from markbot.bus.queue import MessageBus
 from markbot.cli.slash_commands import CommandContext
+from markbot.cli.slash_commands.router import looks_like_command
+from markbot.locales import t
 from markbot.tools.message import MessageTool
 from markbot.types.permission import PermissionMode
 from markbot.utils.constants import AGENT_IDLE_TIMEOUT_MINUTES
@@ -227,6 +229,10 @@ class AgentLoop:
         self.memory_encoder = ctx.memory_encoder
 
         self._pending_steer: dict[str, str] = {}
+        # Sessions currently inside /moa. MoA is not steerable (nothing drains
+        # the queue while advisors run), so /steer has to refuse rather than
+        # park an instruction that would fire in the next agent turn.
+        self._moa_sessions: set[str] = set()
         self._scrubber_pool = ScrubberPool()
 
         # Per-session last-active timestamps for idle timeout detection.
@@ -1414,6 +1420,17 @@ class AgentLoop:
             result.metadata.setdefault("message_id", msg.metadata.get("message_id"))
             result.metadata.setdefault("reaction_id", msg.metadata.get("reaction_id"))
             return result
+
+        # A leading "/" that matched nothing is almost always a typo
+        # ("/trace[full]", "/compcat"). Answering with /help beats forwarding it
+        # to the model, which would spend a turn "explaining" a non-command.
+        if looks_like_command(raw):
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=t("cmd.unknown", command=raw.split()[0]),
+                metadata={"render_as": "text"},
+            )
 
         # 检测"继续"指令：当用户输入"继续"/"continue"等时，注入 resume 引导，
         # 让 LLM 知道要从上次中断处续接，而不是当作全新请求处理。

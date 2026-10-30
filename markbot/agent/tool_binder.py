@@ -32,6 +32,7 @@ class ToolBinder:
         exec_config: Any = None,
         filesystem_config: Any = None,
         code_execution_config: Any = None,
+        message_config: Any = None,
         computer_use_config: Any = None,
         browser_config: Any = None,
         cron_service: "CronService | None" = None,
@@ -50,6 +51,7 @@ class ToolBinder:
         self._exec_config = exec_config
         self._filesystem_config = filesystem_config
         self._code_execution_config = code_execution_config
+        self._message_config = message_config
         self._computer_use_config = computer_use_config
         self._browser_config = browser_config
         self._cron_service = cron_service
@@ -171,8 +173,12 @@ class ToolBinder:
                 require_allowlist = True
             allow_patterns = list(getattr(self._exec_config, "allow_patterns", None) or [])
             deny_patterns = list(getattr(self._exec_config, "deny_patterns", None) or [])
-            allow_shell_chaining = bool(
-                getattr(self._exec_config, "allow_shell_chaining", False)
+            allow_nested_shell = bool(
+                getattr(
+                    self._exec_config,
+                    "allow_nested_shell",
+                    getattr(self._exec_config, "allow_shell_chaining", False),
+                )
             )
             # Safe default allowlist for assistant/unattended when none configured.
             if require_allowlist and not allow_patterns:
@@ -187,7 +193,7 @@ class ToolBinder:
                     timeout=self._exec_config.timeout,
                     restrict_to_workspace=restrict,
                     require_allowlist=require_allowlist,
-                    allow_shell_chaining=allow_shell_chaining,
+                    allow_nested_shell=allow_nested_shell,
                     allow_patterns=allow_patterns,
                     deny_patterns=deny_patterns,
                     path_append=self._exec_config.path_append,
@@ -221,7 +227,20 @@ class ToolBinder:
         from markbot.tools.think import ThinkTool
         from markbot.tools.todo import TodoTool
 
-        self._tools.register(MessageTool(send_callback=self._publish_outbound))
+        self._tools.register(
+            MessageTool(
+                send_callback=self._publish_outbound,
+                allowed_media_roots=list(
+                    getattr(self._message_config, "allowed_media_roots", None) or []
+                ),
+                allowed_chat_ids=list(
+                    getattr(self._message_config, "allowed_chat_ids", None) or []
+                ),
+                allow_cross_chat=bool(
+                    getattr(self._message_config, "allow_cross_chat", False)
+                ),
+            )
+        )
         if self._subagent_manager and (
             self._profile is None or getattr(self._profile, "enable_subagents", True)
         ):

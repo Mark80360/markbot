@@ -56,6 +56,11 @@ class CodeExecutionTool(Tool):
         if config is not None:
             self._default_timeout = int(getattr(config, "timeout", self._DEFAULT_TIMEOUT))
             self._max_memory_mb = int(getattr(config, "max_memory_mb", 256))
+            # Refuse to run when the host cannot provide OS-level isolation.
+            # PATH restriction is not a sandbox, so an operator who needs the
+            # guarantee has to be able to say "degrade = fail" instead of
+            # getting a silently unrestricted run.
+            self._require_isolation = bool(getattr(config, "require_isolation", False))
             # Normalise the whitelist once: lowercase package names, strip
             # version specifiers so ``numpy>=1.20`` matches ``numpy``.
             raw_allowed = getattr(config, "allowed_dependencies", None) or []
@@ -63,6 +68,7 @@ class CodeExecutionTool(Tool):
         else:
             self._default_timeout = self._DEFAULT_TIMEOUT
             self._max_memory_mb = 256
+            self._require_isolation = False
             self._allowed_deps = set()
 
     @staticmethod
@@ -160,7 +166,7 @@ class CodeExecutionTool(Tool):
         if len(code) > self._MAX_CODE_CHARS:
             return f"Error: Code exceeds {self._MAX_CODE_CHARS:,} character limit."
 
-        scan_error = self._scan_code(code)
+        scan_error, scan_warnings = self._scan_code(code)
         if scan_error:
             return scan_error
 
@@ -181,6 +187,7 @@ class CodeExecutionTool(Tool):
                 max_memory_mb=self._max_memory_mb,
                 max_cpu_time=timeout,
                 network=False,
+                require_isolation=self._require_isolation,
             )
 
             sandbox = Sandbox(sandbox_config)
@@ -211,6 +218,21 @@ class CodeExecutionTool(Tool):
             )
 
             output = self._format_result(result)
+
+            # Surface the findings the trust policy allowed through. These are
+            # not blocks, but they are the difference between "the scanner saw
+            # nothing" and "the scanner saw something and we ran it anyway".
+            # Silently dropping them here made a risky run indistinguishable
+            # from a clean one for both the model and the human reviewing the
+            # transcript, which is exactly the kind of hidden state that turns
+            # a warning into a surprise later.
+            if scan_warnings:
+                output = (
+                    "--- Security scan (not blocked, review recommended) ---\n"
+                    + "\n".join(f"  - {w}" for w in scan_warnings)
+                    + "\n"
+                    + output
+                )
 
             # Persist a successful script as a reusable skill tool so the
             # agent can extend its own toolset. Only persist when the run
@@ -266,7 +288,15 @@ class CodeExecutionTool(Tool):
                 except OSError:
                     pass
 
-    def _scan_code(self, code: str) -> str | None:
+    def _scan_code(self, code: str) -> tuple[str | None, list[str]]:
+        """Scan *code* before execution.
+
+        Returns ``(blocking_error, warnings)``. ``warnings`` are the findings
+        the trust policy lets through (``high``/``medium`` under
+        ``agent-created``); they used to be written to a debug log and were
+        invisible in the transcript, so a "caution" scan and a clean scan
+        looked identical to both the model and the operator.
+        """
         try:
             from markbot.skills.core.scanner import BLOCKING_SEVERITIES, SecurityScanner
 
@@ -284,18 +314,14 @@ class CodeExecutionTool(Tool):
                         "Error: Code blocked by security scan.\n"
                         + "\n".join(blocking)
                         + "\nRefactor the code to avoid these patterns."
-                    )
+                    ), []
 
-            if scan_result.findings:
-                warnings = [
-                    f"  - [{f.severity}] {f.message}"
-                    for f in scan_result.findings
-                    if f.severity not in BLOCKING_SEVERITIES
-                ]
-                if warnings:
-                    logger.debug("Code scan warnings: {}", warnings)
-
-            return None
+            warnings = [
+                f"[{f.severity}] {f.message} (line {f.line})"
+                for f in scan_result.findings
+                if f.severity not in BLOCKING_SEVERITIES
+            ]
+            return None, warnings
 
         except Exception as e:
             # Fail CLOSED. This is a security control: an import error, a
@@ -311,7 +337,7 @@ class CodeExecutionTool(Tool):
                 "Refusing to execute unscanned code. This is a fail-closed "
                 "guard; retry, or run the command through the exec tool with "
                 "an explicit approval prompt."
-            )
+            ), []
 
     @staticmethod
     def _build_dep_shim(dependencies: list[str]) -> str:
@@ -535,5 +561,24 @@ class CodeExecutionTool(Tool):
 
         if result.execution_time_ms > 1000:
             parts.append(f"\n[executed in {result.execution_time_ms / 1000:.1f}s]")
+
+        # Report the isolation level that was *actually* applied. A degraded
+        # run has no kernel-level filesystem or network restriction, only a
+        # PATH clamp, and previously nothing told the model (or the operator
+        # reading the transcript) that the guarantee had silently vanished.
+        # "none" is only worth mentioning when isolation was asked for.
+        isolation = getattr(result, "isolation_level", "none")
+        if isolation == "degraded":
+            parts.append(
+                "\n[markbot warning] OS-level isolation was NOT applied "
+                "(sandbox-exec/bwrap unavailable). This run had unrestricted "
+                "filesystem read access and could reach the network; only "
+                "PATH was restricted. Do not treat its output as sandboxed."
+            )
+        elif isolation == "none" and getattr(result, "isolation_requested", False):
+            parts.append(
+                "\n[markbot warning] Isolation is disabled by configuration "
+                "(isolate=False); the script ran without a sandbox."
+            )
 
         return "\n".join(parts)

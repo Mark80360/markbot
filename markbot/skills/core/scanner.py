@@ -30,6 +30,10 @@ class ScanResult:
     findings: list[Finding] = field(default_factory=list)
     scan_duration_ms: float = 0.0
     verdict: str = "safe"
+    #: Trust level the ``is_safe`` verdict was computed under. Recorded so a
+    #: caller can tell *why* a "caution" scan came back safe instead of
+    #: having to guess which of two rules was applied.
+    trust_level: str = "workspace"
 
 
 TRUST_POLICY = {
@@ -40,6 +44,24 @@ TRUST_POLICY = {
 }
 
 BLOCKING_SEVERITIES = {"critical", "high"}
+
+
+def is_safe_for_trust_level(verdict: str, trust_level: str) -> bool:
+    """The single definition of "this scan passed".
+
+    ``scan()`` and ``scan_code()`` used to answer this question two
+    different ways: ``scan()`` asked "does any finding have a blocking
+    severity" (``critical`` **or** ``high``), while ``scan_code()`` asked
+    "does the trust policy block this verdict". For a ``high`` finding under
+    ``agent-created`` the first said unsafe and the second said safe — the
+    same input, two answers, depending on which entry point you called.
+
+    The trust policy is the authority: it is the documented ladder
+    (builtin > workspace > agent-created > external) and ``should_allow``
+    already used it. Both scan paths now go through here.
+    """
+    policy = TRUST_POLICY.get(trust_level, TRUST_POLICY["workspace"])
+    return policy.get(verdict, "block") != "block"
 
 
 def should_allow(result: ScanResult, trust_level: str = "workspace") -> tuple[bool, str]:
@@ -80,6 +102,19 @@ THREAT_PATTERNS = [
     (r'\$HOME/\.aws|\~/\.aws',
      "aws_dir_access", "high", "exfiltration",
      "references user AWS credentials directory"),
+    # The two rules above only fire when ``~/.ssh`` appears as a contiguous
+    # string. ``Path.home() / ".ssh" / "id_rsa"`` reads the exact same file
+    # and matched nothing at all — the scanner returned verdict "safe" with
+    # zero findings. These rules catch the path-component spelling.
+    (r'''["']\.(ssh|aws|kube|gnupg|docker|azure|config/gcloud)["']''',
+     "credential_dir_component", "critical", "exfiltration",
+     "builds a path into a credential directory (~/.ssh, ~/.aws, …)"),
+    (r'''["']\.(netrc|pgpass|npmrc|pypirc|git-credentials)["']''',
+     "credential_file_component", "critical", "exfiltration",
+     "references a known credential file by name"),
+    (r'Path\.home\s*\(\s*\)',
+     "path_home_access", "high", "exfiltration",
+     "resolves the user's home directory (credential access precursor)"),
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)',
      "read_secrets_file", "critical", "exfiltration",
      "reads known secrets file"),
@@ -200,7 +235,7 @@ THREAT_PATTERNS = [
      "eval_string", "high", "obfuscation",
      "eval() with string argument"),
     (r'\bexec\s*\(\s*["\']',
-     "exec_string", "high", "obfuscation",
+     "exec_string", "critical", "obfuscation",
      "exec() with string argument"),
     (r'echo\s+[^\n]*\|\s*(bash|sh|python|perl|ruby|node)',
      "echo_pipe_exec", "critical", "obfuscation",
@@ -222,13 +257,13 @@ THREAT_PATTERNS = [
      "python_subprocess", "medium", "execution",
      "Python subprocess execution"),
     (r'os\.system\s*\(',
-     "python_os_system", "high", "execution",
+     "python_os_system", "critical", "execution",
      "os.system() — unguarded shell execution"),
     (r'os\.popen\s*\(',
-     "python_os_popen", "high", "execution",
+     "python_os_popen", "critical", "execution",
      "os.popen() — shell pipe execution"),
     (r'child_process\.(exec|spawn|fork)\s*\(',
-     "node_child_process", "high", "execution",
+     "node_child_process", "critical", "execution",
      "Node.js child_process execution"),
 
     (r'\.\./\.\./\.\.',
@@ -376,7 +411,12 @@ class SecurityScanner:
                     logger.warning("Invalid SKILL.md threat pattern '{}': {}", pid, e)
         return self._compiled_skill_md_threats
 
-    def scan(self, script_path: Path, language: Optional[str] = None) -> ScanResult:
+    def scan(
+        self,
+        script_path: Path,
+        language: Optional[str] = None,
+        trust_level: str = "workspace",
+    ) -> ScanResult:
         """Scan a script file for dangerous patterns."""
         import time
 
@@ -434,7 +474,10 @@ class SecurityScanner:
         findings.extend(self._check_obfuscation(content))
 
         verdict = self._compute_verdict(findings)
-        is_safe = verdict == "safe" or not any(f.severity in BLOCKING_SEVERITIES for f in findings)
+        # Was a second, incompatible rule: "any finding with a blocking
+        # severity". A high finding therefore made scan() report unsafe while
+        # scan_code() reported safe for the same input.
+        is_safe = is_safe_for_trust_level(verdict, trust_level)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -443,6 +486,7 @@ class SecurityScanner:
             findings=findings,
             scan_duration_ms=scan_duration,
             verdict=verdict,
+            trust_level=trust_level,
         )
 
     def scan_code(
@@ -491,10 +535,7 @@ class SecurityScanner:
         findings.extend(self._check_obfuscation(code))
 
         verdict = self._compute_verdict(findings)
-
-        policy = TRUST_POLICY.get(trust_level, TRUST_POLICY["workspace"])
-        action = policy.get(verdict, "block")
-        is_safe = action != "block"
+        is_safe = is_safe_for_trust_level(verdict, trust_level)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -503,9 +544,12 @@ class SecurityScanner:
             findings=findings,
             scan_duration_ms=scan_duration,
             verdict=verdict,
+            trust_level=trust_level,
         )
 
-    def scan_skill_md(self, skill_md_path: Path) -> ScanResult:
+    def scan_skill_md(
+        self, skill_md_path: Path, trust_level: str = "workspace"
+    ) -> ScanResult:
         """Scan a SKILL.md file for prompt injection and dangerous patterns."""
         import time
 
@@ -533,7 +577,7 @@ class SecurityScanner:
                 ))
 
         verdict = self._compute_verdict(findings)
-        is_safe = self._is_safe_from_findings(findings)
+        is_safe = is_safe_for_trust_level(verdict, trust_level)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -542,6 +586,7 @@ class SecurityScanner:
             findings=findings,
             scan_duration_ms=scan_duration,
             verdict=verdict,
+            trust_level=trust_level,
         )
 
     def scan_skill_dir(self, skill_dir: Path, trust_level: str = "workspace") -> ScanResult:
@@ -553,7 +598,7 @@ class SecurityScanner:
 
         skill_md = skill_dir / "SKILL.md"
         if skill_md.exists():
-            md_result = self.scan_skill_md(skill_md)
+            md_result = self.scan_skill_md(skill_md, trust_level=trust_level)
             all_findings.extend(md_result.findings)
 
         for f in sorted(skill_dir.rglob("*")):
@@ -571,11 +616,11 @@ class SecurityScanner:
             if not language:
                 continue
 
-            result = self.scan(f, language)
+            result = self.scan(f, language, trust_level=trust_level)
             all_findings.extend(result.findings)
 
         verdict = self._compute_verdict(all_findings)
-        is_safe = self._is_safe_from_findings(all_findings)
+        is_safe = is_safe_for_trust_level(verdict, trust_level)
 
         scan_duration = (time.perf_counter() - start_time) * 1000
 
@@ -584,10 +629,18 @@ class SecurityScanner:
             findings=all_findings,
             scan_duration_ms=scan_duration,
             verdict=verdict,
+            trust_level=trust_level,
         )
 
     @staticmethod
     def _is_safe_from_findings(findings: list[Finding]) -> bool:
+        """Severity-only view: "does this contain a critical/high finding".
+
+        This is **not** the allow/deny verdict — it is a strictness probe
+        kept for callers that want "is there anything alarming at all".
+        Use :func:`is_safe_for_trust_level` (or ``ScanResult.is_safe``) for
+        the decision, so the trust ladder is applied exactly once.
+        """
         return not any(f.severity in BLOCKING_SEVERITIES for f in findings)
 
     @staticmethod

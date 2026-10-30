@@ -40,3 +40,5 @@ node_modules/
 web/node_modules/
 .markbot/
 .mimocode/
+.screenshots/
+.pytest_tmp/

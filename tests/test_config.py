@@ -33,7 +33,10 @@ class TestAgentDefaults:
         assert ad.max_tool_iterations == 40
         assert ad.timezone == "UTC"
         assert ad.default_permission_mode is None  # inherit from profile
-        assert ad.profile == "coding"
+        # Was "coding", which resolved to permission_mode="auto" — i.e. an
+        # unset profile meant "no confirmation anywhere".
+        assert ad.profile == "assistant"
+        assert ad.permission_approval_timeout_s == 60.0
 
     def test_custom_values(self):
         ad = AgentDefaults(max_tokens=4096, temperature=0.5)

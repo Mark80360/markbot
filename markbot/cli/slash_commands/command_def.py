@@ -11,8 +11,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
 
+from markbot.locales import t
+
 if TYPE_CHECKING:
     from markbot.cli.slash_commands.router import CommandContext, Handler
+
+
+def _i18n(key: str, default: str) -> str:
+    """``t()`` that falls back to *default* instead of echoing the key."""
+    try:
+        text = t(key)
+    except Exception:  # pragma: no cover - i18n must never break /help
+        return default
+    return default if text == key else text
 
 
 class CommandTier(str, Enum):
@@ -52,9 +63,20 @@ class CommandDef:
             names.append(a if a.startswith("/") else f"/{a}")
         return tuple(names)
 
+    def localized_description(self) -> str:
+        """Description in the active UI language, falling back to ``description``.
+
+        ``t()`` returns the bare key when a catalog entry is missing, so the
+        English literal in ``description`` stays the source of truth and the
+        locale file only has to override what it actually translates.
+        """
+        key = f"cmd.help.desc.{self.canonical.lstrip('/')}"
+        return _i18n(key, self.description)
+
     def help_line(self) -> str:
         hint = f" {self.args_hint}" if self.args_hint else ""
-        return f"{self.canonical}{hint} — {self.description}"
+        alias = f" ({', '.join(self.all_names()[1:])})" if self.aliases else ""
+        return f"{self.canonical}{hint}{alias} — {self.localized_description()}"
 
 
 @dataclass
@@ -82,9 +104,29 @@ class CommandCatalog:
         return out
 
     def help_text(self, surface: str | CommandSurface = CommandSurface.ALL) -> str:
-        lines = ["MarkBot commands:"]
-        for d in self.list_for_surface(surface):
-            lines.append(d.help_line())
+        """Render the command list grouped by ``category``.
+
+        Grouping is what keeps a 13-line flat list readable as more commands
+        land; the order below is the one users scan in (what can stop the
+        agent, what touches the conversation, what changes the process).
+        """
+        items = self.list_for_surface(surface)
+        header = _i18n(
+            "cmd.help.header",
+            "MarkBot session commands (only valid inside a markbot session):",
+        )
+        lines = [header]
+        buckets: dict[str, list[CommandDef]] = {}
+        for d in items:
+            buckets.setdefault(d.category, []).append(d)
+        order = ["control", "session", "runtime", "general"]
+        categories = [c for c in order if c in buckets]
+        categories += [c for c in buckets if c not in order]
+        for category in categories:
+            lines.append("")
+            lines.append(_i18n(f"cmd.help.category.{category}", category))
+            for d in buckets[category]:
+                lines.append(f"  {d.help_line()}")
         return "\n".join(lines)
 
     def names(self) -> list[str]:

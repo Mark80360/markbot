@@ -631,6 +631,66 @@ class TestGuardrailResetForTurn:
         assert g.state.failed_methods == []
 
 
+class TestPolicyDenialIsNotAToolFailure:
+    """A guard refusal must not be learned as "this tool is broken".
+
+    Regression from the 2026-10-30 gateway log: three ``cd … && ls`` commands
+    were refused by the allowlist, the third refusal produced "Tool `exec`
+    failed 3 times in a row. Stop using it and switch methods", and the
+    denial was written into the failed-method blacklist. The model then
+    reported that exec had been disabled and abandoned it for the rest of the
+    session — over a command it only had to rewrite.
+    """
+
+    DENIAL = (
+        "Error: Command blocked by safety guard (not in allowlist): "
+        "`cd` is not an allowed command. Allowed leading commands: ls, cat."
+    )
+
+    def test_classifier(self):
+        from markbot.agent.tool_guardrails import is_policy_denial
+        assert is_policy_denial(self.DENIAL)
+        assert not is_policy_denial("Error: exit code 2")
+        assert not is_policy_denial("Traceback: boom")
+        # File/log content that merely mentions the phrase is not a refusal.
+        assert not is_policy_denial("README says: blocked by safety guard is the marker")
+
+    def test_streak_not_advanced_by_denials(self):
+        from markbot.agent.tool_guardrails import ToolCallGuardrail, GuardrailAction
+        g = ToolCallGuardrail()
+        decisions = [
+            g.observe("exec", {"command": f"cd /w && ls {i}"}, self.DENIAL)
+            for i in range(5)
+        ]
+        assert all(d.action is GuardrailAction.ALLOW for d in decisions)
+        assert g.state.tool_streaks.get("exec", 0) == 0
+
+    def test_denial_not_written_to_the_blacklist(self):
+        from markbot.agent.tool_guardrails import ToolCallGuardrail
+        g = ToolCallGuardrail()
+        g.observe("exec", {"command": "cd /w && ls"}, self.DENIAL)
+        assert g.state.failed_methods == []
+
+    def test_denial_still_counts_toward_the_failure_window(self):
+        """A turn full of refusals is still a turn going badly — the window
+        keeps feeding reflection / halt, only the per-tool verdict changes."""
+        from markbot.agent.tool_guardrails import ToolCallGuardrail
+        g = ToolCallGuardrail()
+        g.observe("exec", {"command": "cd /w && ls"}, self.DENIAL)
+        assert g.state.total_failures == 1
+        assert g.state.recent_failures == [True]
+
+    def test_real_failures_still_blacklisted_and_escalated(self):
+        from markbot.agent.tool_guardrails import ToolCallGuardrail, GuardrailAction
+        g = ToolCallGuardrail()
+        decision = None
+        for i in range(3):
+            decision = g.observe("exec", {"command": f"make {i}"}, "Error: exit code 2")
+        assert decision.action is GuardrailAction.WARN
+        assert decision.reason == "tool_streak"
+        assert g.state.failed_methods and g.state.failed_methods[0].startswith("exec")
+
+
 class TestGuardrailLoopCap:
     """check_loop_cap enforces per-turn hard ceilings on runaway tools."""
 

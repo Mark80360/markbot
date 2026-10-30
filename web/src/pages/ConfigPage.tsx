@@ -100,7 +100,7 @@ function ConfigField({
 
   if (type === "boolean") {
     return (
-      <div className="flex items-center justify-between py-2">
+      <div className="flex flex-col gap-1.5 py-2 sm:flex-row sm:items-center sm:justify-between">
         <label className="text-sm text-text-secondary">{label}</label>
         <button
           onClick={() => onChange(fieldKey, !value)}
@@ -122,13 +122,13 @@ function ConfigField({
 
   if (type === "number") {
     return (
-      <div className="flex items-center justify-between py-2">
+      <div className="flex flex-col gap-1.5 py-2 sm:flex-row sm:items-center sm:justify-between">
         <label className="text-sm text-text-secondary">{label}</label>
         <input
           type="number"
           value={value ?? ""}
           onChange={(e) => onChange(fieldKey, e.target.value === "" ? null : Number(e.target.value))}
-          className="w-28 px-2 py-1 text-sm text-right rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
+          className="w-full rounded border border-border bg-background px-2 py-1 text-sm text-text-primary outline-none transition-colors focus:border-accent-teal sm:w-28 sm:text-right"
         />
       </div>
     );
@@ -137,13 +137,13 @@ function ConfigField({
   if (type === "array") {
     const strValue = Array.isArray(value) ? value.join(", ") : String(value ?? "");
     return (
-      <div className="flex items-center justify-between py-2">
+      <div className="flex flex-col gap-1.5 py-2 sm:flex-row sm:items-center sm:justify-between">
         <label className="text-sm text-text-secondary">{label}</label>
         <input
           type="text"
           value={strValue}
           onChange={(e) => onChange(fieldKey, e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
-          className="w-48 px-2 py-1 text-sm rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
+          className="w-full rounded border border-border bg-background px-2 py-1 text-sm text-text-primary outline-none transition-colors focus:border-accent-teal sm:w-48"
           placeholder="逗号分隔"
         />
       </div>
@@ -151,13 +151,13 @@ function ConfigField({
   }
 
   return (
-    <div className="flex items-center justify-between py-2">
+    <div className="flex flex-col gap-1.5 py-2 sm:flex-row sm:items-center sm:justify-between">
       <label className="text-sm text-text-secondary">{label}</label>
       <input
         type="text"
         value={value ?? ""}
         onChange={(e) => onChange(fieldKey, e.target.value)}
-        className="w-48 px-2 py-1 text-sm rounded border border-border bg-background text-text-primary outline-none focus:border-accent-teal transition-colors"
+        className="w-full rounded border border-border bg-background px-2 py-1 text-sm text-text-primary outline-none transition-colors focus:border-accent-teal sm:w-48"
       />
     </div>
   );
@@ -318,15 +318,15 @@ export default function ConfigPage() {
     toast("已重置为默认值", "success");
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   const activeSubGroups = isSearching ? searchSubGroups : categorySubGroups;
   const totalFields = isSearching ? searchResults.length : categoryFields.length;
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="Config"
+        title="配置"
         description="编辑 Markbot 配置"
         actions={
           <div className="flex items-center gap-2">
@@ -373,13 +373,13 @@ export default function ConfigPage() {
             onChange={(e) => setRaw(e.target.value)}
             spellCheck={false}
             className="w-full font-mono text-sm p-4 bg-transparent text-text-primary outline-none resize-none"
-            style={{ height: "calc(100vh - 260px)", minHeight: "400px" }}
+            style={{ height: "calc(100dvh - 260px)", minHeight: "320px" }}
           />
         </div>
       ) : (
-        <div className="flex gap-4">
-          <aside className="w-48 shrink-0">
-            <div className="sticky top-4">
+        <div className="flex flex-col gap-4 lg:flex-row">
+          <aside className="w-full shrink-0 lg:w-48">
+            <div className="lg:sticky lg:top-4">
               <div className="rounded-lg border border-border bg-background-secondary overflow-hidden">
                 <div className="px-3 py-2 border-b border-border flex items-center gap-2">
                   <Search size={12} className="text-text-muted" />

@@ -39,14 +39,14 @@ export default function ChannelsPage() {
     }
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   const channels = data?.channels || [];
   const enabledCount = channels.filter((c: any) => c.enabled).length;
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
-      <PageHeader title="Channels" description={`消息通道状态与配置 · ${enabledCount}/${channels.length} 启用`} />
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
+      <PageHeader title="渠道" description={`消息通道状态与配置 · ${enabledCount}/${channels.length} 启用`} />
 
       <Feedback message={feedback} />
 

@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from markbot.skills.core.scanner import (
+    BLOCKING_SEVERITIES,
     Finding,
     ScanResult,
     SecurityScanner,
+    is_safe_for_trust_level,
     should_allow,
 )
 
@@ -86,7 +88,15 @@ class TestSecurityScanner:
         script.write_text('import os\nos.system("ls")\n')
         result = scanner.scan(script)
         assert len(result.findings) > 0
-        assert any(f.severity == "high" for f in result.findings)
+        # ``os.system`` used to be ``high``, which under the ``workspace``
+        # policy produced a "caution" verdict that was then *allowed*. It is
+        # unguarded shell execution: a string reaches /bin/sh with no quoting,
+        # no argv separation and no way to inspect what will run. It is now
+        # ``critical`` so the verdict is "dangerous" and the default policy
+        # blocks it. Assert the actual current severity, not a vague ">0".
+        assert any(f.severity == "critical" for f in result.findings)
+        assert result.verdict == "dangerous"
+        assert result.is_safe is False
 
     def test_scan_pickle(self, scanner, tmp_path):
         script = tmp_path / "unsafe.py"
@@ -183,3 +193,116 @@ class TestSecurityScanner:
     def test_get_allowed_patterns_unknown(self, scanner):
         patterns = scanner.get_allowed_patterns("unknown_lang")
         assert patterns == []
+
+
+class TestTrustLevelIsTheOnlyVerdict:
+    """``scan()`` and ``scan_code()`` must answer "did this pass" identically.
+
+    Before: ``scan()`` asked "is any finding critical/high" while
+    ``scan_code()`` asked "does the trust policy block this verdict". A
+    ``high`` finding under ``agent-created`` was unsafe through one door and
+    safe through the other. Same bytes, two answers.
+    """
+
+    #: Contains ``sudo`` -> a single ``high`` finding, no ``critical``.
+    HIGH_ONLY = "sudo -n true\n"
+
+    def test_high_finding_is_safe_under_agent_created(self, scanner, tmp_path):
+        script = tmp_path / "s.py"
+        script.write_text(self.HIGH_ONLY)
+
+        by_file = scanner.scan(script, "python", trust_level="agent-created")
+        by_code = scanner.scan_code(self.HIGH_ONLY, "python", trust_level="agent-created")
+
+        assert by_file.verdict == "caution"
+        assert by_file.is_safe == by_code.is_safe == is_safe_for_trust_level("caution", "agent-created")
+        assert by_file.is_safe is True
+
+    def test_high_finding_is_blocked_under_external(self, scanner, tmp_path):
+        script = tmp_path / "s.py"
+        script.write_text(self.HIGH_ONLY)
+
+        by_file = scanner.scan(script, "python", trust_level="external")
+        by_code = scanner.scan_code(self.HIGH_ONLY, "python", trust_level="external")
+
+        assert by_file.is_safe is False
+        assert by_file.is_safe == by_code.is_safe
+
+    def test_entry_points_agree_across_all_trust_levels(self, scanner, tmp_path):
+        script = tmp_path / "s.py"
+        script.write_text(self.HIGH_ONLY)
+        for level in ("builtin", "workspace", "agent-created", "external", "nonsense"):
+            by_file = scanner.scan(script, "python", trust_level=level)
+            by_code = scanner.scan_code(self.HIGH_ONLY, "python", trust_level=level)
+            assert by_file.is_safe == by_code.is_safe, level
+            assert by_file.trust_level == by_code.trust_level == level
+
+    def test_dangerous_is_blocked_everywhere_except_builtin(self, scanner):
+        code = "import os\nos.system('rm -rf /')\n"
+        for level in ("workspace", "agent-created", "external"):
+            assert scanner.scan_code(code, trust_level=level).is_safe is False, level
+        assert scanner.scan_code(code, trust_level="builtin").is_safe is True
+
+    def test_policy_is_a_superset_not_a_bypass(self, scanner):
+        """Pin the ladder: no trust level may be *laxer* than ``workspace``
+        on ``dangerous`` (except ``builtin``, the documented escape hatch for
+        code shipping with markbot itself), and ``external`` is strictly
+        stricter because it also blocks ``caution``."""
+        expected = {
+            "builtin":       {"safe": True, "caution": True, "dangerous": True},
+            "workspace":     {"safe": True, "caution": True, "dangerous": False},
+            "agent-created": {"safe": True, "caution": True, "dangerous": False},
+            "external":      {"safe": True, "caution": False, "dangerous": False},
+        }
+        for level, table in expected.items():
+            for verdict, want in table.items():
+                assert is_safe_for_trust_level(verdict, level) is want, (level, verdict)
+
+        # An unknown trust level must fall back to workspace, never to builtin.
+        for verdict in ("safe", "caution", "dangerous"):
+            assert is_safe_for_trust_level(verdict, "no-such-level") is is_safe_for_trust_level(
+                verdict, "workspace"
+            )
+
+        assert BLOCKING_SEVERITIES == {"critical", "high"}
+
+
+class TestCredentialPathComponents:
+    """``Path.home() / ".ssh" / "id_rsa"`` matched nothing before.
+
+    The old rules only fired on the contiguous strings ``~/.ssh`` and
+    ``$HOME/.ssh``. Building the same path out of components is the natural
+    way to write it in Python and returned verdict ``safe`` with zero
+    findings — the scanner was blind to the most ordinary spelling.
+    """
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            'key = Path.home() / ".ssh" / "id_rsa"',
+            'p = os.path.join(str(Path.home()), ".aws", "credentials")',
+            'cfg = home / ".kube" / "config"',
+            'gpg = Path.home() / ".gnupg"',
+            'd = Path.home() / ".docker" / "config.json"',
+            'n = Path.home() / ".netrc"',
+            'pypi = Path.home() / ".pypirc"',
+            'git = home / ".git-credentials"',
+        ],
+    )
+    def test_component_spelling_is_detected(self, scanner, snippet):
+        result = scanner.scan_code(snippet, trust_level="workspace")
+        assert result.findings, f"no finding for: {snippet}"
+        assert result.verdict == "dangerous"
+        assert result.is_safe is False
+
+    @pytest.mark.parametrize(
+        "snippet",
+        [
+            'path = Path("data") / "output.csv"',
+            'name = ".config"',
+            'import json\njson.dump({}, open("out.json", "w"))',
+        ],
+    )
+    def test_ordinary_paths_are_not_flagged(self, scanner, snippet):
+        result = scanner.scan_code(snippet, trust_level="workspace")
+        assert result.is_safe is True, [(f.pattern, f.severity) for f in result.findings]

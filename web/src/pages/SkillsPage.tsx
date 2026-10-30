@@ -49,7 +49,7 @@ export default function SkillsPage() {
     }
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   const allSkills = data?.skills || [];
   const skills = search
@@ -59,9 +59,9 @@ export default function SkillsPage() {
   const customCount = allSkills.length - builtinCount;
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="Skills"
+        title="技能"
         description={`技能插件管理 · 共 ${allSkills.length} 个 · ${builtinCount} 内置 · ${customCount} 自定义`}
         actions={
           <Button size="sm" onClick={() => setShowAdd(!showAdd)}>

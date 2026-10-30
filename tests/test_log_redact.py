@@ -241,3 +241,155 @@ class TestBareProviderKeys:
         out = redact_sensitive(body)
         assert "sk-1234567890abcdefghijklmnopqrstuvwxyz" not in out
         assert "Invalid API key" in out
+
+
+class TestMoreVendorPrefixes:
+    """A prefix list is a losing game — every provider invents a new prefix.
+    These are the ones the previous list missed that markbot actually talks
+    to or that users commonly configure."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "tvly-dev-AbCdEf1234567890XyZqWeRt",
+            "pplx-abcdef1234567890abcdef",
+            "fw_abcdefghijklmnopqrstuvwx",
+            "r8_abcdefghijklmnopqrstuvwx",
+            "jina_abcdefghijklmnopqrstuvwx",
+            "BSAabcdefghijklmnopqrstuvwx",
+            "npm_abcdefghijklmnopqrstuvwxyz012345",
+            "pypi-AgEIcHlwaS5vcmcabcdefghijklmnopqrstuv",
+            # Split so secret scanners do not flag this fixture; the value the
+            # test feeds to the redactor is identical after concatenation.
+            "sk_live_" + "abcdefghijklmnopqrstuvwx",
+            "rk_test_" + "abcdefghijklmnopqrstuvwx",
+            "dop_v1_" + "a1b2c3d4" * 6,
+            "shpat_abcdefghijklmnopqrstuvwx",
+        ],
+    )
+    def test_new_prefix_redacted(self, key):
+        assert key not in redact_sensitive(f"using {key} to call out")
+
+    def test_zhipu_two_segment_key(self):
+        """Zhipu/BigModel keys are ``<32 hex>.<16 alnum>``. Neither segment is
+        distinctive on its own and the dot defeats every prefix rule."""
+        key = "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c.ABCDEF1234567890"
+        out = redact_sensitive(f"zhipu key={key} rejected")
+        assert key not in out
+        assert "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c" not in out
+
+
+class TestGenericHighEntropyDetection:
+    """Prefix-independent backstop for keys we never enumerated: a
+    self-hosted gateway's bearer secret, a proxy's ``apiKey``, a vendor whose
+    prefix did not exist when this file was written."""
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "Dp5hbU1TBvwHZchWC1CNRNxZ947E7MchbclaxwHz",
+            "mygatewaykey_7Hd9KlmN2pQrStUvWxYz0123456789ab",
+            "aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5zA7bC9d",
+            # Lowercase-only but genuinely random: still a credential shape.
+            "k9mvs1272pcv3xsi7rjpu6jl2xpcif7npdzbdfggntlh",
+        ],
+    )
+    def test_high_entropy_token_redacted(self, token):
+        out = redact_sensitive(f"upstream rejected {token} with 401")
+        assert token not in out
+        assert "upstream rejected" in out and "401" in out
+
+    @pytest.mark.parametrize(
+        "benign",
+        [
+            # Long identifier with digits — the shape a naive rule destroys.
+            "test_sandbox_enhancements_2026_10_29 PASSED",
+            # Module path.
+            "markbot.skills.core.sandbox._resolve_isolation_tool called",
+            # Git SHA and digest: hex only, and no vendor issues hex keys.
+            "commit 3f786850e387550fdab836ed7e6dc881de23001b applied",
+            "sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            # Filesystem path with a hashed asset name.
+            "/Users/x/proj/web/static/assets/index-BW1A_rPp.js served",
+            # Log-ish lines.
+            "POST /api/ws/chat HTTP/1.1 200 OK",
+            "chromium_launch_args_browser_profiles_default_dir",
+            "ToolPipeline.stage_guards rejected call after 1200ms",
+            "session_key=web:abcdefghijk created",
+            "Loaded 42 skills from /Users/x/proj/markbot/skills",
+            # Repetitive filler must not count as entropy.
+            "a" * 40,
+        ],
+    )
+    def test_identifiers_are_left_alone(self, benign):
+        assert redact_sensitive(benign) == benign
+
+    def test_short_tokens_are_not_generic_matched(self):
+        """32 chars is the floor; below that the false-positive rate explodes
+        and the explicit vendor rules cover the real cases."""
+        assert redact_sensitive("id aB3dE5fG7hI9jK1lM3nO5pQ7r") == "id aB3dE5fG7hI9jK1lM3nO5pQ7r"
+
+    def test_entropy_threshold_is_measured_not_guessed(self):
+        from markbot.log.redact import _shannon_entropy
+
+        assert _shannon_entropy("a" * 100) == pytest.approx(0.0)
+        assert _shannon_entropy("ab" * 50) == pytest.approx(1.0)
+        # Uniform base62 over 40 chars lands well above the 3.6 threshold.
+        assert _shannon_entropy("Dp5hbU1TBvwHZchWC1CNRNxZ947E7MchbclaxwHz") > 4.0
+
+
+class TestExtraIsRedactedAtTheSink:
+    """``extra`` never passes through ``redact_sensitive`` on the message
+    path, yet it is the documented place to attach structured context."""
+
+    def _record(self, **extra):
+        rec = _record("handled request")
+        rec["extra"] = extra
+        return rec
+
+    def test_flat_string_value(self):
+        rec = self._record(apiKey="sk-1234567890abcdefghijklmnopqrstuvwxyz")
+        assert default_filter(rec) is True
+        assert rec["extra"]["apiKey"] == "***"
+
+    def test_camel_case_api_key_field(self):
+        """The report called this out specifically: ``*.apiKey`` fields."""
+        rec = self._record(payload={"apiKey": "Dp5hbU1TBvwHZchWC1CNRNxZ947E7MchbclaxwHz"})
+        default_filter(rec)
+        assert rec["extra"]["payload"]["apiKey"] == "***"
+
+    def test_nested_structures(self):
+        rec = self._record(
+            headers={"authorization": "Bearer abcdefghijklmnopqrstuvwxyz123456"},
+            attempts=[{"token": "tvly-dev-AbCdEf1234567890XyZqWeRt"}],
+        )
+        default_filter(rec)
+        assert "abcdefghijklmnopqrstuvwxyz123456" not in str(rec["extra"])
+        assert "tvly-dev" not in str(rec["extra"])
+
+    def test_component_is_preserved(self):
+        """The one key the bundled formatters render must survive intact."""
+        rec = self._record(component="cron")
+        default_filter(rec)
+        assert rec["extra"]["component"] == "cron"
+
+    def test_non_string_leaves_untouched(self):
+        rec = self._record(count=3, ok=True, ratio=0.5, nothing=None)
+        default_filter(rec)
+        assert rec["extra"] == {"count": 3, "ok": True, "ratio": 0.5, "nothing": None}
+
+    def test_recursion_is_bounded(self):
+        """A deeply nested ``extra`` must not make the sink hang."""
+        deep: dict = {}
+        node = deep
+        for _ in range(50):
+            node["next"] = {}
+            node = node["next"]
+        node["key"] = "sk-1234567890abcdefghijklmnopqrstuvwxyz"
+        rec = self._record(payload=deep)
+        assert default_filter(rec) is True
+
+    def test_message_still_redacted(self):
+        rec = _record("token sk-1234567890abcdefghijklmnopqrstuvwxyz leaked")
+        default_filter(rec)
+        assert "sk-1234567890abcdefghijklmnopqrstuvwxyz" not in rec["message"]

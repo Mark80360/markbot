@@ -93,15 +93,15 @@ export default function CronPage() {
     }
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   const jobs = data?.jobs || [];
   const enabledCount = jobs.filter((j: any) => j.enabled).length;
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="Cron"
+        title="定时任务"
         description={`定时任务管理 · ${enabledCount}/${jobs.length} 启用`}
         actions={
           <Button size="sm" onClick={() => { setShowAdd(!showAdd); setEditingJob(null); }}>

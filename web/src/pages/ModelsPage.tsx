@@ -68,13 +68,13 @@ export default function ModelsPage() {
     setSaving(false);
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   const providerOptions = options?.options || [];
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
-      <PageHeader title="Models" description="模型配置与参数调优" />
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
+      <PageHeader title="模型" description="模型配置与参数调优" />
 
       <Feedback message={feedback} />
 
@@ -110,7 +110,7 @@ export default function ModelsPage() {
         {options && (
           <Section icon={<Zap size={14} />} title="切换模型">
             <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
                   <label className="text-xs text-text-tertiary block mb-1.5">Provider</label>
                   <select
@@ -169,7 +169,7 @@ export default function ModelsPage() {
         {/* Agent Parameters */}
         <Section icon={<Settings2 size={14} />} title="Agent 参数">
           <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className="text-xs text-text-tertiary block mb-1.5">Max Tokens</label>
                 <input type="number" value={params.max_tokens}

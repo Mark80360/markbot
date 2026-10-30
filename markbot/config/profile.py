@@ -9,7 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from loguru import logger
+
 ProfileName = Literal["coding", "assistant", "unattended"]
+
+#: Profile used when ``agents.defaults.profile`` is unset or unrecognised.
+#: Must stay a profile whose ``permission_mode`` is not ``auto``: this is
+#: the value every unspecified installation lands on.
+DEFAULT_PROFILE: ProfileName = "assistant"
 
 
 # Tool groups used for enable/disable by profile.
@@ -70,7 +77,12 @@ class Profile:
 _PROFILES: dict[str, Profile] = {
     "coding": Profile(
         name="coding",
-        permission_mode="auto",
+        # Was "auto": every destructive tool ran with no confirmation at all.
+        # `accept_edits` keeps the developer workflow frictionless (reads and
+        # file edits go straight through) while exec / run_code / delete_file
+        # / computer_use clicks still ask. A user who wants the old behaviour
+        # can select `auto` explicitly with /mode.
+        permission_mode="accept_edits",
         enable_desktop=True,
         enable_browser=True,
         enable_autopilot=True,
@@ -84,7 +96,11 @@ _PROFILES: dict[str, Profile] = {
     ),
     "assistant": Profile(
         name="assistant",
-        permission_mode="default",
+        # Was "default" (ask for every non-read-only tool). `accept_edits`
+        # removes the confirmation prompt for ordinary file edits, which is
+        # the friction that pushed people back to the fully-permissive
+        # profile; everything destructive still asks.
+        permission_mode="accept_edits",
         enable_desktop=False,
         enable_browser=True,
         enable_autopilot=False,
@@ -126,12 +142,24 @@ def list_profiles() -> list[str]:
 
 
 def get_profile(name: str | None) -> Profile:
-    """Return a known profile, defaulting to coding."""
+    """Return a known profile, defaulting to ``assistant``.
+
+    The fallback used to be ``coding``, whose ``permission_mode`` was
+    ``auto`` — so "profile not set" and "profile misspelled" both silently
+    resolved to *no confirmation at all*. Defaulting to the interactive
+    profile means an unknown name fails towards asking, not towards
+    granting.
+    """
     if not name:
-        return _PROFILES["coding"]
+        return _PROFILES[DEFAULT_PROFILE]
     key = str(name).strip().lower()
     if key not in _PROFILES:
-        return _PROFILES["coding"]
+        logger.warning(
+            "Unknown agent profile {!r}; falling back to {!r}",
+            name,
+            DEFAULT_PROFILE,
+        )
+        return _PROFILES[DEFAULT_PROFILE]
     return _PROFILES[key]
 
 

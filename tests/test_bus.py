@@ -1,10 +1,17 @@
 """Tests for markbot.bus module (events, emitter, queue)."""
 
+import asyncio
+
 import pytest
 
 from markbot.bus.emitter import EventEmitter
 from markbot.bus.events import Event, EventType, InboundMessage, OutboundMessage
-from markbot.bus.queue import BackpressurePolicy, MessageBus, Priority
+from markbot.bus.queue import (
+    BackpressurePolicy,
+    MessageBus,
+    Priority,
+    _PartitionedQueue,
+)
 
 
 class TestEventType:
@@ -229,3 +236,68 @@ class TestMessageBus:
         result2 = bus.publish_inbound_nowait(msg2, priority=Priority.USER)
         assert result1 is True
         assert result2 is False
+
+
+class TestPartitionedQueueRetryDoesNotRecurse:
+    """``get()`` used to retry via ``return await self.get()``.
+
+    Each lost race (``_total`` says there is work, every partition is
+    empty) added one coroutine frame. That is unbounded recursion in a
+    queue reader: under sustained contention it fails with RecursionError
+    instead of simply waiting for the next signal.
+    """
+
+    def test_no_self_recursive_tail_call_in_source(self):
+        """Structural guard: the anti-pattern must not come back."""
+        import inspect
+        import re
+
+        from markbot.bus.queue import _PartitionedQueue
+
+        source = inspect.getsource(_PartitionedQueue.get)
+        # Strip comments before matching — the explanatory comment above the
+        # loop names the old pattern and would otherwise trip this check.
+        code_lines = [
+            re.sub(r"#.*$", "", line) for line in source.splitlines()
+        ]
+        code = "\n".join(code_lines)
+        assert "await self.get()" not in code, (
+            "get() re-introduced the self-recursive retry; use a loop instead"
+        )
+        assert "while True:" in code
+
+    async def test_recovers_from_an_inconsistent_count(self):
+        """The retry path still returns the item once the state is coherent."""
+        q = _PartitionedQueue(maxsize_per_partition=10)
+        await q.put("a", 1)
+        assert await q.get() == ("a", 1)
+
+        # Claim work that no partition holds — the exact state that used to
+        # trigger the recursive retry.
+        q._total = 1
+
+        async def _produce_later():
+            await asyncio.sleep(0.02)
+            await q.put("b", 2)
+
+        asyncio.create_task(_produce_later())
+        key, value = await asyncio.wait_for(q.get(), timeout=2.0)
+        assert (key, value) == ("b", 2)
+
+    async def test_many_retries_do_not_overflow_the_stack(self):
+        """Drive the retry path repeatedly; it must not grow the stack."""
+        q = _PartitionedQueue(maxsize_per_partition=10)
+
+        async def _produce_after_spins():
+            # Wake the waiter many times with nothing to hand over, which is
+            # what a flapping producer/consumer pair does in production.
+            for _ in range(400):
+                q._total = 1
+                q._global_event.set()
+                await asyncio.sleep(0)
+            q._total = 0
+            await q.put("final", 42)
+
+        asyncio.create_task(_produce_after_spins())
+        key, value = await asyncio.wait_for(q.get(), timeout=5.0)
+        assert (key, value) == ("final", 42)

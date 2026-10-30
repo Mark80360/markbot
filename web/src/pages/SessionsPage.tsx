@@ -172,8 +172,8 @@ export default function SessionsPage() {
   };
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
-      <PageHeader title="Sessions" description="浏览和管理对话历史" />
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
+      <PageHeader title="会话管理" description="浏览、搜索与管理历史对话" />
 
       {stats && (
         <div className="flex items-center gap-6 mb-4 px-4 py-3 rounded-lg border border-border bg-background-secondary">
@@ -276,7 +276,7 @@ export default function SessionsPage() {
                     {s.message_count} 条消息 · {formatTime(s.last_active)}
                   </div>
                 </div>
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                <div className="flex items-center gap-1 transition-all md:opacity-0 md:group-hover:opacity-100">
                   <button
                     onClick={(e) => { e.stopPropagation(); setRenamingId(s.id); setRenameValue(s.title); }}
                     className="p-1.5 rounded hover:bg-background-hover text-text-muted hover:text-text-primary transition-all"

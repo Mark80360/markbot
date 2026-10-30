@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import unquote, urlparse
 
-import aiohttp
 from loguru import logger
 from pydantic import Field
 
@@ -41,6 +40,18 @@ from markbot.config.schema import Base
 from markbot.utils.helpers import split_message
 from markbot.utils.ssrf import validate_url_target
 
+# ``aiohttp`` is a *direct* dependency of this module (media upload uses
+# ``aiohttp.ClientSession`` directly), not just a transitive one from
+# ``qq-botpy``. Importing it outside the ``try`` below defeated the whole
+# graceful-degradation design: if it were ever missing, line 33 would raise
+# before the handler at the bottom of this block could set
+# ``QQ_AVAILABLE = False``, and a user without the QQ channel installed would
+# get an ImportError instead of a skipped channel.
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover
+    aiohttp = None  # type: ignore[assignment]
+
 try:
     import botpy
     from botpy.http import Route
@@ -50,6 +61,9 @@ except ImportError:  # pragma: no cover
     QQ_AVAILABLE = False
     botpy = None
     Route = None
+
+if aiohttp is None or not QQ_AVAILABLE:  # pragma: no cover
+    QQ_AVAILABLE = False
 
 if TYPE_CHECKING:
     from botpy.message import BaseMessage, C2CMessage, GroupMessage

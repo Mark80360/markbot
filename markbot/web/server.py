@@ -84,7 +84,15 @@ def _build_app(workspace: str | Path | None = None):
                 _log.warning("Failed to stop agent runtime on shutdown", exc_info=True)
 
     app = FastAPI(title="Markbot", version="1.0", lifespan=lifespan)
+    # Order matters: Starlette applies middleware in reverse registration
+    # order, so the last one added is the outermost. Security headers must be
+    # outermost so they are present even on the 401 responses produced by the
+    # auth middleware below.
     app.add_middleware(TokenAuthMiddleware)
+
+    from markbot.web.security_headers import SecurityHeadersMiddleware
+
+    app.add_middleware(SecurityHeadersMiddleware)
 
     store = get_store()
 
@@ -479,16 +487,23 @@ def _build_app(workspace: str | Path | None = None):
         mt = media_types.get(ext, "application/octet-stream")
         return FileResponse(str(file_path), media_type=mt)
 
-    def _spa_response(include_token: bool = False):
+    def _spa_response(request: Request, include_token: bool = False):
         content = (WEB_DIST / "index.html").read_bytes()
         html = content.decode("utf-8")
         if include_token:
             # Only hand the token to a caller that already proved it has one.
             # Injecting it into every anonymous page load made ``curl /`` a
             # free credential for the whole API (config, env, logs).
+            #
+            # The inline script must carry the request's CSP nonce: script-src
+            # has no 'unsafe-inline', so without it the browser would block the
+            # bootstrap and the UI would silently lose its credentials.
+            nonce = getattr(request.state, "csp_nonce", "") or ""
+            nonce_attr = f' nonce="{nonce}"' if nonce else ""
+            token_literal = json.dumps(get_token())
             html = html.replace(
                 "</head>",
-                f'<script>window.__MARKBOT_SESSION_TOKEN__="{get_token()}";</script></head>',
+                f"<script{nonce_attr}>window.__MARKBOT_SESSION_TOKEN__={token_literal};</script></head>",
                 1,
             )
         return FastResponse(
@@ -512,7 +527,7 @@ def _build_app(workspace: str | Path | None = None):
 
         @app.get("/")
         async def serve_index(request: Request):
-            return _spa_response(_request_has_token(request))
+            return _spa_response(request, _request_has_token(request))
 
         # Register favicon BEFORE the catch-all SPA route so it isn't shadowed
         @app.get("/favicon.ico")
@@ -526,7 +541,7 @@ def _build_app(workspace: str | Path | None = None):
         async def serve_spa(full_path: str, request: Request):
             if full_path.startswith("api/"):
                 return FastResponse(status_code=404)
-            return _spa_response(_request_has_token(request))
+            return _spa_response(request, _request_has_token(request))
     else:
         @app.get("/")
         async def no_frontend():

@@ -6,7 +6,7 @@
 
 - **协议**：AGPL-3.0
 - **运行时**：Python ≥ 3.11（Web 控制台为 React + Vite，微信桥接需要 Node.js ≥ 18）
-- **当前版本**：`20261029`
+- **当前版本**：`20261030`
 
 ---
 
@@ -34,7 +34,7 @@
 - **Prompt Caching**：Anthropic 与 OpenRouter 支持前缀缓存，缓存策略跨 Provider 统一管理。
 - **Mixture-of-Agents（MoA）**：`/moa` 命令让多个低成本模型并行独立作答，再由聚合模型综合成最终答案；顾问模型可显式指定，也可从各 Provider 的 `default_aux_model` 自动挑选。
 - **辅助模型路由**：`agents.defaults.auxiliary` 可按任务名（如 `web_extract`）固定辅助模型，未配置的任务走自动解析。
-- **Provider 插件**：向数据目录的 `providers/` 放入任意 `.py` 并调用 `register_provider_spec()`，即可新增或覆盖内置 Provider，无需改动源码。
+- **Provider 插件**：向数据目录的 `providers/` 放入 `.py` 并调用 `register_provider_spec()`，即可新增或覆盖内置 Provider，无需改动源码（默认不加载，需在 `security` 中显式 opt-in）。
 
 ### 多渠道消息接入
 
@@ -77,17 +77,18 @@
 ### 安全与权限
 
 - 5 种权限模式（default / plan / accept_edits / auto / bypass_permissions），3 种运行档案（coding / assistant / unattended）。
-- **特权命令鉴权**：`/mode`、`/stop`、`/restart` 等进程级操作按 `security.adminIds` 校验发送者；群聊默认不具备特权，单管理员部署可回退到 `allowFrom` 唯一匹配。
+- **特权命令鉴权**：`/mode`、`/profile`、`/restart` 等进程级操作按 `security.adminIds` 校验发送者；`/stop`、`/clear`、`/new` 只在群聊中要求管理员（1:1 会话里操作者只会影响自己）。群聊默认不具备特权，单管理员部署可回退到 `allowFrom` 唯一匹配。
 - 文件系统与 Shell 默认限制在工作区内；SSRF 防护（云元数据地址硬黑名单 + 私网段拦截）；工具循环 guardrails 防止死循环烧钱。
 - 会话预算控制（USD 上限 + 告警阈值 + 自定义单价）与 token 用量实时统计。
 
 ### Web 控制台
 
-自托管单用户聊天与管理界面（React SPA + FastAPI WebSocket），十个页面：
+自托管单用户聊天与管理界面（React SPA + FastAPI WebSocket），十一个页面：
 
 | 页面 | 功能 |
 |------|------|
 | Chat | 对话（流式输出、工具调用可视化、Markdown 渲染） |
+| Sessions | 历史会话检索、重命名、导出与批量删除 |
 | Models | 模型与提供商管理 |
 | Channels | 渠道状态与启停 |
 | MCP | MCP 服务器管理 |
@@ -97,6 +98,8 @@
 | Keys | 环境变量与密钥查看（敏感值单独分组） |
 | Logs | 运行日志查看 |
 | System | 系统 / 运行状态 |
+
+界面为响应式布局：桌面端为可折叠侧边栏，移动端切换为抽屉式导航；`Ctrl/⌘ + K` 打开命令面板，`Ctrl/⌘ + B` 折叠侧边栏，支持亮/暗主题。
 
 ### 可观测性
 
@@ -139,7 +142,7 @@
 | Python | ≥ 3.11 | 必需 |
 | Node.js | ≥ 18 | 仅微信渠道扫码登录的桥接服务需要 |
 | Chromium | — | 浏览器自动化需要（`playwright install chromium`） |
-| 系统包（Linux 桌面控制） | python3-tk、python3-xlib、scrot、at-spi2-core、wmctrl/xdotool | 仅 `computer_use` 需要 |
+| 系统包（Linux 桌面控制） | python3-tk、python3-xlib、scrot、at-spi2-core、python3-pyatspi、wmctrl/xdotool | 仅 `computer_use` 需要 |
 
 ### 安装
 
@@ -156,7 +159,7 @@ pip install -e ".[web]"               # Web 控制台后端 (FastAPI + uvicorn)
 pip install -e ".[chroma]"            # ChromaDB 向量记忆后端
 pip install -e ".[local-embeddings]"  # 本地 sentence-transformers 向量化（离线记忆）
 pip install -e ".[desktop]"           # 桌面控制 computer_use (pyautogui/Pillow)
-pip install -e ".[desktop-linux]"     # 同上，Linux 别名（附加 pyatspi）
+pip install -e ".[desktop-linux]"     # 同上，Linux 别名（另需 apt 装 python3-pyatspi）
 pip install -e ".[desktop-macos]"     # 同上，macOS 别名
 pip install -e ".[desktop-windows]"   # 同上，Windows 别名
 pip install -e ".[weixin]"            # 微信二维码登录 (qrcode/pycryptodome)
@@ -402,7 +405,7 @@ CMD ["markbot", "web", "--host", "0.0.0.0", "--port", "9120", "--config", "/etc/
 
 内置 provider 标识（可直接作为键名）：`anthropic`、`openai`、`openai_codex`(OAuth)、`github_copilot`(OAuth)、`azure_openai`、`openrouter`、`deepseek`、`groq`、`zhipu`、`dashscope`、`gemini`、`moonshot`、`minimax`、`mistral`、`stepfun`、`xai`、`nvidia`、`huggingface`、`aihubmix`、`siliconflow`、`volcengine`、`volcengine_coding_plan`、`byteplus`、`byteplus_coding_plan`、`vllm`、`ollama`、`ovms`、`custom`（任意 OpenAI 兼容端点）。部分 provider 支持别名查找（如 `anthropic`=`claude`、`gemini`=`google`、`dashscope`=`alibaba`/`qwen-dashscope`）。
 
-**Provider 插件**：在数据目录的 `providers/` 下（默认 `~/.markbot/providers/`）放置任意 `.py`，模块导入时调用 `register_provider_spec()` 即可注册自定义 Provider：
+**Provider 插件**：在数据目录的 `providers/` 下（默认 `~/.markbot/providers/`）放置 `.py`，模块导入时调用 `register_provider_spec()` 即可注册自定义 Provider：
 
 ```python
 # ~/.markbot/providers/mycloud.py
@@ -418,6 +421,22 @@ register_provider_spec(ProviderSpec(
 ```
 
 同名插件会覆盖内置 Provider（后写入者生效），新名字则追加在内置列表之后；发现是惰性的，插件加载失败不会影响启动。
+
+**插件默认不加载，需要显式开启。** 该目录在 agent 自己的文件工具可写范围内，无条件导入其中的 `.py` 等于把「写一个文件」变成「在本进程内执行任意代码」，绕过权限确认与沙箱。两种开启方式（任选其一）：
+
+```json
+{
+  "security": {
+    "allow_user_provider_plugins": false,
+    "user_provider_plugin_allowlist": ["mycloud.py"]
+  }
+}
+```
+
+- `user_provider_plugin_allowlist`（推荐）：只导入列出的文件（文件名或去掉 `.py` 的 stem 均可）。
+- `allow_user_provider_plugins: true`：导入目录下全部非 `_` 开头的 `.py`。
+
+被跳过的文件会在日志里逐个列出并提示如何开启，不会静默失效。此外，世界可写（`o+w`）的插件文件即使已开启也会被拒绝加载——任何人都能替换的文件无法证明「被批准的是这份代码」。
 
 #### channels —— 渠道
 
@@ -438,7 +457,7 @@ register_provider_spec(ProviderSpec(
 | `restrictToWorkspace` | 总开关（默认 `true`）：所有工具限制在工作区内访问 |
 | `web.proxy` | HTTP/SOCKS5 代理，如 `http://127.0.0.1:7890` |
 | `web.search` | `provider`: `brave/tavily/duckduckgo/searxng/jina`；`apiKey`；SearXNG 另填 `base_url`；`maxResults`(5) |
-| `exec` | Shell：`enable`、`timeout`(60s)、`restrictToWorkspace`、`allowShellChaining`、`requireAllowlist` + `allowPatterns`/`denyPatterns` 正则白黑名单、`allowedInternalIps`（放行 SSRF 检查的内网 IP）。详见 [tools.exec —— Shell 安全防护粒度](#tools-exec--shell-安全防护粒度) |
+| `exec` | Shell：`enable`、`timeout`(60s)、`restrictToWorkspace`、`allowNestedShell`、`requireAllowlist` + `allowPatterns`/`denyPatterns` 正则白黑名单、`allowedInternalIps`（放行 SSRF 检查的内网 IP）。详见 [tools.exec —— Shell 安全防护粒度](#tools-exec--shell-安全防护粒度) |
 | `filesystem` | `backupDir` 备份目录、`maxBackups`(50)、`safeDelete`(true=移入回收站而非直接删除) |
 | `codeExecution` | 沙箱 Python：`enable`、`timeout`(5–300s)、`maxMemoryMb`(64–4096)、`allowedDependencies`(pip 包白名单) |
 | `memory` | 见下方[记忆配置](#记忆配置) |
@@ -457,8 +476,8 @@ register_provider_spec(ProviderSpec(
 `exec` 的防护按顺序分四层，任一层命中即拦截：
 
 1. **内置危险命令黑名单**（`rm -rf`、`mkfs`、`shutdown`、`curl … | bash` 等）——始终生效，只能用 `denyPatterns` 追加，无法移除；
-2. **注入启发式**（`$(...)`、反引号、`bash -c`、`python -c`、管道进解释器等）——由 `allowShellChaining` 控制；
-3. **白名单**——`requireAllowlist` + `allowPatterns`，只能收窄；
+2. **嵌套 shell / 命令替换**（`$(...)`、反引号、`bash -c`、`python -c` 等）——由 `allowNestedShell` 控制；
+3. **白名单**——`requireAllowlist` + `allowPatterns`。`&&`、`;`、`|` 会把命令拆成多段，**每一段都要单独命中白名单**（`ls && bash x.sh` 会被 `bash` 拦下）；`cd` 只接受一个字面路径参数，`cd`、`cd $VAR`、`cd ~`、`cd -` 一律拒绝；
 4. **路径限制**——`restrictToWorkspace`，拦截工作区外的路径。
 
 配置键（config.json 用驼峰，snake_case 亦可解析）：
@@ -468,7 +487,7 @@ register_provider_spec(ProviderSpec(
 | `enable` | 是否注册 `exec` 工具 | `true` |
 | `timeout` | 单条命令超时（秒） | `60` |
 | `restrictToWorkspace` | 拦截路径在工作区外的命令；**显式写 `false` 可关闭**，不写则跟随 profile 默认（`true`） | `true` |
-| `allowShellChaining` | 放行 `$(...)`、反引号、`bash -c`、`python -c` 等链式 / 解释器调用 | `false` |
+| `allowNestedShell` | 放行 `$(...)`、反引号、`bash -c`、`python -c` 等嵌套解释器调用；**不控制 `&&` / `;` / `|` 这类普通拼接**（那由白名单逐段判定）。旧键名 `allowShellChaining` 仍可识别 | `false` |
 | `requireAllowlist` | 仅允许 `allowPatterns` 命中的命令 | `false` |
 | `allowPatterns` | 允许名单（正则） | `[]` |
 | `denyPatterns` | 在内置黑名单之上追加（只能加，不能减） | `[]` |
@@ -487,7 +506,7 @@ register_provider_spec(ProviderSpec(
       "enable": true,
       "timeout": 600,
       "restrictToWorkspace": false,
-      "allowShellChaining": true,
+      "allowNestedShell": true,
       "requireAllowlist": false,
       "allowedInternalIps": ["0.0.0.0/0"]
     }
@@ -507,7 +526,7 @@ register_provider_spec(ProviderSpec(
       "enable": true,
       "timeout": 30,
       "restrictToWorkspace": true,
-      "allowShellChaining": false,
+      "allowNestedShell": false,
       "requireAllowlist": true,
       "allowPatterns": ["^ls\\b", "^cat\\b", "^pwd\\b", "^git status\\b"],
       "denyPatterns": ["\\bcurl\\b", "\\bwget\\b", "\\bssh\\b"],
@@ -601,7 +620,9 @@ Embedding 后端按优先级自动选择：① OpenAI 兼容 API（设置 `embed
 
 #### security —— 特权命令鉴权
 
-`/mode`、`/stop`、`/restart` 等命令是**进程级**的：一次 `/mode auto` 会切换整个守护进程的工具权限并写回 `config.json`。因此这些命令不按渠道 `allowFrom` 放行，而是走独立的管理员校验。
+`/mode`、`/profile`、`/restart` 是**进程级**的：一次 `/mode auto` 会切换整个守护进程的工具权限并写回 `config.json`。因此这些命令不按渠道 `allowFrom` 放行，而是走独立的管理员校验。
+
+`/stop`、`/clear`、`/new` 只影响单个会话，所以规则更窄：1:1 会话里发送者就是唯一受影响的人，不需要管理员；群聊里同样的命令会取消或抹掉其他参与者正在等待的工作，按进程级命令同等校验。群聊类型无法判断时按群聊处理（fail closed）。
 
 | 键 | 默认 | 说明 |
 |----|------|------|
@@ -697,21 +718,31 @@ markbot --version
 
 ## 会话内斜杠命令
 
-| 命令 | 说明 |
-|------|------|
-| `/new` | 开启新会话（携带记忆摘要） |
-| `/compact` | 手动触发上下文压缩 |
-| `/compact_str` | 查看当前压缩摘要内容 |
-| `/clear` | 清空历史与压缩摘要 |
-| `/stop` | 取消所有活动任务与子代理 |
-| `/steer` | 向运行中的 Agent 注入中途指令 |
-| `/status` | 会话状态、token 用量与统计 |
-| `/trace [full]` | 查看上一回合的决策轨迹（加 `full` 输出完整时间线） |
-| `/mode [mode]` | 查看/切换权限模式 |
-| `/profile [name]` | 查看/切换运行档案 |
-| `/restart` | 重启 Agent 进程 |
-| `/moa [question]` | Mixture-of-Agents：多个顾问并行作答，再由聚合模型综合 |
-| `/help` | 显示可用命令 |
+**这些命令只在 markbot 会话内生效**——即 `markbot` 交互式终端、Web 控制台，以及 Feishu / QQ / 微信等渠道的对话框里输入的消息。它们不是 shell 命令：在系统终端敲 `/new` 不会有任何效果；反过来，在会话里输入 `markbot gateway` 也只会被当作一句话发给模型。shell 子命令见上一节。
+
+命令名与参数之间用**空格**分隔（写 `/trace full`，不是 `/trace[full]`）。输入了不存在的命令会收到一条"未知命令"提示，不会被当成普通消息送去消耗一次模型调用。
+
+| 类别 | 命令 | 说明 |
+|------|------|------|
+| 控制 | `/stop` | 取消本会话所有活动任务与子代理 |
+| 控制 | `/steer <指令>`（别名 `/btw`） | 向运行中的 Agent 注入中途指令；没有任务在跑时直接拒绝 |
+| 控制 | `/restart` | 重启 Agent 进程（需管理员） |
+| 会话 | `/status` | 会话状态、token 用量与统计 |
+| 会话 | `/trace [full]` | 查看上一回合的决策轨迹（加 `full` 输出完整时间线） |
+| 会话 | `/compact` | 手动触发上下文压缩（保留窗口与自动压缩一致，取 `compaction.autoCompactKeepRecent`） |
+| 会话 | `/summary`（别名 `/compact_str`） | 查看当前压缩摘要内容 |
+| 会话 | `/new` | 把当前会话归档到长期记忆，然后开启新会话 |
+| 会话 | `/clear` | 清空历史与压缩摘要（不写长期记忆） |
+| 运行时 | `/mode [mode]` | 查看/切换权限模式（需管理员） |
+| 运行时 | `/profile [name]` | 查看/切换运行档案（需管理员） |
+| 通用 | `/moa [question]` | Mixture-of-Agents：多个顾问并行作答，再由聚合模型综合 |
+| 通用 | `/help` | 显示可用命令（按类别分组） |
+
+几点容易误解的地方：
+
+- **`/new` 与 `/clear` 都是从空上下文开始**，区别只有一处：`/new` 会先把当前消息交给记忆管理器做长期记忆归档，`/clear` 不会。两者都会丢弃当前会话的压缩摘要——那份摘要属于正在结束的会话，不属于新会话。
+- **群聊里的 `/stop`、`/clear`、`/new` 需要管理员身份**：它们会取消或抹掉其他参与者正在等待的工作。1:1 会话不受此限制，任何人都能停掉自己那个跑飞的任务。
+- **`/moa` 的结果会写入会话历史**，可以直接接着追问；但它运行期间不接受 `/steer`（MoA 不消费中途指令）。
 
 ---
 
@@ -721,21 +752,24 @@ markbot --version
 
 | 模式 | 行为 |
 |------|------|
-| `default` | 危险操作前确认（当前无交互确认 UI 时，非只读工具返回 Permission required） |
+| `default` | 除只读工具外，全部需要确认 |
 | `plan` | 只读模式，阻止一切变更操作 |
-| `accept_edits` | 允许文件编辑，破坏性操作仍需确认 |
-| `auto` | 所有工具免确认（推荐，schema 默认） |
+| `accept_edits` | 允许文件编辑，破坏性操作（exec / run_code / delete_file / 桌面点击）仍需确认 |
+| `auto` | 所有工具免确认（**schema 默认已不是它**，需显式 `/mode auto`） |
 | `bypass_permissions` | 绕过全部权限检查（仅调试用） |
+
+确认 UI 是存在的：`PermissionApprover` 会通过当前渠道发一条带编号选项的消息（CLI 下走 stdin），等待用户在 `agents.defaults.permissionApprovalTimeoutS`（默认 60 秒）内回答。**超时一律拒绝**，不存在放行路径。没有渠道、没有 stdin、回答无法解析，也都是拒绝。
 
 要点：
 
-- Cron / Autopilot / Heartbeat 等无人值守路径**始终以 auto 模式**运行。
-- `/mode`、`/stop`、`/restart` 等进程级命令需要管理员身份，配置见 [security](#security--特权命令鉴权)。
+- Cron / Autopilot / Heartbeat 等无人值守路径**始终以 auto 模式**运行（`process_direct` 强制传入）。
+- `/mode`、`/profile`、`/restart` 需要管理员身份；`/stop`、`/clear`、`/new` 仅在群聊中需要。配置见 [security](#security--特权命令鉴权)。
 - 三种典型配置范式：
   - **安全聊天**（只读）：关闭 `exec` / `codeExecution` / `computerUse` / `browser`，配合 `/mode plan`；
   - **本地开发助手**：开启 exec + 代码执行但 `restrictToWorkspace: true`，配合 `/mode accept_edits`；
   - **完全桌面托管**：放开所有限制，配合 `/mode auto` 或 `bypass`。
-- 安全默认值：`gateway.host` 默认仅监听 `127.0.0.1`；Shell 与文件工具默认限制在工作区内；删除默认进入回收站目录。
+- 默认值（`agents.defaults.profile` 未设置时）是 **`assistant` + `accept_edits`**：文件读写与编辑免确认，exec / 代码执行 / 删除 / 桌面操作需要确认；桌面控制默认关闭（`enableDesktop: false` 且 `disabledTools` 含 `computer_use`），需要时显式切到 `coding`。
+- 其余安全默认值：`gateway.host` 默认仅监听 `127.0.0.1`；Shell 与文件工具默认限制在工作区内；删除默认进入回收站目录；`message` 工具的附件只能取自 workspace，且不能发往当前会话以外的 chat。
 
 ---
 
@@ -785,7 +819,8 @@ npm run dev                       # Vite 开发服务器
 npm run build                     # 构建产物输出到后端静态目录
 
 # 调试运行（走真实 runtime 装配路径）
-python run_debug.py
+python -m markbot.cli.commands --help
+markbot status                    # 进程 / 工作区 / 运行时状态
 ```
 
 ### 贡献流程

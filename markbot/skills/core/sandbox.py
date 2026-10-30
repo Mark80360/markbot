@@ -98,6 +98,14 @@ class SandboxConfig:
     # ``network`` flag) and ``ExecutionResult.isolation_level`` reflects
     # ``"degraded"`` so callers know true isolation was not applied.
     isolate: bool = True
+    # When True, a run that *wanted* OS isolation but could not get it is
+    # refused instead of being executed unisolated. PATH restriction is not
+    # a sandbox: it leaves the full filesystem readable and the network
+    # reachable, so silently continuing is a capability downgrade the
+    # caller never agreed to. Default False keeps the historical
+    # "best-effort" behaviour for hosts that cannot provide isolation, but
+    # the degradation is now always reported (see ``ExecutionResult``).
+    require_isolation: bool = False
 
     def resolve_workspace_path(self, workspace: Path) -> None:
         """Resolve {workspace} placeholder in allowed_paths."""
@@ -119,6 +127,10 @@ class ExecutionResult:
     # "degraded" = OS tool unavailable; fell back to PATH restriction only.
     # "none" = isolation disabled (isolate=False).
     isolation_level: str = "none"
+    #: True when the caller asked for OS isolation (``isolate=True``).
+    #: Lets a consumer distinguish "isolation off on purpose" from
+    #: "isolation silently unavailable" without re-reading the config.
+    isolation_requested: bool = False
 
 
 class Sandbox:
@@ -315,11 +327,34 @@ class Sandbox:
             cmd, cwd, effective_script
         )
         if isolation_level == "degraded":
+            logger.error(
+                "OS isolation requested but unavailable on this host; "
+                "the run has NO kernel-level filesystem or network "
+                "restriction. Install sandbox-exec (macOS, built-in) or "
+                "bwrap (Linux) for true isolation."
+            )
+            if self.config.require_isolation:
+                message = (
+                    "Refusing to execute: OS-level isolation was requested "
+                    "(require_isolation=True) but is unavailable on this "
+                    "host — sandbox-exec/bwrap is missing, or the platform "
+                    "blocks it. Running the script anyway would give it "
+                    "unrestricted filesystem read access and outbound "
+                    "network access. Install the isolation tool, or set "
+                    "require_isolation=False to accept a degraded run."
+                )
+                return ExecutionResult(
+                    success=False,
+                    stdout="",
+                    stderr=message,
+                    exit_code=None,
+                    execution_time_ms=(time.perf_counter() - start_time) * 1000,
+                    isolation_level="degraded",
+                )
             logger.warning(
-                "OS isolation requested but tool unavailable; "
-                "falling back to PATH restriction only. "
-                "Install sandbox-exec (macOS, built-in) or bwrap (Linux) "
-                "for true network/filesystem isolation."
+                "Falling back to PATH restriction only. This is NOT a "
+                "sandbox: the script keeps full read access to the "
+                "filesystem and can reach the network."
             )
 
         # Apply PATH restrictions only when OS isolation was NOT applied.
@@ -403,6 +438,7 @@ class Sandbox:
                     exit_code=process.returncode,
                     execution_time_ms=execution_time,
                     isolation_level=isolation_level,
+                    isolation_requested=self.config.isolate,
                 )
 
             except asyncio.TimeoutError:
@@ -422,6 +458,7 @@ class Sandbox:
                     exit_code=-1,
                     execution_time_ms=execution_time,
                     isolation_level=isolation_level,
+                    isolation_requested=self.config.isolate,
                 )
 
         except Exception as e:
@@ -434,6 +471,7 @@ class Sandbox:
                 exit_code=-1,
                 execution_time_ms=execution_time,
                 isolation_level=isolation_level,
+                isolation_requested=self.config.isolate,
             )
         finally:
             # Clean up the preamble temp file if we created one.

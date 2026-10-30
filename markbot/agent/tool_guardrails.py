@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
+from markbot.utils.constants import SAFETY_GUARD_MARKER
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -431,6 +433,31 @@ def is_preblocked_result(result: Any) -> bool:
     return isinstance(result, PreblockedResult)
 
 
+def is_policy_denial(result: Any) -> bool:
+    """True when *result* is a guard refusal, not a command that failed.
+
+    ``ExecTool`` refuses a command before it runs: denylist hit, allowlist
+    miss, path outside the workspace, internal URL. The string looks like an
+    execution error to the model, but the two need different treatment —
+    the fix for a refusal is to rewrite the command, while a failing command
+    means the tool or the environment is at fault.
+
+    Treating a refusal as an execution failure is what turned one wrong
+    command shape into an outage: three refusals tripped the tool-streak
+    warning ("stop using it"), the denial was written into the failed-method
+    blacklist, and the model reported that ``exec`` was disabled and moved
+    the rest of the task to another subsystem.
+    """
+    if not isinstance(result, str):
+        return False
+    # Every guard refusal is emitted as "Error: Command <marker> (...)". The
+    # "Error:" anchor matters: file/log content the model happens to read can
+    # contain the same phrase, and a successful read must not be mistaken for
+    # a refusal.
+    text = result[:300]
+    return text.startswith("Error:") and SAFETY_GUARD_MARKER in text.lower()
+
+
 def is_failure_result(result: Any, tool_name: str = "") -> bool:
     """Single failure classifier used by the iteration runner and this engine.
 
@@ -622,6 +649,13 @@ class ToolCallGuardrail:
             if is_failure is None
             else bool(is_failure)
         )
+        # A guard refusal still counts toward the failure window — a turn
+        # full of refusals *is* going badly and deserves the same reflection /
+        # halt policy. It must not, however, advance the per-tool streak or
+        # enter the failed-method blacklist: both say "this tool / method is
+        # broken, never use it again", and that is exactly the wrong lesson to
+        # teach the model about a command it merely has to rewrite.
+        denied = is_policy_denial(result)
         self.state.total_calls += 1
         if failed:
             self.state.total_failures += 1
@@ -629,12 +663,12 @@ class ToolCallGuardrail:
         if len(self.state.recent_failures) > self.config.window_size:
             self.state.recent_failures = self.state.recent_failures[-self.config.window_size :]
 
-        if failed and tool_name:
+        if failed and tool_name and not denied:
             self.note_failed_method(tool_name, result)
 
         decisions = [
             self._observe_exact_failure(tool_name, arguments, failed),
-            self._observe_tool_streak(tool_name, failed),
+            self._observe_tool_streak(tool_name, failed and not denied),
             self._observe_repeat_call(tool_name, arguments),
         ]
         if not failed:

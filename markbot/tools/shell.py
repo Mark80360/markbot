@@ -19,12 +19,84 @@ from markbot.utils.helpers import strip_ansi
 #: POSIX (``$VAR`` / ``${VAR}``) or Windows (``%VAR%``) form.
 _ENV_REF_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%+")
 
+#: A parameter expansion that carries a modifier — ``${HOME:0:6}``,
+#: ``${HOME#/}``, ``${HOME%/*}``, ``${HOME/x/y}``, ``${HOME:-/tmp}``.
+#: The value cannot be known without running the shell, so a path built
+#: from one is unresolvable and must fail closed.
+_MODIFIER_EXPANSION_RE = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*[:\-#%/^,][^}]*\}"
+)
+
+#: Cheap pre-check so ordinary commands do not pay for a URL scan.
+_URL_SCHEME_RE = re.compile(r"https?://", re.IGNORECASE)
+
 #: Device / standard-stream paths that are outside the workspace but safe to
 #: reference (e.g. the ubiquitous ``2>/dev/null``). Exempted from the lexical
 #: confinement check so ordinary shell commands are not blocked.
 _SAFE_DEVICE_PATHS: frozenset[str] = frozenset({
     "/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr",
 })
+
+#: Quoted spans. Blanked before splitting so a ``|`` inside
+#: ``grep -E "a|b" file`` is not mistaken for a pipe.
+_QUOTED_SPAN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+#: Separators between simple commands. A bare ``&`` counts only when it is
+#: not part of a redirection (``2>&1``, ``&>file``); ``&&`` and ``||`` are
+#: matched by their own alternatives first.
+_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\n|(?<![>&])&(?![>&])|\|")
+
+#: A ``cd`` invocation: the command word at the start of a segment, plus
+#: everything up to the next separator. Anchored on a separator (or the
+#: start) so ``abcd`` is not a hit, and stopped at ``)`` so a subshell does
+#: not swallow the next token.
+_CD_INVOCATION_RE = re.compile(r"(?:^|[;&|(]\s*)cd\b([^;&|)]*)")
+
+#: One shell word: a quoted span stays a single token so ``cd "a b"`` has one
+#: operand, not three. ``shlex`` is not used because it would eat the
+#: backslashes in ``C:\Users\…``.
+_WORD_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+
+#: ``^(a|b|c)`` — the shape the default allowlist is written in. Used only to
+#: name the permitted commands in a refusal, never to decide the verdict.
+_ALLOWLIST_LITERALS_RE = re.compile(r"^\^\(([^()]*)\)")
+
+
+def _command_segments(command: str) -> list[str]:
+    """Split *command* into its simple commands.
+
+    The allowlist used to be matched against the first token of the whole
+    string, so ``ls && bash evil.sh`` was authorised by its ``ls`` and then
+    ran ``bash`` — an allowlist that a semicolon walks straight through.
+    Every segment is a separate command and is authorised separately.
+
+    Quoted spans are blanked first, so ``grep -E "a|b" f`` stays one segment.
+    This is a guard, not a shell parser: anything it cannot split stays a
+    single segment, which fails closed rather than open.
+    """
+    blanked = _QUOTED_SPAN_RE.sub("_", command)
+    return [seg.strip() for seg in _CHAIN_SPLIT_RE.split(blanked) if seg.strip()]
+
+
+def _unresolvable_path_expansion(command: str) -> str | None:
+    """Return the first path token built from a modified parameter expansion.
+
+    ``${HOME:0:6}/.ssh/id_rsa`` resolves to the same file as
+    ``~/.ssh/id_rsa`` but contains no literal path component, so the
+    lexical confinement check had nothing to look at and let it through.
+    Rather than trying to model every bash expansion form, any token that
+    both looks path-like *and* uses a modifier is treated as an escape.
+    """
+    for token in command.split():
+        tok = token.strip("\"'")
+        if not tok:
+            continue
+        if "/" not in tok and "\\" not in tok and not tok.startswith("~"):
+            continue
+        match = _MODIFIER_EXPANSION_RE.search(tok)
+        if match:
+            return match.group(0)
+    return None
 
 
 class ExecTool(Tool):
@@ -71,7 +143,7 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = True,
         require_allowlist: bool = False,
-        allow_shell_chaining: bool = False,
+        allow_nested_shell: bool = False,
         path_append: str = "",
         allowed_internal_ips: list[str] | None = None,
         extra_env_allow: list[str] | None = None,
@@ -89,7 +161,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.require_allowlist = require_allowlist
-        self.allow_shell_chaining = allow_shell_chaining
+        self.allow_nested_shell = allow_nested_shell
         self.path_append = path_append
         self.allowed_internal_ips = allowed_internal_ips or []
         # Optional env vars to re-inject even though they look secret
@@ -158,7 +230,18 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        base = "Execute a shell command and return its output. Use with caution."
+        if self.allow_patterns or self.require_allowlist:
+            # State the constraint up front. The model used to learn it only
+            # from a refusal, and the refusal said nothing about `working_dir`
+            # or about which commands were allowed at all.
+            base += (
+                " Commands run in the workspace root by default — pass "
+                "`working_dir` instead of prefixing `cd`. Only allowlisted "
+                "leading commands may run; a refused command is answered with "
+                "the list of allowed ones."
+            )
+        return base
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -420,14 +503,17 @@ class ExecTool(Tool):
             if re.search(pattern, lower):
                 return "Error: Command blocked by safety guard (dangerous pattern detected)"
 
-        # Shell metacharacter / interpreter chaining that commonly bypasses
-        # simple command denylists. This is still best-effort, not a sandbox.
-        # Operators who need such pipelines may opt out via
-        # ``tools.exec.allow_shell_chaining``.
-        if not self.allow_shell_chaining and self._looks_like_shell_injection(cmd):
+        # Nested shells and command substitution hide a second command from
+        # the denylist and from the allowlist alike (`echo $(id)` carries no
+        # recognisable command word at all). Plain chaining — ``&&``, ``;``,
+        # ``|`` — is *not* covered here: it is handled by authorising every
+        # segment in the allowlist check below, which is stricter than
+        # refusing the separator outright. Operators who genuinely need such
+        # constructs may opt out via ``tools.exec.allow_nested_shell``.
+        if not self.allow_nested_shell and self._looks_like_shell_injection(cmd):
             return (
                 "Error: Command blocked by safety guard "
-                "(shell chaining / interpreter injection detected)"
+                "(nested shell / command substitution detected)"
             )
 
         if self.allow_patterns or self.require_allowlist:
@@ -436,8 +522,19 @@ class ExecTool(Tool):
                     "Error: Command blocked by safety guard "
                     "(allowlist required but empty — configure tools.exec.allow_patterns)"
                 )
-            if not any(re.search(p, lower) for p in self.allow_patterns):
-                return "Error: Command blocked by safety guard (not in allowlist)"
+            # Every simple command in the chain needs its own authorisation.
+            # ``cd`` is exempt here because its *target* — not the fact that
+            # it ran — is what matters, and that is validated below.
+            for segment in _command_segments(lower):
+                head = segment.split()[0]
+                if head == "cd":
+                    continue
+                if not any(re.search(p, segment) for p in self.allow_patterns):
+                    return (
+                        "Error: Command blocked by safety guard (not in allowlist): "
+                        f"`{head}` is not an allowed command. "
+                        f"{self._allowlist_hint()}"
+                    )
 
         curl_wget_error = self._validate_curl_wget_urls(cmd)
         if curl_wget_error:
@@ -449,13 +546,58 @@ class ExecTool(Tool):
             # `cd ..` (and `cd -`) escapes without looking like a path token;
             # everything after it resolves against the new directory. Absolute
             # `cd` targets are already covered by the path scan below.
-            for m in re.finditer(r'(?:^|[;&|]\s*)cd\s+([^\s;&|]+)', cmd):
-                target = m.group(1).strip("\"'")
-                if target in ("..", "-") or target.startswith(("../", "..\\")):
+            #
+            # A target the path scan cannot see lexically has to be refused
+            # outright: `cd` with no argument lands in $HOME, `cd $VAR` and
+            # `cd ~` resolve through the environment or the passwd entry, and
+            # `cd -` through $OLDPWD. `cd $HOME && cat .ssh/id_rsa` reads a
+            # file outside the workspace while every literal token in the
+            # command looks harmless. Requiring exactly one non-flag operand
+            # also catches `cd > /dev/null`, where the redirect hides the fact
+            # that there is no operand at all.
+            for m in _CD_INVOCATION_RE.finditer(cmd):
+                tokens = [
+                    t.strip("\"'") for t in _WORD_RE.findall(m.group(1) or "")
+                ]
+                if not tokens:
+                    return (
+                        "Error: Command blocked by safety guard "
+                        "(cd without a target — it would land in $HOME)"
+                    )
+                if "-" in tokens:
                     return (
                         "Error: Command blocked by safety guard "
                         "(cd outside working dir)"
                     )
+                operands = [t for t in tokens if not t.startswith("-")]
+                if len(operands) != 1 or not operands[0]:
+                    return (
+                        "Error: Command blocked by safety guard "
+                        "(cd takes exactly one literal path)"
+                    )
+                target = operands[0]
+                if target == ".." or target.startswith(("../", "..\\")):
+                    return (
+                        "Error: Command blocked by safety guard "
+                        "(cd outside working dir)"
+                    )
+                if target[0] in "$~%":
+                    return (
+                        "Error: Command blocked by safety guard "
+                        f"(cd target cannot be resolved lexically: {target})"
+                    )
+
+            # A path assembled with a modified parameter expansion
+            # (``${HOME:0:6}/.ssh/id_rsa``) contains no literal path
+            # component, so the token scan below has nothing to resolve.
+            # The expansion's value is only knowable at shell-run time, so
+            # this fails closed instead of guessing.
+            expansion = _unresolvable_path_expansion(cmd)
+            if expansion:
+                return (
+                    "Error: Command blocked by safety guard "
+                    f"(unresolvable parameter expansion in path: {expansion})"
+                )
 
             for raw in self._extract_all_paths(cmd):
                 token = raw.strip()
@@ -498,6 +640,45 @@ class ExecTool(Tool):
 
         return None
 
+    def _allowlist_commands(self) -> list[str]:
+        """Best-effort literal command names from the configured allowlist.
+
+        The default allowlist is a union of ``^(a|b|c)`` alternatives; pulling
+        the literals out lets a refusal name what *is* permitted instead of
+        only what is not. Patterns written in any other shape are skipped —
+        this feeds the error message, never the verdict.
+        """
+        names: list[str] = []
+        for pattern in self.allow_patterns:
+            match = _ALLOWLIST_LITERALS_RE.match(pattern)
+            if not match:
+                continue
+            for alternative in match.group(1).split("|"):
+                name = alternative.strip().rstrip("?")
+                if re.fullmatch(r"[A-Za-z0-9_.+-]+", name) and name not in names:
+                    names.append(name)
+        return names
+
+    def _allowlist_hint(self) -> str:
+        """Actionable tail for an allowlist refusal.
+
+        The bare "not in allowlist" text left the model guessing: in the logs
+        it blamed ``grep``, then ``&&``, and finally concluded that exec
+        itself was disabled. Naming the permitted commands — and the
+        ``working_dir`` parameter that makes ``cd`` unnecessary — gives it
+        something to act on.
+        """
+        names = self._allowlist_commands()
+        hint = (
+            "Commands already run in the workspace root — pass `working_dir` "
+            "instead of prefixing `cd`."
+        )
+        if not names:
+            return hint
+        shown = ", ".join(names[:12])
+        suffix = ", …" if len(names) > 12 else ""
+        return f"Allowed leading commands: {shown}{suffix}. {hint}"
+
     def _check_rate_limit(self) -> str | None:
         """Rate-limit shell commands to prevent abuse."""
         now = time.time()
@@ -519,15 +700,22 @@ class ExecTool(Tool):
         return None
 
     def _validate_curl_wget_urls(self, command: str) -> str | None:
-        """Validate URLs in curl/wget commands target only external hosts."""
+        """Validate that no URL in *command* targets an internal host.
+
+        This used to gate on ``lower.startswith(("curl", "wget"))``, which
+        made the whole check a no-op for anything that merely *wraps* the
+        download — ``env curl …``, ``command curl …``, ``timeout 5 curl …``,
+        ``nice curl …``, ``true; curl …``. In other words the guard did not
+        cover the way commands are normally written. Any command carrying
+        an http(s) URL is now scanned, whatever the leading token is.
+        """
         from markbot.utils.ssrf import contains_internal_url
 
-        lower = command.lower()
-        if not (lower.startswith("curl") or lower.startswith("wget")):
+        if not _URL_SCHEME_RE.search(command):
             return None
 
         if contains_internal_url(command, self.allowed_internal_ips):
-            return "Error: Command blocked by safety guard (internal/private URL in curl/wget)"
+            return "Error: Command blocked by safety guard (internal/private URL in command)"
 
         return None
 
@@ -590,7 +778,12 @@ class ExecTool(Tool):
 
         remaining = quoted_re.sub(' ', command)
 
-        win_paths = re.findall(r'[A-Za-z]:[\\/][^\s\"\'|><;]+', remaining)
+        # A drive letter is never preceded by another letter. Without the
+        # lookbehind, ``https://example.com`` matched on the ``s:/`` — the
+        # URL was resolved as a path on drive S: and every ``curl``/``wget``
+        # to an external host was refused as "path outside working dir"
+        # (Windows only, but it made the tool unusable for network calls).
+        win_paths = re.findall(r'(?<![A-Za-z])[A-Za-z]:[\\/][^\s\"\'|><;]+', remaining)
         posix_paths = re.findall(r'(?:^|[\s|>])(/[^\s\"\'|><;]*)', remaining)
         home_paths = re.findall(r'(?:^|[\s|>])(~[^\s\"\'|><;]*)', remaining)
         # Environment-variable path references, both POSIX (``$HOME/…``,

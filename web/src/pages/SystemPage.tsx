@@ -139,9 +139,9 @@ export default function SystemPage() {
     };
   }, [autoRefresh, interval, lastUpdated, fetchAll]);
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
-  if (error && !stats) return <main className="flex-1 p-6"><p className="text-sm text-destructive">{error}</p></main>;
-  if (!stats) return <main className="flex-1 p-6"><p className="text-sm text-text-tertiary">无法加载系统信息</p></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
+  if (error && !stats) return <main className="flex-1 p-4 md:p-6"><p className="text-sm text-destructive">{error}</p></main>;
+  if (!stats) return <main className="flex-1 p-4 md:p-6"><p className="text-sm text-text-tertiary">无法加载系统信息</p></main>;
 
   const cpu = stats.cpu || {};
   const mem = stats.memory || {};
@@ -154,9 +154,9 @@ export default function SystemPage() {
   const childProcs = process?.children || proc.children || [];
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="System"
+        title="系统状态"
         description="系统状态和诊断信息"
         actions={
           <div className="flex items-center gap-2">
@@ -309,7 +309,7 @@ export default function SystemPage() {
           <div className="text-xs text-text-tertiary mb-3 flex items-center gap-1">
             <Network size={12} /> 网络流量
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="p-3 rounded bg-background">
               <div className="text-[10px] text-text-muted mb-1">发送</div>
               <div className="text-sm font-mono text-accent-teal">{formatBytes(net.bytes_sent || 0)}</div>

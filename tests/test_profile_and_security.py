@@ -58,15 +58,48 @@ class TestProfiles:
 
     def test_assistant_defaults(self):
         p = get_profile("assistant")
-        assert p.permission_mode == "default"
+        # Was "default" (ask for everything). accept_edits keeps ordinary
+        # file edits prompt-free while mutations still ask.
+        assert p.permission_mode == "accept_edits"
         assert p.exec_require_allowlist is True
         assert p.enable_desktop is False
+        assert "computer_use" in p.disabled_tools
+
+    def test_no_profile_grants_unconfirmed_mutations(self):
+        """No profile may resolve to ``auto`` except the explicit unattended one.
+
+        ``coding`` used to be ``auto``, and it was also the fallback for an
+        unset or misspelled profile name — so the default install ran every
+        destructive tool with no confirmation.
+        """
+        for name in ("coding", "assistant"):
+            assert get_profile(name).permission_mode != "auto", name
+        # unattended is the one profile that *is* auto, by definition, and
+        # it is never selected implicitly.
+        assert get_profile("unattended").permission_mode == "auto"
+
+    def test_unknown_profile_falls_back_to_a_confirming_profile(self):
+        for bad in (None, "", "nonsense", "AUTO"):
+            p = get_profile(bad)
+            assert p.name == "assistant", bad
+            assert p.permission_mode != "auto", bad
 
     def test_config_profile_field(self):
         c = Config()
-        assert c.agents.defaults.profile == "coding"
+        # The default profile is the one every unspecified install lands on,
+        # so it must be the confirming one.
+        assert c.agents.defaults.profile == "assistant"
         assert c.agents.defaults.default_permission_mode is None
         assert isinstance(c.reliability, ReliabilityConfig)
+
+    def test_approval_timeout_is_configurable(self):
+        """It used to be a bare 300s literal that nothing could override."""
+        c = Config()
+        assert c.agents.defaults.permission_approval_timeout_s == 60.0
+        c2 = Config.model_validate(
+            {"agents": {"defaults": {"permissionApprovalTimeoutS": 15}}}
+        )
+        assert c2.agents.defaults.permission_approval_timeout_s == 15.0
 
 
 class TestPermissionApproval:

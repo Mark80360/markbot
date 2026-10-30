@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -10,6 +11,26 @@ if TYPE_CHECKING:
     from markbot.session.session import Session
 
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
+
+#: A first token that *looks* like a command name: ``/name`` with no second
+#: slash, no whitespace, and a bounded length. Brackets/parens are allowed so
+#: typos such as ``/trace[full]`` are caught instead of being sent to the model.
+_COMMAND_TOKEN = re.compile(r"^/[A-Za-z][\w\-\[\]()=]{0,38}$")
+
+
+def looks_like_command(text: str) -> bool:
+    """Whether *text* is a plausible slash-command attempt.
+
+    Used to answer an unmatched command with ``/help`` rather than forwarding
+    it to the model as prose. Deliberately conservative: absolute paths
+    (``/etc/hosts``) and ``//`` are *not* commands, because a chat message can
+    legitimately start with a path.
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return False
+    token = stripped.split(maxsplit=1)[0]
+    return bool(_COMMAND_TOKEN.match(token))
 
 
 @dataclass

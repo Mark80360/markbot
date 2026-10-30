@@ -1,5 +1,5 @@
 {
-  "_comment": "MarkBot static-message catalog -- English (baseline / source of truth). Only user-facing static messages from permission approval prompts and slash-command replies live here. Agent-generated output, log lines, error tracebacks, tool outputs, and slash-command descriptions stay in English and are NOT translated. Keys are dotted paths; nesting below is purely for readability. Values may contain {placeholder} tokens for str.format substitution. When adding a new key, add it to EVERY locale file in the same commit -- tests/test_i18n.py asserts catalog parity.",
+  "_comment": "MarkBot static-message catalog -- English (baseline / source of truth). Only user-facing static messages from permission approval prompts and slash-command replies live here. Agent-generated output, log lines, error tracebacks and tool outputs stay in English and are NOT translated; /help descriptions may be translated here and fall back to the English literal in CommandDef when a key is missing. Keys are dotted paths; nesting below is purely for readability. Values may contain {placeholder} tokens for str.format substitution. When adding a new key, add it to EVERY locale file in the same commit -- tests/test_i18n.py asserts catalog parity.",
 
   "permission": {
     "confirmation_header": "🔐 Permission Confirmation",
@@ -21,6 +21,31 @@
   },
 
   "cmd": {
+    "unknown": "Unknown command: {command}. Type /help for the list of available commands.",
+    "help": {
+      "header": "MarkBot session commands (only valid inside a markbot session):",
+      "category": {
+        "control": "Control",
+        "session": "Session",
+        "runtime": "Runtime",
+        "general": "General"
+      },
+      "desc": {
+        "stop": "Cancel all active tasks and subagents",
+        "steer": "Inject a mid-task instruction into the running agent",
+        "restart": "Restart the agent process",
+        "status": "Show session status, token usage, and statistics",
+        "trace": "Show the last turn's decision trace (add `full` for the timeline)",
+        "mode": "Show or set permission mode (default/plan/accept_edits/auto/bypass)",
+        "profile": "Show or set runtime profile (coding/assistant/unattended)",
+        "help": "Show available slash commands",
+        "compact_str": "View the current compressed summary",
+        "new": "Archive this session to long-term memory and start fresh",
+        "compact": "Force a manual context compaction",
+        "clear": "Clear history and the compressed summary",
+        "moa": "Mixture-of-Agents: parallel advisors + aggregator"
+      }
+    },
     "stop": {
       "stopped": "Stopped {count} task(s).",
       "none": "No active task to stop."
@@ -29,12 +54,12 @@
       "restarting": "Restarting..."
     },
     "new": {
-      "started": "New session started. Summary task dispatched in background."
+      "started": "Session archived to long-term memory. New session started."
     },
     "compact": {
       "no_manager": "Memory manager is not available.",
       "no_messages": "No messages to compact.",
-      "complete": "Compact complete!\n\n**Compressed Summary:**\n{summary}",
+      "complete": "Compacted: {archived} message(s) archived, {kept} kept in context. Use /summary to inspect the summary.",
       "failed": "Compact failed. Check logs for details."
     },
     "compact_str": {
@@ -51,12 +76,13 @@
       "failed": "MoA failed: {error}",
       "reply": "{answer}\n\n— _MoA · {advisors} advisors_"
     },
-    "steer": {
-      "usage": "Usage: /steer <instruction>\nExample: /steer focus on error handling",
-      "no_running": "No agent loop is currently running for this session.",
-      "queued": "Steer queued: {preview}",
-      "rejected": "Steer rejected (empty instruction)."
-    },
+  "steer": {
+    "usage": "Usage: {command} <instruction>\nExample: {command} focus on error handling",
+    "no_running": "No agent loop is currently running for this session.",
+    "moa_running": "Mixture-of-Agents is running for this session; it does not accept mid-task instructions. Wait for it to finish.",
+    "queued": "Steer queued: {preview}",
+    "rejected": "Steer rejected (empty instruction)."
+  },
     "mode": {
       "no_app_state": "App state provider is not available.",
       "modes_header": "Permission modes:",

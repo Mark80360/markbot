@@ -12,17 +12,19 @@ export default function ChatPage() {
     stopStreaming, editAndResend, regenerate,
   } = useChatContext();
 
+  // 支持 /chat?session=xxx 深链；sessionParam 变化时才切换，避免每次渲染重复拉取
   useEffect(() => {
     if (sessionParam && sessionParam !== currentSessionId) {
       switchSession(sessionParam);
     }
-  }, [sessionParam]);
+  }, [sessionParam, currentSessionId, switchSession]);
 
   return (
-    <main className="flex-1 flex flex-col min-w-0">
+    <main className="flex min-w-0 flex-1 flex-col">
       <ChatArea
         messages={messages}
         isStreaming={isStreaming}
+        conversationKey={currentSessionId}
         onSuggestionClick={sendMessage}
         onEdit={editAndResend}
         onRegenerate={regenerate}

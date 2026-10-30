@@ -39,16 +39,19 @@ class TestScannerFailsClosed:
             raise exc
 
         monkeypatch.setattr(scanner_mod, "SecurityScanner", _boom)
-        out = self._tool()._scan_code("print('hello')")
+        out, warnings = self._tool()._scan_code("print('hello')")
         assert out is not None, "a scanner failure must block, not allow"
         assert "blocked" in out.lower()
         assert "fail-closed" in out
+        assert warnings == []
 
     def test_clean_code_passes(self):
-        assert self._tool()._scan_code("print(1 + 1)") is None
+        out, warnings = self._tool()._scan_code("print(1 + 1)")
+        assert out is None
+        assert warnings == []
 
     def test_dangerous_code_blocked(self):
-        out = self._tool()._scan_code("import os; os.system('rm -rf /')")
+        out, _warnings = self._tool()._scan_code("import os; os.system('rm -rf /')")
         assert out is not None
         assert "blocked" in out.lower()
 
@@ -61,9 +64,26 @@ class TestScannerFailsClosed:
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(scanner_mod, "SecurityScanner", _boom)
-        out = self._tool()._scan_code("x = 1")
+        out, _warnings = self._tool()._scan_code("x = 1")
         assert "kaboom" in out
         assert "RuntimeError" in out
+
+    def test_allowed_findings_are_returned_not_swallowed(self):
+        """Findings the trust policy lets through must reach the caller.
+
+        ``agent-created`` lets ``high``/``medium`` findings run. Previously
+        they were written to a debug log, so the model saw a clean result
+        either way. They now come back as warnings and are prepended to the
+        tool output.
+        """
+        code = (
+            "import subprocess\n"
+            "subprocess.run(['ls', '-la'])\n"
+        )
+        out, warnings = self._tool()._scan_code(code)
+        assert out is None, "subprocess without shell=True is not a block"
+        assert warnings, "a flagged-but-allowed finding must be reported"
+        assert any("subprocess" in w.lower() or "process" in w.lower() for w in warnings)
 
 
 class TestFailClosedDiscipline:

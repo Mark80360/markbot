@@ -16,6 +16,15 @@ from markbot.locales import t
 from markbot.types.permission import PermissionMode
 from markbot.utils.helpers import build_status_content
 
+#: How long ``/stop`` waits for cancelled tasks to unwind before reporting.
+#: Long enough for a tool call to release its subprocess, short enough that a
+#: stuck task cannot wedge the inbound dispatch loop.
+STOP_GRACE_SECONDS = 5.0
+
+#: ``/trace full`` renders one line per event; a long turn can produce
+#: thousands. Chat surfaces are not a pager, so the tail is elided.
+TRACE_FULL_MAX_LINES = 120
+
 
 def check_privileged(ctx: CommandContext, command: str) -> str | None:
     """Return a refusal message when the sender may not run *command*.
@@ -65,10 +74,32 @@ def check_privileged(ctx: CommandContext, command: str) -> str | None:
     return reason
 
 
+def check_privileged_in_group(ctx: CommandContext, command: str) -> str | None:
+    """Gate *command* only when the message comes from a multi-party chat.
+
+    In a 1:1 conversation the sender is the only person the command can
+    affect, so they keep unconditional control of their own session — being
+    unable to ``/stop`` a runaway turn because no admin is configured would be
+    worse than the risk. In a group the same command cancels or erases work
+    other participants are waiting on, which is the availability attack
+    ``check_privileged`` exists to prevent. Unknown group-ness fails closed,
+    matching :func:`is_privileged_sender`.
+    """
+    msg = ctx.msg
+    if derive_is_group(msg.metadata, msg.chat_id) is False:
+        return None
+    return check_privileged(ctx, command)
+
+
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
+    if refusal := check_privileged_in_group(ctx, "/stop"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
     loop.clear_steer(msg.session_key)
     session_key = msg.session_key
 
@@ -78,15 +109,24 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     # single-threaded model this synchronous read is atomic.
     tasks = list(loop._active_tasks.get(session_key, []))
     cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-    # Not named `t`: that would shadow the module-level i18n helper `t`.
-    for task in tasks:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.opt(exception=True).warning(
-                "Active task raised an exception while being stopped"
+    # Bounded wait: a task that swallows CancelledError must not block the
+    # inbound dispatch loop forever.  This handler runs on the priority path,
+    # i.e. directly in ``run()``, so an unbounded await here would also stall
+    # every other session's messages.
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.opt(exception=exc).warning(
+                    "Active task raised an exception while being stopped"
+                )
+        if pending:
+            logger.warning(
+                "{} task(s) ignored cancellation for session {}",
+                len(pending), session_key,
             )
     sub_cancelled = await loop.subagents.cancel_by_session(session_key)
     total = cancelled + sub_cancelled
@@ -179,7 +219,13 @@ async def cmd_trace(ctx: CommandContext) -> OutboundMessage:
 
     arg = (ctx.args or "").strip().lower()
     if arg in ("--full", "full", "--timeline", "timeline"):
-        body = trace.render()
+        lines = trace.render().splitlines()
+        if len(lines) > TRACE_FULL_MAX_LINES:
+            omitted = len(lines) - TRACE_FULL_MAX_LINES
+            body = "\n".join(lines[:TRACE_FULL_MAX_LINES])
+            body += f"\n… {omitted} more line(s) elided."
+        else:
+            body = "\n".join(lines)
     else:
         s = trace.summary()
         body = "\n".join([
@@ -208,8 +254,20 @@ async def cmd_trace(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session with memory summarization."""
+    """Archive the current conversation to long-term memory, then start fresh.
+
+    Unlike ``/clear`` this hands the messages to the memory manager first, so
+    the next session can still recall them through long-term recall. The
+    compressed (in-context) summary is dropped either way — it belongs to the
+    session that is ending.
+    """
     loop = ctx.loop
+    msg = ctx.msg
+    if refusal := check_privileged_in_group(ctx, "/new"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     mm = getattr(loop, "memory_manager", None)
     if mm and session.messages:
@@ -220,6 +278,8 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
         session_key = make_session_key(ctx.msg.channel, ctx.msg.chat_id)
         if session_key:
             mm.set_compressed_summary("", session_key=session_key)
+    # A steer queued for the old conversation must not leak into the new one.
+    loop.clear_steer(msg.session_key)
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
@@ -227,6 +287,23 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content=t("cmd.new.started"),
     )
+
+
+def _compact_keep_messages(loop) -> int:
+    """Number of recent messages a manual ``/compact`` leaves in context.
+
+    Mirrors the automatic hook (``agent/compact.py``), which keeps
+    ``compaction.auto_compact_keep_recent`` *pairs* — i.e. twice that many
+    messages. A hardcoded value here made ``/compact`` archive *more* than an
+    automatic compaction would, so the command users reach for to tidy up
+    silently dropped more context than the background path.
+    """
+    config = getattr(loop, "config", None)
+    pairs = getattr(getattr(config, "compaction", None),
+                    "auto_compact_keep_recent", None)
+    if not isinstance(pairs, int) or pairs <= 0:
+        pairs = 5
+    return pairs * 2
 
 
 async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
@@ -262,15 +339,18 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage:
         )
         # Advance last_consolidated to mark old messages as archived
         # without deleting them, so get_history() still has access.
-        keep_recent = 6
+        keep_recent = _compact_keep_messages(loop)
+        archived = max(0, len(session.messages) - keep_recent)
         session.last_consolidated = max(
-            session.last_consolidated,
-            max(0, len(session.messages) - keep_recent),
+            session.last_consolidated, archived,
         )
         loop.sessions.save(session)
+        # The summary itself lives behind /summary; dumping it here buried the
+        # confirmation under a wall of text in every chat surface.
         return OutboundMessage(
             channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=t("cmd.compact.complete", summary=summary),
+            content=t("cmd.compact.complete", archived=archived,
+                      kept=min(keep_recent, len(session.messages))),
         )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
@@ -303,8 +383,15 @@ async def cmd_compact_str(ctx: CommandContext) -> OutboundMessage:
 async def cmd_clear(ctx: CommandContext) -> OutboundMessage:
     """Clear conversation history and compressed summary."""
     loop = ctx.loop
+    msg = ctx.msg
+    if refusal := check_privileged_in_group(ctx, "/clear"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=refusal, metadata={"render_as": "text"},
+        )
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     mm = getattr(loop, "memory_manager", None)
+    loop.clear_steer(msg.session_key)
     if mm:
         # Always clear the per-session summary first (this is what
         # /compact_str, /compact, and the agent loop read).  Also clear
@@ -368,7 +455,18 @@ async def cmd_moa(ctx: CommandContext) -> OutboundMessage:
 
     from markbot.agent.moa import run_moa
 
-    result = await run_moa(question=question, history=_history_to_text(history))
+    # MoA answers with prose, not with a status readout, so it is not
+    # steerable: nothing inside ``run_moa`` drains ``_pending_steer``. Mark the
+    # session so ``/steer`` refuses instead of queueing an instruction that
+    # would resurface in an unrelated later turn.
+    moa_sessions = getattr(loop, "_moa_sessions", None)
+    if moa_sessions is None:
+        moa_sessions = loop._moa_sessions = set()
+    moa_sessions.add(ctx.msg.session_key)
+    try:
+        result = await run_moa(question=question, history=_history_to_text(history))
+    finally:
+        moa_sessions.discard(ctx.msg.session_key)
     if result.final_answer is None:
         if not result.advisors_total:
             content = t("cmd.moa.no_advisors")
@@ -384,6 +482,12 @@ async def cmd_moa(ctx: CommandContext) -> OutboundMessage:
         answer=result.final_answer,
         advisors=f"{result.advisors_ok}/{result.advisors_total}",
     )
+    # Persist the exchange. A slash command normally short-circuits before the
+    # turn is written to history, which is right for /status but wrong here:
+    # MoA produces content the user will keep talking about ("expand on the
+    # second option"), and without this the next turn cannot see it.
+    session.add_message("assistant", result.final_answer)
+    loop.sessions.save(session)
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
     )
@@ -395,11 +499,22 @@ async def cmd_steer(ctx: CommandContext) -> OutboundMessage:
     msg = ctx.msg
     steer_text = (ctx.args or "").strip()
     if not steer_text:
+        # Echo back the name the user actually typed, so ``/btw`` does not get
+        # an error message about a command it never mentioned.
+        invoked = (ctx.raw or "").strip().split(maxsplit=1)
+        command = invoked[0] if invoked else "/steer"
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content=t("cmd.steer.usage"),
+            content=t("cmd.steer.usage", command=command),
         )
     session_key = msg.session_key
+    # /moa counts as a running task but never drains the steer queue; letting
+    # it through would replay the instruction inside the next agent turn.
+    if session_key in getattr(loop, "_moa_sessions", ()):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=t("cmd.steer.moa_running"),
+        )
     # Steer is only consumed by ``_inject_pending_steer`` inside an active
     # agent iteration.  If no task is running for this session, queueing
     # the instruction would silently sit in ``_pending_steer`` until the
@@ -557,16 +672,19 @@ async def cmd_profile(ctx: CommandContext) -> OutboundMessage:
       /profile assistant    — interactive personal assistant
       /profile unattended   — cron/heartbeat defaults
     """
-    from markbot.config.profile import get_profile, list_profiles
+    from markbot.config.profile import DEFAULT_PROFILE, get_profile, list_profiles
 
     loop = ctx.loop
     config = getattr(loop, "config", None)
-    current = "coding"
+    # ``DEFAULT_PROFILE`` (assistant) is the same value ``get_profile()``
+    # resolves to; the old hardcoded "coding" fallback made /profile report a
+    # profile the process was not actually running.
+    current = DEFAULT_PROFILE
     try:
-        current = config.agents.defaults.profile if config else "coding"
+        current = config.agents.defaults.profile if config else DEFAULT_PROFILE
     except Exception:
         current = getattr(getattr(loop, "ctx", None), "profile", None)
-        current = getattr(current, "name", None) or "coding"
+        current = getattr(current, "name", None) or DEFAULT_PROFILE
 
     arg = (ctx.args or "").strip().lower()
     if not arg:
@@ -656,6 +774,7 @@ def build_builtin_catalog() -> "CommandCatalog":  # noqa: F821
             handler=cmd_steer,
             description="Inject mid-task instruction into running agent",
             tier=CommandTier.PRIORITY,
+            aliases=("/btw",),
             args_hint="<text>",
             category="control",
             control_plane=True,
@@ -688,7 +807,8 @@ def build_builtin_catalog() -> "CommandCatalog":  # noqa: F821
         CommandDef(
             name="/mode",
             handler=cmd_mode,
-            description="Show or set permission mode (default/plan/auto/bypass)",
+            description="Show or set permission mode "
+                        "(default/plan/accept_edits/auto/bypass)",
             tier=CommandTier.PRIORITY,
             args_hint="[mode]",
             category="runtime",
@@ -716,13 +836,14 @@ def build_builtin_catalog() -> "CommandCatalog":  # noqa: F821
             handler=cmd_compact_str,
             description="View current compressed summary",
             tier=CommandTier.PRIORITY,
+            aliases=("/summary",),
             category="session",
             control_plane=True,
         ),
         CommandDef(
             name="/new",
             handler=cmd_new,
-            description="Start fresh session with memory summary",
+            description="Archive this session to long-term memory and start fresh",
             category="session",
         ),
         CommandDef(

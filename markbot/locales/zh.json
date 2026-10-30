@@ -21,6 +21,31 @@
   },
 
   "cmd": {
+    "unknown": "未知命令：{command}。输入 /help 查看可用命令。",
+    "help": {
+      "header": "MarkBot 会话内命令（仅在 markbot 会话中有效）：",
+      "category": {
+        "control": "控制",
+        "session": "会话",
+        "runtime": "运行时",
+        "general": "通用"
+      },
+      "desc": {
+        "stop": "取消所有活动任务与子代理",
+        "steer": "向运行中的 Agent 注入中途指令",
+        "restart": "重启 Agent 进程",
+        "status": "查看会话状态、token 用量与统计",
+        "trace": "查看上一回合的决策轨迹（加 full 输出完整时间线）",
+        "mode": "查看/切换权限模式（default/plan/accept_edits/auto/bypass）",
+        "profile": "查看/切换运行档案（coding/assistant/unattended）",
+        "help": "显示可用命令",
+        "compact_str": "查看当前压缩摘要内容",
+        "new": "归档当前会话到长期记忆并开启新会话",
+        "compact": "手动触发上下文压缩",
+        "clear": "清空历史与压缩摘要",
+        "moa": "Mixture-of-Agents：多个顾问并行作答，再由聚合模型综合"
+      }
+    },
     "stop": {
       "stopped": "已停止 {count} 个任务。",
       "none": "没有活跃的任务可停止。"
@@ -29,12 +54,12 @@
       "restarting": "正在重启..."
     },
     "new": {
-      "started": "已开始新会话。摘要任务已在后台调度。"
+      "started": "当前会话已归档到长期记忆，新会话已开始。"
     },
     "compact": {
       "no_manager": "内存管理器不可用。",
       "no_messages": "没有可压缩的消息。",
-      "complete": "压缩完成！\n\n**压缩摘要：**\n{summary}",
+      "complete": "压缩完成：已归档 {archived} 条消息，上下文保留 {kept} 条。使用 /summary 查看摘要内容。",
       "failed": "压缩失败。请查看日志了解详情。"
     },
     "compact_str": {
@@ -51,12 +76,13 @@
       "failed": "MoA 失败：{error}",
       "reply": "{answer}\n\n— _MoA · {advisors} 个顾问_"
     },
-    "steer": {
-      "usage": "用法：/steer <指令>\n示例：/steer 专注于错误处理",
-      "no_running": "当前会话没有正在运行的代理循环。",
-      "queued": "已排队指令：{preview}",
-      "rejected": "指令已拒绝（空指令）。"
-    },
+  "steer": {
+    "usage": "用法：{command} <指令>\n示例：{command} 专注于错误处理",
+    "no_running": "当前会话没有正在运行的代理循环。",
+    "moa_running": "当前会话正在运行 Mixture-of-Agents，它不消费中途指令。请等它结束。",
+    "queued": "已排队指令：{preview}",
+    "rejected": "指令已拒绝（空指令）。"
+  },
     "mode": {
       "no_app_state": "应用状态提供器不可用。",
       "modes_header": "权限模式：",

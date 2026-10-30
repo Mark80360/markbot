@@ -65,6 +65,34 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def ensure_private_dir(path: Path) -> Path:
+    """Ensure a directory exists and is only accessible by its owner.
+
+    ``config.json`` holds provider API keys, channel secrets and mail
+    passwords in plaintext, and it lives in the data directory. That
+    directory used to be created with the ambient umask (0755 on a normal
+    install), so any other local account could read every credential. The
+    permission is applied on every call, not just on creation, so a
+    directory that already exists with 0755 gets tightened too.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        # Windows has no POSIX modes; ACLs are the platform's answer and
+        # are outside this helper's scope.
+        pass
+    return path
+
+
+def harden_file_permissions(path: Path, mode: int = 0o600) -> None:
+    """Best-effort ``chmod`` for a file holding secrets."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
+
+
 def timestamp() -> str:
     """Current ISO timestamp."""
     return datetime.now().isoformat()
@@ -282,6 +310,14 @@ def build_status_content(
     return "\n".join(lines)
 
 
+#: Template files that are copied into a workspace. The list used to be
+#: implicit — ``item.name.endswith(".md")`` — so ``templates/feature_list.json``
+#: and ``templates/init.sh`` shipped in the package but were never created in
+#: any workspace. Suffixes are explicit so adding a template of a new type is
+#: a one-line change rather than a silent no-op.
+_TEMPLATE_SUFFIXES = {".md", ".json", ".sh"}
+
+
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files.
 
@@ -310,8 +346,16 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
                 continue
             if item.is_dir():
                 _sync_dir(item, dest_dir / item.name)
-            elif item.is_file() and item.name.endswith(".md"):
+            elif item.is_file() and item.suffix.lower() in _TEMPLATE_SUFFIXES:
                 _write(item, dest_dir / item.name)
+                if item.suffix.lower() == ".sh":
+                    # A shipped shell helper the user cannot execute is a
+                    # template that silently does nothing.
+                    dest = dest_dir / item.name
+                    try:
+                        dest.chmod(dest.stat().st_mode | 0o111)
+                    except OSError:
+                        pass
 
     _sync_dir(tpl, workspace)
     (workspace / "skills").mkdir(exist_ok=True)

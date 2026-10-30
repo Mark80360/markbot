@@ -103,12 +103,12 @@ export default function EnvPage() {
   const normalEnv = filteredEnv.filter((e) => !e.is_secret);
   const fileCount = env.filter((e) => e.source === "file" || e.source === "both").length;
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="Environment Variables"
+        title="密钥与环境变量"
         description={`管理环境变量 · 共 ${env.length} 项 · ${fileCount} 来自 .env · ${secretCount} 个密钥`}
         actions={
           <div className="flex items-center gap-2">

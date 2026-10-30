@@ -144,7 +144,7 @@ export default function McpPage() {
     setTesting(null);
   };
 
-  if (loading) return <main className="flex-1 p-6"><Loading /></main>;
+  if (loading) return <main className="flex-1 p-4 md:p-6"><Loading /></main>;
   const servers = data?.servers || [];
   const enabledCount = servers.filter((s: any) => s.enabled).length;
 
@@ -153,9 +153,9 @@ export default function McpPage() {
   const showHttpFields = formData.type === "sse" || formData.type === "streamableHttp" || (!formData.type && !!formData.url);
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 p-6 overflow-y-auto">
+    <main className="flex-1 flex flex-col min-w-0 overflow-y-auto p-4 md:p-6">
       <PageHeader
-        title="MCP Servers"
+        title="MCP 服务器"
         description={`Model Context Protocol 服务器 · ${enabledCount}/${servers.length} 启用`}
         actions={
           <Button size="sm" onClick={() => { setShowAdd(!showAdd); setEditingServer(null); setFormData(emptyForm); }}>
@@ -174,7 +174,7 @@ export default function McpPage() {
               <button onClick={() => { setShowAdd(false); setEditingServer(null); setFormData(emptyForm); }}
                 className="p-1 rounded hover:bg-background-hover text-text-tertiary"><X size={14} /></button>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className="text-xs text-text-tertiary block mb-1.5">名称</label>
                 <input value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })}
@@ -241,7 +241,7 @@ export default function McpPage() {
               </div>
             )}
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label className="text-xs text-text-tertiary block mb-1.5">工具超时 (秒)</label>
                 <input type="number" value={formData.tool_timeout}

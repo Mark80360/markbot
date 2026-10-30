@@ -1,6 +1,6 @@
 [project]
 name = "markbot"
-version = "20261029"
+version = "20261030"
 description = "A self-hosted, full-featured personal AI assistant framework (single-process, zero external infrastructure)"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -72,14 +72,15 @@ web = [
 #              install ``cua-driver`` separately — it is a third-party
 #              macOS binary, NOT a pip dependency:
 #                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
-#   - Linux:   adds ``pyatspi`` (PEP 508 marker). Also requires system
-#              packages — see README for the apt/dnf/pacman one-liners
-#              (python3-tk, python3-xlib, scrot, at-spi2-core, wmctrl/xdotool).
+#   - Linux:   same pip deps. ``pyatspi`` is NOT a pip package — it ships
+#              with the distro (``python3-pyatspi``, from at-spi2-core) and
+#              must be installed via the system package manager. Also see
+#              README for the apt/dnf/pacman one-liners (python3-tk,
+#              python3-xlib, scrot, at-spi2-core, wmctrl/xdotool).
 #   - Windows: ``pyautogui`` + ``Pillow`` only; PowerShell ships with the OS.
 desktop = [
     "pyautogui>=0.9.54",
     "Pillow>=10.0.0",
-    "pyatspi>=2.38.0; sys_platform == 'linux'",
 ]
 # Per-platform alias extras — install whichever matches the host.
 # They all resolve to the same Python deps today; kept distinct so the
@@ -93,7 +94,6 @@ desktop-macos = [
 desktop-linux = [
     "pyautogui>=0.9.54",
     "Pillow>=10.0.0",
-    "pyatspi>=2.38.0; sys_platform == 'linux'",
 ]
 desktop-windows = [
     "pyautogui>=0.9.54",

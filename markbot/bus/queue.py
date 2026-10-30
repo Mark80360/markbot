@@ -158,28 +158,37 @@ class _PartitionedQueue:
         self._global_event.set()
 
     async def get(self) -> tuple[str, Any]:
-        while self._total == 0:
+        # ``while True`` rather than a tail call: the retry path below used to
+        # be ``return await self.get()``, which grows the coroutine stack by
+        # one frame per lost race. ``_total`` can disagree with the partitions
+        # for a moment (a consumer just drained one while a producer was
+        # incrementing), and each such disagreement recursed once. Unbounded
+        # recursion in a queue reader is a bad failure mode — it raises
+        # RecursionError instead of simply waiting again.
+        while True:
+            while self._total == 0:
+                self._global_event.clear()
+                await self._global_event.wait()
+
+            keys = list(self._partitions.keys())
+            start = self._rr_index % len(keys) if keys else 0
+            for i in range(len(keys)):
+                k = keys[(start + i) % len(keys)]
+                q = self._partitions[k]
+                try:
+                    item = q.get_nowait()
+                    self._total -= 1
+                    self._rr_index = (start + i + 1) % len(keys)
+                    if self._total == 0:
+                        self._global_event.clear()
+                    return k, item
+                except asyncio.QueueEmpty:
+                    continue
+
+            # ``_total`` claimed work but every partition was empty. Wait for
+            # the next signal and retry in this same frame.
             self._global_event.clear()
             await self._global_event.wait()
-
-        keys = list(self._partitions.keys())
-        start = self._rr_index % len(keys) if keys else 0
-        for i in range(len(keys)):
-            k = keys[(start + i) % len(keys)]
-            q = self._partitions[k]
-            try:
-                item = q.get_nowait()
-                self._total -= 1
-                self._rr_index = (start + i + 1) % len(keys)
-                if self._total == 0:
-                    self._global_event.clear()
-                return k, item
-            except asyncio.QueueEmpty:
-                continue
-
-        self._global_event.clear()
-        await self._global_event.wait()
-        return await self.get()
 
     @property
     def qsize(self) -> int:

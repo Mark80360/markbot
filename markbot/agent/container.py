@@ -766,6 +766,7 @@ class AgentContext:
             exec_config=resolved_configs["exec"],
             filesystem_config=resolved_configs["filesystem"],
             code_execution_config=resolved_configs["code_execution"],
+            message_config=getattr(config.tools if config else None, "message", None),
             computer_use_config=getattr(config.tools if config else None, "computer_use", None),
             browser_config=getattr(config.tools if config else None, "browser", None),
             cron_service=cron_service,
@@ -867,7 +868,22 @@ class AgentContext:
 
         # Wire interactive permission approver for DEFAULT/ask mode.
         send_cb = bus.publish_outbound if bus is not None else None
-        permission_approver = _PA(send_callback=send_cb, question_tool=question_tool)
+        # The approval timeout used to be a bare 300s default that nothing
+        # could override: a channel session with nobody watching blocked the
+        # whole turn for five minutes. Read it from config so it is tunable;
+        # denial on timeout stays hardcoded (fail-closed) on purpose.
+        approval_timeout = getattr(
+            getattr(getattr(config, "agents", None), "defaults", None),
+            "permission_approval_timeout_s",
+            None,
+        )
+        approver_kwargs: dict[str, Any] = {
+            "send_callback": send_cb,
+            "question_tool": question_tool,
+        }
+        if approval_timeout is not None:
+            approver_kwargs["timeout_s"] = float(approval_timeout)
+        permission_approver = _PA(**approver_kwargs)
         if hasattr(tools, "set_permission_approver"):
             tools.set_permission_approver(permission_approver)
 

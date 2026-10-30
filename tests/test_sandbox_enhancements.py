@@ -339,3 +339,92 @@ class TestReadWithOptionalStream:
         await asyncio.sleep(0.05)
         assert proc.returncode is not None
 
+
+
+class TestIsolationDegradationIsNotSilent:
+    """A degraded run must be *reported*, and optionally *refused*.
+
+    ``SandboxConfig.isolate=True`` used to degrade to PATH restriction with
+    only a log line: the caller got ``success=True`` and had no way to learn
+    that the kernel-level filesystem/network guarantees it asked for were
+    never applied. ``ExecutionResult.isolation_level`` existed but nothing
+    consumed it, so ``run_code`` output looked identical either way.
+    """
+
+    @staticmethod
+    def _force_degraded(monkeypatch, sandbox):
+        """Make the platform isolation tool look unavailable."""
+        monkeypatch.setattr(
+            Sandbox, "_resolve_isolation_tool", classmethod(lambda cls, tool: None)
+        )
+
+    def test_degraded_level_is_reported_on_the_result(self, monkeypatch, tmp_path):
+        sandbox = Sandbox(SandboxConfig(timeout=20, isolate=True))
+        self._force_degraded(monkeypatch, sandbox)
+        script = tmp_path / "u.py"
+        script.write_text("print('ran')\n", encoding="utf-8")
+
+        result = asyncio.run(sandbox.run(script, "python", {}, cwd=tmp_path))
+
+        assert result.isolation_level == "degraded"
+        assert result.isolation_requested is True
+        # Default stays best-effort: it runs, but says so.
+        assert result.success is True
+
+    def test_require_isolation_refuses_to_run(self, monkeypatch, tmp_path):
+        sandbox = Sandbox(
+            SandboxConfig(timeout=20, isolate=True, require_isolation=True)
+        )
+        self._force_degraded(monkeypatch, sandbox)
+        script = tmp_path / "u.py"
+        script.write_text("print('MUST-NOT-RUN')\n", encoding="utf-8")
+
+        result = asyncio.run(sandbox.run(script, "python", {}, cwd=tmp_path))
+
+        assert result.success is False
+        assert result.isolation_level == "degraded"
+        assert "require_isolation" in result.stderr
+        assert "MUST-NOT-RUN" not in (result.stdout or "")
+
+    def test_run_code_output_warns_about_degraded_isolation(self):
+        from markbot.skills.core.sandbox import ExecutionResult
+        from markbot.tools.code import CodeExecutionTool
+
+        degraded = ExecutionResult(
+            success=True,
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10,
+            isolation_level="degraded",
+            isolation_requested=True,
+        )
+        text = CodeExecutionTool._format_result(degraded)
+        assert "hello" in text
+        assert "isolation was NOT applied" in text
+        assert "unrestricted filesystem" in text
+
+    def test_isolated_run_does_not_warn(self):
+        from markbot.skills.core.sandbox import ExecutionResult
+        from markbot.tools.code import CodeExecutionTool
+
+        isolated = ExecutionResult(
+            success=True,
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10,
+            isolation_level="os",
+            isolation_requested=True,
+        )
+        assert "isolation" not in CodeExecutionTool._format_result(isolated)
+
+    def test_config_flag_is_wired_into_the_tool(self):
+        from types import SimpleNamespace
+
+        from markbot.tools.code import CodeExecutionTool
+
+        assert CodeExecutionTool(SimpleNamespace(require_isolation=True))._require_isolation is True
+        assert CodeExecutionTool(SimpleNamespace(require_isolation=False))._require_isolation is False
+        # No config at all must not raise.
+        assert CodeExecutionTool()._require_isolation is False

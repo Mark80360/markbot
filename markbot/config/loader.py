@@ -8,6 +8,7 @@ import pydantic
 from loguru import logger
 
 from markbot.config.schema import Config
+from markbot.utils.helpers import ensure_private_dir, harden_file_permissions
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
@@ -157,12 +158,16 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config_path: Optional path to save to. Uses default if not provided.
     """
     path = config_path or get_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # config.json contains plaintext API keys, channel app secrets and mail
+    # passwords. Creating the parent with the ambient umask (0755) and the
+    # file with 0644 left every credential readable by any local account.
+    ensure_private_dir(path.parent)
 
     data = config.model_dump(mode="json", by_alias=True)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    harden_file_permissions(path, 0o600)
 
 
 def update_config_value(
@@ -213,9 +218,10 @@ def update_config_value(
             node = node[k]
         node[key_path[-1]] = value
 
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(path.parent)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        harden_file_permissions(path, 0o600)
 
         # Refresh cached config so get_config() reflects the change.
         global _current_config

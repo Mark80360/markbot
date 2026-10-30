@@ -5,14 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 
 from markbot.config.loader import get_config, get_config_path
-from markbot.utils.helpers import ensure_dir
+from markbot.utils.helpers import ensure_dir, ensure_private_dir
 
 _DEFAULT_WORKSPACE = "~/.markbot/workspace"
 
 
 def get_data_dir() -> Path:
-    """Return the instance-level runtime data directory."""
-    return ensure_dir(get_config_path().parent)
+    """Return the instance-level runtime data directory.
+
+    Created 0700: ``config.json`` next to it holds plaintext API keys and
+    channel secrets, so the directory must not be world-readable.
+    """
+    return ensure_private_dir(get_config_path().parent)
 
 
 def get_runtime_subdir(name: str) -> Path:

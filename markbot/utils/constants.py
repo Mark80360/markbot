@@ -103,6 +103,12 @@ _MAX_FILE_SIZE_READ = 128_000  # bytes
 MAX_CONTEXT_LINES = 20
 _MAX_RECURSION_DEPTH = 10
 
+#: Marker carried by every ``ExecTool`` guard refusal (denylist, allowlist,
+#: confinement, internal-URL). Shared with ``agent.tool_guardrails`` so a
+#: refusal can be told apart from a command that actually ran and failed:
+#: the fix for a refusal is to rewrite the command, not to abandon the tool.
+SAFETY_GUARD_MARKER: str = "blocked by safety guard"
+
 # Security patterns for command execution
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+-[rf]{1,2}\b",

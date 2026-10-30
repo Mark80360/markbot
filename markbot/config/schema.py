@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -46,7 +46,7 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     profile: Literal["coding", "assistant", "unattended"] = Field(
-        "coding",
+        "assistant",
         description=(
             "Runtime profile controlling default tool surface, permission mode, "
             "and skill quality filters. coding=dev workflows; assistant=interactive "
@@ -57,9 +57,21 @@ class AgentDefaults(Base):
         None,
         description=(
             "Permission mode applied to AppStateProvider at gateway startup. "
-            "None inherits the selected profile default (coding/unattended→auto, "
-            "assistant→default). Interactive ``/mode`` still overrides at runtime. "
-            "Cron/autopilot/heartbeat force AUTO via process_direct."
+            "None inherits the selected profile default (coding/assistant→"
+            "accept_edits, unattended→auto). Interactive ``/mode`` still "
+            "overrides at runtime. Cron/autopilot/heartbeat force AUTO via "
+            "process_direct."
+        ),
+    )
+    permission_approval_timeout_s: float = Field(
+        default=60.0,
+        ge=5.0,
+        le=3600.0,
+        description=(
+            "How long an 'ask' confirmation waits for an answer before "
+            "denying. Was hardcoded to 300s with no way to change it, so a "
+            "channel session with nobody watching hung for five minutes per "
+            "tool call. Denial on timeout is not configurable."
         ),
     )
     auxiliary_vision: "AuxiliaryVisionConfig" = Field(
@@ -335,14 +347,25 @@ class ExecToolConfig(Base):
             "false) in config.json overrides the profile default."
         ),
     )
-    allow_shell_chaining: bool = Field(
+    allow_nested_shell: bool = Field(
         default=False,
+        validation_alias=AliasChoices(
+            # Current spelling, then the previous one — this field used to be
+            # called `allow_shell_chaining`, which promised more than it did
+            # (plain `&&` / `;` / `|` chaining was never blocked by it).
+            "allow_nested_shell",
+            "allowNestedShell",
+            "allow_shell_chaining",
+            "allowShellChaining",
+        ),
         description=(
-            "If true, skip the shell-chaining / interpreter-injection heuristic "
-            "that blocks `$(...)`, backticks, `bash -c`, `python -c`, pipes into "
-            "interpreters and similar constructs. Off by default; enable only "
-            "when agents legitimately need such pipelines and OS-level isolation "
-            "is not available."
+            "If true, skip the nested-shell / command-substitution heuristic "
+            "that blocks `$(...)`, backticks, `bash -c`, `python -c` and "
+            "similar constructs. It does NOT govern plain chaining: `a && b`, "
+            "`a; b` and `a | b` are always split, and every segment has to pass "
+            "the allowlist on its own. Off by default; enable only when agents "
+            "legitimately need such constructs and OS-level isolation is not "
+            "available."
         ),
     )
     require_allowlist: bool = Field(
@@ -414,6 +437,17 @@ class CodeExecutionConfig(Base):
     allowed_dependencies: list[str] = Field(
         default_factory=list,
         description="If non-empty, only these pip packages are allowed to be installed. Empty = allow all.",
+    )
+    require_isolation: bool = Field(
+        default=False,
+        description=(
+            "When true, run_code refuses to execute if OS-level isolation "
+            "(macOS sandbox-exec / Linux bwrap) is unavailable, instead of "
+            "falling back to PATH restriction only. PATH restriction leaves "
+            "the filesystem readable and the network reachable, so it is not "
+            "a sandbox. The degradation is always reported in the tool output "
+            "either way."
+        ),
     )
 
 class MemoryToolsConfig(Base):
@@ -968,6 +1002,37 @@ class RuntimeBudgetAxesConfig(Base):
     )
 
 
+class MessageConfig(Base):
+    """``message`` tool configuration.
+
+    The message tool is the only path that can carry bytes off the
+    machine, so its defaults are restrictive on purpose.
+    """
+
+    allowed_media_roots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra directories (besides the session workspace) that the "
+            "message tool may attach files from. Empty means workspace only."
+        ),
+    )
+    allowed_chat_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Chat IDs the model may explicitly target from a turn that "
+            "belongs to a different conversation. Empty means the tool can "
+            "only reply to the current chat."
+        ),
+    )
+    allow_cross_chat: bool = Field(
+        default=False,
+        description=(
+            "DANGEROUS: allow the model to send to any chat_id it invents. "
+            "Turns a prompt injection into an outbound channel."
+        ),
+    )
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -975,6 +1040,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
     code_execution: CodeExecutionConfig = Field(default_factory=CodeExecutionConfig)
+    message: MessageConfig = Field(default_factory=MessageConfig)
     memory: MemoryToolsConfig = Field(default_factory=MemoryToolsConfig)
     computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
@@ -1187,6 +1253,25 @@ class SecurityConfig(Base):
             "Allow the single-allowlisted-sender inference on private chats "
             "when adminIds is empty. Set false to require an explicit "
             "adminIds entry on every messaging channel."
+        ),
+    )
+    allow_user_provider_plugins: bool = Field(
+        False,
+        description=(
+            "Import every .py file in <data dir>/providers at startup so it "
+            "can register provider specs. OFF by default: that directory is "
+            "writable by the agent's own file tools, so loading it "
+            "unconditionally turned a file write into in-process code "
+            "execution that bypassed permissions and the sandbox. Prefer "
+            "`user_provider_plugin_allowlist` over enabling this wholesale."
+        ),
+    )
+    user_provider_plugin_allowlist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "File names (e.g. 'acme.py') in <data dir>/providers that may be "
+            "imported, even when `allow_user_provider_plugins` is false. "
+            "Anything not listed is skipped and reported in the log."
         ),
     )
 
