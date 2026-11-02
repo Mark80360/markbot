@@ -87,7 +87,7 @@ def make_provider(config: Config):
 
 def load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
-    from markbot.config.loader import load_config, set_config_path
+    from markbot.config.loader import ConfigValidationError, load_config, set_config_path
 
     config_path = None
     if config:
@@ -98,7 +98,17 @@ def load_runtime_config(config: str | None = None, workspace: str | None = None)
         set_config_path(config_path)
         console.print(f"[dim]Using config: {config_path}[/dim]")
 
-    loaded = load_config(config_path)
+    try:
+        loaded = load_config(config_path)
+    except ConfigValidationError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        for detail in exc.details:
+            console.print(f"  • {detail}")
+        raise typer.Exit(1)
+    except OSError as exc:
+        console.print(f"[red]Error: Cannot read config {config_path}: {exc}[/red]")
+        raise typer.Exit(1)
+
     warn_deprecated_config_keys(config_path)
     if workspace:
         loaded.agents.defaults.workspace = workspace

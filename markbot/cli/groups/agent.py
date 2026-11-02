@@ -146,6 +146,13 @@ def agent(
     from markbot.log.core import setup_logging
     from markbot.runtime import CLI_FEATURES, build_runtime
 
+    # Load config first: ``--config`` switches the active config path, which
+    # ``_gateway_paths()`` uses to derive the log directory. Resolving the
+    # log paths before this call would send logs to the default instance dir.
+    _t0 = time.time()
+    config = load_runtime_config(config, workspace)
+    _config_load_s = time.time() - _t0
+
     _gateway_paths()["agent_log_dir"].mkdir(parents=True, exist_ok=True)
     setup_logging(
         console_level="DEBUG" if logs else "ERROR",
@@ -160,10 +167,7 @@ def agent(
     register_progress_subscriber()
 
     logger.info("agent command starting...")
-
-    _t0 = time.time()
-    config = load_runtime_config(config, workspace)
-    logger.debug("Config loaded, took {:.3f}s", time.time() - _t0)
+    logger.debug("Config loaded, took {:.3f}s", _config_load_s)
 
     _t0 = time.time()
     sync_workspace_templates(config.workspace_path)
