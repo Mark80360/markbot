@@ -281,6 +281,7 @@ class FallbackManager:
         temperature: float | None,
         caller: "_ModelCaller",
         allow_rate_limit_retry: bool = True,
+        on_attempt: Callable[[], None] | None = None,
     ) -> tuple[LLMResponse, list[FallbackAttempt]]:
         """Try each model in chain using *caller* for the actual LLM invocation.
 
@@ -368,6 +369,8 @@ class FallbackManager:
                         "Trying model: {} (credential {}/{})",
                         model_ref, key_index + 1, len(credential_keys),
                     )
+                    if on_attempt is not None:
+                        on_attempt()
                     try:
                         response = await caller(
                             provider, model_config, _max_tokens, _temperature, _reasoning, model_messages,
@@ -627,17 +630,21 @@ class FallbackManager:
     ) -> tuple[LLMResponse, list[FallbackAttempt]]:
         """Try each model in chain with streaming until success."""
 
-        # Track whether this attempt has pushed bytes to the user. Emitted
-        # deltas cannot be retracted, so if the attempt then fails and the
-        # chain rotates, the next model must be told the buffer is polluted
-        # rather than concatenating two answers for the user.
-        emitted = {"any": False}
+        # Track whether an attempt has pushed bytes to the user *before* it
+        # failed. Emitted deltas cannot be retracted, so a failed attempt that
+        # already streamed must force a buffer discard. Emissions from a
+        # successful attempt (or from a later attempt after the failure) do
+        # not pollute the sink, so the flag is scoped per attempt rather than
+        # to the whole chain.
+        attempt_emitted = {"value": False}
+        failed_emitted = {"value": False}
+        attempt_started = {"value": False}
 
         if on_content_delta is not None:
             _inner = on_content_delta
 
             async def _tracking(text: str) -> None:
-                emitted["any"] = True
+                attempt_emitted["value"] = True
                 await _inner(text)
 
             on_content_delta = _tracking
@@ -661,13 +668,24 @@ class FallbackManager:
                 on_content_delta=on_content_delta,
             )
 
+        def _begin_attempt() -> None:
+            # A new attempt starting after one that already emitted means the
+            # previous attempt failed mid-stream and left bytes in the sink.
+            if attempt_started["value"] and attempt_emitted["value"]:
+                failed_emitted["value"] = True
+            attempt_started["value"] = True
+            attempt_emitted["value"] = False
+
         response, attempts = await self._try_chain(
             messages, tools, tool_choice, max_tokens, temperature, _call_stream,
+            on_attempt=_begin_attempt,
         )
-        # Attribute the emission flag to every attempt that shares this sink
-        # and failed, so the loop can discard the buffer.
-        if emitted["any"]:
+        # The chain may end with the emitting attempt itself failing (nothing
+        # started afterwards), in which case no success covers the sink.
+        if attempt_emitted["value"] and not any(a.success for a in attempts):
+            failed_emitted["value"] = True
+        if failed_emitted["value"]:
             for a in attempts:
-                if not a.success:
+                if not a.success and not a.circuit_skipped:
                     a.streamed = True
         return response, attempts

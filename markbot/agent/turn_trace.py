@@ -124,6 +124,7 @@ class TurnTrace:
         cache_creation: int = 0,
         cost_usd: float | None = None,
         finish_reason: str = "",
+        tool_calls: int = 0,
     ) -> None:
         """Record one model call and its cache economics."""
         self.record(
@@ -135,6 +136,7 @@ class TurnTrace:
             cache_creation=cache_creation,
             cost_usd=cost_usd,
             finish_reason=finish_reason,
+            tool_calls=tool_calls,
         )
 
     def finish(self, *, exit_reason: str = "", error: str = "") -> None:

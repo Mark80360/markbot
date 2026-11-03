@@ -407,6 +407,9 @@ def _wire_cron_callbacks(
         from markbot.tools.cron import CronTool
         from markbot.tools.message import MessageTool
 
+        async def _silent(*_args, **_kwargs):
+            pass
+
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -423,6 +426,7 @@ def _wire_cron_callbacks(
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or default_channel,
                 chat_id=job.payload.to or "direct",
+                on_progress=_silent,
                 permission_mode=PermissionMode.AUTO,
             )
         finally:

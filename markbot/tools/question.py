@@ -135,9 +135,20 @@ class AskUserQuestionTool(Tool):
             "required": ["question", "options"]
         }
 
+    @staticmethod
+    def _normalise_options(options: Any) -> list[dict[str, str]]:
+        """Accept plain-string options from models that ignore the schema."""
+        normalised: list[dict[str, str]] = []
+        for opt in options or []:
+            if isinstance(opt, dict):
+                normalised.append(opt)
+            elif isinstance(opt, str) and opt.strip():
+                normalised.append({"label": opt.strip()})
+        return normalised
+
     async def _legacy_execute(self, **kwargs: Any) -> str:
         question = kwargs.get("question", "")
-        options = kwargs.get("options", [])
+        options = self._normalise_options(kwargs.get("options", []))
 
         if not self._send_callback:
             return "Error: Message sending not configured"
@@ -232,8 +243,12 @@ class AskUserQuestionTool(Tool):
 
         lines = [question, ""]
         for i, opt in enumerate(options, 1):
-            label = opt.get("label", f"Option {i}")
-            desc = opt.get("description", "")
+            if isinstance(opt, dict):
+                label = opt.get("label", f"Option {i}")
+                desc = opt.get("description", "")
+            else:
+                label = str(opt)
+                desc = ""
             if desc:
                 lines.append(f"{i}. {label} - {desc}")
             else:

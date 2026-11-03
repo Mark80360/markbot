@@ -168,6 +168,19 @@ _NO_VERIFY_EXTENSIONS: frozenset[str] = frozenset({
 # without verifying, we let it (the user can see the warning footer).
 _MAX_VERIFY_NUDGES = 2
 
+# Maximum number of "continue after output-limit truncation" nudges per turn.
+# Two attempts let the model finish an interrupted final answer (or emit the
+# tool call it wrote as plain text) without risking an endless loop.
+_MAX_LENGTH_CONTINUES = 2
+
+_LENGTH_CONTINUE_NUDGE = (
+    "[System — output truncated]\n"
+    "Your previous response was cut off because it hit the output token limit. "
+    "Continue from exactly where you stopped and produce concise, complete output. "
+    "If you intended to call a tool (for example `message` to deliver the result), "
+    "make an actual tool call now — never write the tool call as plain JSON text."
+)
+
 # Channels where verify-on-stop is active. On messaging channels
 # (feishu/qq/weixin/dingtalk/email/telegram/discord), the verify nudge
 # is noise — users can't see terminal output and running pytest in a
@@ -317,6 +330,8 @@ class LoopState:
     last_call_cost: float | None = None
     last_compact_action: CompactAction = CompactAction.NONE
     steer_continues: int = 0
+    # Output-limit continuation attempts (per-loop, not persisted).
+    length_continues: int = 0
     # Cache telemetry (populated by _phase_call_llm).
     last_cache_event: CacheEvent | None = None
     # 结构化退出原因：在每个 return IterationResult 处赋值，由 _finalize_loop
@@ -3372,7 +3387,49 @@ class IterationRunner:
                 self._stream_filter.reset()
             state.stream_finalized = True
 
+        # Output token limit: the response is incomplete. Never treat a
+        # truncated answer as a successful final response — a half-written
+        # tool call would otherwise be delivered to the user as the result.
+        length_truncated = response.finish_reason == "length"
+        if length_truncated:
+            state.length_continues += 1
+            partial = strip_think(response.content) or ""
+            if state.length_continues <= _MAX_LENGTH_CONTINUES:
+                logger.warning(
+                    "LLM response truncated by output limit (continue {}/{})",
+                    state.length_continues,
+                    _MAX_LENGTH_CONTINUES,
+                )
+                # Keep the partial text in history so the model knows where
+                # it stopped, then nudge it to finish (or to make the real
+                # tool call it wrote as plain text).
+                if partial:
+                    state.messages = self.loop.context.add_assistant_message(
+                        state.messages,
+                        partial,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                state.messages.append({
+                    "role": "user",
+                    "content": _LENGTH_CONTINUE_NUDGE,
+                })
+                state.new_msg_start += 1 + (1 if partial else 0)
+                state.final_content = None
+                self._flush_messages(state)
+                return IterationResult(
+                    should_continue=True, exit_reason=TurnExitReason.TOOL_CONTINUE
+                )
+            logger.error(
+                "LLM response still truncated after {} continuations; "
+                "delivering partial content with a warning",
+                _MAX_LENGTH_CONTINUES,
+            )
+
         clean = strip_think(response.content) or None
+        if length_truncated:
+            warning = "> ⚠️ 回复因输出长度上限被截断，内容可能不完整。"
+            clean = f"{clean}\n\n{warning}" if clean else warning
         if response.finish_reason == "error":
             safe_clean = (clean or "")[:200].replace("{", "{{").replace("}", "}}")
             logger.error("LLM returned error finish_reason: {}", safe_clean)

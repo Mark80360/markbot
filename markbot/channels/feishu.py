@@ -60,6 +60,9 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    # Set when this buffer is resumed by a later agent round; the next delta
+    # then starts a new paragraph instead of running into the previous text.
+    pending_separator: bool = False
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -801,6 +804,33 @@ class FeishuChannel(BaseChannel):
                         await self._add_reaction(message_id, self.config.done_emoji)
                         logger.info("added done_emoji {}", self.config.done_emoji)
 
+            if is_resuming:
+                # The turn continues (more tool rounds follow). Keep the
+                # streaming card and buffer alive so the next round's text is
+                # appended to the same message instead of producing another
+                # bubble that looks like a cut-off fragment.
+                buf = self._stream_bufs.get(chat_id)
+                if not buf or not buf.text:
+                    return
+                clean_text = self._THINK_TAG_RE.sub("", buf.text).strip()
+                if buf.card_id and clean_text:
+                    buf.sequence += 1
+                    ok = await loop.run_in_executor(
+                        None,
+                        self._stream_update_text_sync,
+                        buf.card_id,
+                        clean_text,
+                        buf.sequence,
+                    )
+                    if ok:
+                        buf.last_edit = time.monotonic()
+                buf.pending_separator = True
+                logger.info(
+                    "_stream_end: keeping card open for next round ({} chars)",
+                    len(buf.text),
+                )
+                return
+
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
                 logger.info("_stream_end: no buffer or empty text, returning")
@@ -880,6 +910,9 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[chat_id] = buf
+        if buf.pending_separator and buf.text:
+            buf.text += "\n\n"
+        buf.pending_separator = False
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1008,20 +1041,38 @@ class FeishuChannel(BaseChannel):
         """
         if not elements:
             return [[]]
+
+        def _is_heading_or_separator(el: dict) -> bool:
+            """True for heading divs / divider-only markdown.
+
+            These belong with the table that follows them; leaving them behind
+            produces a card containing only a title and a card containing a
+            table without its title.
+            """
+            if el.get("tag") == "div":
+                return True
+            if el.get("tag") == "markdown":
+                text = (el.get("content") or "").strip()
+                return text in ("", "---", "***") or text.startswith("#")
+            return False
+
         groups: list[list[dict]] = []
         current: list[dict] = []
         table_count = 0
         for el in elements:
+            if el.get("tag") == "table" and table_count >= max_tables:
+                # Carry the trailing headings/separators into the new group so
+                # the table keeps its title instead of being split away from it.
+                carry: list[dict] = []
+                while current and _is_heading_or_separator(current[-1]):
+                    carry.insert(0, current.pop())
+                if current:
+                    groups.append(current)
+                current = carry
+                table_count = 0
+            current.append(el)
             if el.get("tag") == "table":
-                if table_count >= max_tables:
-                    if current:
-                        groups.append(current)
-                    current = []
-                    table_count = 0
-                current.append(el)
                 table_count += 1
-            else:
-                current.append(el)
         if current:
             groups.append(current)
         return groups or [[]]
