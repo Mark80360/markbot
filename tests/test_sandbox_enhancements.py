@@ -18,7 +18,6 @@ is verified end-to-end rather than by mocking internals.
 
 import asyncio
 import sys
-from pathlib import Path
 
 import pytest
 

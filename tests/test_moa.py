@@ -7,16 +7,14 @@ all-advisor failure, aggregator failure, and the /moa message helpers.
 
 from __future__ import annotations
 
-import pytest
-
 from markbot.agent.moa import _resolve_advisors, run_moa
 from markbot.cli.slash_commands.builtin import _history_to_text, _last_user_message
 from markbot.config.schema import (
     AgentDefaults,
     AgentsConfig,
     Config,
-    ModelConfig,
     MoAConfig,
+    ModelConfig,
     ProviderConfig,
     ProvidersConfig,
 )

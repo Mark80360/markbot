@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 _DATA_DIR = Path.home() / ".markbot"
 _DB_PATH = _DATA_DIR / "web_chat.db"
 

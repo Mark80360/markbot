@@ -14,7 +14,6 @@ from markbot.runtime.factory import (
     GATEWAY_FEATURES,
     WEB_FEATURES,
     AgentRuntime,
-    RuntimeFeatures,
     build_runtime,
 )
 

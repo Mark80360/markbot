@@ -17,8 +17,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from markbot.types.exceptions import BudgetExceededError
 from markbot.agent.cache_protocol import CanonicalUsage
+from markbot.types.exceptions import BudgetExceededError
 
 
 @dataclass

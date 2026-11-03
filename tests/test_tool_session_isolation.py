@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
 

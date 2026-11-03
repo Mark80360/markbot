@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -12,7 +10,6 @@ from fastapi.testclient import TestClient
 
 from markbot.web import auth
 from markbot.web.store import WebSessionStore
-
 
 # ---------------------------------------------------------------------------
 # auth.py
@@ -302,7 +299,7 @@ class TestWebSessionStore:
 
     def test_db_path_parent_created(self, tmp_path):
         nested = tmp_path / "nested" / "deep" / "web.db"
-        s = WebSessionStore(db_path=nested)
+        WebSessionStore(db_path=nested)
         assert nested.parent.exists()
 
     def test_fts_table_present(self, store):
@@ -373,9 +370,8 @@ class TestServerBuildApp:
             assert path in routes
 
     def test_workspace_override_controls_upload_dir(self, tmp_path, monkeypatch):
-        from markbot.web import auth
-        from markbot.web import server
         from markbot.config.schema import Config
+        from markbot.web import auth, server
 
         monkeypatch.setattr(auth, "_session_token", "tok")
         monkeypatch.setattr(server, "WEB_DIST", tmp_path / "missing-dist")
@@ -422,10 +418,10 @@ class TestStatusRouter:
 
 class TestSystemRouter:
     def test_system_stats_with_psutil(self, monkeypatch):
-        from markbot.web.routers import system
-
         # Stub psutil via sys.modules insert in the router's import
         import sys
+
+        from markbot.web.routers import system
 
         class FakeVM:
             total = 1000

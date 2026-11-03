@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from markbot.tools.base import Tool, _resolve_path
-from markbot.utils.constants import BOOTSTRAP_FILES, MEMORY_FILENAME, USER_FILENAME, is_main_memory_session
+from markbot.utils.constants import (
+    BOOTSTRAP_FILES,
+    MEMORY_FILENAME,
+    USER_FILENAME,
+    is_main_memory_session,
+)
 from markbot.utils.helpers import format_time
 
 if TYPE_CHECKING:

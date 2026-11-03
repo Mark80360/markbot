@@ -13,13 +13,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from markbot.agent.iteration import (
-    _ACTION_COMPLETION_CLAIM_PATTERNS,
-    _classify_shell_command,
+    IterationRunner,
     LoopState,
-    TurnExitReason,
+    _classify_shell_command,
 )
-from markbot.agent.iteration import IterationRunner
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -394,7 +391,7 @@ class TestActionVerifyFlow:
         assert state.side_effect_pending is True
         assert state.verification_done is False
         assert runner._should_inject_verify_nudge(state) is True
-        
+
         # 2. Nudge injected, model heeds it and runs `systemctl is-active gateway`.
         runner._record_verification_call(
             state, _tool_call("exec", "systemctl is-active gateway"), ""

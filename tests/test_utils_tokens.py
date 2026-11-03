@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from markbot.utils.tokens import estimate_messages_tokens, estimate_tokens
-
 
 # ---------------------------------------------------------------------------
 # estimate_tokens

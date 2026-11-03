@@ -24,9 +24,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -118,7 +115,6 @@ class TestSessionSummaryPath:
     def test_session_summary_writes_under_memory_daily(self, tmp_path: Path):
         from datetime import datetime
 
-        from markbot.memory.manager import MemoryManager
 
         mgr = _make_manager(tmp_path)
         mgr.set_compressed_summary("hello world", session_key="feishu:chat1")
@@ -299,7 +295,7 @@ class TestEncoderPersistence:
         from markbot.memory.encoder import MemoryEncoder
 
         encoder1 = MemoryEncoder(workspace=tmp_path)
-        match = _make_match("always use tabs")
+        _make_match("always use tabs")
         encoder1._recent_detections["always use tabs"] = time.time() - 1
         encoder1._save_detection_log()
 
@@ -513,8 +509,9 @@ class TestDailyLogRetention:
     """Fix: DailyLogManager prunes old daily log files."""
 
     def test_prune_removes_old_files(self, tmp_path: Path):
-        from markbot.memory.daily_log import DailyLogManager
         import time as _time
+
+        from markbot.memory.daily_log import DailyLogManager
 
         mgr = DailyLogManager(workspace=tmp_path, retention_days=7)
         old_file = mgr.daily_dir / "2020-01-01.md"
@@ -529,8 +526,9 @@ class TestDailyLogRetention:
         assert not old_file.exists()
 
     def test_prune_keeps_recent_files(self, tmp_path: Path):
-        from markbot.memory.daily_log import DailyLogManager
         from datetime import datetime
+
+        from markbot.memory.daily_log import DailyLogManager
 
         mgr = DailyLogManager(workspace=tmp_path, retention_days=7)
         recent_file = mgr.daily_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
@@ -550,8 +548,10 @@ class TestDailyLogRetention:
         assert not old_named.exists()
 
     def test_retention_zero_disables_prune(self, tmp_path: Path):
+        import os
+        import time as _time
+
         from markbot.memory.daily_log import DailyLogManager
-        import time as _time, os
 
         mgr = DailyLogManager(workspace=tmp_path, retention_days=0)
         old_file = mgr.daily_dir / "2020-01-01.md"
@@ -567,8 +567,8 @@ class TestVectorSearchCache:
 
     def test_cache_returns_same_result_within_ttl(self, tmp_path: Path):
         mgr = _make_manager(tmp_path)
-        from markbot.memory.longterm import LongTermMemory
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.longterm import LongTermMemory
         from markbot.memory.vectorstore import InMemoryVectorStore
 
         ltm = LongTermMemory(
@@ -585,8 +585,8 @@ class TestVectorSearchCache:
 
     def test_cache_cleared_on_sync_turn(self, tmp_path: Path):
         mgr = _make_manager(tmp_path)
-        from markbot.memory.longterm import LongTermMemory
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.longterm import LongTermMemory
         from markbot.memory.vectorstore import InMemoryVectorStore
 
         ltm = LongTermMemory(
@@ -693,9 +693,9 @@ class TestConsolidatorBlockwiseDedup:
     """Fix: consolidator dedup is blockwise, not O(n²) full matrix."""
 
     def test_dedup_removes_near_duplicates(self, tmp_path: Path):
-        from markbot.memory.consolidation import Consolidator, ConsolidationConfig
-        from markbot.memory.vectorstore import InMemoryVectorStore
+        from markbot.memory.consolidation import ConsolidationConfig, Consolidator
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import InMemoryVectorStore
 
         store = InMemoryVectorStore()
         emb = HashingEmbedder()
@@ -718,8 +718,8 @@ class TestSQLiteMaxScanRecords:
     """Fix: SQLiteVectorStore.query caps loaded records."""
 
     def test_query_with_scan_cap(self, tmp_path: Path):
-        from markbot.memory.vectorstore import SQLiteVectorStore
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import SQLiteVectorStore
 
         store = SQLiteVectorStore(tmp_path / "test.db", max_records=100, max_scan_records=5)
         emb = HashingEmbedder()
@@ -735,8 +735,8 @@ class TestSQLiteMaxScanRecords:
         store.close()
 
     def test_query_with_source_respects_scan_cap(self, tmp_path: Path):
-        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
 
         store = SQLiteVectorStore(tmp_path / "test_source.db", max_records=100, max_scan_records=5)
         emb = HashingEmbedder()
@@ -751,8 +751,8 @@ class TestSQLiteMaxScanRecords:
         store.close()
 
     def test_query_metadata_filter_applies_before_scan_cap(self, tmp_path: Path):
-        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
         from markbot.memory.embedder import HashingEmbedder
+        from markbot.memory.vectorstore import SQLiteVectorStore, VectorRecord
 
         store = SQLiteVectorStore(tmp_path / "test_meta.db", max_records=100, max_scan_records=5)
         emb = HashingEmbedder()

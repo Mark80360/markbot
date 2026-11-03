@@ -14,7 +14,6 @@ from typing import Any, Iterable
 
 from markbot.config.profile import TOOL_GROUPS
 
-
 PROFILE_GROUP_FLAGS: dict[str, str] = {
     "desktop": "enable_desktop",
     "browser": "enable_browser",

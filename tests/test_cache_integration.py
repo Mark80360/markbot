@@ -15,13 +15,11 @@ tests don't see end-to-end:
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 from markbot.agent.cache_chip import render_cache_hit_chip
 from markbot.agent.cache_protocol import CacheEvent, CanonicalUsage
-from markbot.agent.iteration import USAGE_NORMALISERS, normalise_usage
 from markbot.agent.cost import CostTracker, ModelPricing, PricingTable
+from markbot.agent.iteration import USAGE_NORMALISERS, normalise_usage
 
 
 class TestCostTrackerAcceptsCanonicalUsage(unittest.TestCase):

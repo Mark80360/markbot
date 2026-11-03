@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from markbot.agent.turn_trace import TraceEvent, TurnTrace
+from markbot.agent.turn_trace import TurnTrace
 
 
 class TestRecording:

@@ -409,6 +409,7 @@ class SessionBootstrap:
         advisory — the agent decides whether to resume the prior task.
         """
         import os
+
         from markbot.cli.daemon import RESTART_MARKER_FRESH_S
 
         ts = os.environ.get("MARKBOT_LAST_RESTART_AT")

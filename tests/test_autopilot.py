@@ -10,6 +10,19 @@ import pytest
 
 from markbot.autopilot import service as service_mod
 from markbot.autopilot.store import AutopilotStore
+from markbot.autopilot.tools import (
+    ALL_AUTOPILOT_TOOLS,
+    AutopilotIntakeTool,
+    AutopilotListTool,
+    AutopilotPickNextTool,
+    AutopilotRejectTool,
+    AutopilotRequeueTool,
+    AutopilotStatusTool,
+    AutopilotVerifyTool,
+    _get_store,
+    _invalidate_store,
+    _store_cache,
+)
 from markbot.autopilot.types import (
     AutopilotConfig,
     AutopilotPolicy,
@@ -21,19 +34,6 @@ from markbot.autopilot.types import (
     VerificationPolicy,
     VerificationStep,
 )
-from markbot.autopilot.tools import (
-    ALL_AUTOPILOT_TOOLS,
-    AutopilotIntakeTool,
-    AutopilotListTool,
-    AutopilotPickNextTool,
-    AutopilotRequeueTool,
-    AutopilotRejectTool,
-    AutopilotStatusTool,
-    AutopilotVerifyTool,
-    _get_store,
-    _invalidate_store,
-    _store_cache,
-)
 from markbot.autopilot.verification import (
     build_verification_commands,
     parse_verification_entry,
@@ -43,7 +43,6 @@ from markbot.autopilot.verification import (
 )
 from markbot.types.permission import PermissionMode, ToolPermissionContext
 from markbot.types.tool import ToolContext
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -230,7 +229,7 @@ class TestStore:
         assert card.source_kind == "github_issue"
         assert card.score > 0
         assert card.score_reasons
-        assert "source:github_issue=75" in Card_reasons(card)
+        assert "source:github_issue=75" in card_reasons(card)
 
     def test_enqueue_idempotent_refresh(self, store: AutopilotStore):
         c1, created1 = store.enqueue_card(
@@ -441,7 +440,7 @@ class TestStore:
         assert cfg.autopilot_policy.max_attempts == 3
 
 
-def Card_reasons(card: TaskCard) -> str:
+def card_reasons(card: TaskCard) -> str:
     return ", ".join(card.score_reasons)
 
 

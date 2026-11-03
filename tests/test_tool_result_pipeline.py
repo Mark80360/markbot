@@ -18,8 +18,6 @@ import inspect
 import textwrap
 from types import SimpleNamespace
 
-import pytest
-
 from markbot.agent.iteration import IterationRunner
 
 

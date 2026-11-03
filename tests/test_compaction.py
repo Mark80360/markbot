@@ -4,8 +4,8 @@ import pytest
 
 from markbot.agent.compact import (
     CompactAction,
-    CompactResult,
     CompactionConfig,
+    CompactResult,
     MultiLevelCompactor,
     is_prompt_too_long_error,
 )

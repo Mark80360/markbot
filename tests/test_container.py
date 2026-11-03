@@ -163,9 +163,10 @@ class TestSessionExtensionsPermissionMode:
         _ASP._instance = None
 
     def _build(self, tmp_path, default_permission_mode):
+        from unittest.mock import MagicMock
+
         from markbot.agent.container import AgentContext
         from markbot.config.schema import Config
-        from unittest.mock import MagicMock
 
         config = Config.model_validate({
             "agents": {"defaults": {"default_permission_mode": default_permission_mode}}
@@ -196,9 +197,10 @@ class TestSessionExtensionsPermissionMode:
         assert ext["app_state"].get().permission_mode is PermissionMode.DEFAULT
 
     def test_no_config_keeps_default(self, tmp_path):
-        from markbot.types.permission import PermissionMode
-        from markbot.agent.container import AgentContext
         from unittest.mock import MagicMock
+
+        from markbot.agent.container import AgentContext
+        from markbot.types.permission import PermissionMode
         self._reset_app_state_singleton()
         ext = AgentContext._build_session_extensions(
             tmp_path, MagicMock(), MagicMock(), MagicMock(), {}, None,

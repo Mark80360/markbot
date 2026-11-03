@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from markbot.tools.base import BaseTool
 from markbot.bus.events import make_session_key
+from markbot.tools.base import BaseTool
 from markbot.types.permission import PermissionDecision
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter
 

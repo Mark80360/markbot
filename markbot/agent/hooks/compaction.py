@@ -23,9 +23,8 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from markbot.bus.events import make_session_key
-
 from markbot.agent.tokens import estimate_tokens as _estimate_tokens
+from markbot.bus.events import make_session_key
 
 if TYPE_CHECKING:
     from markbot.memory.base import BaseMemoryManager

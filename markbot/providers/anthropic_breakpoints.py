@@ -58,7 +58,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
 
-
 #: Default TTL for cache breakpoints.  5 minutes is the Anthropic default
 #: and is the right choice for interactive agents; switch to ``"1h"``
 #: for long-running batch workloads.

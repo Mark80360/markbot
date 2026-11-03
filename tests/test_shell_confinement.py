@@ -12,9 +12,6 @@ Two independent holes are covered here:
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 
 from markbot.tools.shell import (

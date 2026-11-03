@@ -42,7 +42,7 @@ dependencies = [
     "mcp>=1.26.0,<2.0.0",
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
-    "openai>=2.8.0",
+    "openai>=2.8.0,<3.0.0",
     "tiktoken>=0.12.0,<1.0.0",
     "portalocker>=2.5.0,<4.0.0",
     "filelock>=3.13.0,<4.0.0",
@@ -109,6 +109,10 @@ dev = [
 [project.scripts]
 markbot = "markbot.cli.commands:app"
 
+[project.urls]
+Homepage = "https://github.com/mickletang/markbot"
+Issues = "https://github.com/mickletang/markbot/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -121,8 +125,13 @@ include = [
     "markbot/**/*.py",
     "markbot/locales/*.json",
     "markbot/templates/**/*.md",
+    "markbot/templates/*.json",
+    "markbot/templates/*.sh",
     "markbot/skills/**/*.md",
     "markbot/skills/**/*.sh",
+    # Built Web console: `markbot web` serves these files at runtime, so a
+    # wheel without them ships a server with no UI.
+    "markbot/web/static/**/*",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -146,7 +155,21 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
-ignore = ["E501"]
+ignore = [
+    "E501",
+    # Deferred imports inside functions use short CamelCase aliases on
+    # purpose (they keep import cost off the module import path).
+    "N814",
+    "N817",
+    # Local lookup tables are constants by intent even though they live in
+    # a function body.
+    "N806",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles mirror an external JSON schema verbatim, so the field names
+# cannot be renamed.
+"tests/test_mcp_arguments.py" = ["N815"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -157,6 +180,9 @@ source = ["markbot"]
 omit = ["tests/*", "**/tests/*"]
 
 [tool.coverage.report]
+# 49% is today's measured floor. This gate exists to stop regressions; raise
+# it as coverage improves.
+fail_under = 48
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",

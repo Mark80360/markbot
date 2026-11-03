@@ -177,5 +177,5 @@ class TestMessagePipeline:
         ))
 
         # Should not raise - error is caught
-        result = await pipeline.process(process_ctx, handler)
+        await pipeline.process(process_ctx, handler)
         mw.on_error.assert_called_once()

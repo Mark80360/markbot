@@ -16,8 +16,6 @@ import ast
 import io
 import json
 
-import pytest
-
 
 def _codex_fn(name: str):
     """Load one function from the Codex module without importing it.

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
 from loguru import logger
 
 from markbot.log.core import InterceptHandler, get_logger, setup_logging
@@ -15,7 +14,6 @@ from markbot.log.format import (
     console_format,
     file_format,
 )
-
 
 # ---------------------------------------------------------------------------
 # _escape_markup
@@ -171,7 +169,7 @@ class TestInterceptHandler:
         # Loguru must be configured with a sink to capture
         setup_logging(level="INFO", install_exception_hooks=False)
         handler.emit(record)
-        captured = capsys.readouterr()
+        capsys.readouterr()
         # If stderr is not a TTY, setup_logging won't add the console sink.
         # We just verify no exception is raised.
 

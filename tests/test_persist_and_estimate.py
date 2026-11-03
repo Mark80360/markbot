@@ -7,14 +7,11 @@ the user's actual ``~/.markbot`` directory.
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from markbot.agent.token_estimate_cache import TokenEstimateCache
 from markbot.agent.prompt_persist import (
-    CacheMetadata,
     cache_dir,
     cache_stats,
     clear_cached_base_section,
@@ -22,7 +19,7 @@ from markbot.agent.prompt_persist import (
     load_cached_base_section,
     save_cached_base_section,
 )
-
+from markbot.agent.token_estimate_cache import TokenEstimateCache
 
 SYSTEM = "You are a helpful assistant."
 

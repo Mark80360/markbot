@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from markbot.agent.permission_approval import PermissionApprover, _parse_choice
+from markbot.agent.permission_approval import _parse_choice
 from markbot.config.profile import get_profile, list_profiles
-from markbot.config.schema import AgentDefaults, Config, ExecToolConfig, ReliabilityConfig
+from markbot.config.schema import Config, ReliabilityConfig
 from markbot.schedule.cron import CronJob, CronPayload, CronSchedule, CronService, _now_ms
 from markbot.tools.base import BaseTool
 from markbot.tools.registry import ToolRegistry
@@ -197,7 +195,7 @@ class TestExecGuard:
 class TestCronReliability:
     @pytest.mark.asyncio
     async def test_retries_then_dead_letter(self, tmp_path: Path):
-        from markbot.schedule.cron import CronJob, CronJobState, CronPayload
+        from markbot.schedule.cron import CronJobState
 
         calls = {"n": 0}
 
@@ -238,7 +236,7 @@ class TestCronReliability:
 
     @pytest.mark.asyncio
     async def test_success_no_retry(self, tmp_path: Path):
-        from markbot.schedule.cron import CronJob, CronJobState, CronPayload
+        from markbot.schedule.cron import CronJobState
 
         calls = {"n": 0}
 

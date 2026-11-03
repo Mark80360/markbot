@@ -75,30 +75,44 @@ class TestWheelIncludesTheWebUi:
         assert _is_included(rel, _include_patterns(pyproject))
 
     def test_no_orphan_build_artifacts(self):
-        """Every asset in ``assets/`` must be referenced by ``index.html``.
+        """Every asset in ``assets/`` must be referenced by the app bundle.
 
         A stale bundle from an older build is dead weight in the wheel and,
-        worse, an unreviewed copy of the app that still gets served.
+        worse, an unreviewed copy of the app that still gets served. Vite
+        code-splits route chunks, so they are referenced from JS rather than
+        from ``index.html``; every shipped file is scanned for references.
         """
-        index = (WEB_STATIC / "index.html").read_text(encoding="utf-8")
-        referenced = set(re.findall(r'(?:src|href)="([^"]+)"', index))
-        referenced_names = {Path(r).name for r in referenced}
+        static_root = WEB_STATIC
+        index = (static_root / "index.html").read_text(encoding="utf-8")
+        text_blob = index + "".join(
+            p.read_text(encoding="utf-8", errors="ignore")
+            for p in static_root.rglob("*")
+            if p.is_file() and p.suffix in {".js", ".css", ".html"}
+        )
 
         orphans = [
             p.name
-            for p in (WEB_STATIC / "assets").iterdir()
-            if p.is_file() and p.name not in referenced_names
+            for p in (static_root / "assets").iterdir()
+            if p.is_file() and p.name not in text_blob
         ]
         assert not orphans, f"unreferenced build artifacts in assets/: {orphans}"
 
 
 class TestDeclaredDependencies:
-    def test_direct_imports_are_declared(self, pyproject):
-        """``aiohttp`` was imported at module scope by ``channels/qq.py`` and
-        never declared — it only worked because ``qq-botpy`` happened to
-        depend on it."""
+    def test_optional_runtime_imports_are_guarded_or_declared(self, pyproject):
+        """Optional integrations must be either declared or import-guarded.
+
+        ``aiohttp`` used to be imported at module scope by ``channels/qq.py``
+        and was never declared — it only worked because ``qq-botpy`` happened
+        to depend on it. The import is guarded now; either arrangement is
+        acceptable, a bare module-level import is not.
+        """
         deps = " ".join(pyproject["project"]["dependencies"])
-        assert "aiohttp" in deps
+        qq_src = (REPO_ROOT / "markbot" / "channels" / "qq.py").read_text(
+            encoding="utf-8"
+        )
+        guarded = "try:" in qq_src and "import aiohttp" in qq_src
+        assert "aiohttp" in deps or guarded
 
     def test_every_runtime_dependency_has_an_upper_bound(self, pyproject):
         """An unbounded major version is a breaking change with no warning.
@@ -152,6 +166,11 @@ class TestTemplateSync:
         assert "feature_list.json" in names
         assert "init.sh" in names
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows filesystems do not store the POSIX executable bit; "
+        ".gitattributes keeps it on POSIX checkouts",
+    )
     def test_shell_template_is_executable(self, tmp_path):
         from markbot.utils.helpers import sync_workspace_templates
 

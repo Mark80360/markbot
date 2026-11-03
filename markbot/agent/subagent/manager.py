@@ -315,7 +315,6 @@ class SubagentManager:
         iteration = 0
         final_result: str | None = None
         residual_risk = ""
-        child_halted = False
         artifacts: list[str] = []
         evidence: list[str] = []
 

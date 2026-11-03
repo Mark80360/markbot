@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import platform
 import time
 from datetime import datetime, timezone
@@ -88,8 +87,9 @@ def _get_cpu_info() -> dict:
 
 @router.get("/api/system/stats")
 async def system_stats():
-    from markbot import __version__
     import asyncio
+
+    from markbot import __version__
     try:
         import psutil
     except ImportError:

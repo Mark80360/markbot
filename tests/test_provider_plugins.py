@@ -266,6 +266,11 @@ class TestPluginsAreOptIn:
 
         assert find_by_name("wantedprovider") is not None
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX mode bits are synthesized on Windows, so the "
+        "world-writable refusal cannot be exercised there",
+    )
     def test_world_writable_plugin_is_refused_even_when_enabled(self, tmp_path):
         """If anyone can replace the file, "opted in" no longer means the
         operator approved *this* code."""

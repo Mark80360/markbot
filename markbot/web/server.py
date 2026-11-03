@@ -11,9 +11,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from starlette.routing import WebSocketRoute
-
 from fastapi import File, Request, UploadFile
+from starlette.routing import WebSocketRoute
 
 from markbot.web.auth import get_token, is_valid_token
 
@@ -39,23 +38,24 @@ def invalidate_agent() -> None:
 
 def _build_app(workspace: str | Path | None = None):
     from fastapi import FastAPI
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response as FastResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import Response as FastResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.websockets import WebSocket
 
     from markbot.web.auth import TokenAuthMiddleware, get_token, verify_ws_token
-    from markbot.web.store import get_store
-    from markbot.web.routers.status import router as status_router
-    from markbot.web.routers.config import router as config_router
-    from markbot.web.routers.env import router as env_router
-    from markbot.web.routers.sessions import router as sessions_router
-    from markbot.web.routers.models import router as models_router
-    from markbot.web.routers.logs import router as logs_router
-    from markbot.web.routers.skills import router as skills_router
-    from markbot.web.routers.cron import router as cron_router
     from markbot.web.routers.channels import router as channels_router
-    from markbot.web.routers.system import router as system_router
+    from markbot.web.routers.config import router as config_router
+    from markbot.web.routers.cron import router as cron_router
+    from markbot.web.routers.env import router as env_router
+    from markbot.web.routers.logs import router as logs_router
     from markbot.web.routers.mcp import router as mcp_router
+    from markbot.web.routers.models import router as models_router
+    from markbot.web.routers.sessions import router as sessions_router
+    from markbot.web.routers.skills import router as skills_router
+    from markbot.web.routers.status import router as status_router
+    from markbot.web.routers.system import router as system_router
+    from markbot.web.store import get_store
 
     workspace_override = Path(workspace).expanduser().resolve() if workspace else None
 
@@ -166,7 +166,7 @@ def _build_app(workspace: str | Path | None = None):
 
         await websocket.accept()
         _log.info("WebSocket accepted")
-        agent = await _get_agent()
+        await _get_agent()
 
         session_id: str | None = None
         # Shared stop flag across the connection; set by stop_streaming,

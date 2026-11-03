@@ -900,8 +900,8 @@ class AgentLoop:
         if self._direct_inflight > 0:
             return True
         for tasks in self._active_tasks.values():
-            for t in tasks:
-                if not t.done():
+            for task in tasks:
+                if not task.done():
                     return True
         subagents = getattr(self, "subagents", None)
         if subagents is not None and hasattr(subagents, "has_running_tasks"):

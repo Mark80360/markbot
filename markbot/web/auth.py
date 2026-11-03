@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
-
 
 _session_token = secrets.token_urlsafe(32)
 

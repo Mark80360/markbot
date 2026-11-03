@@ -13,9 +13,8 @@ from __future__ import annotations
 import unittest
 
 from markbot.agent.cache_protocol import (
-    CanonicalUsage,
     CacheEvent,
-    UsageNormaliser,
+    CanonicalUsage,
 )
 from markbot.agent.iteration import (
     USAGE_NORMALISERS,

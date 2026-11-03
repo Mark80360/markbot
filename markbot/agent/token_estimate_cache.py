@@ -41,13 +41,13 @@ long-running session cannot blow out memory.
 
 from __future__ import annotations
 
-import time
 from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from markbot.agent.tokens import estimate_messages_tokens
+
 # ``estimate_messages_tokens`` only takes the messages list; the
 # system prompt is implicit in the ``system`` message at index 0.
 # We still keep the system fingerprint as a *cache key component* —

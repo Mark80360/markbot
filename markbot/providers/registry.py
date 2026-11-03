@@ -46,11 +46,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -408,7 +409,6 @@ class GeminiSpec(ProviderSpec):
     """Gemini — thinking_config translation for OpenAI-compat endpoint."""
 
     def build_extra_body(self, **context: Any) -> dict[str, Any]:
-        model = context.get("model") or ""
         reasoning_config = context.get("reasoning_config")
 
         if not reasoning_config or not isinstance(reasoning_config, dict):
@@ -1113,7 +1113,10 @@ def _discover_user_plugins() -> None:
         except OSError as exc:
             logger.warning("Cannot stat user provider plugin {}: {}", child.name, exc)
             continue
-        if mode & 0o002:
+        # Windows synthesizes POSIX mode bits from file attributes and reports
+        # regular files as 0o666, so everyone would look world-writable there.
+        # The check is only meaningful where the bits are real.
+        if os.name == "posix" and mode & 0o002:
             logger.error(
                 "Refusing world-writable user provider plugin {} (mode {:o}). "
                 "Run: chmod o-w {}",
@@ -1223,8 +1226,6 @@ def find_by_name(name: str) -> ProviderSpec | None:
             return spec
     return None
 
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from markbot.providers.base import LLMProvider

@@ -293,6 +293,7 @@ class TestUpdateConfigValue:
 
     def test_creates_intermediate_dicts_when_missing(self, tmp_path):
         import json
+
         from markbot.config.loader import update_config_value
         cfg = tmp_path / "config.json"
         cfg.write_text("{}", encoding="utf-8")
@@ -306,6 +307,7 @@ class TestUpdateConfigValue:
 
     def test_preserves_neighboring_fields(self, tmp_path):
         import json
+
         from markbot.config.loader import update_config_value
         cfg = tmp_path / "config.json"
         original = {
@@ -328,6 +330,7 @@ class TestUpdateConfigValue:
 
     def test_overwrites_existing_value(self, tmp_path):
         import json
+
         from markbot.config.loader import update_config_value
         cfg = tmp_path / "config.json"
         cfg.write_text(
@@ -344,6 +347,7 @@ class TestUpdateConfigValue:
 
     def test_creates_file_when_missing(self, tmp_path):
         import json
+
         from markbot.config.loader import update_config_value
         cfg = tmp_path / "subdir" / "config.json"
         ok = update_config_value(

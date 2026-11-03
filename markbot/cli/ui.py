@@ -17,7 +17,7 @@ import os
 import select
 import sys
 from contextlib import nullcontext
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.markdown import Markdown

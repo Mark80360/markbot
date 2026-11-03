@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
+from typing import TYPE_CHECKING, Callable
 
 from markbot.locales import t
 
 if TYPE_CHECKING:
-    from markbot.cli.slash_commands.router import CommandContext, Handler
+    from markbot.cli.slash_commands.router import Handler
 
 
 def _i18n(key: str, default: str) -> str:

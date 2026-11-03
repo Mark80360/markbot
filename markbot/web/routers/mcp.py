@@ -180,7 +180,7 @@ async def test_mcp_server(name: str):
 async def _test_mcp_connection(transport_type: str, mcp_cfg) -> dict[str, Any]:
     """Attempt to connect to an MCP server and list its tools."""
     from contextlib import AsyncExitStack
-    from markbot.tools.mcp import connect_mcp_servers
+
     from markbot.tools.registry import ToolRegistry
 
     # Build a temporary dict in the format connect_mcp_servers expects

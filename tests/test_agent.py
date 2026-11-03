@@ -346,8 +346,8 @@ class TestIdleTimeout:
         assert "ses:1" not in loop._session_last_active
 
     def test_idle_disabled_when_zero(self, monkeypatch):
-        from markbot.agent.loop import AgentLoop
         import markbot.agent.loop as agent_loop
+        from markbot.agent.loop import AgentLoop
 
         monkeypatch.setattr(agent_loop, "AGENT_IDLE_TIMEOUT_MINUTES", 0)
 
@@ -656,7 +656,7 @@ class TestPolicyDenialIsNotAToolFailure:
         assert not is_policy_denial("README says: blocked by safety guard is the marker")
 
     def test_streak_not_advanced_by_denials(self):
-        from markbot.agent.tool_guardrails import ToolCallGuardrail, GuardrailAction
+        from markbot.agent.tool_guardrails import GuardrailAction, ToolCallGuardrail
         g = ToolCallGuardrail()
         decisions = [
             g.observe("exec", {"command": f"cd /w && ls {i}"}, self.DENIAL)
@@ -681,7 +681,7 @@ class TestPolicyDenialIsNotAToolFailure:
         assert g.state.recent_failures == [True]
 
     def test_real_failures_still_blacklisted_and_escalated(self):
-        from markbot.agent.tool_guardrails import ToolCallGuardrail, GuardrailAction
+        from markbot.agent.tool_guardrails import GuardrailAction, ToolCallGuardrail
         g = ToolCallGuardrail()
         decision = None
         for i in range(3):
@@ -696,7 +696,7 @@ class TestGuardrailLoopCap:
 
     @pytest.fixture
     def guardrail(self):
-        from markbot.agent.tool_guardrails import ToolCallGuardrail, GuardrailConfig
+        from markbot.agent.tool_guardrails import GuardrailConfig, ToolCallGuardrail
         return ToolCallGuardrail(GuardrailConfig(
             max_web_searches_per_turn=3,
             max_web_fetches_per_turn=2,
@@ -736,7 +736,9 @@ class TestGuardrailLoopCap:
 
     def test_cap_zero_means_unlimited(self):
         from markbot.agent.tool_guardrails import (
-            ToolCallGuardrail, GuardrailConfig, GuardrailAction,
+            GuardrailAction,
+            GuardrailConfig,
+            ToolCallGuardrail,
         )
         g = ToolCallGuardrail(GuardrailConfig(max_web_searches_per_turn=0))
         for _ in range(100):
@@ -806,8 +808,9 @@ class TestToolStreakBlock:
     def test_streak_warn_at_threshold(self):
         """failures below the warn threshold → ALLOW; at it → WARN."""
         from markbot.agent.tool_guardrails import (
-            ToolCallGuardrail, GuardrailAction,
             DEFAULT_TOOL_STREAK_WARN,
+            GuardrailAction,
+            ToolCallGuardrail,
         )
         g = ToolCallGuardrail()
         for _ in range(DEFAULT_TOOL_STREAK_WARN - 1):
@@ -821,8 +824,9 @@ class TestToolStreakBlock:
     def test_streak_block_at_threshold(self):
         """block-th consecutive failure → BLOCK (tool added to blocked_tools)."""
         from markbot.agent.tool_guardrails import (
-            ToolCallGuardrail, GuardrailAction,
             DEFAULT_TOOL_STREAK_BLOCK,
+            GuardrailAction,
+            ToolCallGuardrail,
         )
         g = ToolCallGuardrail()
         for _ in range(DEFAULT_TOOL_STREAK_BLOCK - 1):
@@ -835,8 +839,9 @@ class TestToolStreakBlock:
     def test_streak_resets_on_success(self):
         """A success resets the streak to 0."""
         from markbot.agent.tool_guardrails import (
-            ToolCallGuardrail, GuardrailAction,
             DEFAULT_TOOL_STREAK_WARN,
+            GuardrailAction,
+            ToolCallGuardrail,
         )
         g = ToolCallGuardrail()
         for _ in range(DEFAULT_TOOL_STREAK_WARN - 1):
@@ -859,7 +864,8 @@ class TestErrorClassifier:
     ])
     def test_ssl_cert_is_deterministic(self, message):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(None, message)
         assert result.category is ErrorCategory.DETERMINISTIC
@@ -874,7 +880,8 @@ class TestErrorClassifier:
     ])
     def test_context_overflow_is_deterministic(self, message):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(None, message)
         assert result.category is ErrorCategory.DETERMINISTIC
@@ -884,7 +891,8 @@ class TestErrorClassifier:
     @pytest.mark.parametrize("status_code", [400, 401, 402, 403, 404, 413])
     def test_4xx_deterministic(self, status_code):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(status_code, "error")
         assert result.category is ErrorCategory.DETERMINISTIC
@@ -893,7 +901,8 @@ class TestErrorClassifier:
     @pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504, 529])
     def test_5xx_and_rate_limit_transient(self, status_code):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(status_code, "error")
         assert result.category is ErrorCategory.TRANSIENT
@@ -901,7 +910,8 @@ class TestErrorClassifier:
 
     def test_timeout_message_transient(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(None, "Connection timed out after 30s")
         assert result.category is ErrorCategory.TRANSIENT
@@ -909,7 +919,8 @@ class TestErrorClassifier:
 
     def test_rate_limit_body_transient(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(None, "Rate limit exceeded")
         assert result.category is ErrorCategory.TRANSIENT
@@ -917,7 +928,8 @@ class TestErrorClassifier:
 
     def test_content_filter_deterministic(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(400, "content_filter triggered")
         assert result.category is ErrorCategory.DETERMINISTIC
@@ -927,7 +939,8 @@ class TestErrorClassifier:
     def test_model_not_found_overrides_5xx(self):
         """Aggregator 503 with 'model not found' body → deterministic + fallback."""
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(503, "model not found: gpt-5")
         assert result.category is ErrorCategory.DETERMINISTIC
@@ -937,7 +950,8 @@ class TestErrorClassifier:
 
     def test_unknown_defaults_to_transient(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(None, "something weird happened")
         assert result.category is ErrorCategory.TRANSIENT
@@ -962,7 +976,8 @@ class TestErrorClassifier:
 
     def test_exception_parameter(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         exc = ConnectionRefusedError("Connection refused")
         result = classify_api_error(None, "", exc)
@@ -1013,7 +1028,8 @@ class TestErrorClassifierRecoveryHints:
     def test_432_quota_exhausted_should_fallback(self):
         """HTTP 432 (Tavily quota exhausted) → billing, deterministic, fallback."""
         from markbot.providers.error_classifier import (
-            classify_api_error, ErrorCategory,
+            ErrorCategory,
+            classify_api_error,
         )
         result = classify_api_error(432, "Client error '432'")
         assert result.reason == "billing"
@@ -1064,7 +1080,9 @@ class TestErrorClassifierBackoff:
 
     def test_rate_limit_jittered_backoff(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy, RATE_LIMIT_WINDOW_SECONDS,
+            RATE_LIMIT_WINDOW_SECONDS,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(429, "rate limit exceeded")
         # A TPM/RPM budget is a rolling minute: a 5s backoff retried the same
@@ -1077,7 +1095,8 @@ class TestErrorClassifierBackoff:
 
     def test_overloaded_exponential_backoff(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(529, "overloaded")
         assert result.backoff_seconds == 3.0
@@ -1086,7 +1105,8 @@ class TestErrorClassifierBackoff:
     def test_429_with_overloaded_body_refines_to_overloaded(self):
         """429 status + 'overloaded' body → overloaded (not rate_limit)."""
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(429, "service is temporarily overloaded")
         assert result.reason == "overloaded"
@@ -1094,7 +1114,8 @@ class TestErrorClassifierBackoff:
 
     def test_timeout_fixed_backoff(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(408, "timeout")
         assert result.backoff_seconds == 1.0
@@ -1107,7 +1128,8 @@ class TestErrorClassifierBackoff:
 
     def test_service_unavailable_exponential(self):
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(503, "service unavailable")
         assert result.backoff_seconds == 3.0
@@ -1127,7 +1149,8 @@ class TestErrorClassifierBackoff:
     def test_overloaded_body_no_status(self):
         """Body-only 'overloaded' → transient with exponential backoff."""
         from markbot.providers.error_classifier import (
-            classify_api_error, BackoffStrategy,
+            BackoffStrategy,
+            classify_api_error,
         )
         result = classify_api_error(None, "server is overloaded")
         assert result.reason == "overloaded"

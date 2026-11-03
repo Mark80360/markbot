@@ -14,7 +14,6 @@ import pytest
 
 from markbot.locales import i18n
 
-
 LOCALES_DIR = i18n._locales_dir()
 
 
@@ -46,7 +45,9 @@ def test_all_locales_exist():
         assert (LOCALES_DIR / f"{lang}.json").is_file(), f"missing locales/{lang}.json"
 
 
-@pytest.mark.parametrize("lang", [l for l in i18n.SUPPORTED_LANGUAGES if l != "en"])
+@pytest.mark.parametrize(
+    "lang", [lang for lang in i18n.SUPPORTED_LANGUAGES if lang != "en"]
+)
 def test_catalog_keys_match_english(lang: str):
     """Every non-English catalog must have the same key set as English.
 

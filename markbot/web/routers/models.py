@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
+
 from markbot.config.loader import load_config, save_config
 
 router = APIRouter()

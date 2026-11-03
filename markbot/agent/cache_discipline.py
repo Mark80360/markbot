@@ -28,7 +28,6 @@ without per-prompt enforcement:
 
 from __future__ import annotations
 
-
 #: Section body.  Keep this **short and stable** — every byte of
 #: drift here is a cache miss on the *next* turn.
 CACHE_DISCIPLINE_SECTION = """# Cache discipline

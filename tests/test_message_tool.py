@@ -190,10 +190,10 @@ class TestDefaultConfigIsRestrictive:
 
     def test_tool_binder_passes_the_config_through(self):
         """The guards are pointless if the binder never hands them over."""
+        from types import SimpleNamespace
+
         from markbot.agent.tool_binder import ToolBinder
         from markbot.tools.registry import ToolRegistry
-
-        from types import SimpleNamespace
 
         registry = ToolRegistry()
         binder = ToolBinder(

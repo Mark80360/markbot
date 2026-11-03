@@ -67,8 +67,8 @@ if TYPE_CHECKING:
 # Cache layer (runtime imports — these are instantiated below in
 # from_legacy_params, so they MUST be importable at module load time,
 # not only under TYPE_CHECKING).
-from markbot.agent.prefix_cache import PrefixStabilityManager
 from markbot.agent.llm_response_cache import LLMResponseCache
+from markbot.agent.prefix_cache import PrefixStabilityManager
 from markbot.agent.token_estimate_cache import TokenEstimateCache
 
 
@@ -484,9 +484,17 @@ class AgentContext:
         """Resolve tool configs to their defaults when not supplied."""
         from markbot.config.schema import (
             CodeExecutionConfig as _CEC,
+        )
+        from markbot.config.schema import (
             ExecToolConfig as _ETC,
+        )
+        from markbot.config.schema import (
             FilesystemToolConfig as _FTC,
+        )
+        from markbot.config.schema import (
             MemoryToolsConfig as _MTC,
+        )
+        from markbot.config.schema import (
             WebSearchConfig as _WSC,
         )
         return {
@@ -829,9 +837,9 @@ class AgentContext:
     ) -> dict[str, Any]:
         """Build handoff, task tracker, memory encoder, bootstrap, commands."""
         from markbot.agent.permission_approval import PermissionApprover as _PA
+        from markbot.agent.services.executor import ToolExecutor as _TE
         from markbot.cli.slash_commands import CommandRouter as _CR
         from markbot.cli.slash_commands import register_builtin_commands as _rbc
-        from markbot.agent.services.executor import ToolExecutor as _TE
         from markbot.memory.encoder import MemoryEncoder as _ME
         from markbot.session.app_state import AppStateProvider as _ASP
         from markbot.session.bootstrap import SessionBootstrap as _SB

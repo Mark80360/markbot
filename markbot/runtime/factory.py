@@ -30,14 +30,7 @@ from markbot.config.schema import Config
 from markbot.types.permission import PermissionMode
 
 if TYPE_CHECKING:
-    from markbot.agent.loop import AgentLoop
-    from markbot.channels.manager import ChannelManager
-    from markbot.providers.fallback import FallbackManager
-    from markbot.schedule.cron import CronService
-    from markbot.schedule.dream import DreamService
-    from markbot.schedule.heartbeat import HeartbeatService
     from markbot.session.session import SessionManager
-    from markbot.skills.curator import CuratorService
 
 
 # ---------------------------------------------------------------------------

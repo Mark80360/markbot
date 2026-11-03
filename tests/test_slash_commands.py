@@ -44,8 +44,8 @@ class TestCmdModePersist:
     """
 
     def test_mode_auto_persists_to_config(self, tmp_path, monkeypatch):
-        from markbot.config import loader as loader_mod
         from markbot.cli.slash_commands.builtin import cmd_mode
+        from markbot.config import loader as loader_mod
 
         cfg = tmp_path / "config.json"
         cfg.write_text("{}", encoding="utf-8")
@@ -68,8 +68,8 @@ class TestCmdModePersist:
         assert data["agents"]["defaults"]["defaultPermissionMode"] == "auto"
 
     def test_mode_default_persists_to_config(self, tmp_path, monkeypatch):
-        from markbot.config import loader as loader_mod
         from markbot.cli.slash_commands.builtin import cmd_mode
+        from markbot.config import loader as loader_mod
 
         cfg = tmp_path / "config.json"
         cfg.write_text(
@@ -91,8 +91,8 @@ class TestCmdModePersist:
         # Point get_config_path at a path whose parent cannot be created
         # (a file blocking the dir) so the write fails. The in-memory
         # switch must still take effect.
-        from markbot.config import loader as loader_mod
         from markbot.cli.slash_commands.builtin import cmd_mode
+        from markbot.config import loader as loader_mod
 
         # The assertion below looks for the English word "warning", so pin the
         # language: get_language() otherwise reads display.language from the

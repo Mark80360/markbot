@@ -1,15 +1,13 @@
 """Tests for markbot.utils.network — SSRF protection and URL validation."""
 
-import pytest
-from unittest.mock import patch, MagicMock
 import socket
+from unittest.mock import patch
 
 from markbot.utils.network import (
-    validate_url_target,
-    validate_resolved_url,
-    contains_internal_url,
     _is_private,
-    _BLOCKED_NETWORKS,
+    contains_internal_url,
+    validate_resolved_url,
+    validate_url_target,
 )
 
 

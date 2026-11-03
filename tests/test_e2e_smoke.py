@@ -9,21 +9,16 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from markbot.agent.cache_protocol import (
-    CanonicalUsage,
-    CacheEvent,
-)
 from markbot.agent.cost import CostTracker, ModelPricing, PricingTable
 from markbot.agent.iteration import (
+    USAGE_NORMALISERS,
     IterationRunner,
     LoopState,
-    USAGE_NORMALISERS,
     normalise_usage,
 )
 from markbot.agent.turn_metadata import make_turn_metadata
-from markbot.providers.anthropic_breakpoints import system_and_3
 
 
 class _FakeLoop:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -129,13 +130,31 @@ def atomic_write_json(
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(str(tmp_path), str(path))
+        _replace_with_retry(tmp_path, path)
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+
+
+def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int = 8) -> None:
+    """``os.replace`` with a short retry loop for Windows sharing violations.
+
+    On Windows a concurrent reader (another thread finishing its own
+    ``open``, an indexer, or antivirus) can hold the destination open and
+    ``os.replace`` fails with ``PermissionError``. The window is milliseconds,
+    so retrying briefly is enough and keeps the write atomic.
+    """
+    for remaining in range(attempts, 0, -1):
+        try:
+            os.replace(str(tmp_path), str(path))
+            return
+        except PermissionError:
+            if remaining == 1:
+                raise
+            time.sleep(0.01)
 
 
 __all__ = ["FileLock", "LockAcquisitionError", "atomic_write_json"]

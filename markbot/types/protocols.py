@@ -7,7 +7,7 @@ between modules, replacing raw ``Any`` types with explicit contracts.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypedDict, runtime_checkable
 
 
 @runtime_checkable
@@ -122,9 +122,6 @@ class ChannelProtocol(Protocol):
 
     @property
     def is_running(self) -> bool: ...
-
-
-from typing import TypedDict
 
 
 class ToolCallPayload(TypedDict, total=False):

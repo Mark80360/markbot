@@ -5,7 +5,7 @@ Refactored to use new core types inspired by MarkBot.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from markbot.types.permission import PermissionDecision, PermissionMode
 from markbot.types.tool import ToolContext, ToolDefinition, ToolParameter

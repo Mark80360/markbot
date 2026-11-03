@@ -18,14 +18,9 @@ from typing import Any, Optional
 
 from loguru import logger
 
-# The single source of truth for token estimation lives in markbot.utils
-# so both the agent loop and the memory manager can use it without a
-# cross-module dependency. Re-export here for backward compatibility
-# with existing ``from markbot.agent.tokens import estimate_tokens`` calls.
-from markbot.utils.tokens import (  # noqa: F401
-    estimate_messages_tokens as _estimate_messages_tokens,
-    estimate_tokens,
-)
+# Keep the public name re-exported; the redundant alias marks it as an
+# intentional re-export for ruff (which would otherwise drop it as unused).
+from markbot.utils.tokens import estimate_tokens as estimate_tokens
 
 try:
     import tiktoken

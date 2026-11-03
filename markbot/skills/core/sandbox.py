@@ -328,10 +328,10 @@ class Sandbox:
         )
         if isolation_level == "degraded":
             logger.error(
-                "OS isolation requested but unavailable on this host; "
-                "the run has NO kernel-level filesystem or network "
-                "restriction. Install sandbox-exec (macOS, built-in) or "
-                "bwrap (Linux) for true isolation."
+                "OS isolation requested but unavailable on this host "
+                "(Windows has no isolation backend yet, or sandbox-exec/bwrap "
+                "is missing); the run has NO kernel-level filesystem or "
+                "network restriction."
             )
             if self.config.require_isolation:
                 message = (
@@ -640,10 +640,17 @@ class Sandbox:
         * ``"os"`` — isolation applied (sandbox-exec or bwrap available).
         * ``"degraded"`` — tool unavailable; caller should fall back to
           PATH restriction via the legacy ``network`` flag.
-        * ``"none"`` — ``isolate=False`` or Windows (no isolation attempted).
+        * ``"none"`` — ``isolate=False`` (no isolation attempted).
+
+        Windows has no supported isolation backend yet, so a requested
+        isolation degrades there too — reporting ``"none"`` would make
+        ``require_isolation=True`` silently run unrestricted.
         """
-        if not self.config.isolate or os.name == "nt":
+        if not self.config.isolate:
             return cmd, "none"
+
+        if os.name == "nt":
+            return cmd, "degraded"
 
         writable = self._writable_paths_for(cwd, script_path)
 

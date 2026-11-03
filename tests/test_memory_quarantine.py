@@ -14,8 +14,6 @@ Two related holes:
 
 from __future__ import annotations
 
-import pytest
-
 from markbot.memory.fencing import (
     MEMORY_TRUST_DERIVED,
     MEMORY_TRUST_UNVERIFIED,

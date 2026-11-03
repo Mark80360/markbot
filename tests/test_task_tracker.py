@@ -88,7 +88,7 @@ class TestTaskTracker:
         return TaskTracker(tmp_path)
 
     def test_creates_tasks_directory(self, tmp_path):
-        tracker = TaskTracker(tmp_path)
+        TaskTracker(tmp_path)
         assert (tmp_path / "tasks").exists()
 
     def test_create_task(self, tracker):

@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from markbot.agent.iteration import IterationRunner
-from markbot.providers.base import LLMResponse, ToolCallRequest
+from markbot.providers.base import LLMResponse
 from markbot.providers.fallback import FallbackAttempt
 
 

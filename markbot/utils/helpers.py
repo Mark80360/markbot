@@ -107,8 +107,9 @@ def normalize_timezone(tz: str | None) -> str:
     if not tz:
         return "UTC"
 
-    from loguru import logger
     from zoneinfo import ZoneInfo
+
+    from loguru import logger
 
     try:
         ZoneInfo(tz)

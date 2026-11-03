@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
 from markbot.agent.context import (
-    ContextBuilder,
     DEFAULT_SYSTEM_PROMPT_TOKEN_BUDGET,
+    ContextBuilder,
     PromptSection,
     unwrap_multimodal_result,
 )
-
 
 # ---------------------------------------------------------------------------
 # PromptSection

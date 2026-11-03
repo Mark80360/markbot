@@ -361,7 +361,13 @@ class WebFetchTool(Tool):
         self.max_chars = max_chars
         self.proxy = proxy
 
-    async def _legacy_execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> Any:
+    async def _legacy_execute(
+        self,
+        url: str,
+        extractMode: str = "markdown",  # noqa: N803 — mirrors the tool schema
+        maxChars: int | None = None,  # noqa: N803 — mirrors the tool schema
+        **kwargs: Any,
+    ) -> Any:
         max_chars = maxChars or self.max_chars
         is_valid, error_msg = _validate_url_safe(url)
         if not is_valid:
@@ -514,7 +520,7 @@ async def _process_content_with_llm(
 ) -> Optional[str]:
     """
     Process web content using LLM to create intelligent summaries.
-    
+
     For large content (>500K chars), uses chunked processing.
     For extremely large content (>2M chars), refuses to process.
     """
@@ -670,9 +676,9 @@ class WebExtractTool(Tool):
     name = "web_extract"
 
     _is_read_only = True
-    description = """Extract content from web page URLs. Returns page content in markdown format. 
-Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. 
-Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. 
+    description = """Extract content from web page URLs. Returns page content in markdown format.
+Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text.
+Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page.
 Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead."""
     parameters = {
         "type": "object",
@@ -889,7 +895,7 @@ Pages over 2M chars are refused. If a URL fails or times out, use the browser to
         """Local fallback using readability-lxml."""
         from readability import Document
 
-        from markbot.utils.ssrf import SSRFRedirectError, guarded_client
+        from markbot.utils.ssrf import guarded_client
 
         try:
             # Guarded transport: every hop (original + each redirect) is

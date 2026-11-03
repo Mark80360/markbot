@@ -20,15 +20,13 @@ self-explanatory rather than a mystery.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from types import SimpleNamespace
 
 import pytest
 
-from markbot.agent.cache_protocol import CanonicalUsage
-from markbot.agent.cost import BudgetExceededError, CostTracker, ModelPricing, PricingTable
-from markbot.agent.iteration import IterationRunner, LoopState
+from markbot.agent.cost import CostTracker, ModelPricing, PricingTable
+from markbot.agent.iteration import IterationRunner
 from markbot.providers.base import LLMResponse, ToolCallRequest
 from markbot.tools.base import BaseTool
 from markbot.types.permission import (
@@ -37,7 +35,6 @@ from markbot.types.permission import (
     ToolPermissionContext,
 )
 from markbot.types.tool import ToolDefinition, ToolParameter
-
 
 # ---------------------------------------------------------------------------
 # Harness
@@ -698,9 +695,9 @@ class TestSecurityInvariants:
             assert "authoritative" not in fence_context("x", trust=trust).lower()
 
     def test_shell_strips_credentials_from_child_env(self):
-        from markbot.tools.shell import ExecTool
-
         import os
+
+        from markbot.tools.shell import ExecTool
 
         tool = ExecTool(working_dir=os.getcwd())
         env = tool._build_env()

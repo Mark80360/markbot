@@ -201,7 +201,6 @@ def tick(
         budget_config=runtime_config.budget if runtime_config.budget.enabled else None,
     )
 
-    from markbot.autopilot.service import AutopilotService
     service = AutopilotService(store, agent_loop)
 
     async def _run():

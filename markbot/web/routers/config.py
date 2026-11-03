@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter
-from starlette.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
 
 from markbot.config.loader import load_config, save_config
 from markbot.config.schema import Config

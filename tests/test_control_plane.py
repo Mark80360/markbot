@@ -18,10 +18,7 @@ from markbot.agent.subagent.policy import DelegationPolicy, DelegationTracker
 from markbot.agent.tool_guardrails import (
     GuardrailAction,
     GuardrailConfig,
-    PreblockedResult,
     ToolCallGuardrail,
-    is_failure_result,
-    is_preblocked_result,
 )
 from markbot.cli.slash_commands.builtin import build_builtin_catalog, register_builtin_commands
 from markbot.cli.slash_commands.router import CommandRouter
@@ -29,7 +26,6 @@ from markbot.config.schema import Config, ToolsConfig
 from markbot.tools.base import BaseTool
 from markbot.tools.registry import ToolRegistry
 from markbot.types.tool import ToolContext, ToolDefinition
-
 
 # ---------------------------------------------------------------------------
 # Tool guardrails
@@ -648,7 +644,7 @@ class TestRuntimeBudget:
 
 class TestSkillMutationDefer:
     def test_bind_cache_policy_defers_script_reload(self, tmp_path):
-        from markbot.agent.cache_policy import CacheMutationPolicy, MutationKind
+        from markbot.agent.cache_policy import CacheMutationPolicy
         from markbot.skills.core.registry import SkillRegistry
         from markbot.tools.registry import ToolRegistry
         from markbot.types.skill import SkillDefinition
@@ -719,7 +715,6 @@ class TestMcpRegistrationDefer:
 class TestProfileHotSwitch:
     def test_set_profile_defers_tool_surface_mid_turn(self):
         from types import SimpleNamespace
-        from unittest.mock import MagicMock
 
         from markbot.agent.cache_policy import CacheMutationPolicy
         from markbot.agent.footprint import ToolFootprint, apply_footprint_to_registry

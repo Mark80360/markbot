@@ -7,27 +7,25 @@ a configured token budget, lower-priority sections are automatically
 truncated to preserve space for conversation history.
 """
 
-from dataclasses import dataclass
-
 import hashlib
 import json
 import mimetypes
 import platform
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
+from markbot.agent.cache_discipline import (
+    CACHE_DISCIPLINE_SECTION,
+    VOLATILE_BOUNDARY_MARKER,
+)
 from markbot.agent.tokens import estimate_tokens
 from markbot.agent.turn_metadata import (
     TurnMetadata,
     attach_turn_meta,
-    make_turn_metadata,
-)
-from markbot.agent.cache_discipline import (
-    CACHE_DISCIPLINE_SECTION,
-    VOLATILE_BOUNDARY_MARKER,
 )
 from markbot.skills.core.loader import BUILTIN_SKILLS_DIR
 from markbot.utils.constants import (

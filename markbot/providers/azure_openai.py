@@ -21,7 +21,7 @@ _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "n
 class AzureOpenAIProvider(LLMProvider):
     """
     Azure OpenAI provider with API version 2024-10-21 compliance.
-    
+
     Features:
     - Hardcoded API version 2024-10-21
     - Uses model field as Azure deployment name in URL path
@@ -359,6 +359,7 @@ class AzureOpenAIProvider(LLMProvider):
         return self.default_model
 
 
-from markbot.providers.registry import register_provider_factory
+# Registered after the class body: the registry imports the base provider.
+from markbot.providers.registry import register_provider_factory  # noqa: E402
 
 register_provider_factory("azure_openai", AzureOpenAIProvider)

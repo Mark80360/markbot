@@ -424,7 +424,7 @@ class ExploreTool(Tool):
                 continue
             if any(p in path.parts for p in _IGNORE_DIRS):
                 continue
-            rel = path.relative_to(root)
+            path.relative_to(root)
             name = path.name
             lower_name = name.lower()
 
@@ -1236,7 +1236,6 @@ class ExploreTool(Tool):
     @staticmethod
     def _ast_args(func_node):
         args = []
-        defaults_dict = {}
         defaults_list = list(func_node.args.defaults)
         all_args = func_node.args.args
         offset = len(all_args) - len(defaults_list)

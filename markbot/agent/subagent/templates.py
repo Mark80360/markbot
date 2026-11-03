@@ -10,7 +10,6 @@ from typing import Any, Mapping
 
 from markbot.agent.subagent.capability import CapabilityToken
 
-
 _TEMPLATES: dict[str, CapabilityToken] = {
     "research": CapabilityToken(
         allowed_tools=(

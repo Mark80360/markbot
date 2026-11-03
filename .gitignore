@@ -42,3 +42,8 @@ web/node_modules/
 .mimocode/
 .screenshots/
 .pytest_tmp/
+*.tsbuildinfo
+.tmp_patch_loop.py
+.coverage
+.coverage.*
+htmlcov/

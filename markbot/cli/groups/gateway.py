@@ -25,7 +25,6 @@ from markbot.cli.daemon import (
     read_pid,
     read_restart_sentinel,
     remove_pid,
-    sentinel_path,
     spawn_detached_restarter,
     start_daemon,
     terminate_process,

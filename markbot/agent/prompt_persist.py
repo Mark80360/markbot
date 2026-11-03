@@ -48,10 +48,9 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from loguru import logger
-
 
 CACHE_DIR_ENV = "MARKBOT_PROMPT_CACHE_DIR"
 META_FILENAME_SUFFIX = ".meta"

@@ -13,8 +13,6 @@ from __future__ import annotations
 import ast
 import io
 
-import pytest
-
 
 def _call_codex_body() -> str:
     """Parse the module without importing it.

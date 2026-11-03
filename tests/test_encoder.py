@@ -116,7 +116,7 @@ class TestMemoryEncoder:
 
     def test_scan_message_correction(self, encoder):
         # Test with a pattern that matches the correction regex
-        matches = encoder.scan_message("switch to React instead")
+        encoder.scan_message("switch to React instead")
         # The pattern requires specific phrasing
         # Let's verify the patterns are compiled correctly
         assert len(_CORRECTION_PATTERNS) > 0

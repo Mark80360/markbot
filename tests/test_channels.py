@@ -8,14 +8,13 @@ import time
 from collections import OrderedDict
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from markbot.bus.events import InboundMessage, OutboundMessage
 from markbot.bus.queue import MessageBus
-from markbot.channels import BaseChannel, ChannelManager
-from markbot.channels import discovery
+from markbot.channels import BaseChannel, ChannelManager, discovery
 from markbot.channels.base import BaseChannel as BaseChannelAlias
 from markbot.channels.base import (
     SendError,
@@ -23,7 +22,6 @@ from markbot.channels.base import (
     classify_send_error,
 )
 from markbot.channels.manager import ChannelManager as ChannelManagerAlias
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -444,7 +442,7 @@ class TestChannelManager:
     @pytest.mark.asyncio
     async def test_send_once_regular(self, bus):
         cfg = self._make_config({"dingtalk": {"enabled": False}})
-        mgr = ChannelManager(cfg, bus)
+        ChannelManager(cfg, bus)
         ch = AsyncMock()
         msg = OutboundMessage(channel="x", chat_id="c", content="hi")
         await ChannelManager._send_once(ch, msg)
@@ -454,7 +452,7 @@ class TestChannelManager:
     @pytest.mark.asyncio
     async def test_send_once_stream_delta(self, bus):
         cfg = self._make_config({"dingtalk": {"enabled": False}})
-        mgr = ChannelManager(cfg, bus)
+        ChannelManager(cfg, bus)
         ch = AsyncMock()
         msg = OutboundMessage(
             channel="x", chat_id="c", content="d", metadata={"_stream_delta": True}
@@ -1094,8 +1092,8 @@ class TestFeishuChannel:
     async def test_persistent_dedup_expires_after_ttl(self, bus, tmp_path, monkeypatch):
         """Entries older than the 24h TTL are dropped on load and re-admitted."""
         from markbot.channels.feishu import (
-            FeishuChannel,
             _FEISHU_DEDUP_TTL_SECONDS,
+            FeishuChannel,
         )
 
         state_file = tmp_path / "seen_message_ids.json"
@@ -1174,7 +1172,7 @@ class TestQQChannel:
         assert _is_image_name("noext") is False
 
     def test_guess_send_file_type(self):
-        from markbot.channels.qq import _guess_send_file_type, QQ_FILE_TYPE_IMAGE, QQ_FILE_TYPE_FILE
+        from markbot.channels.qq import QQ_FILE_TYPE_FILE, QQ_FILE_TYPE_IMAGE, _guess_send_file_type
 
         assert _guess_send_file_type("photo.png") == QQ_FILE_TYPE_IMAGE
         assert _guess_send_file_type("photo.jpg") == QQ_FILE_TYPE_IMAGE
@@ -1291,14 +1289,15 @@ class TestWeixinChannel:
         assert _ext_for_type("file") == ""
 
     def test_parse_aes_key_raw_bytes(self):
-        from markbot.channels.weixin import _parse_aes_key
-
         import base64
+
+        from markbot.channels.weixin import _parse_aes_key
         raw = b"\x00" * 16
         assert _parse_aes_key(base64.b64encode(raw).decode()) == raw
 
     def test_parse_aes_key_hex_string(self):
         import base64
+
         from markbot.channels.weixin import _parse_aes_key
 
         hex_key = "00112233445566778899aabbccddeeff"
@@ -1307,6 +1306,7 @@ class TestWeixinChannel:
 
     def test_parse_aes_key_invalid(self):
         import base64
+
         from markbot.channels.weixin import _parse_aes_key
 
         with pytest.raises(ValueError):
@@ -1314,6 +1314,7 @@ class TestWeixinChannel:
 
     def test_encrypt_decrypt_roundtrip(self):
         import base64
+
         from markbot.channels.weixin import _decrypt_aes_ecb, _encrypt_aes_ecb
 
         key = b"0123456789abcdef"
@@ -1341,9 +1342,9 @@ class TestWeixinChannel:
         assert dc["baseUrl"] == "https://ilinkai.weixin.qq.com"
 
     def test_random_wechat_uin_is_base64(self):
-        from markbot.channels.weixin import WeixinChannel
-
         import base64
+
+        from markbot.channels.weixin import WeixinChannel
         val = WeixinChannel._random_wechat_uin()
         # Must be a valid base64 string of a decimal number.
         decoded = base64.b64decode(val).decode()
@@ -1380,9 +1381,9 @@ class TestWeixinChannel:
         assert ch._session_pause_remaining_s() == 0
 
     def test_assert_session_active_raises(self):
-        from markbot.channels.weixin import WeixinChannel, WeixinConfig
-
         import time
+
+        from markbot.channels.weixin import WeixinChannel, WeixinConfig
         ch = WeixinChannel.__new__(WeixinChannel)
         ch.config = WeixinConfig()
         ch._session_pause_until = time.time() + 600
@@ -1390,7 +1391,6 @@ class TestWeixinChannel:
             ch._assert_session_active()
 
     def test_assert_session_active_ok(self):
-        import time
         from markbot.channels.weixin import WeixinChannel, WeixinConfig
 
         ch = WeixinChannel.__new__(WeixinChannel)
@@ -1399,7 +1399,7 @@ class TestWeixinChannel:
         ch._assert_session_active()  # no raise
 
     def test_process_message_skips_bot_type(self):
-        from markbot.channels.weixin import WeixinChannel, WeixinConfig, MESSAGE_TYPE_BOT
+        from markbot.channels.weixin import MESSAGE_TYPE_BOT, WeixinChannel, WeixinConfig
 
         ch = WeixinChannel.__new__(WeixinChannel)
         ch.config = WeixinConfig(allow_from=["*"])
@@ -1624,17 +1624,17 @@ class TestEmailChannel:
         assert EmailChannel._is_missing_mailbox_error(Exception("unrelated")) is False
 
     def test_extract_text_body_plain(self):
-        from markbot.channels.email import EmailChannel
-
         from email.message import EmailMessage
+
+        from markbot.channels.email import EmailChannel
         msg = EmailMessage()
         msg.set_content("Hello body")
         assert "Hello body" in EmailChannel._extract_text_body(msg)
 
     def test_extract_text_body_html(self):
-        from markbot.channels.email import EmailChannel
-
         from email.message import EmailMessage
+
+        from markbot.channels.email import EmailChannel
         msg = EmailMessage()
         msg.add_alternative("<p>HTML body</p>", subtype="html")
         out = EmailChannel._extract_text_body(msg)
@@ -1926,6 +1926,7 @@ class TestInboundSurfaceContract:
 
 class TestPackageExports:
     def test_exports(self):
-        from markbot.channels import BaseChannel, ChannelManager as CM
+        from markbot.channels import BaseChannel
+        from markbot.channels import ChannelManager as CM
         assert BaseChannel is BaseChannelAlias
         assert CM is ChannelManagerAlias

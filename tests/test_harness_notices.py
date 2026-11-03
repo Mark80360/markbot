@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
-
 from markbot.agent.iteration import IterationRunner
 
 
@@ -36,7 +34,7 @@ class TestAppendSyntheticNotice:
         return object.__new__(IterationRunner)
 
     def test_appends_as_user_role(self):
-        r = self._runner()
+        self._runner()
         msgs = [{"role": "system", "content": "sys"}]
         IterationRunner._append_synthetic_notice(msgs, "notice", "_m")
         assert msgs[-1]["role"] == "user"
@@ -46,7 +44,7 @@ class TestAppendSyntheticNotice:
     def test_does_not_disturb_existing_prefix(self):
         """Every pre-existing message must stay byte-identical and in place —
         that is what keeps the prefix cache valid."""
-        r = self._runner()
+        self._runner()
         original = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "q1"},
@@ -59,14 +57,14 @@ class TestAppendSyntheticNotice:
         assert len(msgs) == len(original) + 1
 
     def test_repeated_notices_stack_in_order(self):
-        r = self._runner()
+        self._runner()
         msgs: list = []
         IterationRunner._append_synthetic_notice(msgs, "first", "_m")
         IterationRunner._append_synthetic_notice(msgs, "second", "_m")
         assert [m["content"] for m in msgs] == ["first", "second"]
 
     def test_empty_content_still_marked(self):
-        r = self._runner()
+        self._runner()
         msgs: list = []
         IterationRunner._append_synthetic_notice(msgs, "", "_m")
         assert len(msgs) == 1

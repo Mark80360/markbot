@@ -146,7 +146,8 @@ class OpenAICodexProvider(LLMProvider):
         return self.default_model
 
 
-from markbot.providers.registry import register_provider_factory
+# Registered after the class body: the registry imports the base provider.
+from markbot.providers.registry import register_provider_factory  # noqa: E402
 
 register_provider_factory("openai_codex", OpenAICodexProvider)
 
@@ -301,7 +302,7 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [entry[5:].strip() for entry in buffer if entry.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue

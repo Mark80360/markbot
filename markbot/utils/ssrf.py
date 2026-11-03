@@ -30,11 +30,15 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from loguru import logger
 
 from markbot.config.schema import Config
+
+if TYPE_CHECKING:
+    import httpx
 
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset()
 _ALWAYS_BLOCKED_IPS: tuple[ipaddress._BaseAddress, ...] = ()

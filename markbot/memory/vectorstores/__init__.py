@@ -15,7 +15,6 @@ Requires ``pip install markbot[chroma]`` (chromadb).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -29,7 +28,7 @@ from ..vectorstore import VectorRecord, VectorStore, _normalize
 
 try:
     import chromadb  # type: ignore
-    from chromadb.api.types import EmbeddingFunction, Documents, Embeddings  # type: ignore
+    from chromadb.api.types import Documents, EmbeddingFunction, Embeddings  # type: ignore
     _HAS_CHROMA = True
 except ImportError:
     chromadb = None  # type: ignore[assignment]

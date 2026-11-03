@@ -389,7 +389,7 @@ class SubagentProgressManager:
 
     def get_output_file(self, task_id: str) -> Optional[Path]:
         """Get output file path for a task.
-        
+
         Returns the path even if the tracker has been removed,
         allowing access to completed task outputs.
         """
@@ -407,7 +407,7 @@ class SubagentProgressManager:
 
     async def read_output(self, task_id: str, max_bytes: int = 100_000) -> str:
         """Read output file for a task.
-        
+
         Works even after the tracker has been removed,
         as long as the output file exists on disk.
         """
@@ -428,7 +428,7 @@ class SubagentProgressManager:
 
     async def tail_output(self, task_id: str, lines: int = 50) -> str:
         """Get last N lines of output.
-        
+
         Works even after the tracker has been removed,
         as long as the output file exists on disk.
         """
@@ -446,7 +446,7 @@ class SubagentProgressManager:
 
     def get_task_summary(self, task_id: str) -> Optional[dict[str, Any]]:
         """Get a summary of a task from its output file.
-        
+
         Used when the tracker has been removed but we need basic info.
         """
         output_file = self.get_output_file(task_id)

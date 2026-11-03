@@ -42,7 +42,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-
 _TURN_META_TAG = "<turn_meta>"
 _TURN_META_CLOSE = "</turn_meta>"
 

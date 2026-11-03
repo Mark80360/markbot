@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
+
 from markbot.web.store import get_store
 
 router = APIRouter()

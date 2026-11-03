@@ -13,7 +13,7 @@ import asyncio
 import pytest
 
 from markbot.bus.emitter import get_event_emitter, reset_event_emitter
-from markbot.bus.events import Event, EventType
+from markbot.bus.events import EventType
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +43,6 @@ def test_register_is_idempotent():
 def test_subscriber_logs_progress_event(caplog):
     """Emitting a TOOL_PROGRESS event must reach the registered
     subscriber, which forwards it to loguru at DEBUG level."""
-    import logging
 
     from markbot.cli.progress import register_progress_subscriber
 
